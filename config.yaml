@@ -1,0 +1,162 @@
+# AI Control Plane configuration.
+#
+# Load order (later wins): built-in defaults < config.yaml < config.local.yaml (same directory,
+# optional, not committed) < environment variables < settings saved from the UI (settings store).
+# Environment overrides: PROJECT_ID, QUOTA_PROJECT_ID, AUDIT_DATASET_ID, BILLING_PROJECT_ID,
+# BILLING_DATASET_ID, BILLING_TABLE_ID, BILLING_ACCOUNT_ID, WORKSPACE_TIMEZONE, ORGANIZATION_NAME,
+# PRODUCT_NAME, DEFAULT_LOCALE, AUTH_MODE, IAP_AUDIENCE, ADMIN_EMAILS (comma separated), SETTINGS_BUCKET,
+# DISCOVERY_ENGINE_LOCATIONS and AGENT_ENGINE_REGIONS (comma separated), AI_DEFAULT_MODEL, AI_LOCATION,
+# HOST, PORT, CONFIG_PATH.
+# All values below are placeholders. Replace them per customer or override them with environment
+# variables; do not commit customer identifiers to this file.
+
+product:
+  name: "AI Control Plane"
+  tagline: "Unified governance for Gemini Enterprise and Agent Platform"
+
+branding:
+  organization_name: "Your Organization"
+  logo_url: ""                 # https URL or /assets/... path; empty shows a generated monogram
+  accent_color: "#2563EB"      # #RRGGBB
+  default_locale: "en"         # en | ko
+  default_theme: "system"      # system | light | dark
+
+server:
+  host: "127.0.0.1"            # the container image sets HOST=0.0.0.0
+  port: 8088                   # PORT (set by Cloud Run) wins
+  cache_ttl_seconds: 120
+
+workspace:
+  project_id: "your-gcp-project-id"   # values starting with "your-" mean "not configured"
+  quota_project_id: ""                # empty = project_id
+  timezone: "UTC"                     # IANA name, for example Asia/Seoul
+  default_range_days: 14
+  audit_dataset: "ge_analytics"       # BigQuery dataset that receives the log sinks
+  billing:
+    project_id: ""                    # empty = workspace project
+    dataset: "billing_detailed_usage"
+    table: "gcp_billing_export_resource_v1_XXXXXX_XXXXXX_XXXXXX"
+    account_id: ""                    # XXXXXX-XXXXXX-XXXXXX
+  discovery_engine_locations: ["global"]
+  agent_engine_regions: ["us-central1"]
+  telemetry_datasets: []              # extra datasets scanned by telemetry discovery ("dataset" or "project.dataset")
+
+security:
+  # auto (iap on Cloud Run, local otherwise) | google | iap | local | public_readonly
+  #   google: the application's own sign-in page (/login) with Google accounts. Only approved
+  #           accounts (admins + allowed_users) get a session; others can request access and
+  #           administrators approve them in Settings > Access control. Requires google_client_id
+  #           plus the GOOGLE_OAUTH_CLIENT_SECRET and SESSION_SECRET environment variables (store
+  #           both in Secret Manager). scripts/deploy.sh sets this up (ACCESS_MODE=google_oauth).
+  auth_mode: "auto"
+  # Expected audience of the signed IAP header. Direct IAP on Cloud Run (recommended):
+  #   /projects/PROJECT_NUMBER/locations/REGION/services/SERVICE_NAME
+  # Alternatives: /projects/PROJECT_NUMBER/global/backendServices/SERVICE_ID (load balancer),
+  #   /projects/PROJECT_NUMBER/apps/PROJECT_ID (App Engine). Empty: signature, expiry and issuer are
+  #   still verified, but not the audience (a startup warning is logged).
+  iap_audience: ""
+  admins: []                   # exact emails or *@domain.com patterns; ADMIN_EMAILS is merged
+  allowed_users: []            # google mode: approved viewer accounts or *@domain.com; ALLOWED_USERS is merged
+  google_client_id: ""         # google mode: OAuth Web client id (GOOGLE_OAUTH_CLIENT_ID)
+  public_base_url: ""          # google mode: https://dashboard.example.com (PUBLIC_BASE_URL); fixes the redirect URI
+  session_hours: 12            # google mode: session lifetime, 1-168 (SESSION_HOURS)
+  # google mode without an OAuth client: URL of the IAP-protected sign-in bridge service
+  # (SIGN_IN_BRIDGE_URL). The bridge itself runs the same image with auth_mode iap and
+  # bridge_return_url = this dashboard's URL (BRIDGE_RETURN_URL). scripts/deploy.sh sets this up (ACCESS_MODE=google).
+  sign_in_bridge_url: ""
+  bridge_return_url: ""
+  mask_pii_for_viewers: true
+
+storage:
+  backend: "auto"              # auto | file | gcs | memory (auto = gcs if gcs_bucket, else file locally / memory on Cloud Run)
+  file_path: "data/settings.json"
+  gcs_bucket: ""               # SETTINGS_BUCKET
+  gcs_object: "control-plane/settings.json"
+
+bigquery:
+  max_bytes_billed: 20000000000   # per dashboard query
+
+ai_engine:
+  location: "global"
+  default_model: "gemini-3.8-flash"
+  models: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-4-argon"]
+  discover_models: true
+  restrict_to_allowed: true       # only configured (and discovered, if enabled) models are accepted
+
+modules:
+  overview: true
+  gemini_enterprise: true
+  notebooklm: true
+  model_usage: true
+  agent_gateway: true
+  agent_registry: true
+  agent_deployments: true
+  model_armor: true
+  users: true
+  antigravity: true
+  finops: true
+  telemetry: true
+  analyst: true
+
+model_catalog:
+  auto_enable_new_models: true
+  disabled_models: []             # model keys, for example gemini-3.8-flash-lite
+  excluded_sku_patterns: ["code assist", "duet ai"]   # always enforced, even if removed here
+  ai_grouping: false              # optional Gemini refinement of model family names (cached 6 hours)
+
+gateway:
+  services:
+    - "aiplatform.googleapis.com"
+    - "discoveryengine.googleapis.com"
+    - "modelarmor.googleapis.com"
+    - "businessaicode.googleapis.com"
+    - "notebooklm.googleapis.com"
+    - "geminidataanalytics.googleapis.com"
+    - "generativelanguage.googleapis.com"
+
+agent_lifecycle:
+  idle_days: 14
+  deprecation_days: 50
+
+finops:
+  spike_threshold_pct: 50
+  spike_min_delta: 1.0
+
+governance:
+  antigravity:
+    usage_source: "auto"          # auto | bigquery | logging
+    inference_log: "businessaicode.googleapis.com%2Finference_response"
+    access_role: "roles/discoveryengine.agentspaceUser"
+    cap_marker_role: "CustomAntigravityCapBlocked"
+    admin_marker_role: "CustomAntigravityAdminBlocked"
+    legacy_marker_roles: ["CustomAntigravityRestrictedUser"]
+    privileged_roles: ["roles/owner", "roles/editor", "roles/discoveryengine.admin"]
+    extra_access_roles: []
+    period: "daily"               # settlement period: daily | weekly | monthly | all (all = 90 days)
+    window: "calendar"            # calendar (resets at local midnight in reset_timezone) | rolling
+    reset_timezone: "UTC"         # IANA zone of calendar period boundaries, for example Asia/Seoul
+    token_cap: 500000             # 0 = disabled
+    request_cap: 1000             # 0 = disabled
+    cost_cap: 0                   # amount per person and period in `currency`, e.g. 1000000 (KRW); 0 = disabled
+    currency: ""                  # ISO code of cost caps, e.g. KRW; empty = billing account currency
+    pricing_source: "auto"        # auto = price per token the billing account paid (last 30 days), then the
+                                  # public Google Cloud price list, converted at the Google exchange rate
+                                  # manual = the prices below
+    input_price_per_million: 0    # manual prices only; model_prices also override automatic prices
+    output_price_per_million: 0   # applies to candidate and thinking tokens
+    model_prices: []              # [{model: "gemini-3.8-pro", input: 0, output: 0}] (exact id or prefix)
+    enforcement_mode: "manual"    # manual = review queue | auto = scheduled runs suspend over-cap users
+    scheduler_invokers: []        # SCHEDULER_INVOKERS: service accounts allowed to call the enforce endpoint
+                                  # with a Google OIDC token (Cloud Scheduler); requires security.public_base_url
+    change_budget_min: 10
+    change_budget_ratio: 0.2
+    max_log_entries: 20000
+    audit_log_name: "agy-admin%2Fadmin_actions"
+    webhook_url: ""               # https only; allowed hosts: hooks.slack.com, chat.googleapis.com
+
+telemetry:
+  connectors: []                  # read-only connectors; connectors created in the UI are stored in the settings store
+
+analyst:
+  max_bytes_billed: 10000000000
+  max_rows: 500
