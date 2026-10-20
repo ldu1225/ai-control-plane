@@ -10,6 +10,7 @@ import { pageHeader, kpi, card, button, dataTable, statusBadge, userCell, emptyS
 import { serverText } from '../core/messages.js';
 import { lineChart, barChart, donutChart, fromTimeline, TONES, colorAt } from '../core/charts.js';
 import { pageFlow, fetchRange, rangeText, deltaOf, chartCard, mountCharts, openUserDrawer } from './_shared.js';
+import { widgetBoard } from '../core/widgets.js';
 
 export default async function render(ctx) {
   const header = pageHeader({
@@ -98,6 +99,9 @@ function renderOverview(ctx, body, d) {
       onClick: nav('#/antigravity'),
     }) : null);
   body.append(kpis);
+  // Personal widgets: Telemetry Extensions dashboards each person pins here and arranges by drag and drop.
+  const board = widgetBoard({ page: 'overview', signal: ctx.signal, navigate: ctx.navigate, prominent: true });
+  if (board) body.append(board);
 
   const row1 = h('div', { class: 'grid' });
   const spendCard = chartCard({

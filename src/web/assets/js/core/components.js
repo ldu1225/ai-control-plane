@@ -264,9 +264,21 @@ export function switchInput({ checked, onChange, disabled, label, id }) {
   return input;
 }
 
+const LABELABLE = 'input:not([type="hidden"]), select, textarea, button, meter, output, progress';
+let fieldSeq = 0;
+
+/**
+ * A captioned form field. A single input, select or textarea is wrapped in a <label>, so a click on the
+ * caption focuses it. Anything else (preset buttons, radio or checkbox lists, a code block with a copy button)
+ * gets a role="group" container: a <label> forwards clicks on its caption, help text and empty space to its
+ * first labelable descendant, which would press the first preset button.
+ */
 export function field({ label, help, control, error }) {
-  return h('label', { class: 'field' },
-    label ? h('span', { class: 'field-label' }, label) : null,
+  const targets = control instanceof Element ? [control, ...control.querySelectorAll(LABELABLE)].filter((el) => el.matches(LABELABLE)) : [];
+  const single = targets.length === 1 && targets[0].tagName !== 'BUTTON';
+  const id = single || !label ? null : `field-caption-${++fieldSeq}`;
+  return h(single ? 'label' : 'div', { class: 'field', role: single ? null : 'group', 'aria-labelledby': id },
+    label ? h('span', { class: 'field-label', id }, label) : null,
     control,
     help ? h('span', { class: 'field-help' }, help) : null,
     error ? h('span', { class: 'field-error' }, error) : null);

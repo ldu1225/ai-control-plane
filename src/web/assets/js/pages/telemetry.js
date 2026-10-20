@@ -13,11 +13,13 @@ import { api, isAbort } from '../core/api.js';
 import { store, isAdmin, isModuleEnabled, rangeParams } from '../core/state.js';
 import {
   pageHeader, kpi, card, dataTable, badge, button, banner, switchInput, openModal, openDrawer, toast, setBusy, field, textInput,
-  selectInput, errorState, warningsNotice, confirmDialog, codeBlock, chip, userCell, searchBox,
+  selectInput, errorState, warningsNotice, confirmDialog, codeBlock, chip, userCell, searchBox, skeleton,
 } from '../core/components.js';
 import { errorText } from '../core/messages.js';
 import { barChart, hbarList, mapList, sparkline, fromTimeline, TONES, colorAt } from '../core/charts.js';
 import { rangeText, chartCard, mountCharts, pageSkeleton, deltaOf } from './_shared.js';
+import { cardTitle, cardWhat, shortValue, statusText } from '../core/telemetry_view.js';
+import { loadLayouts, isPinned, togglePin, canEditLayouts } from '../core/widgets.js';
 
 const MAPPING_FIELDS = [
   ['time', 'Timestamp', true],
@@ -52,11 +54,6 @@ const PAGES = {
   antigravity: ['Antigravity Controls', 'antigravity'],
 };
 
-/** gRPC canonical codes, used to explain numeric error codes such as 13 (INTERNAL). */
-const GRPC_CODES = ['OK', 'CANCELLED', 'UNKNOWN', 'INVALID_ARGUMENT', 'DEADLINE_EXCEEDED', 'NOT_FOUND', 'ALREADY_EXISTS',
-  'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED', 'FAILED_PRECONDITION', 'ABORTED', 'OUT_OF_RANGE', 'UNIMPLEMENTED', 'INTERNAL',
-  'UNAVAILABLE', 'DATA_LOSS', 'UNAUTHENTICATED'];
-
 const LOG_FILTER_RE = /^\s*logName\s*=\s*"projects\/[^/"]+\/logs\/([^"]+)"\s*$/;
 
 export default async function render(ctx) {
@@ -65,14 +62,6 @@ export default async function render(ctx) {
 }
 
 /* ------------------------------------------------------------------ text helpers */
-
-function cardTitle(c) {
-  return c && c.title ? t(c.title, c.titleParams || undefined) : '';
-}
-
-function cardWhat(c) {
-  return c && c.what ? t(c.what, c.whatParams || undefined) : '';
-}
 
 /** Card title; sources that share a title (for example two Cloud Run system log streams) add their log or table. */
 function sourceTitle(s) {
@@ -107,25 +96,6 @@ function rangeDays() {
   return Number.isFinite(start) && Number.isFinite(end) ? Math.max(1, Math.round((end - start) / 86400000) + 1) : 14;
 }
 
-/** Shortens long identifiers for chart labels; the full value stays in the tooltip and the tables. */
-function shortValue(v) {
-  if (v === null || v === undefined || v === '') return t('Unknown');
-  const s = String(v);
-  const slash = s.split('/');
-  if (slash.length > 3) return slash.slice(-2).join('/');
-  const dots = s.split('.');
-  if (dots.length > 3 && /^[A-Za-z_][\w.]*$/.test(s)) return dots.slice(-2).join('.');
-  return s;
-}
-
-/** A status value for people: numeric error codes get their gRPC name. */
-function statusText(v, labelKey) {
-  if (v === null || v === undefined || v === '') return t('Unknown');
-  const s = String(v);
-  if (labelKey === 'Error code' && /^\d{1,2}$/.test(s) && GRPC_CODES[Number(s)]) return `${s} ${GRPC_CODES[Number(s)]}`;
-  return shortValue(s);
-}
-
 /* ------------------------------------------------------------------ list view */
 
 async function renderList(ctx) {
@@ -138,27 +108,26 @@ async function renderList(ctx) {
   mount(ctx.root, header, body);
   mount(body, pageSkeleton(3, 2));
 
-  let connectors = [];
-  let discovery = null;
+  // Discovery reads Cloud Logging, Monitoring and BigQuery and can take a while when it is not cached, so the
+  // dashboards are shown as soon as they load and the source list follows.
+  const discoveryReq = api.get('/api/v1/telemetry/discover', null, { signal: ctx.signal }).catch((e) => ({ error: e }));
+  let cRes;
   try {
-    const [cRes, dRes] = await Promise.all([
-      api.get('/api/v1/telemetry/connectors', null, { signal: ctx.signal }),
-      api.get('/api/v1/telemetry/discover', null, { signal: ctx.signal }).catch((e) => ({ error: e })),
-    ]);
-    if (ctx.signal.aborted) return null;
-    connectors = cRes.data.connectors || [];
-    discovery = dRes.error ? null : dRes.data;
-    mount(body);
-    const notice = warningsNotice([...(cRes.meta.warnings || []), ...((dRes.meta && dRes.meta.warnings) || [])]);
-    if (notice) body.append(notice);
-    if (dRes.error) body.append(banner({ tone: 'warning', title: t('The sources of this project could not be listed'), text: errorText(dRes.error) }));
+    cRes = await api.get('/api/v1/telemetry/connectors', null, { signal: ctx.signal });
   } catch (err) {
     if (isAbort(err) || ctx.signal.aborted) return null;
     mount(body, card({ body: errorState(err, { onRetry: () => ctx.rerender() }) }));
     return null;
   }
-  ctx.discovery = discovery;
+  if (ctx.signal.aborted) return null;
+  const connectors = cRes.data.connectors || [];
+  const pending = card({ title: t('Data you can add'), body: skeleton('block') });
+  mount(body, warningsNotice(cRes.meta.warnings || []), howItWorks(), dashboardsSection(ctx, connectors), pending);
 
+  const dRes = await discoveryReq;
+  if (ctx.signal.aborted || isAbort(dRes.error)) return null;
+  const discovery = dRes.error ? null : dRes.data;
+  ctx.discovery = discovery;
   const sources = buildSources(discovery);
   const env = {
     admin,
@@ -166,12 +135,13 @@ async function renderList(ctx) {
     logs: (discovery && Array.isArray(discovery.logs)) ? discovery.logs : [],
     listed: Boolean(discovery && (Array.isArray(discovery.tables) || Array.isArray(discovery.logs))),
   };
-  body.append(howItWorks());
-  body.append(dashboardsSection(ctx, connectors));
-  body.append(sourcesSection(ctx, sources, env));
-  const builtin = builtinSection(sources);
-  if (builtin) body.append(builtin);
-  body.append(notListedCard(ctx, env));
+  pending.replaceWith(...[
+    warningsNotice((dRes.meta && dRes.meta.warnings) || []),
+    dRes.error ? banner({ tone: 'warning', title: t('The sources of this project could not be listed'), text: errorText(dRes.error) }) : null,
+    sourcesSection(ctx, sources, env),
+    builtinSection(sources),
+    notListedCard(ctx, env),
+  ].filter(Boolean));
   return null;
 }
 
@@ -456,6 +426,28 @@ function connectorCard(ctx, c) {
 
 /* ------------------------------------------------------------------ connector dashboard */
 
+/** "Add to Overview" / "Remove from Overview" for a dashboard: pins a summary widget to the person's Overview. */
+function pinControl(c) {
+  const host = h('span', { class: 'row' });
+  const render = (pinned, busy) => mount(host, button({
+    label: pinned ? t('Remove from Overview') : t('Add to Overview'), icon: pinned ? 'check' : 'grid', disabled: busy,
+    onClick: async () => {
+      render(pinned, true);
+      try {
+        const now = await togglePin('overview', c.id);
+        toast({ title: now ? t('Added to the Overview') : t('Removed from the Overview'), text: now ? t('Drag it on the Overview to change its place.') : null, tone: 'success' });
+        render(now, false);
+      } catch (err) {
+        toast({ title: t('The widget layout could not be saved'), text: errorText(err), tone: 'danger' });
+        render(pinned, false);
+      }
+    },
+  }));
+  render(false, true);
+  loadLayouts().then(() => { if (canEditLayouts()) render(isPinned('overview', c.id), false); else mount(host); }).catch(() => mount(host));
+  return host;
+}
+
 function backButton(ctx) {
   return button({ label: t('Telemetry Extensions'), icon: 'chevron-left', variant: 'ghost', onClick: () => ctx.navigate('#/extensions') });
 }
@@ -514,6 +506,7 @@ async function renderConnector(ctx, id) {
     actions: [
       backButton(ctx),
       h('label', { class: 'row' }, h('span', { class: 'muted' }, t('Enabled')), toggle),
+      c.id ? pinControl(c) : null,
       admin ? button({ label: t('Edit'), icon: 'edit', onClick: () => openConnectorForm(ctx, c, null) }) : null,
       admin ? button({ label: t('Delete'), icon: 'trash', variant: 'danger', onClick: () => deleteConnector(ctx, c) }) : null,
     ],

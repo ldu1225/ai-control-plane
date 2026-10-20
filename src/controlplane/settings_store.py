@@ -300,6 +300,61 @@ def make_store(base_settings, gcp, environ=None):
     return MemoryStore()
 
 
+class UserDocStore:
+    """Small per-user JSON documents (personal widget layouts) next to the settings document.
+
+    Uses the backend of the settings store: <settings folder>/users/<key>.json in the same bucket or
+    directory, or process memory. Keys are user hashes (security.uid_for), never email addresses.
+    Writes are optimistic: a concurrent change is retried on the fresh document."""
+
+    KEY_LEN = 16
+
+    def __init__(self, settings_store):
+        self.base = settings_store
+        self._memory = {}
+        self._lock = threading.Lock()
+
+    def _store(self, key):
+        if not isinstance(key, str) or len(key) != self.KEY_LEN or any(c not in "0123456789abcdef" for c in key):
+            raise ValueError("invalid user document key")
+        base = self.base
+        if isinstance(base, GcsStore):
+            folder = base.obj.rsplit("/", 1)[0] + "/" if "/" in base.obj else ""
+            return GcsStore(base.gcp, base.bucket, "%susers/%s.json" % (folder, key), base.quota_project_fn)
+        if isinstance(base, FileStore):
+            return FileStore(os.path.join(os.path.dirname(base.path), "users", key + ".json"), base.durable)
+        return None
+
+    def load(self, key):
+        """Returns (doc, generation); a missing document is ({}, 0)."""
+        store = self._store(key)
+        if store is None:
+            with self._lock:
+                doc, generation = self._memory.get(key, ({}, 0))
+                return copy.deepcopy(doc), generation
+        doc, generation = store.load()
+        return (doc if generation and isinstance(doc, dict) else {}), generation
+
+    def mutate(self, key, fn, attempts=3):
+        """Applies fn(doc) to the current document and saves it; returns the saved document."""
+        for _ in range(attempts):
+            doc, generation = self.load(key)
+            fn(doc)
+            store = self._store(key)
+            try:
+                if store is None:
+                    with self._lock:
+                        if self._memory.get(key, ({}, 0))[1] != generation:
+                            raise StoreConflict()
+                        self._memory[key] = (copy.deepcopy(doc), generation + 1)
+                else:
+                    store.save(doc, generation)
+                return doc
+            except StoreConflict:
+                continue
+        raise StoreConflict()
+
+
 class SettingsManager:
     """Effective settings = finalize(base (defaults+yaml+env) merged with persisted overrides)."""
 

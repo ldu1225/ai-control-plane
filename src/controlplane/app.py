@@ -19,11 +19,11 @@ from .httpkit import ApiError, BaseHandler, Router, Server, StaticSite, csrf_val
 from .schema import SchemaRegistry
 from .security import Identity, IapVerifier, RateLimiter, authenticate, mask_for_viewer, resolve_auth_mode, \
     scheduler_identity
-from .settings_store import SettingsManager, make_store
+from .settings_store import SettingsManager, UserDocStore, make_store
 from .services import base as svc_base
 from .services import access
 from .services import agent_activity
-from .services import (agents, analyst, finops, gateway, gemini_enterprise, governance, model_armor, models,
+from .services import (agents, analyst, finops, gateway, gemini_enterprise, governance, layouts, model_armor, models,
                        notebooklm, overview, system, telemetry, users)
 
 LOG = logging.getLogger("controlplane.app")
@@ -56,6 +56,9 @@ _route("POST", "/api/v1/settings", system.settings_post, admin=True, mask=False)
 _route("POST", "/api/v1/settings/reset", system.settings_reset, admin=True, mask=False)
 _route("GET", "/api/v1/ai/models", system.ai_models)
 _route("POST", "/api/v1/ai/test", system.ai_test, admin=True, rate="ai")
+# Personal widget layouts (any signed-in person, own layout only; never cached across users)
+_route("GET", "/api/v1/layouts", layouts.get_layouts, mask=False)
+_route("POST", "/api/v1/layouts", layouts.save_layout, mask=False)
 # Modules
 _route("GET", "/api/v1/overview/summary", overview.summary, module="overview", range=True, cache=True)
 _route("GET", "/api/v1/gemini-enterprise/summary", gemini_enterprise.summary, module="gemini_enterprise", range=True,
@@ -121,6 +124,7 @@ class App:
         self.site = StaticSite(WEB_ROOT, __version__)
         self.router = ROUTER
         self.settings = SettingsManager(base, make_store(base, self.gcp, self.environ))
+        self.user_docs = UserDocStore(self.settings.store)
         mode = resolve_auth_mode(base["security"]["auth_mode"], self.environ)
         self.auth = None
         if mode == "google":

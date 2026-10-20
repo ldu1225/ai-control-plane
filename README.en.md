@@ -97,7 +97,7 @@ flowchart LR
 - **Single container**: A Python standard library HTTP server serves both the static SPA (`src/web`) and the REST API (`/api/v1`). There is no web framework and no frontend build step, so the code is easy to audit and change. There are 6 runtime dependencies (`requirements.txt`).
 - **Frontend**: A dependency-free ES module SPA. It does not use `innerHTML` and renders only with text nodes.
 - **Data access**: BigQuery is used only with parameterized queries, and every query has a cost cap set with `maximum_bytes_billed`. REST APIs are called with Application Default Credentials (the runtime service account) and a quota project header.
-- **Settings store**: Settings changed in the UI, exception rules and suspension records are saved to a Cloud Storage bucket. Only the changes are saved. Multiple instances re-read them every 30 seconds to stay consistent.
+- **Settings store**: Settings changed in the UI, exception rules and suspension records are saved to a Cloud Storage bucket. Only the changes are saved. Multiple instances re-read them every 30 seconds to stay consistent. Personal widget layouts are saved in the same bucket under `users/`, one document per person, named by a hash rather than the email address.
 - **Cache**: A TTL cache per endpoint and query parameters is used (120 seconds by default). It is invalidated immediately when settings change.
 
 ### 2.2 Repository structure
@@ -166,7 +166,7 @@ What the script does:
 | 1. Enable APIs | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Vertex AI, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing (price list), Service Usage, and IAP and Cloud Scheduler when needed |
 | 2. Container image | Creates an Artifact Registry repository (`ai-control-plane`) and builds the image with Cloud Build. If `IMAGE` is set, the build is skipped. |
 | 3. Runtime service account | Creates a dedicated service account and grants it only read roles. If `ENABLE_GOVERNANCE_ACTIONS=true`, IAM write roles are added ([6.6](#66-runtime-service-account-permissions)). |
-| 4. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. It stores settings changed in the UI, exception rules and suspension records. |
+| 4. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. It stores settings changed in the UI, exception rules, suspension records and personal widget layouts. |
 | 5. Session signing key | Creates a random key in Secret Manager and gives the service account read access to it. |
 | 6. Audit log routing | Creates a BigQuery dataset and a Log Router sink (`CREATE_LOG_SINK=true`). Optionally, also turns on Data Access audit logs. |
 | 7. Cloud Run deployment | Deploys the dashboard and configures the sign-in method (`ACCESS_MODE`). |
@@ -403,7 +403,7 @@ Antigravity token usage per user is read from the `businessaicode.googleapis.com
 | `roles/aiplatform.user` | Read Agent Engine, call AI Analyst (Gemini) |
 | `roles/iam.securityReviewer` | Read the project IAM policy (Antigravity state classification) |
 | `roles/serviceusage.serviceUsageConsumer` | Use the quota project header on all calls |
-| `roles/storage.objectAdmin` (settings bucket only) | Store UI settings, exception rules and suspension records |
+| `roles/storage.objectAdmin` (settings bucket only) | Store UI settings, exception rules, suspension records and personal widget layouts |
 | `roles/secretmanager.secretAccessor` (secrets only) | Session signing key, OAuth client secret |
 
 **Control features (only when `ENABLE_GOVERNANCE_ACTIONS=true`)**
@@ -423,6 +423,14 @@ Antigravity token usage per user is read from the `businessaicode.googleapis.com
 ### 7.1 Overview
 
 Brings the key KPIs of each module together on one page and shows the change compared with the previous period of the same length. KPIs of disabled modules are shown as "Module disabled".
+
+**My widgets**: pin dashboards created in Telemetry Extensions to the Overview and arrange them your way.
+
+- Select **Add widget** and choose the dashboard, what it shows (summary, events per day, breakdown, status breakdown or latest entries) and its size (small, medium, wide). The **Add to Overview** button on a dashboard page pins it too.
+- Drag a widget by its handle to change the order. With the keyboard, press the arrow keys on the handle, or use Move earlier / Move later in the widget menu.
+- Other pages (Gemini Enterprise, Users & Access and so on) can hold widgets too, with **Add a widget to this page** at the bottom.
+- Layouts are saved per person (`GET/POST /api/v1/layouts`) in `users/<user hash>.json` in the settings bucket; file names never contain email addresses. Shared read-only sessions cannot save.
+- Widget data uses the same API as the Telemetry Extensions dashboards, so the selected period, caching and viewer masking apply in the same way.
 
 ### 7.2 Gemini Enterprise
 
@@ -776,7 +784,7 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 
 ### 14.3 Upgrading
 
-Get the new version, then run `scripts/deploy.sh` again with the same `deploy.env`. UI settings, exception rules and suspension records are in the settings bucket, so they are kept.
+Get the new version, then run `scripts/deploy.sh` again with the same `deploy.env`. UI settings, exception rules, suspension records and widget layouts are in the settings bucket, so they are kept.
 
 ---
 
@@ -784,7 +792,7 @@ Get the new version, then run `scripts/deploy.sh` again with the same `deploy.en
 
 ```bash
 scripts/teardown.sh                 # deletes the service, scheduler, service accounts, IAM bindings and secrets
-scripts/teardown.sh --delete-data   # also deletes the settings bucket (UI settings, exception rules, suspension records) and the log sink
+scripts/teardown.sh --delete-data   # also deletes the settings bucket (UI settings, exception rules, suspension records, widget layouts) and the log sink
 ```
 
 The BigQuery audit log dataset, the Artifact Registry repository and the Data Access audit log settings are not deleted automatically. The script only shows the commands to delete them. If the dashboard has suspended any users, restore them on the Antigravity Controls page before removal.
@@ -825,6 +833,7 @@ The unit tests verify code behavior and do not connect to Google Cloud. Test inp
 | `GET /api/v1/governance/audit-log`, `/governance/antigravity/agent-activity` | Audit log, agent activity |
 | `GET /api/v1/finops/summary`, `POST /api/v1/finops/spikes/analyze` | FinOps |
 | `GET /api/v1/telemetry/discover`, `/connectors`, `/connectors/data`, `POST /connectors`, `/connectors/delete` | Telemetry Extensions |
+| `GET /api/v1/layouts`, `POST /api/v1/layouts` | Personal widget layouts (Overview and other pages) |
 | `POST /api/v1/analyst/chat` | AI Analyst |
 
 ### 16.3 Adding pages and localization

@@ -14,6 +14,7 @@ import {
 } from './core/components.js';
 import { errorText, serverText } from './core/messages.js';
 import { applyAccent, brandMark as brandMarkFor, accountAvatar } from './core/brand.js';
+import { widgetBoard } from './core/widgets.js';
 
 export const ROUTES = [
   { path: 'overview', label: 'Overview', icon: 'grid', module: 'overview', group: null, range: true, load: () => import('./pages/overview.js') },
@@ -500,6 +501,10 @@ function onGlobalKey(e) {
 
 /* ------------------------------------------------------------------ router */
 
+/** Pages that show the personal widget board below their content (the Overview places its own board). */
+const WIDGET_PAGES = new Set(['gemini-enterprise', 'notebooklm', 'gateway', 'registry', 'deployments', 'model-armor', 'models',
+  'finops', 'users', 'antigravity']);
+
 function parseHash() {
   const raw = window.location.hash.replace(/^#\/?/, '');
   const [pathPart, queryPart] = raw.split('?');
@@ -536,7 +541,9 @@ async function renderPage(force = false) {
   closePopover();
   const { params, query } = parseHash();
   const container = h('div', { class: 'page' });
-  mount(shell.content, container);
+  // Personal widgets live next to the page (not inside it), so page re-renders never remove them.
+  const widgetsHost = h('div', { class: 'page-widgets' });
+  mount(shell.content, h('div', { class: 'page-wrap' }, container, widgetsHost));
   try {
     const mod = await r.load();
     if (controller.signal.aborted) return;
@@ -553,6 +560,10 @@ async function renderPage(force = false) {
       refreshHealth: () => loadHealth(true),
     };
     current.cleanup = await mod.default(ctx);
+    if (WIDGET_PAGES.has(r.path) && !params.length && !controller.signal.aborted) {
+      const board = widgetBoard({ page: r.path, signal: controller.signal, navigate: ctx.navigate });
+      if (board) mount(widgetsHost, board);
+    }
     store.lastUpdated = new Date();
     shell.updated.textContent = t('Updated {time}', { time: fmt.time(store.lastUpdated.toISOString()) });
   } catch (err) {

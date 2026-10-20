@@ -97,7 +97,7 @@ flowchart LR
 - **단일 컨테이너**: Python 표준 라이브러리 HTTP 서버가 정적 SPA(`src/web`)와 REST API(`/api/v1`)를 함께 제공합니다. 웹 프레임워크와 프런트엔드 빌드 단계가 없어 감사와 수정이 쉽습니다. 런타임 의존성은 6개입니다(`requirements.txt`).
 - **프런트엔드**: 의존성 없는 ES Module SPA입니다. `innerHTML`을 쓰지 않고 텍스트 노드로만 렌더링합니다.
 - **데이터 접근**: BigQuery는 매개변수화된 쿼리만 사용하고 쿼리마다 `maximum_bytes_billed`로 비용 상한을 둡니다. REST API는 Application Default Credentials(런타임 서비스 계정)와 quota project 헤더로 호출합니다.
-- **설정 저장소**: 화면에서 바꾼 설정, 예외 규칙, 정지 기록은 변경분만 Cloud Storage 버킷에 저장합니다. 여러 인스턴스가 30초 주기로 다시 읽어 일관성을 유지합니다.
+- **설정 저장소**: 화면에서 바꾼 설정, 예외 규칙, 정지 기록은 변경분만 Cloud Storage 버킷에 저장합니다. 여러 인스턴스가 30초 주기로 다시 읽어 일관성을 유지합니다. 사람별 위젯 배치는 같은 버킷의 `users/` 폴더에 사람마다 문서 하나로 저장하며, 파일 이름은 이메일이 아닌 해시입니다.
 - **캐시**: 엔드포인트와 조회 조건 단위 TTL 캐시(기본 120초)를 쓰고, 설정이 바뀌면 즉시 무효화합니다.
 
 ### 2.2 저장소 구조
@@ -166,7 +166,7 @@ scripts/deploy.sh              # 실제 배포 (보통 3~8분)
 | 1. API 사용 설정 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Vertex AI, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing(가격표), Service Usage, 필요하면 IAP와 Cloud Scheduler |
 | 2. 컨테이너 이미지 | Artifact Registry 저장소(`ai-control-plane`)를 만들고 Cloud Build로 이미지를 빌드합니다. `IMAGE`를 지정하면 빌드를 건너뜁니다. |
 | 3. 런타임 서비스 계정 | 전용 서비스 계정을 만들고 읽기 역할만 부여합니다. `ENABLE_GOVERNANCE_ACTIONS=true`이면 IAM 쓰기 역할을 추가합니다([6.6](#66-런타임-서비스-계정-권한)). |
-| 4. 설정 버킷 | 비공개(공개 접근 차단), 버전 관리되는 Cloud Storage 버킷을 만듭니다. 화면에서 바꾼 설정, 예외 규칙, 정지 기록이 저장됩니다. |
+| 4. 설정 버킷 | 비공개(공개 접근 차단), 버전 관리되는 Cloud Storage 버킷을 만듭니다. 화면에서 바꾼 설정, 예외 규칙, 정지 기록, 사람별 위젯 배치가 저장됩니다. |
 | 5. 세션 서명 키 | Secret Manager에 임의 키를 만들고 서비스 계정에 읽기 권한을 줍니다. |
 | 6. 감사 로그 라우팅 | BigQuery 데이터셋과 Log Router 싱크를 만듭니다(`CREATE_LOG_SINK=true`). 선택하면 Data Access 감사 로그도 켭니다. |
 | 7. Cloud Run 배포 | 대시보드를 배포하고 로그인 방식(`ACCESS_MODE`)을 구성합니다. |
@@ -403,7 +403,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 | `roles/aiplatform.user` | Agent Engine 조회, AI 애널리스트(Gemini) 호출 |
 | `roles/iam.securityReviewer` | 프로젝트 IAM 정책 조회(Antigravity 상태 분류) |
 | `roles/serviceusage.serviceUsageConsumer` | 모든 호출에 quota project 헤더 사용 |
-| `roles/storage.objectAdmin` (설정 버킷에만) | 화면 설정, 예외 규칙, 정지 기록 저장 |
+| `roles/storage.objectAdmin` (설정 버킷에만) | 화면 설정, 예외 규칙, 정지 기록, 사람별 위젯 배치 저장 |
 | `roles/secretmanager.secretAccessor` (시크릿에만) | 세션 서명 키, OAuth 클라이언트 보안 비밀 |
 
 **통제 기능 (`ENABLE_GOVERNANCE_ACTIONS=true`일 때만)**
@@ -423,6 +423,14 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 ### 7.1 개요
 
 각 모듈의 핵심 KPI를 한 화면에 모으고 이전 같은 길이 기간과 비교한 증감을 보여 줍니다. 꺼진 모듈의 KPI는 "모듈 비활성"으로 표시됩니다.
+
+**내 위젯**: 텔레메트리 확장에서 만든 대시보드를 개요에 고정해 사람마다 원하는 대로 배치할 수 있습니다.
+
+- **위젯 추가**를 누르고 대시보드, 보여줄 내용(요약, 일별 건수, 항목별 분포, 상태별 분포, 최근 로그), 크기(작게, 보통, 넓게)를 고릅니다. 대시보드 화면의 **개요에 추가** 버튼으로도 고정할 수 있습니다.
+- 위젯 왼쪽 손잡이를 끌어 놓으면 순서가 바뀝니다. 키보드로는 손잡이에서 화살표 키를, 메뉴에서는 앞으로·뒤로 이동을 씁니다.
+- 다른 화면(Gemini Enterprise, 사용자 및 액세스 등)도 아래쪽의 **이 화면에 위젯 추가**로 같은 위젯을 둘 수 있습니다.
+- 배치는 사람마다 따로 저장됩니다(`GET/POST /api/v1/layouts`). 설정 버킷의 `users/<사용자 해시>.json`에 저장되며 파일 이름에 이메일을 쓰지 않습니다. 공유 읽기 전용 세션은 저장할 수 없습니다.
+- 위젯 데이터는 텔레메트리 확장 대시보드와 같은 API를 쓰므로 기간 선택, 캐시, 뷰어 마스킹이 똑같이 적용됩니다.
 
 ### 7.2 Gemini Enterprise
 
@@ -776,7 +784,7 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 
 ### 14.3 업그레이드
 
-새 버전을 받은 뒤 같은 `deploy.env`로 `scripts/deploy.sh`를 다시 실행합니다. 화면 설정, 예외 규칙, 정지 기록은 설정 버킷에 있으므로 그대로 유지됩니다.
+새 버전을 받은 뒤 같은 `deploy.env`로 `scripts/deploy.sh`를 다시 실행합니다. 화면 설정, 예외 규칙, 정지 기록, 위젯 배치는 설정 버킷에 있으므로 그대로 유지됩니다.
 
 ---
 
@@ -784,7 +792,7 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 
 ```bash
 scripts/teardown.sh                 # 서비스, 스케줄러, 서비스 계정, IAM 바인딩, 시크릿 삭제
-scripts/teardown.sh --delete-data   # 설정 버킷(화면 설정, 예외 규칙, 정지 기록)과 로그 싱크까지 삭제
+scripts/teardown.sh --delete-data   # 설정 버킷(화면 설정, 예외 규칙, 정지 기록, 위젯 배치)과 로그 싱크까지 삭제
 ```
 
 BigQuery 감사 로그 데이터셋, Artifact Registry 저장소, Data Access 감사 로그 설정은 자동으로 지우지 않고 삭제 명령만 안내합니다. 대시보드가 정지한 사용자가 있다면 삭제 전에 Antigravity 통제 화면에서 복원합니다.
@@ -825,6 +833,7 @@ python3 -m unittest discover -s tests/unit -v
 | `GET /api/v1/governance/audit-log`, `/governance/antigravity/agent-activity` | 감사 로그, 에이전트 작업 |
 | `GET /api/v1/finops/summary`, `POST /api/v1/finops/spikes/analyze` | FinOps |
 | `GET /api/v1/telemetry/discover`, `/connectors`, `/connectors/data`, `POST /connectors`, `/connectors/delete` | 텔레메트리 확장 |
+| `GET /api/v1/layouts`, `POST /api/v1/layouts` | 사람별 위젯 배치(개요와 각 화면) |
 | `POST /api/v1/analyst/chat` | AI 애널리스트 |
 
 ### 16.3 화면 추가와 다국어

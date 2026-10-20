@@ -3,7 +3,7 @@
 #
 #   scripts/teardown.sh                  # services, scheduler job, service accounts, IAM bindings, secrets
 #   scripts/teardown.sh --delete-data    # also the settings bucket (UI settings, exception rules,
-#                                        # suspension records) and the Log Router sink
+#                                        # suspension records, widget layouts) and the Log Router sink
 #   scripts/teardown.sh --config other.env --yes
 #
 # Never deleted automatically: the BigQuery audit dataset (it holds your logs), the Artifact Registry
