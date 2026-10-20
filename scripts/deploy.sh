@@ -119,9 +119,14 @@ fi
 ACCOUNT="$(gcloud config get-value account 2>/dev/null || true)"
 [[ -n "$ACCOUNT" ]] || die "no active gcloud account (run: gcloud auth login)"
 PROJECT_NUMBER=""
+GCLOUD_ERR="$(mktemp)"
+trap 'rm -f "$GCLOUD_ERR"' EXIT
 for attempt in 1 2 3; do
-  if PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>&1)"; then break; fi
-  [[ $attempt -lt 3 ]] || die "cannot read project ${PROJECT_ID} with ${ACCOUNT}: ${PROJECT_NUMBER}"
+  # stdout only: gcloud may print notices on stderr, which must never end up in URLs or identities.
+  PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>"$GCLOUD_ERR" || true)"
+  PROJECT_NUMBER="$(printf '%s' "$PROJECT_NUMBER" | tr -d '[:space:]')"
+  [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]] && break
+  [[ $attempt -lt 3 ]] || die "cannot read project ${PROJECT_ID} with ${ACCOUNT}: $(tail -n 3 "$GCLOUD_ERR")"
   sleep 5
 done
 
@@ -301,7 +306,7 @@ else
 fi
 if [[ "$ENABLE_DATA_ACCESS_LOGS" == "true" ]]; then
   POLICY_FILE="$(mktemp)"
-  trap 'rm -f "$POLICY_FILE"' EXIT
+  trap 'rm -f "$POLICY_FILE" "$GCLOUD_ERR"' EXIT
   gcloud projects get-iam-policy "$PROJECT_ID" --format=json >"$POLICY_FILE"
   CHANGED="$(python3 - "$POLICY_FILE" <<'PY'
 import json, sys

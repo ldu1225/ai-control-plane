@@ -1,4 +1,7 @@
-"""Telemetry extensions: table/log auto-discovery and UI-managed connectors."""
+"""Telemetry extensions: table/log auto-discovery, one-click connectors and their standard dashboards.
+
+Discovery describes every source with the plain-language catalog in telemetry_catalog.py.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +20,8 @@ from ..schema import SEGMENT_RE, build_expr, expr, quote_ident, table_ref
 from ..security import uid_for
 from .base import (CORE_TABLES, bucket_or_sentinel, bucket_values, iso, parse_rfc3339, period_sql, range_params,
                    split_rollup, to_int)
+from . import agents, monitoring
+from . import telemetry_catalog as catalog
 
 LOG = logging.getLogger("controlplane.telemetry")
 
@@ -24,8 +29,13 @@ LOGGING_V2 = "https://logging.googleapis.com/v2"
 MAPPING_KEYS = ("time", "user", "model", "tokens", "operation", "status")
 MAX_TABLES = 100
 MAX_LOG_ENTRIES = 5000
+MESSAGE_CHARS = 300
 CONNECTOR_ID_RE = re.compile(r"^conn_[0-9a-f]{8}$")
 HEALTH_TTL = 300
+LOG_ENTRY_METRIC = "logging.googleapis.com/log_entry_count"
+ACTIVITY_DAYS = 7
+ENGINE_ID_RE = re.compile(r"(?:reasoningEngines/)?([0-9]{6,})$")
+NAMES_TTL = 600
 HEURISTICS = {
     "user": ("principalemail", "useriamprincipal", "user_id", "userid", "user_email", "email", "user"),
     "model": ("model_id", "modelid", "model", "model_version"),
@@ -60,8 +70,7 @@ def suggested_mapping(leaf_types):
     return mapping
 
 
-def sanitize_log_name(short):
-    return re.sub(r"[./\-]", "_", short.replace("%2F", "/")).lower()
+sanitize_log_name = catalog.sanitize_log_name
 
 
 def all_connectors(ctx):
@@ -83,17 +92,10 @@ def _table_stats(ctx, project, dataset):
     return {r["table_id"]: r for r in rows if r.get("table_id")}
 
 
-def discover(ctx):
-    # tables is null when no dataset could be scanned; logs is null when the log list failed.
+def _discover_tables(ctx, connectors_by_table):
+    """Tables of the audit and telemetry datasets, or None when no dataset could be scanned."""
     tables = []
-    logs = None
     scanned = 0
-    registered = set()
-    for conn in all_connectors(ctx):
-        bq = conn.get("bigquery") or {}
-        if conn.get("source") == "bigquery" and bq.get("table"):
-            registered.add((bq.get("project"), bq.get("dataset"), bq["table"].rstrip("*").rstrip("_")))
-    logical_names = set()
     for project, dataset in discover_datasets(ctx):
         label = "bigquery:%s" % dataset
         try:
@@ -121,7 +123,6 @@ def discover(ctx):
                                                                                                     dataset))
         for name in names:
             info = groups[name]
-            logical_names.add(name.lower())
             sharded = info["kind"] == "sharded"
             if sharded:
                 members = [s for tid, s in stats.items() if tid.startswith(name + "_") and tid[len(name) + 1:].isdigit()]
@@ -131,35 +132,137 @@ def discover(ctx):
             size = sum(to_int(s.get("size_bytes")) for s in members) if members else None
             modified = max((to_int(s.get("last_modified_time")) for s in members), default=None) if members else None
             ok, meta = schemas.get(name, (False, None))
-            columns = None
-            mapping = None
-            if ok and meta:
-                columns = meta["schema"].leaf_paths(200)
-                mapping = suggested_mapping(meta["schema"].leaf_types(200))
-            tables.append({"project": project, "dataset": dataset, "table": name + ("_*" if sharded else ""),
+            schema = meta["schema"] if ok and meta else None
+            columns = schema.leaf_paths(200) if schema is not None else None
+            mapping = suggested_mapping(schema.leaf_types(200)) if schema is not None else None
+            sid = name.lower()
+            core = name in CORE_TABLES and (project, dataset) == (ctx.project, ctx.audit_dataset)
+            card = catalog.describe(sid, dataset=dataset, built_in=None if core else [])
+            quick, card = catalog.bigquery_connector(card, project, dataset, name, schema, mapping)
+            conn_id = connectors_by_table.get((project, dataset, name))
+            tables.append({"id": sid, "project": project, "dataset": dataset, "table": name + ("_*" if sharded else ""),
                            "logical": name, "sharded": sharded, "rows": rows, "sizeBytes": size,
                            "lastModified": iso(dt.datetime.fromtimestamp(modified / 1000.0, tz=dt.timezone.utc))
                            if modified else None,
-                           "core": name in CORE_TABLES and (project, dataset) == (ctx.project, ctx.audit_dataset),
-                           "registered": (project, dataset, name) in registered,
-                           "suggestedMapping": mapping, "columns": columns})
+                           "core": core, "registered": conn_id is not None, "connectorId": conn_id,
+                           "suggestedMapping": mapping, "columns": columns, "catalog": card, "quickAdd": quick,
+                           "entries7d": None, "daily": None})
+    return tables if scanned else None
+
+
+def _list_logs(ctx):
+    """[{logName, shortName}] of the project, or None when the log list failed."""
     try:
         names, truncated = ctx.gcp.paginate("%s/projects/%s/logs" % (LOGGING_V2, ctx.project),
                                             quota_project=ctx.quota_project, items_key="logNames", page_size=1000,
                                             max_pages=5)
-        ctx.add_source("api:logging.logs")
-        if truncated:
-            ctx.warn("api:logging.logs", "truncated", "Only the first 5000 log names are listed.")
-        logs = []
-        for log_name in names:
-            if not isinstance(log_name, str) or "/logs/" not in log_name:
-                continue
-            short = urllib.parse.unquote(log_name.split("/logs/", 1)[1])
-            logs.append({"logName": log_name, "shortName": short,
-                         "routedToBigQuery": sanitize_log_name(short) in logical_names})
     except GcpError as err:
         ctx.warn_error("api:logging.logs", err, "The Cloud Logging log list")
-    return {"tables": tables if scanned else None, "logs": logs}
+        return None
+    ctx.add_source("api:logging.logs")
+    if truncated:
+        ctx.warn("api:logging.logs", "truncated", "Only the first 5000 log names are listed.")
+    out = []
+    for log_name in names:
+        if isinstance(log_name, str) and "/logs/" in log_name:
+            out.append({"logName": log_name, "shortName": urllib.parse.unquote(log_name.split("/logs/", 1)[1])})
+    return out
+
+
+def _log_activity(ctx):
+    """{log id: [daily entry counts, oldest first]} over the last ACTIVITY_DAYS days, or None if unreadable.
+
+    Uses the Cloud Monitoring log_entry_count metric, which costs one call for every log of the project
+    (the Logging API would need one rate-limited call per log). A log may report one series per resource
+    type, so counts are summed per log."""
+    tz = timeutil.get_zone(ctx.tz_name)
+    now = dt.datetime.now(dt.timezone.utc)
+    today = now.astimezone(tz).date()
+    index = {today - dt.timedelta(days=ACTIVITY_DAYS - 1 - i): i for i in range(ACTIVITY_DAYS)}
+    try:
+        series = monitoring.time_series(ctx, LOG_ENTRY_METRIC, ["metric.label.log"],
+                                        now - dt.timedelta(days=ACTIVITY_DAYS), now)
+    except GcpError as err:
+        ctx.warn_error("api:monitoring.log_entry_count", err, "Log activity from Cloud Monitoring")
+        return None
+    ctx.add_source("api:monitoring.log_entry_count")
+    out = {}
+    for labels, points in series:
+        name = urllib.parse.unquote(str(labels.get("metric.label.log") or "")).strip()
+        if not name:
+            continue
+        counts = out.setdefault(name, [0] * ACTIVITY_DAYS)
+        for day, value in points:
+            pos = index.get(day)
+            if pos is not None:
+                counts[pos] += to_int(value)
+    return out
+
+
+def _builtin_logs(ctx):
+    """Logs that built-in pages read directly from Cloud Logging: {log id: [route ids]}."""
+    agy = (ctx.settings.get("governance") or {}).get("antigravity") or {}
+    out = {}
+    inference = urllib.parse.unquote(agy.get("inference_log") or "")
+    if inference:
+        out[inference] = list(catalog.BUILT_IN.get(catalog.sanitize_log_name(inference), ["antigravity"]))
+    audit = urllib.parse.unquote(agy.get("audit_log_name") or "")
+    if audit:
+        out[audit] = ["antigravity"]
+    return out
+
+
+def _task_result(ctx, result, source, what):
+    ok, value = result
+    if ok:
+        return value
+    ctx.warn_error(source, value, what)
+    return None
+
+
+def discover(ctx):
+    """Every telemetry source of the project, described in plain language.
+
+    tables is null when no dataset could be scanned and logs is null when the log list failed. Each source has
+    `catalog` (what the data is and what its dashboard shows), `quickAdd` (a ready body for
+    POST /api/v1/telemetry/connectors, null when the source cannot be added) and `connectorId` (the connector
+    that already reads it). entries7d/daily are the entries written per day over the last 7 days according to
+    Cloud Monitoring; they are null when that metric could not be read."""
+    by_table, by_log = {}, {}
+    for conn in all_connectors(ctx):
+        bq = conn.get("bigquery") or {}
+        if conn.get("source") == "bigquery" and bq.get("table"):
+            key = (bq.get("project"), bq.get("dataset"), bq["table"][:-2] if bq["table"].endswith("_*") else bq["table"])
+            by_table.setdefault(key, conn.get("id"))
+        elif conn.get("source") == "logging":
+            sid = catalog.connector_source_id(conn)
+            if sid:
+                by_log.setdefault(sid, conn.get("id"))
+    res = ctx.run_composite({"tables": lambda: _discover_tables(ctx, by_table), "logs": lambda: _list_logs(ctx),
+                             "activity": lambda: _log_activity(ctx)})
+    tables = _task_result(ctx, res["tables"], "telemetry:tables", "Table discovery")
+    logs = _task_result(ctx, res["logs"], "api:logging.logs", "The Cloud Logging log list")
+    activity = _task_result(ctx, res["activity"], "api:monitoring.log_entry_count", "Log activity from Cloud Monitoring")
+    logical = {tb["id"] for tb in tables or []}
+    builtin = _builtin_logs(ctx)
+    by_id = {}
+    for log in logs or []:
+        short = log["shortName"]
+        sid = catalog.sanitize_log_name(short)
+        counts = (activity.get(short) or [0] * ACTIVITY_DAYS) if activity is not None else None
+        core = sid in CORE_TABLES or short in builtin
+        card = catalog.describe(sid, short=short, built_in=builtin.get(short) if short in builtin else
+                                (None if core else []))
+        log.update({"id": sid, "routedToBigQuery": sid in logical, "core": core,
+                    "registered": sid in by_log, "connectorId": by_log.get(sid),
+                    "entries7d": sum(counts) if counts is not None else None, "daily": counts,
+                    "catalog": card, "quickAdd": catalog.logging_connector(card, log["logName"])})
+        by_id.setdefault(sid, log)
+    for tb in tables or []:
+        log = by_id.get(tb["id"])
+        if log is not None:
+            tb["entries7d"], tb["daily"] = log["entries7d"], log["daily"]
+    return {"tables": tables, "logs": logs, "activityDays": ACTIVITY_DAYS}
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +303,7 @@ def with_health(ctx, conn):
     (health, last), _ = ctx.app.cache.get_or_compute(key, HEALTH_TTL, lambda: _connector_health(ctx, conn))
     item["health"] = health
     item["lastEvent"] = last
+    item["catalog"] = catalog.for_connector(conn)
     return item
 
 
@@ -213,7 +317,7 @@ def list_connectors(ctx):
             out.append(value)
         else:
             item = copy.deepcopy(conns[i])
-            item.update({"health": "error", "lastEvent": None})
+            item.update({"health": "error", "lastEvent": None, "catalog": catalog.for_connector(conns[i])})
             out.append(item)
     return {"connectors": out}
 
@@ -382,10 +486,35 @@ def _get_path(obj, path):
     return cur
 
 
+def _log_message(entry):
+    """The human-readable line of a LogEntry: textPayload, a JSON message or an audit status message."""
+    text = entry.get("textPayload")
+    if not isinstance(text, str):
+        payload = entry.get("jsonPayload") if isinstance(entry.get("jsonPayload"), dict) else {}
+        text = next((payload[k] for k in ("message", "msg", "error") if isinstance(payload.get(k), str)), None)
+    if not isinstance(text, str):
+        proto = entry.get("protoPayload") if isinstance(entry.get("protoPayload"), dict) else {}
+        status = proto.get("status") if isinstance(proto.get("status"), dict) else {}
+        text = status.get("message") if isinstance(status.get("message"), str) else None
+    text = text.strip() if isinstance(text, str) else ""
+    return text[:MESSAGE_CHARS] or None
+
+
+def _message_expr(schema):
+    """SQL for the same line in an exported table (typed payload columns are named jsonpayload_<type>)."""
+    candidates = ["textPayload", "jsonPayload.message"]
+    candidates += ["%s.message" % node.name for name, node in schema.tree.items()
+                   if name.startswith("jsonpayload") and name != "jsonpayload"]
+    candidates.append("protopayload_auditlog.status.message")
+    sql = expr("t", schema, *candidates, cast="STRING")
+    return "SUBSTR(%s, 1, %d)" % (sql, MESSAGE_CHARS) if sql else "CAST(NULL AS STRING)"
+
+
 def _empty_data(conn, rng):
     return {"connector": conn, "kpis": {"events": {"value": None, "previous": None}, "users": None, "tokens": None,
                                         "lastEvent": None},
-            "trend": None, "topOperations": None, "topUsers": None, "topModels": None, "recent": None}
+            "trend": None, "topOperations": None, "topStatuses": None, "topUsers": None, "topModels": None,
+            "recent": None, "sample": None, "valueNames": None}
 
 
 def _bq_data(ctx, conn, rng, out):
@@ -410,12 +539,13 @@ def _bq_data(ctx, conn, rng, out):
                                                    period_sql("ts"), bucket_or_sentinel("ts")))
     tops_sql = ("WITH %s,\n%s\nSELECT 'operation' AS kind, operation AS k, COUNT(*) AS events, SUM(tokens) AS tokens "
                 "FROM d GROUP BY k\nUNION ALL SELECT 'user', user, COUNT(*), SUM(tokens) FROM d GROUP BY user\n"
-                "UNION ALL SELECT 'model', model, COUNT(*), SUM(tokens) FROM d GROUP BY model"
+                "UNION ALL SELECT 'model', model, COUNT(*), SUM(tokens) FROM d GROUP BY model\n"
+                "UNION ALL SELECT 'status', status, COUNT(*), SUM(tokens) FROM d GROUP BY status"
                 % (src.cte("src", start="start_ts", time_col=time_col), proj))
     recent_sql = ("WITH %s\nSELECT %s AS ts, %s AS user, %s AS operation, %s AS model, %s AS tokens, %s AS status, "
-                  "SUBSTR(TO_JSON_STRING(t), 1, 2048) AS payload FROM src t ORDER BY ts DESC LIMIT 20"
+                  "%s AS message, SUBSTR(TO_JSON_STRING(t), 1, 2048) AS payload FROM src t ORDER BY ts DESC LIMIT 20"
                   % (src.cte("src", start="start_ts", time_col=time_col), ts, user or null, op or null, model or null,
-                     tokens or "CAST(NULL AS INT64)", status or null))
+                     tokens or "CAST(NULL AS INT64)", status or null, _message_expr(s)))
     res = ctx.run({"kpi": lambda: ctx.query(kpi_sql, params_prev, "telemetry"),
                    "tops": lambda: ctx.query(tops_sql, params_cur, "telemetry"),
                    "recent": lambda: ctx.query(recent_sql, params_cur, "telemetry")})
@@ -435,7 +565,7 @@ def _bq_data(ctx, conn, rng, out):
     out["trend"] = timeutil.timeline(rng, series)
     ok, rows = res["tops"]
     if ok:
-        groups = {"operation": [], "user": [], "model": []}
+        groups = {"operation": [], "user": [], "model": [], "status": []}
         for row in rows:
             if row.get("k") is None:
                 continue
@@ -445,6 +575,8 @@ def _bq_data(ctx, conn, rng, out):
         # Unmapped fields have no source: their lists stay null.
         out["topOperations"] = [{"operation": r["k"], "events": to_int(r.get("events"))}
                                 for r in groups["operation"][:10]] if op else None
+        out["topStatuses"] = [{"status": r["k"], "events": to_int(r.get("events"))}
+                              for r in groups["status"][:10]] if status else None
         out["topUsers"] = [{"uid": uid_for(r["k"]), "user": r["k"], "events": to_int(r.get("events"))}
                            for r in groups["user"][:10]] if user else None
         out["topModels"] = [{"model": r["k"], "events": to_int(r.get("events")),
@@ -456,7 +588,8 @@ def _bq_data(ctx, conn, rng, out):
     if ok:
         out["recent"] = [{"time": iso(r.get("ts")), "user": r.get("user"), "operation": r.get("operation"),
                           "model": r.get("model"), "tokens": to_int(r.get("tokens")) if r.get("tokens") is not None
-                          else None, "status": r.get("status"), "payload": r.get("payload")} for r in rows]
+                          else None, "status": r.get("status"), "message": r.get("message") or None,
+                          "payload": r.get("payload")} for r in rows]
     else:
         ctx.warn_error(label, rows, "The connector table")
     return out
@@ -498,7 +631,7 @@ def _logging_data(ctx, conn, rng, out):
     users = set()
     last = None
     ev_pairs, tok_pairs = [], []
-    ops, top_users, models = {}, {}, {}
+    ops, statuses, top_users, models = {}, {}, {}, {}
     recent = []
     for entry in entries:
         ts = parse_rfc3339(_get_path(entry, time_path) if time_path != "timestamp" else entry.get("timestamp"))
@@ -524,6 +657,8 @@ def _logging_data(ctx, conn, rng, out):
             top_users[str(user)] = top_users.get(str(user), 0) + 1
         if op is not None:
             ops[str(op)] = ops.get(str(op), 0) + 1
+        if status is not None:
+            statuses[str(status)] = statuses.get(str(status), 0) + 1
         if model is not None:
             agg = models.setdefault(str(model), [0, 0])
             agg[0] += 1
@@ -534,17 +669,33 @@ def _logging_data(ctx, conn, rng, out):
                            "operation": str(op) if op is not None else None,
                            "model": str(model) if model is not None else None, "tokens": tok,
                            "status": str(status) if status is not None else None,
+                           "message": _log_message(entry),
                            "payload": json.dumps(entry, separators=(",", ":"), default=str)[:2048]})
-    # Entries are read newest first, so a truncated read under-counts the previous period.
+    # Entries are read newest first: a truncated read misses the oldest entries. When the cut falls inside the
+    # selected period, counts are lower bounds and the days up to the cut are unknown (null), never zero.
+    oldest = parse_rfc3339(entries[-1].get("timestamp")) if truncated and entries else None
+    partial = bool(oldest is not None and oldest >= rng.start_ts())
+    out["sample"] = {"limit": MAX_LOG_ENTRIES, "truncated": truncated, "partial": partial,
+                     "since": iso(oldest) if partial else None}
     out["kpis"] = {"events": {"value": cur_events, "previous": None if truncated else prev_events},
                    "users": len(users) if mapping.get("user") else None,
                    "tokens": tokens_total if mapping.get("tokens") else None, "lastEvent": iso(last)}
-    series = [timeutil.series("events", "Events", timeutil.fold(rng, ev_pairs, int))]
-    if mapping.get("tokens"):
-        series.append(timeutil.series("tokens", "Tokens", timeutil.fold(rng, tok_pairs, int)))
+    ev_values = timeutil.fold(rng, ev_pairs, int)
+    tok_values = timeutil.fold(rng, tok_pairs, int) if mapping.get("tokens") else None
+    if partial:
+        cut = rng.bucket_index(oldest)
+        for i in range((cut if cut is not None else -1) + 1):
+            ev_values[i] = None
+            if tok_values is not None:
+                tok_values[i] = None
+    series = [timeutil.series("events", "Events", ev_values)]
+    if tok_values is not None:
+        series.append(timeutil.series("tokens", "Tokens", tok_values))
     out["trend"] = timeutil.timeline(rng, series)
     out["topOperations"] = ([{"operation": k, "events": v} for k, v in sorted(ops.items(), key=lambda kv: -kv[1])[:10]]
                             if mapping.get("operation") else None)
+    out["topStatuses"] = ([{"status": k, "events": v} for k, v in sorted(statuses.items(), key=lambda kv: -kv[1])[:10]]
+                          if mapping.get("status") else None)
     out["topUsers"] = ([{"uid": uid_for(k), "user": k, "events": v}
                         for k, v in sorted(top_users.items(), key=lambda kv: -kv[1])[:10]]
                        if mapping.get("user") else None)
@@ -553,6 +704,45 @@ def _logging_data(ctx, conn, rng, out):
                         if mapping.get("model") else None)
     out["recent"] = recent
     return out
+
+
+def _engine_names(ctx):
+    """{Agent Engine ID: display name} of the configured regions; {} when they cannot be listed.
+
+    Names only label chart values, so listing failures are not reported as data source notices here (the
+    Agent Registry page reports them)."""
+    regions = tuple(ctx.ws.get("agent_engine_regions") or [])
+
+    def build():
+        child = ctx.child()
+        engines, _ = agents.reasoning_engines(child)
+        return {item["name"].rsplit("/", 1)[-1]: item["displayName"] for _, item in engines if item.get("displayName")}
+
+    if not regions:
+        return {}
+    try:
+        names, _ = ctx.app.cache.get_or_compute(("engine_names", ctx.project, regions), NAMES_TTL, build)
+    except (GcpError, ApiError):
+        return {}
+    return names or {}
+
+
+def _value_names(ctx, conn, out):
+    """Display names for operation values the catalog knows how to name, for example Agent Engine IDs."""
+    entry = catalog.lookup(catalog.connector_source_id(conn) or "")
+    if not entry or entry.get("names") != "reasoning_engine":
+        return None
+    values = {o["operation"] for o in out.get("topOperations") or [] if o.get("operation")}
+    values |= {r["operation"] for r in out.get("recent") or [] if r.get("operation")}
+    if not values:
+        return None
+    names = _engine_names(ctx)
+    found = {}
+    for value in values:
+        m = ENGINE_ID_RE.search(str(value))
+        if m and names.get(m.group(1)):
+            found[str(value)] = names[m.group(1)]
+    return {"operation": found} if found else None
 
 
 def connector_data(ctx):
@@ -568,8 +758,11 @@ def connector_data(ctx):
         return out
     try:
         if conn.get("source") == "bigquery":
-            return _bq_data(ctx, conn, rng, out)
-        return _logging_data(ctx, conn, rng, out)
+            _bq_data(ctx, conn, rng, out)
+        else:
+            _logging_data(ctx, conn, rng, out)
     except GcpError as err:
         ctx.warn_error("connector:%s" % conn_id, err, "The connector source")
         return out
+    out["valueNames"] = _value_names(ctx, conn, out)
+    return out

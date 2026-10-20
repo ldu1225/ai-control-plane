@@ -62,7 +62,7 @@ Download this repository, fill in one settings file (`deploy.env`) and run one s
 | Cost & FinOps | `finops` | Gross cost, credits, net cost, cost by service and SKU, spike detection and AI root-cause analysis | Billing export |
 | Users & Access | `users` | 360-degree user view (usage across all services), Antigravity IAM state, individual allow and disallow | All sources, Resource Manager IAM |
 | Antigravity Controls | `antigravity` | Per-user cost/token/request caps, automatic or manual suspension, exception rules, settlement periods, safety gates, Agent activity in your cloud, audit log | Cloud Logging or BigQuery, IAM, billing export, Cloud Billing Catalog API |
-| Telemetry Extensions | `telemetry` | Automatic discovery of new log sources, connector registration, standard dashboards, sink filter generation | BigQuery, Cloud Logging |
+| Telemetry Extensions | `telemetry` | Automatic discovery of logs and tables with plain-language descriptions, one-click standard dashboards, BigQuery export commands | BigQuery, Cloud Logging, Cloud Monitoring |
 | AI Analyst | `analyst` | Natural language questions, validated read-only SQL, result tables and charts, summaries | BigQuery, Vertex AI Gemini |
 
 Common features: light/dark theme, Korean/English switching, command palette (Ctrl/Cmd+K), date range selection (presets and custom range), table search/sort/CSV export, data source health panel.
@@ -398,7 +398,7 @@ Antigravity token usage per user is read from the `businessaicode.googleapis.com
 | `roles/bigquery.jobUser` | Run parameterized queries |
 | `roles/bigquery.dataViewer` | Read audit logs and the billing export (also on the billing project if the billing dataset is in a different project) |
 | `roles/logging.viewer` | Antigravity inference logs, governance audit log, log source discovery |
-| `roles/monitoring.viewer` | Token and invocation metrics per model |
+| `roles/monitoring.viewer` | Token and invocation metrics per model, log activity in Telemetry Extensions |
 | `roles/discoveryengine.viewer` | Licenses, engines, assistants, agents |
 | `roles/aiplatform.user` | Read Agent Engine, call AI Analyst (Gemini) |
 | `roles/iam.securityReviewer` | Read the project IAM policy (Antigravity state classification) |
@@ -463,12 +463,15 @@ Brings each user's usage of all services, such as Gemini Enterprise, NotebookLM,
 
 ### 7.10 Telemetry Extensions
 
-Connects telemetry from new agent or model products without code changes.
+Pick logs and tables that the project already collects but the built-in pages do not show, and get a ready-made dashboard with one click. Nothing needs to be typed.
 
-1. **Automatic discovery**: Regularly checks the tables in the audit log dataset and in `workspace.telemetry_datasets`, and the log names in the project, and shows the sources that are not connected yet.
-2. **Sink filter generator**: Select logs, and it builds the `gcloud logging sinks create` command and filter for you.
-3. **Connector registration**: Select a table (or a log filter) and map the time, user, model, token, operation and status fields. Mappings are suggested automatically from column names.
-4. **Standard dashboard**: Each connector gets a view with event, user and token trends, plus top operations, users, models and recent events.
+1. **Found automatically**: Lists the Cloud Logging logs of the project and the BigQuery tables of the audit log dataset (and `workspace.telemetry_datasets`). The entries written per log over the last 7 days come from the Cloud Monitoring metric `logging.googleapis.com/log_entry_count` (one API call regardless of the number of logs).
+2. **Plain-language cards**: Each source says what it is, what its dashboard shows (for example counts by service, by HTTP status, top users), its recent volume and its full technical name (never truncated). Cards are grouped into AI and agents, Security and audit, and Operations, sorted by recent volume; sources without data in the last 7 days are folded away. The text comes from the catalog in [`telemetry_catalog.py`](src/controlplane/services/telemetry_catalog.py); logs that are not in the catalog get an honest generic description based on the product name.
+3. **Add to dashboard**: One button creates the connector. The catalog decides which fields to chart, and for tables exported to BigQuery the paths are resolved against the real schema (`protoPayload` -> `protopayload_auditlog`, typed `jsonpayload_*` columns, case). A log routed to BigQuery is shown once, as its table (complete history, no read cap). Sources that contain prompt or response text ask for confirmation first.
+4. **Standard dashboard**: Events per day, the main breakdown (named by the catalog), a status breakdown, top users and models (when mapped) and the latest 20 entries with a message column. Raw entries and messages are hidden from viewers (`security.mask_pii_for_viewers`).
+5. **Already shown on the built-in pages**: Sources used by the built-in pages, such as the audit logs, Gemini Enterprise activity and Model Armor, are listed separately with links to the pages that show them.
+
+Dashboards that read Cloud Logging directly cover its retention period (30 days by default) and count at most 5,000 entries per view. Busy logs show a note on their card, and **Export logs to BigQuery** builds the `gcloud logging sinks create` command. To chart only part of a log or change the mapping, use **Custom setup** (the manual connector form).
 
 ### 7.11 AI Analyst
 

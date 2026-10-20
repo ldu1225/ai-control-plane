@@ -3,7 +3,7 @@
  * sparkline and horizontal ranking bars. Colors are applied through CSSOM (CSP-safe).
  */
 import { h, s, mount } from './dom.js';
-import { fmt, isNum, addDays } from './format.js';
+import { fmt, isNum, addDays, DASH } from './format.js';
 import { t } from './i18n.js';
 
 export const PALETTE = ['#3B82F6', '#14B8A6', '#8B5CF6', '#F59E0B', '#EC4899', '#22C55E', '#06B6D4', '#EF4444', '#6366F1', '#84CC16', '#F97316', '#64748B'];
@@ -324,9 +324,11 @@ class XYChart extends BaseChart {
       focusDots.replaceChildren();
       let total = 0;
       const rows = visible.map((sr) => {
-        const v = isNum(sr.values[idx]) ? sr.values[idx] : 0;
+        const known = isNum(sr.values[idx]);
+        const v = known ? sr.values[idx] : 0;
         total += v;
-        return { name: sr.name, color: sr.color, value: vFmt(v), raw: v };
+        // Unknown (null) values read as a dash, never as zero.
+        return { name: sr.name, color: sr.color, value: known ? vFmt(v) : DASH, raw: v };
       });
       if (!isBar && !stacked) {
         visible.forEach((sr) => {

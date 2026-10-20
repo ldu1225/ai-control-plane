@@ -10,7 +10,6 @@ let current = 'en';
 /** English singular variants, chosen when the count placeholder ({n} or {total}) equals 1. */
 const EN_SINGULAR = {
   '{n} new models detected': '{n} new model detected',
-  '{n} new telemetry sources detected': '{n} new telemetry source detected',
   '{n} agents are deprecation candidates': '{n} agent is a deprecation candidate',
   '{n} deprecation candidates': '{n} deprecation candidate',
   '{n} agents': '{n} agent',

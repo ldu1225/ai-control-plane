@@ -53,7 +53,7 @@ locals {
     "roles/bigquery.jobUser",                  # run parameterized queries
     "roles/aiplatform.user",                   # Gemini (AI analyst, spike analysis), Agent Engine listing
     "roles/discoveryengine.viewer",            # licenses, engines, assistants, agents
-    "roles/monitoring.viewer",                 # per-model token and invocation metrics
+    "roles/monitoring.viewer",                 # per-model token and invocation metrics, log activity
     "roles/logging.viewer",                    # inference logs, governance audit log, log discovery
     "roles/iam.securityReviewer",              # project IAM policy (Antigravity 6-state classification)
     "roles/serviceusage.serviceUsageConsumer", # required because every call sends x-goog-user-project

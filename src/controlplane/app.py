@@ -103,7 +103,7 @@ _route("GET", "/api/v1/telemetry/connectors", telemetry.list_connectors, module=
 _route("POST", "/api/v1/telemetry/connectors", telemetry.save_connector, module="telemetry", admin=True)
 _route("POST", "/api/v1/telemetry/connectors/delete", telemetry.delete_connector, module="telemetry", admin=True)
 _route("GET", "/api/v1/telemetry/connectors/data", telemetry.connector_data, module="telemetry", range=True,
-       cache=True, mask={"nulls": ("payload",)})
+       cache=True, mask={"nulls": ("payload", "message")})
 _route("POST", "/api/v1/analyst/chat", analyst.chat, module="analyst", rate="ai")
 
 

@@ -62,7 +62,7 @@ Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registr
 | 비용 및 FinOps | `finops` | 총 비용, 크레딧, 순 비용, 서비스와 SKU별 비용, 급증 감지와 AI 원인 분석 | 결제 내보내기 |
 | 사용자 및 액세스 | `users` | 사용자 360 뷰(서비스 전체 사용량), Antigravity IAM 상태, 개별 허용과 차단 | 전체 소스, Resource Manager IAM |
 | Antigravity 통제 | `antigravity` | 사용자별 비용/토큰/요청 한도, 자동 또는 수동 정지, 예외 규칙, 정산 기간, 안전 게이트, 클라우드에서 에이전트가 실행한 작업, 감사 로그 | Cloud Logging 또는 BigQuery, IAM, 결제 내보내기, Cloud Billing Catalog API |
-| 텔레메트리 확장 | `telemetry` | 새 로그 소스 자동 발견, 커넥터 등록, 표준 대시보드, 싱크 필터 생성 | BigQuery, Cloud Logging |
+| 텔레메트리 확장 | `telemetry` | 로그·테이블 자동 발견과 쉬운 설명, 클릭 한 번으로 만드는 표준 대시보드, BigQuery 내보내기 명령 | BigQuery, Cloud Logging, Cloud Monitoring |
 | AI 애널리스트 | `analyst` | 자연어 질문, 검증된 읽기 전용 SQL, 결과 표와 차트, 요약 | BigQuery, Vertex AI Gemini |
 
 공통 기능: 라이트/다크 테마, 한국어/영어 전환, 명령 팔레트(Ctrl/Cmd+K), 기간 선택(프리셋과 직접 지정), 표 검색/정렬/CSV 내보내기, 데이터 소스 상태 패널.
@@ -398,7 +398,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 | `roles/bigquery.jobUser` | 매개변수화된 쿼리 실행 |
 | `roles/bigquery.dataViewer` | 감사 로그와 결제 내보내기 조회(결제 데이터셋이 다른 프로젝트면 그 프로젝트에도) |
 | `roles/logging.viewer` | Antigravity 추론 로그, 거버넌스 감사 로그, 로그 소스 발견 |
-| `roles/monitoring.viewer` | 모델별 토큰과 호출 지표 |
+| `roles/monitoring.viewer` | 모델별 토큰과 호출 지표, 텔레메트리 확장의 로그별 최근 기록 건수 |
 | `roles/discoveryengine.viewer` | 라이선스, 엔진, 어시스턴트, 에이전트 |
 | `roles/aiplatform.user` | Agent Engine 조회, AI 애널리스트(Gemini) 호출 |
 | `roles/iam.securityReviewer` | 프로젝트 IAM 정책 조회(Antigravity 상태 분류) |
@@ -463,12 +463,15 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.10 텔레메트리 확장
 
-새 에이전트나 모델 제품의 텔레메트리를 코드 수정 없이 연결합니다.
+이 프로젝트에서 이미 수집되고 있지만 기본 화면에는 나오지 않는 로그와 테이블을 골라, 클릭 한 번으로 대시보드를 만듭니다. 직접 입력할 것은 없습니다.
 
-1. **자동 발견**: 감사 로그 데이터셋과 `workspace.telemetry_datasets`의 테이블, 프로젝트의 로그 이름을 주기적으로 확인해 아직 연결하지 않은 소스를 보여 줍니다.
-2. **싱크 생성기**: 로그를 고르면 `gcloud logging sinks create` 명령과 필터를 만들어 줍니다.
-3. **커넥터 등록**: 테이블(또는 로그 필터)을 고르고 시간, 사용자, 모델, 토큰, 작업, 상태 필드를 매핑합니다. 컬럼 이름으로 매핑을 자동 제안합니다.
-4. **표준 대시보드**: 커넥터마다 이벤트, 사용자, 토큰 추이와 상위 작업, 사용자, 모델, 최근 이벤트 화면이 생깁니다.
+1. **자동으로 찾기**: 프로젝트의 Cloud Logging 로그 목록과 감사 로그 데이터셋(및 `workspace.telemetry_datasets`)의 BigQuery 테이블을 찾습니다. 로그마다 최근 7일 기록 건수를 Cloud Monitoring의 `logging.googleapis.com/log_entry_count` 지표로 보여 줍니다(로그 수와 상관없이 API 호출 1회).
+2. **쉬운 설명 카드**: 소스마다 무엇인지, 대시보드에서 무엇을 볼 수 있는지(예: 서비스별 건수, HTTP 상태별 건수, 상위 사용자), 최근 양, 전체 기술 이름(잘리지 않음)을 카드로 보여 줍니다. AI·에이전트, 보안·감사, 운영·인프라로 나누고 최근 양이 많은 순서로 정렬합니다. 최근 7일 동안 데이터가 없는 소스는 접어 둡니다. 설명은 [`telemetry_catalog.py`](src/controlplane/services/telemetry_catalog.py)의 카탈로그에서 오며, 카탈로그에 없는 로그는 제품 이름을 바탕으로 정직한 일반 설명을 붙입니다.
+3. **대시보드에 추가**: 버튼 하나로 커넥터가 만들어집니다. 차트로 볼 필드는 카탈로그가 정하며, BigQuery로 내보낸 테이블은 실제 스키마에 맞춰 경로를 바꿉니다(`protoPayload` → `protopayload_auditlog`, 타입이 있는 `jsonpayload_*` 열, 대소문자). 로그가 BigQuery로 라우팅되어 있으면 테이블 카드 하나로 합쳐 보여 줍니다(전체 기록, 읽기 상한 없음). 프롬프트·응답 원문이 들어 있는 소스는 추가 전에 확인을 받습니다.
+4. **표준 대시보드**: 일별 건수, 주요 항목별 분포(카탈로그 이름 사용), 상태별 분포, 상위 사용자·모델(매핑된 경우), 메시지 열이 있는 최근 로그 20건을 보여 줍니다. 뷰어에게는 원본 로그와 메시지가 가려집니다(`security.mask_pii_for_viewers`).
+5. **기본 화면에서 이미 쓰는 데이터**: 감사 로그, Gemini Enterprise 활동, Model Armor 등 기본 화면이 쓰는 소스는 따로 모아, 어느 화면에서 보는지 링크로 알려 줍니다.
+
+Cloud Logging을 직접 읽는 대시보드는 보존 기간(기본 30일) 안에서 한 번에 최대 5,000건까지 집계합니다. 양이 많은 로그는 카드에 안내가 표시되며, **로그를 BigQuery로 내보내기**가 `gcloud logging sinks create` 명령을 만들어 줍니다. 로그 일부만 보거나 매핑을 바꾸려면 **직접 설정**(기존 수동 커넥터 양식)을 사용합니다.
 
 ### 7.11 AI 애널리스트
 

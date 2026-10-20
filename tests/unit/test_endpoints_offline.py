@@ -244,6 +244,20 @@ class OfflineEndpointsTest(unittest.TestCase):
 
     def test_all_endpoints(self):
         results = self.run_all()
+        discovered = results["/api/v1/telemetry/discover"]
+        self.assertEqual(discovered["activityDays"], 7)
+        for tb in discovered["tables"]:
+            self.assertIn(tb["catalog"]["category"], ("ai", "security", "operations", "other"))
+            self.assertEqual(tb["quickAdd"]["bigquery"], {"project": PROJECT, "dataset": "ge_analytics",
+                                                          "table": tb["logical"]})
+            self.assertEqual(tb["core"], bool(tb["catalog"]["builtIn"]))
+        codemender = next(tb for tb in discovered["tables"] if tb["logical"] == "codemender_googleapis_com_events")
+        self.assertEqual(codemender["connectorId"], "conn_0000abcd")
+        connectors = {c["id"]: c for c in results["/api/v1/telemetry/connectors"]["connectors"]}
+        self.assertEqual(connectors["conn_0000abcd"]["catalog"]["id"], "codemender_googleapis_com_events")
+        self.assertIsNone(connectors["conn_0000beef"]["catalog"])  # custom filter
+        for path in ("/api/v1/telemetry/connectors/data?id=conn_0000abcd", "/api/v1/telemetry/connectors/data?id=conn_0000beef"):
+            self.assertIn("topStatuses", results[path])
         if self.mode == "empty":
             # Sources succeeded without rows: lists are empty (not null) and counters are zero.
             self.assertEqual(results["/api/v1/agent-platform/registry"]["agents"], [])
