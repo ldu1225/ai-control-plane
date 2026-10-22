@@ -112,7 +112,8 @@ flowchart LR
 |-- .dockerignore, .gcloudignore
 |-- scripts/
 |   |-- deploy.sh               # 명령 한 번 배포 (다시 실행해도 안전)
-|   `-- teardown.sh             # 배포한 리소스 삭제
+|   |-- teardown.sh             # 배포한 리소스 삭제
+|   `-- prepublish_scan.py      # 배포 전 검사: 비밀 정보와 배포 식별자 (CI에서도 실행)
 |-- terraform/                  # Terraform 배포 (IAP 방식, 선택)
 |-- src/
 |   |-- backend_server.py       # 진입점
@@ -127,8 +128,9 @@ flowchart LR
 |   |   |-- gcp.py, ai.py, cache.py, timeutil.py
 |   |   `-- services/           # 모듈별 서비스 (governance, pricing, gemini_enterprise, ...)
 |   `-- web/                    # 프런트엔드 SPA (index.html, login.html, assets/)
-|-- tests/unit/                 # 단위 테스트 (232개)
-`-- .github/workflows/tests.yml # 푸시마다 단위 테스트 실행
+|-- eval/analyst/               # AI 애널리스트 골든 데이터셋과 평가 하네스 (16.1)
+|-- tests/unit/                 # 단위 테스트 (268개)
+`-- .github/workflows/tests.yml # 푸시마다 단위 테스트, 배포 전 검사, 데이터셋 검증 실행
 ```
 
 ---
@@ -165,7 +167,7 @@ scripts/deploy.sh              # 실제 배포 (보통 3~8분)
 |---|---|
 | 1. API 사용 설정 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Vertex AI, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing(가격표), Service Usage, 필요하면 IAP와 Cloud Scheduler |
 | 2. 컨테이너 이미지 | Artifact Registry 저장소(`ai-control-plane`)를 만들고 Cloud Build로 이미지를 빌드합니다. `IMAGE`를 지정하면 빌드를 건너뜁니다. |
-| 3. 런타임 서비스 계정 | 전용 서비스 계정을 만들고 읽기 역할만 부여합니다. `ENABLE_GOVERNANCE_ACTIONS=true`이면 IAM 쓰기 역할을 추가합니다([6.6](#66-런타임-서비스-계정-권한)). |
+| 3. 런타임 서비스 계정 | 전용 서비스 계정을 만들고 읽기 역할과 감사 로그 쓰기 역할을 부여합니다. `ENABLE_GOVERNANCE_ACTIONS=true`이면 IAM 쓰기 역할을 추가합니다([6.6](#66-런타임-서비스-계정-권한)). `google` 방식에서는 로그인 브리지용 서비스 계정을 따로 만들고, 세션 서명 키만 읽을 수 있게 합니다. |
 | 4. 설정 버킷 | 비공개(공개 접근 차단), 버전 관리되는 Cloud Storage 버킷을 만듭니다. 화면에서 바꾼 설정, 예외 규칙, 정지 기록, 사람별 위젯 배치가 저장됩니다. |
 | 5. 세션 서명 키 | Secret Manager에 임의 키를 만들고 서비스 계정에 읽기 권한을 줍니다. |
 | 6. 감사 로그 라우팅 | BigQuery 데이터셋과 Log Router 싱크를 만듭니다(`CREATE_LOG_SINK=true`). 선택하면 Data Access 감사 로그도 켭니다. |
@@ -246,7 +248,7 @@ scripts/deploy.sh              # 실제 배포 (보통 3~8분)
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `ENABLE_GOVERNANCE_ACTIONS` | `false` | IAM 쓰기 역할 부여. 한도 초과 사용자 정지, 복원, 개별 허용/차단, 마커 역할 생성에 필요 |
-| `ENFORCEMENT_SCHEDULE` | 비어 있음 | 자동 집행 일정(cron). 예: `*/15 * * * *`. `ENABLE_GOVERNANCE_ACTIONS=true`와 `google` 또는 `google_oauth` 방식이 필요합니다. |
+| `ENFORCEMENT_SCHEDULE` | 비어 있음 | 자동 집행 일정(cron). 예: `*/15 * * * *`. `ENABLE_GOVERNANCE_ACTIONS=true`와 `google` 또는 `google_oauth` 방식이 필요합니다. 정지된 사용자는 집행 실행에서 복원되므로, 일정이 없으면 기간이 초기화된 뒤 관리자가 집행을 실행해야 접근이 돌아옵니다. 스크립트와 Antigravity 화면이 이를 경고합니다. |
 
 ### 4.6 기타
 
@@ -274,6 +276,12 @@ scripts/deploy.sh              # 실제 배포 (보통 3~8분)
 | `google_oauth` | 같은 로그인 화면을 직접 만든 OAuth 클라이언트로 운영합니다. | 브리지 서비스를 두고 싶지 않거나 OAuth 동의 화면을 직접 관리하려는 경우 |
 | `iap` | Identity-Aware Proxy가 대시보드 앞에서 로그인을 처리합니다. 앱은 IAP 서명 헤더를 검증합니다. | 이미 IAP와 그룹 기반 접근 관리를 쓰는 조직 |
 
+그 밖의 `security.auth_mode` 값(`config.yaml` 또는 `AUTH_MODE` 환경 변수로만 설정, 화면에서는 바꿀 수 없음):
+
+- `local`: 컴퓨터 한 대에서 개발할 때 씁니다([11](#11-로컬-실행)). 루프백 주소에서 직접 온 요청만 관리자로 처리하고, 프록시를 거친 요청(`X-Forwarded-For`, `Forwarded`, `X-Real-IP`)은 관리자로 보지 않습니다. Cloud Run에서는 시작 단계에서 이 모드를 거부합니다. `auto`는 서버가 루프백 주소(`127.0.0.1`, `::1`, `localhost`)에서 대기할 때만 `local`이 되고, 다른 주소에 바인딩하면 시작을 멈추고 `google` 또는 `iap`를 고르라고 안내합니다.
+
+익명 접속 모드는 없습니다. 어떤 배포에서든 승인된 Google 계정만 대시보드를 열 수 있습니다.
+
 ```mermaid
 sequenceDiagram
   participant B as 브라우저
@@ -300,7 +308,7 @@ sequenceDiagram
 | 역할 | 할 수 있는 일 |
 |---|---|
 | admin | 모든 화면, 설정 변경, 사용자 승인, 한도 정책, 정지/복원, 예외 규칙, 커넥터 관리 |
-| viewer | 모든 화면 조회. 이메일은 서버에서 마스킹되고(`ad***@example.com`), Model Armor 원문과 업로드 파일명은 제공되지 않습니다. |
+| viewer | 모든 화면 조회. 이메일은 서버에서 마스킹되고(`ad***@example.com`), Model Armor 원문과 업로드 파일명은 제공되지 않습니다. AI 애널리스트는 관리자가 허용한 경우에만 쓸 수 있습니다(`analyst.allow_viewers`). 설정은 읽기 전용이며, 배포 식별자(설정 버킷, OAuth 클라이언트 ID, IAP audience, 결제 계정 ID)는 `***`로 표시됩니다. |
 
 - 관리자 = `ADMIN_EMAILS` + `config.yaml`의 `security.admins` + 화면에서 추가한 관리자.
 - viewer = `ALLOWED_USERS` + `security.allowed_users` + 화면에서 승인한 사용자.
@@ -396,13 +404,14 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 | 역할 | 용도 |
 |---|---|
 | `roles/bigquery.jobUser` | 매개변수화된 쿼리 실행 |
-| `roles/bigquery.dataViewer` | 감사 로그와 결제 내보내기 조회(결제 데이터셋이 다른 프로젝트면 그 프로젝트에도) |
+| `roles/bigquery.dataViewer` | 감사 로그와 결제 내보내기 조회. 결제 데이터셋이 다른 프로젝트에 있으면 그 데이터셋에만 읽기 권한을 줍니다. |
 | `roles/logging.viewer` | Antigravity 추론 로그, 거버넌스 감사 로그, 로그 소스 발견 |
 | `roles/monitoring.viewer` | 모델별 토큰과 호출 지표, 텔레메트리 확장의 로그별 최근 기록 건수 |
 | `roles/discoveryengine.viewer` | 라이선스, 엔진, 어시스턴트, 에이전트 |
 | `roles/aiplatform.user` | Agent Engine 조회, AI 애널리스트(Gemini) 호출 |
 | `roles/iam.securityReviewer` | 프로젝트 IAM 정책 조회(Antigravity 상태 분류) |
 | `roles/serviceusage.serviceUsageConsumer` | 모든 호출에 quota project 헤더 사용 |
+| `roles/logging.logWriter` | 거버넌스 감사 로그 기록(집행 실행, 시험 실행, 검토 결정, 예외 변경). 통제 기능 사용 여부와 관계없이 부여 |
 | `roles/storage.objectAdmin` (설정 버킷에만) | 화면 설정, 예외 규칙, 정지 기록, 사람별 위젯 배치 저장 |
 | `roles/secretmanager.secretAccessor` (시크릿에만) | 세션 서명 키, OAuth 클라이언트 보안 비밀 |
 
@@ -411,8 +420,9 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 | 역할 | 용도 |
 |---|---|
 | `roles/resourcemanager.projectIamAdmin` | 한도 초과 정지와 복원, 개별 허용과 차단(etag 기반 `setIamPolicy`) |
-| `roles/logging.logWriter` | 거버넌스 감사 로그 기록 |
 | `roles/iam.roleAdmin` | 마커 역할 생성(처음 한 번) |
+
+**로그인 브리지 (`google` 방식)**: 브리지는 별도 서비스 계정(`SERVICE_NAME-signin`, 서비스 이름은 앞 23자까지)으로 실행됩니다. 프로젝트 역할이 없고 세션 서명 키만 읽을 수 있습니다.
 
 **상속 바인딩 확인 (선택)**: 조직 수준 `roles/iam.securityReviewer`를 주면 폴더와 조직에서 상속된 Antigravity 접근 권한까지 판별합니다(Terraform `organization_id`). 주지 않으면 해당 사용자는 `UNKNOWN / ANCESTOR_UNCHECKED`로 분류되고 변경 대상에서 빠집니다.
 
@@ -485,6 +495,8 @@ Cloud Logging을 직접 읽는 대시보드는 보존 기간(기본 30일) 안�
 
 자연어 질문을 BigQuery SQL로 바꿔 실행하고 표, 차트, 요약을 보여 줍니다. 생성된 SQL은 실행 전에 검증합니다. 주석과 문자열을 제거한 뒤 단일 `SELECT`/`WITH` 문인지 확인하고, DML/DDL을 거부하고, 참조 테이블이 허용된 데이터셋(감사 로그, 결제, 등록된 커넥터)에 속하는지 확인합니다. 실행에는 `analyst.max_bytes_billed`와 `analyst.max_rows` 상한이 적용됩니다. 요약은 결과 행만 근거로 쓰며, 결과 데이터 안의 지시문은 따르지 않습니다.
 
+쿼리 결과에는 프롬프트 같은 원문 열이 포함될 수 있어, 뷰어 마스킹(`security.mask_pii_for_viewers`)이 켜져 있으면 기본적으로 관리자만 AI 애널리스트를 쓸 수 있습니다. 뷰어에게도 허용하려면 **설정 > 거버넌스 정책 > AI 애널리스트 제한**에서 **뷰어도 AI 애널리스트 사용 허용**을 켭니다(`analyst.allow_viewers`). 뷰어의 결과는 이메일만 마스킹되므로, 원문이 담긴 테이블이 데이터셋에 있는지 먼저 확인하세요.
+
 ---
 
 ## 8. Antigravity 사용자별 한도와 정지
@@ -508,7 +520,7 @@ flowchart TD
 
 ### 8.2 시작하기
 
-1. `ENABLE_GOVERNANCE_ACTIONS="true"`로 배포합니다. 자동 정지를 쓰려면 `ENFORCEMENT_SCHEDULE="*/15 * * * *"`도 지정합니다.
+1. `ENABLE_GOVERNANCE_ACTIONS="true"`로 배포합니다. 자동 정지와 기간 종료 시 자동 복원을 쓰려면 `ENFORCEMENT_SCHEDULE="*/15 * * * *"`도 지정합니다.
 2. **Antigravity 통제 > 집행 사전 요구 사항**에서 마커 역할과 권한을 확인하고, 마커 역할이 없으면 **마커 역할 생성**을 누릅니다.
 3. **한도 정책 > 정책 편집**에서 정합니다.
    - 1인당 비용 한도: `₩100만`, `₩200만`, `₩300만` 버튼 또는 직접 입력
@@ -539,7 +551,7 @@ flowchart TD
 | 자동 정지 | 집행 실행마다 정지됩니다. | 정산 기간이 끝나면 자동 |
 
 - **집행 실행**은 **지금 집행 실행** 버튼 또는 Cloud Scheduler 작업(`ENFORCEMENT_SCHEDULE`)으로 일어납니다. 스케줄러 작업은 권한이 없는 전용 서비스 계정의 Google OIDC 토큰으로 `POST /api/v1/governance/antigravity/enforce`를 호출하고, 앱은 발급자, 대상(`PUBLIC_BASE_URL` + 경로), 이메일 검증, 허용 목록(`SCHEDULER_INVOKERS`)을 확인합니다. 인증 없는 호출과 다른 토큰은 401입니다.
-- 정지 = 접근 역할(`roles/discoveryengine.agentspaceUser`)을 한도 마커 역할(`CustomAntigravityCapBlocked`)로 바꾸는 하나의 etag 기반 `setIamPolicy`입니다. 정지 기록(시작, 종료 예정, 사유, 실행 주체)이 설정 버킷에 남고, 기간이 끝나면 텔레메트리가 없어도 복원됩니다. 단, 새 기간 사용량이 이미 한도를 넘었으면 유지됩니다.
+- 정지 = 접근 역할(`roles/discoveryengine.agentspaceUser`)을 한도 마커 역할(`CustomAntigravityCapBlocked`)로 바꾸는 하나의 etag 기반 `setIamPolicy`입니다. 정지 기록(시작, 종료 예정, 사유, 실행 주체)이 설정 버킷에 남고, 기간이 끝난 뒤 첫 집행 실행이 텔레메트리가 없어도 복원합니다. `ENFORCEMENT_SCHEDULE`이 있으면 한 주기 안에 복원되고, 없으면 초기화될 때마다 집행을 실행해야 합니다. 단, 새 기간 사용량이 이미 한도를 넘었으면 유지됩니다.
 
 ### 8.5 예외 규칙
 
@@ -568,7 +580,7 @@ flowchart TD
 |---|---|---|
 | `G1_POLICY_READABLE` | 프로젝트 IAM 정책을 읽지 못함 | 적용 중단 |
 | `G2_ANY_DETERMINATE` | 판단 가능한 사용자가 없음 | 적용 중단 |
-| `G3_TELEMETRY_HEALTHY` | 사용량 조회 실패 또는 0건 | 정지만 적용, 사용량 기반 복원 보류(기간 종료 복원은 진행) |
+| `G3_TELEMETRY_HEALTHY` | 사용량 조회 실패, 0건, 또는 Cloud Logging 읽기가 `max_log_entries`(기본 20,000건)에서 잘림 | 정지만 적용, 사용량 기반 복원 보류(기간 종료 복원은 진행). 잘린 집계는 하한값이므로 한도 초과 판정은 유효합니다. 사용자가 많으면 추론 로그를 BigQuery로 내보내세요. |
 | `G4_CHANGE_BUDGET` | 계획된 변경이 `max(change_budget_min, ceil(change_budget_ratio x 대상 인원))` 초과 | 적용 중단 |
 | `G5_NON_USER_GRANT_ABSENT` | 접근 역할에 그룹 또는 도메인 바인딩 존재 | 경고 |
 
@@ -576,7 +588,7 @@ flowchart TD
 
 ### 8.7 감사, 알림, 영속성
 
-- 모든 집행 실행, 검토 결정, 예외 규칙, 허용/차단은 Cloud Logging 감사 로그(`projects/PROJECT_ID/logs/agy-admin%2Fadmin_actions`)에 기록되고 **관리 감사 로그** 카드에 표시됩니다. [agy-admin-cli](https://github.com/terrychahn/agy-admin-cli)와 같은 마커 역할과 감사 로그를 쓰므로 함께 운영할 수 있습니다. 함께 쓸 때는 두 도구의 실행 시각이 겹치지 않게 합니다.
+- 모든 집행 실행, 검토 결정, 예외 규칙, 허용/차단은 Cloud Logging 감사 로그(`projects/PROJECT_ID/logs/agy-admin%2Fadmin_actions`)에 기록되고 **관리 감사 로그** 카드에 표시됩니다. 이를 위해 서비스 계정에 `roles/logging.logWriter`가 항상 부여됩니다. 그래도 기록에 실패하면 변경은 유지되고 API 응답에 `auditLogged: false`로 표시됩니다. [agy-admin-cli](https://github.com/terrychahn/agy-admin-cli)와 같은 마커 역할과 감사 로그를 쓰므로 함께 운영할 수 있습니다. 함께 쓸 때는 두 도구의 실행 시각이 겹치지 않게 합니다.
 - `governance.antigravity.webhook_url`(Slack `hooks.slack.com` 또는 Google Chat `chat.googleapis.com`, HTTPS만)을 지정하면 새 검토 대기 사용자와 집행 결과를 보냅니다.
 - 예외 규칙과 정지 기록은 설정 버킷에 저장되어 재시작 후에도 남습니다. 설정 버킷 없이 Cloud Run에서 실행하면 메모리에만 저장되며 화면에 경고가 표시됩니다.
 
@@ -615,7 +627,7 @@ flowchart TD
 | `agent_lifecycle` | `idle_days`, `deprecation_days` | 휴면과 폐기 권고 기준 |
 | `finops` | `spike_threshold_pct`, `spike_min_delta` | 비용 급증 기준 |
 | `governance.antigravity` | `cost_cap`, `currency`, `pricing_source`, `token_cap`, `request_cap`, `period`, `window`, `reset_timezone`, `enforcement_mode`, 마커 역할, 변경 예산, `webhook_url` | Antigravity 한도 정책 |
-| `analyst` | `max_bytes_billed`, `max_rows` | AI 애널리스트 쿼리 상한 |
+| `analyst` | `max_bytes_billed`, `max_rows`, `allow_viewers` | AI 애널리스트 쿼리 상한, 뷰어 사용 허용 여부(기본 `false`) |
 
 ### 9.3 환경 변수
 
@@ -679,7 +691,7 @@ terraform apply
 | `audit_dataset_id`, `billing_*`, `quota_project_id` | `ge_analytics` 등 | 데이터 소스 |
 | `organization_name`, `product_name`, `default_locale`, `workspace_timezone` | `Your Organization`, `AI Control Plane`, `en`, `UTC` | 표시 |
 | `discovery_engine_locations`, `agent_engine_regions` | `["global"]`, `["us-central1"]` | API 위치 |
-| `auth_mode`, `enable_iap`, `iap_members`, `iap_audience` | `iap`, `true`, `[]`, 자동 계산 | 인증 |
+| `auth_mode`, `enable_iap`, `iap_members`, `iap_audience` | `iap`(`iap` 또는 `auto`만 허용), `true`, `[]`, 자동 계산 | 인증 |
 | `admin_emails` | `[]` | 관리자 |
 | `ai_default_model`, `ai_location` | `gemini-3.8-flash`, `global` | AI 엔진 |
 | `enable_governance_actions` | `false` | 통제 기능 쓰기 역할 |
@@ -709,23 +721,23 @@ python3 src/backend_server.py
 
 ```bash
 docker build -t ai-control-plane .
-docker run --rm -p 8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=local \
+docker run --rm -p 127.0.0.1:8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=local \
   -e GOOGLE_APPLICATION_CREDENTIALS=/creds/adc.json \
   -v "$HOME/.config/gcloud/application_default_credentials.json:/creds/adc.json:ro" \
   ai-control-plane
 ```
 
-컨테이너 안에서는 브라우저 요청이 루프백 주소로 보이지 않으므로 viewer로 접속됩니다. 설정을 바꾸려면 위의 `python3` 실행이나 Cloud Run 배포를 씁니다.
+컨테이너 안에서는 브라우저 요청이 루프백 주소로 보이지 않으므로 viewer로 접속됩니다. `-p 127.0.0.1:8080:8080`은 이 컴퓨터에만 포트를 열기 때문에 네트워크의 다른 컴퓨터는 접속할 수 없습니다. 설정을 바꾸려면 위의 `python3` 실행이나 Cloud Run 배포를 씁니다.
 
 ---
 
 ## 12. 보안 모델
 
-- **인증**: Google 로그인(브리지 또는 OAuth 클라이언트), IAP 서명 헤더(JWT) 검증, 로컬 개발용 루프백 관리자 중 하나를 씁니다. 세션은 목적별로 파생한 키로 HMAC-SHA256 서명한 토큰이며 `__Host-` 쿠키(HttpOnly, Secure, SameSite=Lax)에 담깁니다. 승인 목록에서 지운 계정의 세션은 즉시 무효가 됩니다.
+- **인증**: Google 로그인(브리지 또는 OAuth 클라이언트), IAP 서명 헤더(JWT) 검증, 로컬 개발용 루프백 관리자 중 하나를 씁니다. 루프백 관리자는 Cloud Run에서 거부되며, 익명 접속 모드는 없습니다. 세션은 목적별로 파생한 키로 HMAC-SHA256 서명한 토큰이며 `__Host-` 쿠키(HttpOnly, Secure, SameSite=Lax)에 담깁니다. 승인 목록에서 지운 계정의 세션은 즉시 무효가 됩니다.
 - **권한**: admin과 viewer 두 역할입니다. 모든 쓰기 API는 관리자 전용입니다.
 - **CSRF**: 이중 제출 쿠키(`__Host-cp_csrf`, HttpOnly, SameSite=Strict)와 `X-CSRF-Token` 헤더를 상수 시간 비교로 검증합니다. `Sec-Fetch-Site: cross-site` 쓰기 요청은 거부합니다. 스케줄러 경로만 CSRF 대신 Google OIDC 토큰으로 인증합니다.
 - **브라우저 보호**: nonce 기반 Content-Security-Policy(인라인 스크립트와 스타일 금지), `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`, HTTPS에서 HSTS.
-- **개인정보 최소화**: viewer에게 이메일을 서버에서 마스킹하고, Model Armor 원문과 업로드 파일명을 주지 않습니다. 호출자 IP의 마지막 옥텟을 가립니다. 로그에는 토큰, 쿠키, CSRF 값, 프롬프트 원문을 남기지 않습니다.
+- **개인정보 최소화**: viewer에게 이메일을 서버에서 마스킹하고, Model Armor 원문과 업로드 파일명을 주지 않습니다. 호출자 IP의 마지막 옥텟을 가립니다. 로그에는 토큰, 쿠키, CSRF 값, 프롬프트 원문을 남기지 않고, 상위 서비스 오류 메시지는 따옴표 안의 값과 이메일 주소를 지운 뒤에만 기록합니다. viewer는 설정을 읽기 전용으로 보며 배포 식별자는 보이지 않습니다.
 - **쿼리 안전성**: BigQuery 값은 모두 매개변수로 전달하고, 테이블과 컬럼 식별자는 정규식 검증 후에만 씁니다. 쿼리마다 `maximum_bytes_billed`를 적용합니다.
 - **속도 제한**: 사용자별 일반 요청 분당 240회, AI 요청 분당 20회, 거버넌스 쓰기 분당 10회, 데이터 소스 강제 재점검 분당 6회.
 - **IAM 변경 보호**: 안전 게이트, 변경 예산, etag 기반 원자적 갱신, 통제 불가 사용자 비변경, 감사 로그.
@@ -795,7 +807,7 @@ scripts/teardown.sh                 # 서비스, 스케줄러, 서비스 계정,
 scripts/teardown.sh --delete-data   # 설정 버킷(화면 설정, 예외 규칙, 정지 기록, 위젯 배치)과 로그 싱크까지 삭제
 ```
 
-BigQuery 감사 로그 데이터셋, Artifact Registry 저장소, Data Access 감사 로그 설정은 자동으로 지우지 않고 삭제 명령만 안내합니다. 대시보드가 정지한 사용자가 있다면 삭제 전에 Antigravity 통제 화면에서 복원합니다.
+BigQuery 감사 로그 데이터셋, Artifact Registry 저장소, Data Access 감사 로그 설정은 자동으로 지우지 않고 삭제 명령만 안내합니다. 마커 역할도 정지된 사용자가 아직 쓰고 있을 수 있어 남겨 두고 삭제 명령만 안내합니다. 대시보드가 정지한 사용자가 있다면 삭제 전에 Antigravity 통제 화면에서 복원합니다.
 
 ---
 
@@ -807,7 +819,17 @@ BigQuery 감사 로그 데이터셋, Artifact Registry 저장소, Data Access �
 python3 -m unittest discover -s tests/unit -v
 ```
 
-단위 테스트는 코드 동작을 검증하기 위한 것이며 Google Cloud에 접속하지 않습니다. 테스트 입력값은 예약 도메인(`example.com` 등)만 쓰고, 컨테이너 이미지에는 포함되지 않습니다. GitHub Actions(`.github/workflows/tests.yml`)가 푸시마다 실행합니다.
+단위 테스트는 코드 동작을 검증하기 위한 것이며 Google Cloud에 접속하지 않습니다. 테스트 입력값은 예약 도메인(`example.com` 등)만 쓰고, 컨테이너 이미지에는 포함되지 않습니다. GitHub Actions(`.github/workflows/tests.yml`)가 푸시와 풀 리퀘스트마다 단위 테스트, 스크립트 `bash -n`, 배포 전 검사, AI 애널리스트 골든 데이터셋의 오프라인 검증을 실행합니다.
+
+**배포 전 검사 (릴리스 관문).** 푸시하기 전에 실행합니다.
+
+```bash
+python3 scripts/prepublish_scan.py
+```
+
+Git이 공개할 파일을 검사해 비밀 정보(개인 키, API 키, OAuth 클라이언트 보안 비밀, 토큰, 웹훅), Git에서 제외된 `deploy.env`·`config.local.yaml`·`terraform/terraform.tfvars`의 값, 예시 도메인 밖의 이메일 주소, 프로젝트 번호가 들어간 Cloud Run URL, 홈 디렉터리 경로가 있으면 실패합니다. 그 밖에 절대 공개하면 안 되는 단어(예: 개인 계정 이름)는 Git에서 제외되는 `.prepublish-terms` 파일에 한 줄에 하나씩 적습니다.
+
+**AI 애널리스트 평가.** `eval/analyst/`에는 4단계 골든 데이터셋(정상 질문, 함정, 환각 유도, 범위 밖)과, 관리자 세션으로 어떤 배포에든 실행할 수 있는 하네스가 있습니다. 정답은 실행 시점에 고객 자신의 BigQuery 데이터로 계산하고, 결과는 Git에서 제외되는 `eval/analyst/out/`에 남습니다. 자세한 내용은 [eval/analyst/README.md](eval/analyst/README.md)를 봅니다.
 
 ### 16.2 API 계약
 

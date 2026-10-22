@@ -157,6 +157,9 @@ DEFAULTS = {
     "analyst": {
         "max_bytes_billed": 10000000000,
         "max_rows": 500,
+        # Viewers may use AI Analyst only when this is true (or viewer masking is off): query results can
+        # contain free text, such as prompts, that the dashboard endpoints withhold from viewers.
+        "allow_viewers": False,
     },
 }
 
@@ -459,7 +462,7 @@ VALIDATORS = {
     "workspace.discovery_engine_locations": _list(_regex(LOCATION_RE, "location"), 10),
     "workspace.agent_engine_regions": _list(_regex(LOCATION_RE, "region"), 20),
     "workspace.telemetry_datasets": _list(_dataset_ref, 20),
-    "security.auth_mode": _enum("auto", "iap", "google", "local", "public_readonly"),
+    "security.auth_mode": _enum("auto", "iap", "google", "local"),
     "security.iap_audience": _text(300),
     "security.admins": _list(_admin_entry, 200),
     "security.allowed_users": _list(_admin_entry, 1000),
@@ -516,6 +519,7 @@ VALIDATORS = {
     "governance.antigravity.scheduler_invokers": _list(_regex(EMAIL_RE, "service account email", lower=True), 10),
     "analyst.max_bytes_billed": _int(10000000, 10 ** 13),
     "analyst.max_rows": _int(1, 5000),
+    "analyst.allow_viewers": _bool,
 }
 for _module in MODULE_IDS:
     VALIDATORS["modules.%s" % _module] = _bool
@@ -889,8 +893,15 @@ def reset_keys(section, keys):
     return out
 
 
+# Deployment identifiers that viewers do not need: shown as *** in the viewer's read-only settings view.
+VIEWER_HIDDEN_KEYS = ("storage.gcs_bucket", "security.google_client_id", "security.iap_audience",
+                      "workspace.billing.account_id")
+
+
 def mask_settings_for_viewer(effective):
-    """Returns a copy safe for viewers: webhook URL masked, admin emails masked."""
+    """Returns the read-only settings view for viewers: e-mail addresses masked (approved accounts and the
+    scheduler service accounts), the webhook URL reduced to its host, and deployment identifiers
+    (VIEWER_HIDDEN_KEYS) replaced by ***. Policy values such as caps, periods and prices stay visible."""
     from .security import mask_email  # local import to avoid a cycle
     out = copy.deepcopy(effective)
     hook = get_path(out, "governance.antigravity.webhook_url") or ""
@@ -900,4 +911,12 @@ def mask_settings_for_viewer(effective):
     for dotted in MEMBER_LIST_KEYS:
         members = get_path(out, dotted) or []
         set_path(out, dotted, [a if a.startswith("*@") else mask_email(a) for a in members])
+    invokers = get_path(out, "governance.antigravity.scheduler_invokers") or []
+    if invokers:
+        # mask_email keeps service accounts unchanged, so mask their local part here.
+        set_path(out, "governance.antigravity.scheduler_invokers",
+                 ["%s***@%s" % (str(a).partition("@")[0][:2], str(a).rpartition("@")[2]) for a in invokers])
+    for dotted in VIEWER_HIDDEN_KEYS:
+        if get_path(out, dotted):
+            set_path(out, dotted, "***")
     return out

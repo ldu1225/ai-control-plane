@@ -12,6 +12,7 @@ from ..gcp import GcpError
 from ..httpkit import ApiError, issue_csrf_token
 from ..security import admin_guard, is_admin_email, mask_for_viewer, resolve_auth_mode
 from .base import AUDIT_DATA_ACCESS, describe_error
+from . import analyst
 
 LOG = logging.getLogger("controlplane.system")
 
@@ -39,11 +40,15 @@ def bootstrap(ctx, handler):
                      "defaultTheme": s["branding"]["default_theme"]},
         "workspace": {"configured": config.workspace_configured(s), "projectId": ws["project_id"],
                       "auditDataset": ws["audit_dataset"],
+                      # The billing account ID is an administrator detail; viewers do not receive it.
                       "billing": {"projectId": config.billing_project(s), "dataset": ws["billing"]["dataset"],
-                                  "table": ws["billing"]["table"], "accountId": ws["billing"]["account_id"]},
+                                  "table": ws["billing"]["table"],
+                                  "accountId": ws["billing"]["account_id"] if ctx.identity.is_admin else ""},
                       "timezone": ws["timezone"], "defaultRangeDays": ws["default_range_days"],
                       "today": timeutil.today_in(ws["timezone"]).isoformat()},
-        "modules": [{"id": m, "enabled": bool(s["modules"].get(m, False))} for m in config.MODULE_IDS],
+        # AI Analyst is shown to viewers only when they may use it (analyst.available_to).
+        "modules": [{"id": m, "enabled": bool(s["modules"].get(m, False)) and
+                     (m != "analyst" or analyst.available_to(ctx.identity, s))} for m in config.MODULE_IDS],
         "aiEngine": {"defaultModel": s["ai_engine"]["default_model"], "models": list(s["ai_engine"]["models"]),
                      "location": s["ai_engine"]["location"]},
         "session": session,
@@ -197,7 +202,7 @@ def run_health(ctx):
         if not configured:
             return unconfigured
         model = s["ai_engine"]["default_model"]
-        client = ctx.app.ai._client(ctx.project, s["ai_engine"].get("location") or "global", ctx.quota_project)
+        client = ctx.app.ai.client(ctx.project, s["ai_engine"].get("location") or "global", ctx.quota_project)
         try:
             client.models.get(model=model)
         except Exception as err:  # pylint: disable=broad-except

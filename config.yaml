@@ -42,7 +42,11 @@ workspace:
   telemetry_datasets: []              # extra datasets scanned by telemetry discovery ("dataset" or "project.dataset")
 
 security:
-  # auto (iap on Cloud Run, local otherwise) | google | iap | local | public_readonly
+  # auto (iap on Cloud Run, local otherwise) | google | iap | local
+  #   local:  development on one computer only. The loopback caller is the administrator, requests
+  #           forwarded by a proxy are not, and Cloud Run refuses this mode. auto falls back to local
+  #           only when server.host is a loopback address; otherwise startup stops and asks for
+  #           google or iap.
   #   google: the application's own sign-in page (/login) with Google accounts. Only approved
   #           accounts (admins + allowed_users) get a session; others can request access and
   #           administrators approve them in Settings > Access control. Requires google_client_id

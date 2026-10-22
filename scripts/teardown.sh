@@ -58,6 +58,8 @@ OAUTH_SECRET_NAME="${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}"
 
 SA_EMAIL="${SERVICE_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 SCHEDULER_SA="${SERVICE_NAME:0:20}-scheduler@${PROJECT_ID}.iam.gserviceaccount.com"
+BRIDGE_SA="${SERVICE_NAME:0:23}-signin@${PROJECT_ID}.iam.gserviceaccount.com"
+BILLING_DATASET="${BILLING_DATASET:-}"
 BRIDGE_NAME="${SERVICE_NAME}-signin"
 SINK="${SERVICE_NAME}-ai-logs"
 
@@ -93,10 +95,34 @@ remove_bindings() {  # remove_bindings PROJECT MEMBER
   return 0
 }
 remove_bindings "$PROJECT_ID" "serviceAccount:${SA_EMAIL}"
-[[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]] && remove_bindings "$BILLING_PROJECT_ID" "serviceAccount:${SA_EMAIL}"
+if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; then
+  remove_bindings "$BILLING_PROJECT_ID" "serviceAccount:${SA_EMAIL}"   # deployments made before dataset-level grants
+  if [[ -n "$BILLING_DATASET" ]]; then
+    # Dataset ACL entry added by deploy.sh (BigQuery Data Viewer on the billing export dataset only).
+    file="$(mktemp)"
+    if bq --project_id "$BILLING_PROJECT_ID" show --format=prettyjson "${BILLING_PROJECT_ID}:${BILLING_DATASET}" >"$file" 2>/dev/null \
+        && python3 - "$file" "$SA_EMAIL" <<'PYCODE'
+import json, sys
+path, email = sys.argv[1], sys.argv[2].lower()
+dataset = json.load(open(path))
+access = dataset.get("access", [])
+kept = [a for a in access if (a.get("userByEmail") or "").lower() != email]
+if len(kept) == len(access):
+    sys.exit(3)
+dataset["access"] = kept
+json.dump(dataset, open(path, "w"))
+PYCODE
+    then
+      quiet bq --project_id "$BILLING_PROJECT_ID" update --source "$file" "${BILLING_PROJECT_ID}:${BILLING_DATASET}" \
+        && info "removed ${SA_EMAIL} from ${BILLING_PROJECT_ID}:${BILLING_DATASET}" \
+        || info "could not update ${BILLING_PROJECT_ID}:${BILLING_DATASET}; remove ${SA_EMAIL} from its sharing settings"
+    fi
+    rm -f "$file"
+  fi
+fi
 
 log "Service accounts"
-for sa in "$SA_EMAIL" "$SCHEDULER_SA"; do
+for sa in "$SA_EMAIL" "$SCHEDULER_SA" "$BRIDGE_SA"; do
   quiet gcloud iam service-accounts delete "$sa" --project "$PROJECT_ID" --quiet && info "deleted ${sa}" || info "${sa} not found"
 done
 
@@ -124,3 +150,6 @@ log "Kept on purpose"
 info "BigQuery dataset (your audit logs):   bq rm -r -d ${PROJECT_ID}:${AUDIT_DATASET}"
 info "Container images:                     gcloud artifacts repositories delete ${AR_REPOSITORY} --location ${REGION} --project ${PROJECT_ID}"
 info "Data Access audit logs: IAM & Admin > Audit Logs in the Google Cloud console"
+info "Marker roles (delete only after every suspended user is restored; suspended users keep their other access through them):"
+info "  gcloud iam roles delete CustomAntigravityCapBlocked --project ${PROJECT_ID}"
+info "  gcloud iam roles delete CustomAntigravityAdminBlocked --project ${PROJECT_ID}"

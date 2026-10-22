@@ -2,7 +2,6 @@ name: tests
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -22,3 +21,7 @@ jobs:
         run: python -m unittest discover -s tests/unit -v
       - name: Shell scripts parse
         run: bash -n scripts/deploy.sh && bash -n scripts/teardown.sh
+      - name: Prepublish scan (secrets, e-mail addresses, Cloud Run URLs, local paths)
+        run: python scripts/prepublish_scan.py
+      - name: AI Analyst golden dataset (offline validation, no network)
+        run: python eval/analyst/run_eval.py validate

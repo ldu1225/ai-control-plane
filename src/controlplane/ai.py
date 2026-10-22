@@ -49,6 +49,10 @@ class AiEngine:
         self._clients = {}
         self._cache = TTLCache(32)
 
+    def client(self, project, location, quota_project):
+        """The cached google-genai client for one project, location and quota project."""
+        return self._client(project, location, quota_project)
+
     def _client(self, project, location, quota_project):
         key = (project, location, quota_project)
         with self._lock:

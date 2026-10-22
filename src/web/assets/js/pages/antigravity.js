@@ -202,6 +202,10 @@ function renderStatus(ctx, body, s) {
   if (enforcement.durable === false) {
     body.append(banner({ tone: 'warning', title: t('Exception rules are not stored durably'), text: t('Settings are kept in memory on this deployment, so exception rules and suspension records are lost when the service restarts. Configure a settings bucket (SETTINGS_BUCKET).') }));
   }
+  // Restores happen only inside an enforcement run, so suspended users without a schedule wait for an administrator.
+  if (isNum(totals.suspended) && totals.suspended > 0 && (enforcement.scheduler || {}).configured === false) {
+    body.append(banner({ tone: 'warning', title: t('No enforcement schedule'), text: t('{n} users are suspended, but no enforcement schedule is configured. Their access returns only when an enforcement run happens after the settlement period resets. Select Run enforcement now after each reset, or set ENFORCEMENT_SCHEDULE and redeploy.', { n: fmt.int(totals.suspended) }) }));
+  }
 
   body.append(enforcementCard(ctx, s));
 

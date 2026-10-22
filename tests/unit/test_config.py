@@ -73,13 +73,13 @@ class LayerMergeTest(unittest.TestCase):
     def test_env_layer(self):
         layer = config.env_layer({"PROJECT_ID": "env-project", "PORT": "9090", "ADMIN_EMAILS": "a@example.net, *@corp.example.com",
                                   "ORGANIZATION_NAME": "Env Org", "WORKSPACE_TIMEZONE": "Asia/Seoul",
-                                  "BILLING_TABLE_ID": "", "AUTH_MODE": "public_readonly"})
+                                  "BILLING_TABLE_ID": "", "AUTH_MODE": "iap"})
         self.assertEqual(layer["workspace"]["project_id"], "env-project")
         self.assertEqual(layer["server"]["port"], 9090)
         self.assertEqual(layer["security"]["admins"], ["a@example.net", "*@corp.example.com"])
         self.assertEqual(layer["branding"]["organization_name"], "Env Org")
         self.assertEqual(layer["workspace"]["timezone"], "Asia/Seoul")
-        self.assertEqual(layer["security"]["auth_mode"], "public_readonly")
+        self.assertEqual(layer["security"]["auth_mode"], "iap")
         self.assertNotIn("billing", layer["workspace"])
 
     def test_unknown_environment_variables_are_ignored(self):
@@ -165,7 +165,7 @@ class SettingsUpdateTest(unittest.TestCase):
         self.assertEqual(out, {"governance.antigravity.token_cap": 1000, "governance.antigravity.period": "weekly"})
 
     def test_ui_locked_keys(self):
-        self.assertBadRequest("security", {"auth_mode": "public_readonly"})
+        self.assertBadRequest("security", {"auth_mode": "iap"})
         out = self.update("security", {"auth_mode": "auto", "mask_pii_for_viewers": False})
         self.assertEqual(out, {"security.mask_pii_for_viewers": False})
 
@@ -199,6 +199,22 @@ class SettingsUpdateTest(unittest.TestCase):
         self.assertEqual(masked["governance"]["antigravity"]["webhook_url"], "https://hooks.slack.com/***")
         self.assertEqual(masked["security"]["admins"], ["ad***@example.com", "*@corp.example.com"])
         self.assertIn("SECRET", eff["governance"]["antigravity"]["webhook_url"])
+
+    def test_viewer_masking_hides_deployment_identifiers(self):
+        eff = copy.deepcopy(self.effective)
+        eff["storage"]["gcs_bucket"] = "acme-control-plane-settings"
+        eff["security"]["google_client_id"] = "123-abc.apps.googleusercontent.com"
+        eff["workspace"]["billing"]["account_id"] = "ABCDEF-123456-ABCDEF"
+        eff["governance"]["antigravity"]["scheduler_invokers"] = ["cp-scheduler@acme.iam.gserviceaccount.com"]
+        masked = config.mask_settings_for_viewer(eff)
+        self.assertEqual(masked["storage"]["gcs_bucket"], "***")
+        self.assertEqual(masked["security"]["google_client_id"], "***")
+        self.assertEqual(masked["workspace"]["billing"]["account_id"], "***")
+        self.assertEqual(masked["governance"]["antigravity"]["scheduler_invokers"],
+                         ["cp***@acme.iam.gserviceaccount.com"])
+        self.assertEqual(masked["security"]["iap_audience"], eff["security"]["iap_audience"] and "***")
+        # Policy values stay visible to viewers.
+        self.assertEqual(masked["governance"]["antigravity"]["token_cap"], eff["governance"]["antigravity"]["token_cap"])
 
 
 if __name__ == "__main__":

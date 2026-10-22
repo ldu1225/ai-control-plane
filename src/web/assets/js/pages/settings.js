@@ -383,6 +383,8 @@ function governance(ctx, panel, data, editable) {
     fields: [
       { path: ['max_bytes_billed'], label: t('Maximum bytes billed per query'), type: 'number', min: 10000000, step: 1000000000 },
       { path: ['max_rows'], label: t('Maximum rows returned'), type: 'number', min: 10, max: 5000 },
+      { path: ['allow_viewers'], label: t('Allow viewers to use AI Analyst'), type: 'switch',
+        help: t('Query results can include free text, such as prompts, that the dashboards hide from viewers. Off by default.') },
     ],
   }));
 }
@@ -396,7 +398,7 @@ function access(ctx, panel, data, editable) {
     body: kv([
       [t('Signed in as'), s.email || DASH],
       [t('Role'), s.role === 'admin' ? badge(t('Administrator'), 'accent', { size: 'sm' }) : badge(t('Viewer'), 'neutral', { size: 'sm' })],
-      [t('Authentication'), { google: t('Google sign-in (approved accounts only)'), iap: t('Identity-Aware Proxy (verified JWT)'), local: t('Local development'), public_readonly: t('Public read-only') }[s.authMode] || s.authMode],
+      [t('Authentication'), { google: t('Google sign-in (approved accounts only)'), iap: t('Identity-Aware Proxy (verified JWT)'), local: t('Local development') }[s.authMode] || s.authMode],
       [t('Configured mode'), h('span', { class: 'mono' }, sec.auth_mode || DASH)],
       google ? [t('Session length'), t('{n} hours', { n: sec.session_hours || 12 })] : [t('IAP audience'), sec.iap_audience ? h('span', { class: 'mono' }, sec.iap_audience) : t('Not configured')],
     ]),

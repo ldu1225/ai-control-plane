@@ -11,8 +11,9 @@
 # Steps
 #   1. Enable the required Google Cloud APIs.
 #   2. Build the container image with Cloud Build (Artifact Registry), unless IMAGE is set.
-#   3. Create the runtime service account and grant read-only roles
-#      (plus IAM write roles when ENABLE_GOVERNANCE_ACTIONS=true).
+#   3. Create the runtime service account and grant read-only roles plus the audit log writer
+#      (and IAM write roles when ENABLE_GOVERNANCE_ACTIONS=true). ACCESS_MODE=google also gets a
+#      separate sign-in bridge service account that can read only the session signing key.
 #   4. Create a private, versioned Cloud Storage bucket for settings saved in the UI.
 #   5. Create the session signing key in Secret Manager.
 #   6. Optional: BigQuery dataset + Log Router sink for AI audit logs, Data Access audit logs.
@@ -54,6 +55,35 @@ retry() {
     [[ $n -ge 6 ]] && return 1
     sleep 10
   done
+}
+# Dataset-level BigQuery access (a dataset ACL entry) for one service account; project IAM is not touched.
+# grant_dataset_role PROJECT DATASET ROLE EMAIL, where ROLE is READER (Data Viewer) or WRITER (Data Editor).
+# Returns non-zero when the dataset cannot be read or updated.
+grant_dataset_role() {
+  local file rc=0
+  file="$(mktemp)"
+  if ! bq --project_id "$1" show --format=prettyjson "${1}:${2}" >"$file"; then
+    rm -f "$file"
+    return 1
+  fi
+  python3 - "$file" "$3" "$4" <<'PYCODE' || rc=$?
+import json, sys
+path, role, email = sys.argv[1], sys.argv[2], sys.argv[3].lower()
+enough = {"READER": ("READER", "WRITER", "OWNER"), "WRITER": ("WRITER", "OWNER")}[role]
+dataset = json.load(open(path))
+access = dataset.setdefault("access", [])
+if any((a.get("userByEmail") or "").lower() == email and a.get("role") in enough for a in access):
+    sys.exit(3)  # already granted
+access.append({"role": role, "userByEmail": email})
+json.dump(dataset, open(path, "w"))
+PYCODE
+  if [[ $rc -eq 0 ]]; then
+    bq --project_id "$1" update --source "$file" "${1}:${2}" >/dev/null || rc=1
+  elif [[ $rc -eq 3 ]]; then
+    rc=0
+  fi
+  rm -f "$file"
+  return $rc
 }
 
 [[ -f "$CONFIG" ]] || die "configuration file not found: $CONFIG (copy deploy.env.example to deploy.env first)"
@@ -115,6 +145,13 @@ esac
 if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
   [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]] || die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
   [[ "$ACCESS_MODE" != "iap" ]] || die "ENFORCEMENT_SCHEDULE needs ACCESS_MODE google or google_oauth (IAP blocks the scheduler's OIDC token)"
+elif [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
+  # Suspended users are restored only inside an enforcement run.
+  if [[ "$ACCESS_MODE" == "iap" ]]; then
+    warn "governance actions without a schedule (IAP mode cannot use one): suspended users get access back only when an administrator runs enforcement after the settlement period resets"
+  else
+    warn "governance actions without ENFORCEMENT_SCHEDULE: suspended users get access back only when an enforcement run happens after the settlement period resets; set ENFORCEMENT_SCHEDULE (for example \"*/15 * * * *\") to restore them automatically"
+  fi
 fi
 ACCOUNT="$(gcloud config get-value account 2>/dev/null || true)"
 [[ -n "$ACCOUNT" ]] || die "no active gcloud account (run: gcloud auth login)"
@@ -139,6 +176,8 @@ BRIDGE_URL="https://${BRIDGE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
 IAP_AGENT="service-${PROJECT_NUMBER}@gcp-sa-iap.iam.gserviceaccount.com"
 SCHEDULER_SA_ID="${SERVICE_NAME:0:20}-scheduler"
 SCHEDULER_SA="${SCHEDULER_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+BRIDGE_SA_ID="${SERVICE_NAME:0:23}-signin"
+BRIDGE_SA="${BRIDGE_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 ENFORCE_URL="${BASE_URL}/api/v1/governance/antigravity/enforce"
 
 log "Deploying ${SERVICE_NAME} to ${PROJECT_ID} (${REGION}) as ${ACCOUNT}"
@@ -179,22 +218,44 @@ if ! gcloud iam service-accounts describe "$SA_EMAIL" --project "$PROJECT_ID" >/
   run gcloud iam service-accounts create "$SERVICE_ACCOUNT_ID" --project "$PROJECT_ID" \
     --display-name "AI Control Plane runtime" --description "Least-privilege identity of the ${SERVICE_NAME} Cloud Run service"
 fi
-READ_ROLES=(roles/bigquery.dataViewer roles/bigquery.jobUser roles/aiplatform.user roles/discoveryengine.viewer
-  roles/monitoring.viewer roles/logging.viewer roles/iam.securityReviewer roles/serviceusage.serviceUsageConsumer)
-GOVERNANCE_ROLES=(roles/resourcemanager.projectIamAdmin roles/logging.logWriter roles/iam.roleAdmin)
+# Read roles plus logging.logWriter, which is always granted so that every governance record (dry runs,
+# exception and review changes, enforcement runs) reaches the audit log, with or without IAM write roles.
+RUNTIME_ROLES=(roles/bigquery.dataViewer roles/bigquery.jobUser roles/aiplatform.user roles/discoveryengine.viewer
+  roles/monitoring.viewer roles/logging.viewer roles/iam.securityReviewer roles/serviceusage.serviceUsageConsumer
+  roles/logging.logWriter)
+GOVERNANCE_ROLES=(roles/resourcemanager.projectIamAdmin roles/iam.roleAdmin)
 grant() {  # grant PROJECT ROLE
   run retry gcloud projects add-iam-policy-binding "$1" --member "serviceAccount:${SA_EMAIL}" --role "$2" \
     --condition=None --quiet >/dev/null
   info "granted $2 on $1"
 }
-for role in "${READ_ROLES[@]}"; do grant "$PROJECT_ID" "$role"; done
+for role in "${RUNTIME_ROLES[@]}"; do grant "$PROJECT_ID" "$role"; done
 if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
   for role in "${GOVERNANCE_ROLES[@]}"; do grant "$PROJECT_ID" "$role"; done
 else
   info "governance write roles skipped (ENABLE_GOVERNANCE_ACTIONS=false): dashboards and simulations only"
 fi
+# Billing export in another project: read access on that dataset only (no project-level role there).
 if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; then
-  grant "$BILLING_PROJECT_ID" roles/bigquery.dataViewer
+  if [[ -z "$BILLING_DATASET" ]]; then
+    warn "BILLING_PROJECT_ID is set without BILLING_DATASET: billing read access was not granted"
+  elif [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] grant BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} (this dataset only)"
+  elif retry grant_dataset_role "$BILLING_PROJECT_ID" "$BILLING_DATASET" READER "$SA_EMAIL"; then
+    info "granted BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} (this dataset only)"
+    # Earlier versions granted this role on the whole billing project; the dataset grant replaces it.
+    gcloud projects remove-iam-policy-binding "$BILLING_PROJECT_ID" --member "serviceAccount:${SA_EMAIL}" \
+      --role roles/bigquery.dataViewer --condition=None --quiet >/dev/null 2>&1 \
+      && info "removed the earlier project-level BigQuery Data Viewer on ${BILLING_PROJECT_ID}" || true
+  else
+    warn "could not grant read access on ${BILLING_PROJECT_ID}:${BILLING_DATASET}; grant BigQuery Data Viewer on that dataset to ${SA_EMAIL}"
+  fi
+fi
+if [[ "$ACCESS_MODE" == "google" ]] && \
+    ! gcloud iam service-accounts describe "$BRIDGE_SA" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  # No project roles: the sign-in bridge only reads the session signing key (granted in step 5).
+  run gcloud iam service-accounts create "$BRIDGE_SA_ID" --project "$PROJECT_ID" \
+    --display-name "AI Control Plane sign-in bridge" --description "Identity of the ${BRIDGE_NAME} sign-in bridge"
 fi
 
 # ------------------------------------------------------------------------------- 4. settings bucket
@@ -221,6 +282,10 @@ if ! gcloud secrets describe "$SESSION_SECRET_NAME" --project "$PROJECT_ID" >/de
 fi
 run retry gcloud secrets add-iam-policy-binding "$SESSION_SECRET_NAME" --project "$PROJECT_ID" \
   --member "serviceAccount:${SA_EMAIL}" --role roles/secretmanager.secretAccessor --condition=None >/dev/null
+if [[ "$ACCESS_MODE" == "google" ]]; then
+  run retry gcloud secrets add-iam-policy-binding "$SESSION_SECRET_NAME" --project "$PROJECT_ID" \
+    --member "serviceAccount:${BRIDGE_SA}" --role roles/secretmanager.secretAccessor --condition=None >/dev/null
+fi
 SECRETS="SESSION_SECRET=${SESSION_SECRET_NAME}:latest"
 
 OAUTH_CLIENT_ID=""
@@ -255,27 +320,8 @@ PY
 fi
 
 # ------------------------------------------------------------------------------- 6. telemetry
-# Dataset-level BigQuery Data Editor (dataset ACL role WRITER) for a sink's writer identity. The writer
-# is often the project's shared Logging service agent, so nothing is granted at project level.
-grant_dataset_writer() {
-  local file
-  file="$(mktemp)"
-  bq --project_id "$PROJECT_ID" show --format=prettyjson "${PROJECT_ID}:${AUDIT_DATASET}" >"$file"
-  if python3 - "$file" "$1" <<'PYCODE'
-import json, sys
-path, email = sys.argv[1], sys.argv[2].lower()
-dataset = json.load(open(path))
-access = dataset.setdefault("access", [])
-if any((a.get("userByEmail") or "").lower() == email and a.get("role") in ("WRITER", "OWNER") for a in access):
-    sys.exit(1)
-access.append({"role": "WRITER", "userByEmail": email})
-json.dump(dataset, open(path, "w"))
-PYCODE
-  then
-    bq --project_id "$PROJECT_ID" update --source "$file" "${PROJECT_ID}:${AUDIT_DATASET}" >/dev/null
-  fi
-  rm -f "$file"
-}
+# The sink's writer identity gets dataset-level BigQuery Data Editor (grant_dataset_role WRITER). The
+# writer is often the project's shared Logging service agent, so nothing is granted at project level.
 log "6/8 Audit log routing"
 if [[ "$CREATE_LOG_SINK" == "true" ]]; then
   if ! bq --project_id "$PROJECT_ID" show --dataset "${PROJECT_ID}:${AUDIT_DATASET}" >/dev/null 2>&1; then
@@ -296,7 +342,8 @@ OR logName=\"projects/${PROJECT_ID}/logs/businessaicode.googleapis.com%2Finferen
   fi
   if [[ "$DRY_RUN" != "1" ]]; then
     WRITER="$(gcloud logging sinks describe "$SINK" --project "$PROJECT_ID" --format='value(writerIdentity)')"
-    grant_dataset_writer "${WRITER#serviceAccount:}"
+    grant_dataset_role "$PROJECT_ID" "$AUDIT_DATASET" WRITER "${WRITER#serviceAccount:}" \
+      || die "could not grant the sink writer BigQuery Data Editor on ${PROJECT_ID}:${AUDIT_DATASET}"
     info "sink ${SINK} -> ${PROJECT_ID}:${AUDIT_DATASET} (writer ${WRITER}: BigQuery Data Editor on this dataset only)"
   else
     info "[dry-run] grant the sink writer BigQuery Data Editor on ${PROJECT_ID}:${AUDIT_DATASET}"
@@ -355,12 +402,13 @@ add_env AI_DEFAULT_MODEL "$AI_DEFAULT_MODEL"
 add_env AI_LOCATION "$AI_LOCATION"
 add_env ALLOWED_USERS "$ALLOWED_USERS"
 [[ -n "$ENFORCEMENT_SCHEDULE" ]] && add_env SCHEDULER_INVOKERS "$SCHEDULER_SA"
-COMMON=(--image "$IMAGE" --project "$PROJECT_ID" --region "$REGION" --service-account "$SA_EMAIL" --cpu-boost --quiet)
+COMMON=(--image "$IMAGE" --project "$PROJECT_ID" --region "$REGION" --cpu-boost --quiet)
+MAIN=("${COMMON[@]}" --service-account "$SA_EMAIL")
 
 case "$ACCESS_MODE" in
   google)
     info "sign-in bridge ${BRIDGE_NAME} (IAP signs users in with Google; the dashboard approves accounts)"
-    run gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --no-allow-unauthenticated --iap \
+    run gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
       --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
       --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
       --set-secrets "$SECRETS"
@@ -375,19 +423,19 @@ case "$ACCESS_MODE" in
         || warn "IAP access for ${member} was refused (an organization policy may restrict it); set BRIDGE_MEMBERS, for example domain:example.com"
     done
     ENV_VARS+="##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
-    run gcloud run deploy "$SERVICE_NAME" "${COMMON[@]}" --no-iap --no-invoker-iam-check \
+    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --no-iap --no-invoker-iam-check \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
       --set-env-vars "$ENV_VARS" --set-secrets "$SECRETS"
     ;;
   google_oauth)
     ENV_VARS+="##AUTH_MODE=google##GOOGLE_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}##PUBLIC_BASE_URL=${BASE_URL}"
-    run gcloud run deploy "$SERVICE_NAME" "${COMMON[@]}" --no-iap --no-invoker-iam-check \
+    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --no-iap --no-invoker-iam-check \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
       --set-env-vars "$ENV_VARS" --set-secrets "$SECRETS"
     ;;
   iap)
     ENV_VARS+="##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
-    run gcloud run deploy "$SERVICE_NAME" "${COMMON[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
+    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
       --set-env-vars "$ENV_VARS" --set-secrets "$SECRETS"
     run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \

@@ -424,7 +424,7 @@ async function signOut() {
 }
 
 function authLabel(mode) {
-  return { google: t('Google sign-in'), iap: t('Identity-Aware Proxy'), local: t('Local development'), public_readonly: t('Public read-only') }[mode] || mode || '';
+  return { google: t('Google sign-in'), iap: t('Identity-Aware Proxy'), local: t('Local development') }[mode] || mode || '';
 }
 
 function switchLocale(locale) {

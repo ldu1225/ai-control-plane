@@ -232,6 +232,11 @@ class GoogleSignInFlowTest(unittest.TestCase):
         boot = self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": session}).json()["data"]
         self.assertEqual((boot["session"]["email"], boot["session"]["role"], boot["session"]["authMode"]),
                          ("person@example.org", "viewer", "google"))
+        self.assertEqual(boot["workspace"]["billing"]["accountId"], "")
+        # Viewers get the read-only settings view without deployment identifiers.
+        view = self.request("GET", "/api/v1/settings", cookies={"cp_session": session}).json()["data"]
+        self.assertEqual(view["effective"]["security"]["google_client_id"], "***")
+        self.assertFalse(view["editable"])
         self.assertEqual(self.request("GET", "/api/v1/access", cookies={"cp_session": session}).status, 403)
         self.assertEqual(self.post("/api/v1/access/users", session, {"email": "x@example.com", "role": "admin"}).status,
                          403)

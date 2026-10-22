@@ -143,6 +143,17 @@ class GatesAndPlanTest(unittest.TestCase):
             self.assertTrue(plan["withheldRestores"])
             self.assertFalse(plan["aborted"])
 
+    def test_g3_truncated_usage_withholds_restores_but_keeps_blocks(self):
+        users = [user("cap_ok", "CAPPED_BY_TOOL", False), user("ea_over", "ENFORCEABLE_ALLOWED", True)]
+        gates, plan, _ = gov.evaluate(users, True, True, 20000, [], CFG, ACCESS_ROLE, telemetry_truncated=True)
+        self.assertEqual(self.gate(gates, "G3_TELEMETRY_HEALTHY"), "warn")
+        self.assertIn("truncated", next(g["detail"] for g in gates if g["id"] == "G3_TELEMETRY_HEALTHY"))
+        # Truncated counts are lower bounds: an over-cap result is still valid, a restore is not.
+        self.assertEqual(plan["block"], ["ea_over"])
+        self.assertEqual(plan["restore"], [])
+        self.assertTrue(plan["withheldRestores"])
+        self.assertFalse(plan["aborted"])
+
     def test_unknown_usage_never_restores_or_blocks(self):
         users = [user("cap", "CAPPED_BY_TOOL", None), user("ea", "ENFORCEABLE_ALLOWED", None)]
         _, plan, _ = self.evaluate(users, telemetry_ok=True, records=5)

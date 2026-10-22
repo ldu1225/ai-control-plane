@@ -5,7 +5,7 @@
  * server-side OpenID Connect flow (/auth/google/start); only approved accounts receive a session.
  * Unapproved accounts see an access-request notice. Signed-in users can continue, switch account
  * or sign out (CSRF-protected POST followed by a full page navigation).
- * Other modes (iap, local, public_readonly) explain how access works and link to the dashboard.
+ * Other modes (iap, local) explain how access works and link to the dashboard.
  *
  * Security: text is always inserted as text nodes (core/dom.js), no tokens are stored client-side,
  * the post-sign-in destination is a same-origin path that the server validates again.
@@ -272,11 +272,9 @@ function otherModeView(mode) {
       note(t('Access is managed by your Google Cloud administrators.'), 'shield'),
     ];
   }
-  const desc = mode === 'local'
-    ? t('This deployment runs in local development mode. Administrator access is limited to this computer.')
-    : t('This deployment is open in read-only mode.');
+  // local development mode (the only other mode): the loopback caller is the administrator.
   return [
-    heading(t('No sign-in required'), desc),
+    heading(t('No sign-in required'), t('This deployment runs in local development mode. Administrator access is limited to this computer.')),
     noticeAlert(),
     h('div', { class: 'login-actions' }, linkButton(t('Open the dashboard'), '/', 'primary', 'arrow-right')),
   ];

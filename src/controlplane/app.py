@@ -17,8 +17,8 @@ from .gcp import Gcp, GcpError
 from .httpkit import ApiError, BaseHandler, Router, Server, StaticSite, csrf_valid, envelope, now_iso, \
     parse_json_object, parse_query
 from .schema import SchemaRegistry
-from .security import Identity, IapVerifier, RateLimiter, authenticate, mask_for_viewer, resolve_auth_mode, \
-    scheduler_identity
+from .security import Identity, IapVerifier, RateLimiter, authenticate, is_loopback_host, mask_for_viewer, \
+    resolve_auth_mode, scheduler_identity
 from .settings_store import SettingsManager, UserDocStore, make_store
 from .services import base as svc_base
 from .services import access
@@ -115,6 +115,7 @@ class App:
         self.environ = os.environ if environ is None else environ
         base, self.loaded_files = config.load_base_settings(self.environ)
         resolve_auth_mode(base["security"]["auth_mode"], self.environ)  # validates early
+        _refuse_unprotected_bind(base, self.environ)
         self.gcp = Gcp()
         self.registry = SchemaRegistry(self.gcp)
         self.ai = AiEngine(self.gcp)
@@ -284,6 +285,18 @@ class ControlPlaneHandler(BaseHandler):
         return True
 
 
+def _refuse_unprotected_bind(base, environ):
+    """auth_mode auto means local outside Cloud Run, which suits only a server that this computer alone
+    can reach. A shared deployment elsewhere (a VM, GKE, a container bound to 0.0.0.0) must choose
+    google or iap; an explicit AUTH_MODE=local stays possible for development."""
+    configured = (base["security"].get("auth_mode") or "auto").strip().lower()
+    if configured == "auto" and resolve_auth_mode(configured, environ) == "local" and \
+            not is_loopback_host(base["server"].get("host")):
+        raise ValueError("auth_mode auto resolves to local outside Cloud Run, but server.host %s is reachable "
+                         "from other computers; set AUTH_MODE=google or iap for a shared deployment, or "
+                         "AUTH_MODE=local explicitly for development on one computer" % base["server"].get("host"))
+
+
 def make_server(app, host, port):
     handler = type("Handler", (ControlPlaneHandler,), {"app": app, "site": app.site})
     return Server((host, port), handler)
@@ -317,8 +330,6 @@ def main():
     if mode == "iap" and not settings["security"].get("iap_audience"):
         LOG.warning("auth_mode=iap without security.iap_audience: signature, expiry and issuer are verified but "
                     "the audience is not; set IAP_AUDIENCE")
-    if mode == "public_readonly":
-        LOG.warning("auth_mode=public_readonly: anonymous read-only access, all write endpoints are disabled")
     if mode == "google":
         LOG.info("auth_mode=google: sign-in page at /login; approved accounts only")
     if not config.workspace_configured(settings):

@@ -63,5 +63,25 @@ class UidTest(unittest.TestCase):
         self.assertNotEqual(security.uid_for("bob@example.com"), expected)
 
 
+class LogSafeTest(unittest.TestCase):
+    """Upstream error text is logged without quoted literals or e-mail addresses (NFR-06)."""
+
+    def test_literals_and_emails_removed(self):
+        from controlplane.gcp import log_safe
+        out = log_safe("Syntax error: Unexpected string literal 'resident number 900101-1234567' at [1:20]")
+        self.assertEqual(out, "Syntax error: Unexpected string literal '?' at [1:20]")
+        out = log_safe('Unrecognized name: x; Did you mean "secret prompt"? owner alice@example.com')
+        self.assertNotIn("secret prompt", out)
+        self.assertNotIn("alice@example.com", out)
+        self.assertIn("<email>", out)
+
+    def test_unterminated_literal_and_length(self):
+        from controlplane.gcp import log_safe
+        self.assertEqual(log_safe("Unexpected literal 'never closed text"), "Unexpected literal '?'")
+        self.assertEqual(len(log_safe("x" * 1000)), 200)
+        self.assertEqual(log_safe(None), "")
+        self.assertIn("`proj.ds.tbl`", log_safe("Not found: Table `proj.ds.tbl` was not found"))
+
+
 if __name__ == "__main__":
     unittest.main()

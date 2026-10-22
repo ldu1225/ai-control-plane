@@ -32,7 +32,11 @@ def _key(ctx):
 
 
 def _editable(ctx):
-    return bool(ctx.identity.email) and ctx.identity.auth_mode != "public_readonly"
+    """Layouts are per person. In local development mode every caller shares one identity, so only the
+    loopback administrator may save there."""
+    if ctx.identity.auth_mode == "local":
+        return ctx.identity.is_admin
+    return bool(ctx.identity.email)
 
 
 def clean_widgets(widgets):

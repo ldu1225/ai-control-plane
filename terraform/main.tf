@@ -57,6 +57,7 @@ locals {
     "roles/logging.viewer",                    # inference logs, governance audit log, log discovery
     "roles/iam.securityReviewer",              # project IAM policy (Antigravity 6-state classification)
     "roles/serviceusage.serviceUsageConsumer", # required because every call sends x-goog-user-project
+    "roles/logging.logWriter",                 # governance audit entries (always, with or without IAM write roles)
   ]
 
   # APIs the dashboards call (BigQuery, Cloud Logging and Monitoring, Gemini Enterprise, Vertex AI,
@@ -78,7 +79,6 @@ locals {
   # Optional governance write roles (Antigravity cap enforcement and marker role setup).
   governance_roles = [
     "roles/resourcemanager.projectIamAdmin", # atomic etag-guarded setIamPolicy
-    "roles/logging.logWriter",               # governance audit entries
     "roles/iam.roleAdmin",                   # create marker custom roles
   ]
 
@@ -148,6 +148,12 @@ resource "google_organization_iam_member" "ancestor_policy_reader" {
   org_id = var.organization_id
   role   = "roles/iam.securityReviewer"
   member = local.sa_member
+}
+
+# The audit log writer used to be a governance role; keep an existing binding instead of re-creating it.
+moved {
+  from = google_project_iam_member.governance["roles/logging.logWriter"]
+  to   = google_project_iam_member.read["roles/logging.logWriter"]
 }
 
 # 3. Optional governance write roles (disabled by default).

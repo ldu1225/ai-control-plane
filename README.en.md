@@ -112,7 +112,8 @@ flowchart LR
 |-- .dockerignore, .gcloudignore
 |-- scripts/
 |   |-- deploy.sh               # one-command deployment (safe to re-run)
-|   `-- teardown.sh             # deletes the deployed resources
+|   |-- teardown.sh             # deletes the deployed resources
+|   `-- prepublish_scan.py      # release gate: secrets and deployment identifiers (also runs in CI)
 |-- terraform/                  # Terraform deployment (IAP mode, optional)
 |-- src/
 |   |-- backend_server.py       # entry point
@@ -127,8 +128,9 @@ flowchart LR
 |   |   |-- gcp.py, ai.py, cache.py, timeutil.py
 |   |   `-- services/           # per-module services (governance, pricing, gemini_enterprise, ...)
 |   `-- web/                    # frontend SPA (index.html, login.html, assets/)
-|-- tests/unit/                 # unit tests (232)
-`-- .github/workflows/tests.yml # runs unit tests on every push
+|-- eval/analyst/               # AI Analyst golden dataset and evaluation harness (16.1)
+|-- tests/unit/                 # unit tests (268)
+`-- .github/workflows/tests.yml # unit tests, prepublish scan and dataset validation on every push
 ```
 
 ---
@@ -165,7 +167,7 @@ What the script does:
 |---|---|
 | 1. Enable APIs | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Vertex AI, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing (price list), Service Usage, and IAP and Cloud Scheduler when needed |
 | 2. Container image | Creates an Artifact Registry repository (`ai-control-plane`) and builds the image with Cloud Build. If `IMAGE` is set, the build is skipped. |
-| 3. Runtime service account | Creates a dedicated service account and grants it only read roles. If `ENABLE_GOVERNANCE_ACTIONS=true`, IAM write roles are added ([6.6](#66-runtime-service-account-permissions)). |
+| 3. Runtime service account | Creates a dedicated service account and grants it read roles plus the audit log writer. If `ENABLE_GOVERNANCE_ACTIONS=true`, IAM write roles are added ([6.6](#66-runtime-service-account-permissions)). In `google` mode, the sign-in bridge gets its own service account that can read only the session signing key. |
 | 4. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. It stores settings changed in the UI, exception rules, suspension records and personal widget layouts. |
 | 5. Session signing key | Creates a random key in Secret Manager and gives the service account read access to it. |
 | 6. Audit log routing | Creates a BigQuery dataset and a Log Router sink (`CREATE_LOG_SINK=true`). Optionally, also turns on Data Access audit logs. |
@@ -246,7 +248,7 @@ You can also enter the billing values after deployment in **Settings > Workspace
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_GOVERNANCE_ACTIONS` | `false` | Grants IAM write roles. Required to suspend users over their cap, restore them, allow or disallow individual users and create marker roles |
-| `ENFORCEMENT_SCHEDULE` | Empty | Automatic enforcement schedule (cron). Example: `*/15 * * * *`. Requires `ENABLE_GOVERNANCE_ACTIONS=true` and the `google` or `google_oauth` mode. |
+| `ENFORCEMENT_SCHEDULE` | Empty | Automatic enforcement schedule (cron). Example: `*/15 * * * *`. Requires `ENABLE_GOVERNANCE_ACTIONS=true` and the `google` or `google_oauth` mode. Suspended users are restored by enforcement runs, so without a schedule they get access back only when an administrator runs enforcement after the period resets. The script and the Antigravity page warn about this. |
 
 ### 4.6 Other
 
@@ -274,6 +276,12 @@ You can also enter the billing values after deployment in **Settings > Workspace
 | `google_oauth` | The same sign-in page runs with an OAuth client that you create. | When you do not want a bridge service, or you want to manage the OAuth consent screen yourself |
 | `iap` | Identity-Aware Proxy handles sign-in in front of the dashboard. The app verifies the IAP signed header. | Organizations that already use IAP and group-based access management |
 
+Other `security.auth_mode` values (set only in `config.yaml` or the `AUTH_MODE` environment variable, never in the UI):
+
+- `local`: for development on one computer ([11](#11-running-locally)). Only a direct request from a loopback address is the administrator; a request forwarded by a proxy (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) never is. Cloud Run refuses this mode at startup. `auto` falls back to `local` only when the server listens on a loopback address (`127.0.0.1`, `::1`, `localhost`); a server bound to another address stops at startup and asks you to choose `google` or `iap`.
+
+There is no anonymous mode: on every deployment, only approved Google accounts can open the dashboard.
+
 ```mermaid
 sequenceDiagram
   participant B as Browser
@@ -300,7 +308,7 @@ Preparing `google_oauth` mode (one time only):
 | Role | What it can do |
 |---|---|
 | admin | All pages, changing settings, approving users, cap policy, suspend/restore, exception rules, connector management |
-| viewer | Views all pages. Emails are masked on the server (`ad***@example.com`), and Model Armor raw text and uploaded file names are not provided. |
+| viewer | Views all pages. Emails are masked on the server (`ad***@example.com`), and Model Armor raw text and uploaded file names are not provided. AI Analyst is available only when an administrator allows it (`analyst.allow_viewers`). Settings are read-only, and deployment identifiers (settings bucket, OAuth client ID, IAP audience, billing account ID) are shown as `***`. |
 
 - Administrators = `ADMIN_EMAILS` + `security.admins` in `config.yaml` + administrators added in the UI.
 - Viewers = `ALLOWED_USERS` + `security.allowed_users` + users approved in the UI.
@@ -396,13 +404,14 @@ Antigravity token usage per user is read from the `businessaicode.googleapis.com
 | Role | Purpose |
 |---|---|
 | `roles/bigquery.jobUser` | Run parameterized queries |
-| `roles/bigquery.dataViewer` | Read audit logs and the billing export (also on the billing project if the billing dataset is in a different project) |
+| `roles/bigquery.dataViewer` | Read audit logs and the billing export. If the billing dataset is in a different project, read access is granted on that dataset only. |
 | `roles/logging.viewer` | Antigravity inference logs, governance audit log, log source discovery |
 | `roles/monitoring.viewer` | Token and invocation metrics per model, log activity in Telemetry Extensions |
 | `roles/discoveryengine.viewer` | Licenses, engines, assistants, agents |
 | `roles/aiplatform.user` | Read Agent Engine, call AI Analyst (Gemini) |
 | `roles/iam.securityReviewer` | Read the project IAM policy (Antigravity state classification) |
 | `roles/serviceusage.serviceUsageConsumer` | Use the quota project header on all calls |
+| `roles/logging.logWriter` | Write the governance audit log (enforcement runs, dry runs, review decisions, exception changes), with or without the control features |
 | `roles/storage.objectAdmin` (settings bucket only) | Store UI settings, exception rules, suspension records and personal widget layouts |
 | `roles/secretmanager.secretAccessor` (secrets only) | Session signing key, OAuth client secret |
 
@@ -411,8 +420,9 @@ Antigravity token usage per user is read from the `businessaicode.googleapis.com
 | Role | Purpose |
 |---|---|
 | `roles/resourcemanager.projectIamAdmin` | Suspending and restoring users over their cap, allowing and disallowing individual users (etag-based `setIamPolicy`) |
-| `roles/logging.logWriter` | Write the governance audit log |
 | `roles/iam.roleAdmin` | Create marker roles (once, the first time) |
+
+**Sign-in bridge (`google` mode)**: The bridge runs as its own service account (`SERVICE_NAME-signin`, at most 23 characters of the service name). It has no project roles and can read only the session signing key.
 
 **Inherited binding check (optional)**: If you grant `roles/iam.securityReviewer` at the organization level, Antigravity access inherited from folders and the organization is also detected (Terraform `organization_id`). Without it, the users concerned are classified as `UNKNOWN / ANCESTOR_UNCHECKED` and are excluded from changes.
 
@@ -485,6 +495,8 @@ Dashboards that read Cloud Logging directly cover its retention period (30 days 
 
 Converts natural language questions into BigQuery SQL, runs it, and shows tables, charts and a summary. The generated SQL is validated before it runs. After comments and strings are removed, the validator checks that it is a single `SELECT`/`WITH` statement, rejects DML/DDL, and checks that the referenced tables belong to allowed datasets (audit logs, billing, registered connectors). Execution is limited by `analyst.max_bytes_billed` and `analyst.max_rows`. The summary is based only on the result rows and does not follow instructions found inside the result data.
 
+Query results can contain raw text columns such as prompts. Therefore, when viewer masking (`security.mask_pii_for_viewers`) is on, only administrators can use AI Analyst by default. To allow viewers, turn on **Allow viewers to use AI Analyst** in **Settings > Governance policy > AI Analyst limits** (`analyst.allow_viewers`). Viewer results mask only email addresses, so first check whether the datasets contain tables with raw text.
+
 ---
 
 ## 8. Antigravity per-user caps and suspension
@@ -508,7 +520,7 @@ flowchart TD
 
 ### 8.2 Getting started
 
-1. Deploy with `ENABLE_GOVERNANCE_ACTIONS="true"`. To use automatic suspension, also set `ENFORCEMENT_SCHEDULE="*/15 * * * *"`.
+1. Deploy with `ENABLE_GOVERNANCE_ACTIONS="true"`. To use automatic suspension and automatic restores at the end of each period, also set `ENFORCEMENT_SCHEDULE="*/15 * * * *"`.
 2. In **Antigravity Controls > Enforcement prerequisites**, check the marker roles and permissions. If the marker roles are missing, select **Create marker roles**.
 3. Set the following in **Cap policy > Edit policy**.
    - Cost cap per person: the `₩1M`, `₩2M` or `₩3M` preset (shown as `₩100만`, `₩200만`, `₩300만` in Korean), or a custom amount
@@ -539,7 +551,7 @@ flowchart TD
 | Automatic suspension | The user is suspended by each enforcement run. | Automatic when the settlement period ends |
 
 - An **enforcement run** is started by the **Run enforcement now** button or by the Cloud Scheduler job (`ENFORCEMENT_SCHEDULE`). The scheduler job calls `POST /api/v1/governance/antigravity/enforce` with a Google OIDC token from a dedicated service account that has no permissions. The app checks the issuer, the audience (`PUBLIC_BASE_URL` + path), email verification and the allowlist (`SCHEDULER_INVOKERS`). Calls without authentication and calls with other tokens get 401.
-- Suspension = one etag-based `setIamPolicy` call that replaces the access role (`roles/discoveryengine.agentspaceUser`) with the cap marker role (`CustomAntigravityCapBlocked`). A suspension record (start, scheduled end, reason, actor) is kept in the settings bucket, and the user is restored when the period ends, even without telemetry. However, the suspension stays if the user's usage in the new period is already over the cap.
+- Suspension = one etag-based `setIamPolicy` call that replaces the access role (`roles/discoveryengine.agentspaceUser`) with the cap marker role (`CustomAntigravityCapBlocked`). A suspension record (start, scheduled end, reason, actor) is kept in the settings bucket, and the first enforcement run after the period ends restores the user, even without telemetry. With `ENFORCEMENT_SCHEDULE` this happens within one interval; without it, run enforcement after each reset. However, the suspension stays if the user's usage in the new period is already over the cap.
 
 ### 8.5 Exception rules
 
@@ -568,7 +580,7 @@ Rules apply in both enforcement modes. Every addition, change and deletion is re
 |---|---|---|
 | `G1_POLICY_READABLE` | The project IAM policy cannot be read | Abort the run |
 | `G2_ANY_DETERMINATE` | No user can be classified | Abort the run |
-| `G3_TELEMETRY_HEALTHY` | The usage query fails or returns 0 records | Apply suspensions only and withhold usage-based restores (restores at the end of the period still proceed) |
+| `G3_TELEMETRY_HEALTHY` | The usage query fails, returns 0 records, or the Cloud Logging read was truncated at `max_log_entries` (default 20,000) | Apply suspensions only and withhold usage-based restores (restores at the end of the period still proceed). Truncated counts are lower bounds, so over-cap results stay valid. Export the inference log to BigQuery when there are many users. |
 | `G4_CHANGE_BUDGET` | Planned changes exceed `max(change_budget_min, ceil(change_budget_ratio x users in scope))` | Abort the run |
 | `G5_NON_USER_GRANT_ABSENT` | The access role has a group or domain binding | Warning |
 
@@ -576,7 +588,7 @@ If the etag conflicts because of a concurrent change, the plan is recalculated a
 
 ### 8.7 Audit, notifications and persistence
 
-- Every enforcement run, review decision, exception rule and allow/disallow action is written to the Cloud Logging audit log (`projects/PROJECT_ID/logs/agy-admin%2Fadmin_actions`) and shown in the **Administrative audit log** card. It uses the same marker roles and audit log as [agy-admin-cli](https://github.com/terrychahn/agy-admin-cli), so you can run both together. When you do, make sure the run times of the two tools do not overlap.
+- Every enforcement run, review decision, exception rule and allow/disallow action is written to the Cloud Logging audit log (`projects/PROJECT_ID/logs/agy-admin%2Fadmin_actions`) and shown in the **Administrative audit log** card. The service account always has `roles/logging.logWriter` for this. If a write still fails, the change is kept and the API response reports `auditLogged: false`. It uses the same marker roles and audit log as [agy-admin-cli](https://github.com/terrychahn/agy-admin-cli), so you can run both together. When you do, make sure the run times of the two tools do not overlap.
 - If you set `governance.antigravity.webhook_url` (Slack `hooks.slack.com` or Google Chat `chat.googleapis.com`, HTTPS only), new users awaiting review and enforcement results are sent to it.
 - Exception rules and suspension records are stored in the settings bucket and are kept after a restart. If you run on Cloud Run without a settings bucket, they are kept only in memory and the UI shows a warning.
 
@@ -615,7 +627,7 @@ Items changed in the UI are marked "Customized", and you can use **Reset to defa
 | `agent_lifecycle` | `idle_days`, `deprecation_days` | Thresholds for idle agents and deprecation candidates |
 | `finops` | `spike_threshold_pct`, `spike_min_delta` | Cost spike thresholds |
 | `governance.antigravity` | `cost_cap`, `currency`, `pricing_source`, `token_cap`, `request_cap`, `period`, `window`, `reset_timezone`, `enforcement_mode`, marker roles, change budget, `webhook_url` | Antigravity cap policy |
-| `analyst` | `max_bytes_billed`, `max_rows` | AI Analyst query limits |
+| `analyst` | `max_bytes_billed`, `max_rows`, `allow_viewers` | AI Analyst query limits, and whether viewers may use it (default `false`) |
 
 ### 9.3 Environment variables
 
@@ -679,7 +691,7 @@ terraform apply
 | `audit_dataset_id`, `billing_*`, `quota_project_id` | `ge_analytics` and others | Data sources |
 | `organization_name`, `product_name`, `default_locale`, `workspace_timezone` | `Your Organization`, `AI Control Plane`, `en`, `UTC` | Display |
 | `discovery_engine_locations`, `agent_engine_regions` | `["global"]`, `["us-central1"]` | API locations |
-| `auth_mode`, `enable_iap`, `iap_members`, `iap_audience` | `iap`, `true`, `[]`, computed automatically | Authentication |
+| `auth_mode`, `enable_iap`, `iap_members`, `iap_audience` | `iap` (only `iap` or `auto` are accepted), `true`, `[]`, computed automatically | Authentication |
 | `admin_emails` | `[]` | Administrators |
 | `ai_default_model`, `ai_location` | `gemini-3.8-flash`, `global` | AI engine |
 | `enable_governance_actions` | `false` | Write roles for control features |
@@ -709,23 +721,23 @@ Running as a container (to check read features):
 
 ```bash
 docker build -t ai-control-plane .
-docker run --rm -p 8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=local \
+docker run --rm -p 127.0.0.1:8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=local \
   -e GOOGLE_APPLICATION_CREDENTIALS=/creds/adc.json \
   -v "$HOME/.config/gcloud/application_default_credentials.json:/creds/adc.json:ro" \
   ai-control-plane
 ```
 
-Inside a container, browser requests do not come from a loopback address, so you are signed in as a viewer. To change settings, use the `python3` run above or a Cloud Run deployment.
+Inside a container, browser requests do not come from a loopback address, so you are signed in as a viewer. `-p 127.0.0.1:8080:8080` publishes the port on this computer only, so other computers on the network cannot open it. To change settings, use the `python3` run above or a Cloud Run deployment.
 
 ---
 
 ## 12. Security model
 
-- **Authentication**: Uses one of Google sign-in (bridge or OAuth client), IAP signed header (JWT) verification, or a loopback administrator for local development. Sessions are tokens signed with HMAC-SHA256 using purpose-derived keys, stored in a `__Host-` cookie (HttpOnly, Secure, SameSite=Lax). Sessions of accounts removed from the approved list become invalid immediately.
+- **Authentication**: Uses one of Google sign-in (bridge or OAuth client), IAP signed header (JWT) verification, or a loopback administrator for local development (refused on Cloud Run; there is no anonymous mode). Sessions are tokens signed with HMAC-SHA256 using purpose-derived keys, stored in a `__Host-` cookie (HttpOnly, Secure, SameSite=Lax). Sessions of accounts removed from the approved list become invalid immediately.
 - **Authorization**: There are two roles, admin and viewer. All write APIs are for administrators only.
 - **CSRF**: A double-submit cookie (`__Host-cp_csrf`, HttpOnly, SameSite=Strict) and the `X-CSRF-Token` header are verified with a constant-time comparison. Write requests with `Sec-Fetch-Site: cross-site` are rejected. Only the scheduler path authenticates with a Google OIDC token instead of CSRF.
 - **Browser protection**: Nonce-based Content-Security-Policy (no inline scripts or styles), `frame-ancestors 'none'`, `nosniff`, `Referrer-Policy`, `Permissions-Policy`, and HSTS over HTTPS.
-- **Personal data minimization**: For viewers, emails are masked on the server, and Model Armor raw text and uploaded file names are not provided. The last octet of caller IPs is hidden. Tokens, cookies, CSRF values and raw prompt text are not written to logs.
+- **Personal data minimization**: For viewers, emails are masked on the server, and Model Armor raw text and uploaded file names are not provided. The last octet of caller IPs is hidden. Tokens, cookies, CSRF values and raw prompt text are not written to logs, and upstream error messages are logged only with quoted literals and email addresses removed. Viewers see settings read-only, without deployment identifiers.
 - **Query safety**: All BigQuery values are passed as parameters, and table and column identifiers are used only after regex validation. `maximum_bytes_billed` is applied to every query.
 - **Rate limits**: Per user, 240 general requests per minute, 20 AI requests per minute, 10 governance writes per minute and 6 forced data source re-checks per minute.
 - **IAM change protection**: Safety gates, change budget, atomic etag-based updates, no changes to users that cannot be controlled, audit log.
@@ -795,7 +807,7 @@ scripts/teardown.sh                 # deletes the service, scheduler, service ac
 scripts/teardown.sh --delete-data   # also deletes the settings bucket (UI settings, exception rules, suspension records, widget layouts) and the log sink
 ```
 
-The BigQuery audit log dataset, the Artifact Registry repository and the Data Access audit log settings are not deleted automatically. The script only shows the commands to delete them. If the dashboard has suspended any users, restore them on the Antigravity Controls page before removal.
+The BigQuery audit log dataset, the Artifact Registry repository and the Data Access audit log settings are not deleted automatically. The script only shows the commands to delete them. The marker roles are also kept, because suspended users still hold them; the script prints the commands to delete them. If the dashboard has suspended any users, restore them on the Antigravity Controls page before removal.
 
 ---
 
@@ -807,7 +819,17 @@ The BigQuery audit log dataset, the Artifact Registry repository and the Data Ac
 python3 -m unittest discover -s tests/unit -v
 ```
 
-The unit tests verify code behavior and do not connect to Google Cloud. Test inputs use only reserved domains (`example.com` and others), and the tests are not included in the container image. GitHub Actions (`.github/workflows/tests.yml`) runs them on every push.
+The unit tests verify code behavior and do not connect to Google Cloud. Test inputs use only reserved domains (`example.com` and others), and the tests are not included in the container image. GitHub Actions (`.github/workflows/tests.yml`) runs them on every push and pull request, together with `bash -n` on the scripts, the prepublish scan and the offline validation of the AI Analyst golden dataset.
+
+**Prepublish scan (release gate).** Run it before every push:
+
+```bash
+python3 scripts/prepublish_scan.py
+```
+
+It scans the files Git would publish and fails on secrets (private keys, API keys, OAuth client secrets, tokens, webhooks), on values from your git-ignored `deploy.env`, `config.local.yaml` and `terraform/terraform.tfvars`, on e-mail addresses outside the example domains, on Cloud Run URLs that contain a project number and on home directory paths. Put other words that must never be published (for example personal account names) in a git-ignored `.prepublish-terms` file, one per line.
+
+**AI Analyst evaluation.** `eval/analyst/` holds a 4-tier golden dataset (happy path, traps, hallucination baits, out of scope) and a harness that runs it against any deployment with an administrator session. Ground truth is computed from your own BigQuery data at run time, and the outputs stay in the git-ignored `eval/analyst/out/`. See [eval/analyst/README.md](eval/analyst/README.md).
 
 ### 16.2 API contract
 

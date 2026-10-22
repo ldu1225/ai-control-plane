@@ -15,6 +15,18 @@ LOG = logging.getLogger("controlplane.gcp")
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 QUERY_TIMEOUT_SECONDS = 60
 _PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_QUOTED_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*\.[A-Za-z]{2,}")
+
+
+def log_safe(message, limit=200):
+    """Upstream error text for server logs: quoted literals (which can echo user questions or prompt text)
+    and e-mail addresses are removed, and the result is cut to `limit` characters. Clients never receive
+    upstream messages; they get a curated message instead."""
+    text = _QUOTED_RE.sub("\x00", str(message or "").replace("\x00", ""))
+    text = re.sub(r"['\"][^'\"]*$", "\x00", text)  # an unterminated literal runs to the end
+    text = _EMAIL_RE.sub("<email>", text.replace("\x00", "'?'"))
+    return text[:limit]
 
 
 def sql_parameter_names(sql):
@@ -196,7 +208,7 @@ class Gcp:
             message, reason = _google_error(payload)
             parsed = urllib.parse.urlsplit(url)
             LOG.warning("upstream error method=%s host=%s path=%s status=%s reason=%s message=%s", method,
-                        parsed.hostname, parsed.path[:160], resp.status_code, reason, message[:200])
+                        parsed.hostname, parsed.path[:160], resp.status_code, reason, log_safe(message))
             raise GcpError(_kind_for_status(resp.status_code, reason), status=resp.status_code,
                            message=message, reason=reason)
         if not expect_json:
@@ -361,7 +373,7 @@ def _classify_api_error(err, module):
             reasons.append(str(item["reason"]))
     reason = ",".join(reasons)
     LOG.warning("bigquery error module=%s status=%s reason=%s message=%s", module, status, reason,
-                message[:200])
+                log_safe(message))
     if "bytesBilledLimitExceeded" in reason or "bytes billed" in message.lower():
         return GcpError("cost_limit", status=status, message=message, reason=reason)
     if status == 404 or "notFound" in reason:

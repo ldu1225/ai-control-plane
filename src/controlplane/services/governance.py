@@ -355,7 +355,7 @@ def suspension_ended(suspension, now):
 
 
 def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_on_access, cfg, access_role,
-             mode="auto", now=None):
+             mode="auto", now=None, telemetry_truncated=False):
     """Computes gates and the plan. `users` items need uid, state and overCap; optional
     `exception` ({"type": allow|block|limit}) and `suspension` ({"until": iso}) refine the plan:
     - block exception: users with access (EA or CAPPED) are disallowed in every cycle.
@@ -363,7 +363,9 @@ def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_o
       so not gated by G3).
     - a suspension whose period has ended is restored regardless of telemetry (the usage window
       restarted), unless usage is known to be over the cap again.
-    - mode "manual": over-cap users go to the review queue instead of the block list."""
+    - mode "manual": over-cap users go to the review queue instead of the block list.
+    - telemetry_truncated: usage was read only partly (log read cap), so counts are lower bounds. Over-cap
+      results stay valid, but usage-based restores are withheld (G3 warns)."""
     now = now or dt.datetime.now(dt.timezone.utc)
     population = len(users)
     determinate = sum(1 for u in users if u["state"] != UNKNOWN)
@@ -375,11 +377,17 @@ def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_o
     gates.append({"id": "G2_ANY_DETERMINATE", "status": "pass" if g2_ok else "fail",
                   "detail": "%d of %d users have a determinate state." % (determinate, population) if population
                   else "No users are in scope."})
-    g3_ok = bool(telemetry_ok) and telemetry_records > 0
-    gates.append({"id": "G3_TELEMETRY_HEALTHY", "status": "pass" if g3_ok else "warn",
-                  "detail": ("%d inference log records in the window." % telemetry_records) if g3_ok else
-                  ("The usage query failed; automatic restores are withheld." if not telemetry_ok else
-                   "No inference log records in the window; automatic restores are withheld.")})
+    g3_ok = bool(telemetry_ok) and telemetry_records > 0 and not telemetry_truncated
+    if g3_ok:
+        g3_detail = "%d inference log records in the window." % telemetry_records
+    elif not telemetry_ok:
+        g3_detail = "The usage query failed; automatic restores are withheld."
+    elif telemetry_truncated:
+        g3_detail = ("Inference log entries were truncated at max_log_entries, so usage is a lower bound; "
+                     "automatic restores are withheld. Route the log to BigQuery for complete counts.")
+    else:
+        g3_detail = "No inference log records in the window; automatic restores are withheld."
+    gates.append({"id": "G3_TELEMETRY_HEALTHY", "status": "pass" if g3_ok else "warn", "detail": g3_detail})
     block, review, restore, disallow, manual = [], [], [], [], []
     withheld = False
     for u in users:
@@ -962,7 +970,7 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
         users.append(row)
     non_user = idx.non_user_members(cfg.access_role) if readable else []
     gates, plan, budget = evaluate(users, readable, usage.ok, usage.records, non_user, cfg, cfg.access_role,
-                                   mode=mode, now=now)
+                                   mode=mode, now=now, telemetry_truncated=usage.truncated)
     planned = {}
     for action in ("block", "review", "restore", "disallow", "manual"):
         for uid in plan[action]:

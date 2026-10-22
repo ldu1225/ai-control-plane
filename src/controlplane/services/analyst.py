@@ -471,7 +471,23 @@ def validate_request(body):
     return question.strip(), clean, locale
 
 
+VIEWER_DENIED = ("The AI Analyst is available to administrators. An administrator can allow viewers in "
+                 "Settings > Governance policy > AI Analyst limits.")
+
+
+def available_to(identity, settings):
+    """Administrators always; viewers only when an administrator allows it or viewer masking is off,
+    because query results can contain free text (for example prompts) that the masked dashboard
+    endpoints withhold from viewers."""
+    if identity is not None and identity.role == "admin":
+        return True
+    return bool(settings["analyst"].get("allow_viewers")) or \
+        not settings["security"].get("mask_pii_for_viewers", True)
+
+
 def chat(ctx):
+    if not available_to(ctx.identity, ctx.settings):
+        raise ApiError("forbidden", VIEWER_DENIED)
     started = time.monotonic()
     question, history, locale = validate_request(ctx.body)
     model = ctx.app.ai.resolve_model(ctx.settings, ctx.body.get("model"))

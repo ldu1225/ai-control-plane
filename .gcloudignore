@@ -1,39 +1,15 @@
-# Files excluded from `gcloud run deploy --source` / `gcloud builds submit` uploads.
-# Mirrors .dockerignore. Dockerfile, .dockerignore, requirements.txt, config.yaml and src/ are uploaded.
-.git
-.github
-.gitignore
-.gcloudignore
-.vscode
-.idea
-**/.DS_Store
+# Files uploaded by `gcloud builds submit` (scripts/deploy.sh) and `gcloud run deploy --source`.
+# Every git-ignored file is excluded first; then an allowlist uploads only what the container build
+# needs (Dockerfile, .dockerignore, requirements.txt, config.yaml and src/). Local configuration,
+# engagement documents, evaluation files, tests and Terraform stay on this computer.
+#!include:.gitignore
+/*
+!/Dockerfile
+!/.dockerignore
+!/requirements.txt
+!/config.yaml
+!/src/
 **/__pycache__
 **/*.py[cod]
+**/.DS_Store
 *.log
-*.pdf
-*.csv
-.env
-.env.*
-env/
-venv/
-.venv/
-node_modules/
-
-# Local-only configuration and runtime data (never uploaded)
-config.local.yaml
-data/
-*.env
-deploy.env.example
-config.local.yaml.example
-client_secret*.json
-*oauth-client*.json
-.github
-LICENSE
-
-# Not needed for the image build
-tests/
-terraform/
-README.md
-
-# Operator scripts (run locally, not part of the image)
-scripts/

@@ -32,9 +32,21 @@ class AuthModeTest(unittest.TestCase):
         self.assertEqual(security.resolve_auth_mode("auto", {"K_SERVICE": "control-plane"}), "iap")
         self.assertEqual(security.resolve_auth_mode("auto", {}), "local")
         self.assertEqual(security.resolve_auth_mode(None, {}), "local")
-        self.assertEqual(security.resolve_auth_mode("public_readonly", {"K_SERVICE": "x"}), "public_readonly")
+        self.assertEqual(security.resolve_auth_mode("local", {}), "local")
+        for invalid in ("disabled", "public_readonly"):
+            with self.assertRaises(ValueError):
+                security.resolve_auth_mode(invalid, {})
+
+    def test_local_mode_refused_on_cloud_run(self):
         with self.assertRaises(ValueError):
-            security.resolve_auth_mode("disabled", {})
+            security.resolve_auth_mode("local", {"K_SERVICE": "control-plane"})
+        self.assertEqual(security.resolve_auth_mode("google", {"K_SERVICE": "control-plane"}), "google")
+
+    def test_loopback_host(self):
+        for host in ("127.0.0.1", "::1", "[::1]", "localhost", "LOCALHOST"):
+            self.assertTrue(security.is_loopback_host(host), host)
+        for host in ("0.0.0.0", "::", "10.0.0.5", "dashboard.example.com", ""):
+            self.assertFalse(security.is_loopback_host(host), host)
 
     def test_local_mode_admin_only_on_loopback(self):
         s = settings_with(auth_mode="local")
@@ -45,9 +57,11 @@ class AuthModeTest(unittest.TestCase):
         self.assertEqual(ident.role, "viewer")
         self.assertFalse(ident.can_write)
 
-    def test_public_readonly_never_writes(self):
-        ident = security.authenticate({}, "127.0.0.1", settings_with(auth_mode="public_readonly"), FakeVerifier())
-        self.assertEqual((ident.email, ident.role, ident.can_write), ("anonymous", "viewer", False))
+    def test_local_mode_never_trusts_a_proxy(self):
+        s = settings_with(auth_mode="local")
+        for header in ("X-Forwarded-For", "Forwarded", "X-Real-IP"):
+            ident = security.authenticate({header: "203.0.113.7"}, "127.0.0.1", s, FakeVerifier())
+            self.assertEqual((ident.role, ident.can_write), ("viewer", False), header)
 
     def test_iap_roles(self):
         s = settings_with(auth_mode="iap", admins=["boss@example.com", "*@admins.example.com"], iap_audience="/aud")
@@ -180,6 +194,35 @@ class QueryParsingTest(unittest.TestCase):
         self.assertEqual(httpkit.parse_query("start=2026-10-01&start=2026-10-02"), {"start": "2026-10-01"})
         with self.assertRaises(ApiError):
             httpkit.parse_query("x=" + "a" * 600)
+
+
+class StartupBindTest(unittest.TestCase):
+    """auth_mode auto falls back to local only on a loopback bind; a shared bind must choose google or iap."""
+
+    def _app(self, extra_env, auth_mode="auto"):
+        import os
+        import tempfile
+        from controlplane import app as app_module
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "config.yaml")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write("workspace:\n  project_id: demo-project\nsecurity:\n  auth_mode: %s\n"
+                         "storage:\n  backend: memory\n" % auth_mode)
+            env = {"CONFIG_PATH": cfg}
+            env.update(extra_env)
+            return app_module.App(environ=env)
+
+    def test_auto_on_a_shared_bind_refuses_to_start(self):
+        with self.assertRaises(ValueError):
+            self._app({"HOST": "0.0.0.0"})
+
+    def test_auto_on_loopback_and_explicit_local_start(self):
+        self.assertIsNotNone(self._app({"HOST": "127.0.0.1"}))
+        self.assertIsNotNone(self._app({"HOST": "0.0.0.0"}, auth_mode="local"))
+
+    def test_local_on_cloud_run_refuses_to_start(self):
+        with self.assertRaises(ValueError):
+            self._app({"HOST": "0.0.0.0", "K_SERVICE": "control-plane"}, auth_mode="local")
 
 
 if __name__ == "__main__":

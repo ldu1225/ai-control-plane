@@ -27,19 +27,33 @@ GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
 CACHED_CERT_URLS = (IAP_CERTS_URL, GOOGLE_CERTS_URL)
 UID_SALT = "cp-uid-v1"
 LOCAL_IDENTITY = "local-admin@localhost"
-ANONYMOUS_IDENTITY = "anonymous"
 
-AUTH_MODES = ("auto", "iap", "google", "local", "public_readonly")
+AUTH_MODES = ("auto", "iap", "google", "local")
+# A request that carries one of these headers came through a proxy, so its peer address is not the client.
+FORWARDING_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP")
 
 
 def resolve_auth_mode(configured, environ=None):
+    """auto resolves to iap on Cloud Run and to local elsewhere. local is a development mode for one
+    computer (the loopback caller is the administrator); it is refused on Cloud Run, where only google
+    and iap are valid. Raises ValueError, which aborts startup."""
     environ = os.environ if environ is None else environ
     mode = (configured or "auto").strip().lower()
     if mode not in AUTH_MODES:
         raise ValueError("invalid auth mode")
+    on_cloud_run = bool(environ.get("K_SERVICE"))
     if mode == "auto":
-        return "iap" if environ.get("K_SERVICE") else "local"
+        return "iap" if on_cloud_run else "local"
+    if mode == "local" and on_cloud_run:
+        raise ValueError("auth_mode=local is a development mode for one computer and is refused on Cloud Run; "
+                         "use google or iap")
     return mode
+
+
+def is_loopback_host(host):
+    """True for a bind address that only this computer can reach (127.0.0.1, ::1, localhost)."""
+    host = (host or "").strip().strip("[]").lower()
+    return host == "localhost" or is_loopback(host)
 
 
 def is_loopback(peer):
@@ -83,7 +97,7 @@ class Identity:
 
     @property
     def can_write(self):
-        return self.role == "admin" and self.auth_mode != "public_readonly"
+        return self.role == "admin"
 
 
 def admin_guard(identity):
@@ -235,9 +249,12 @@ def authenticate(headers, peer, settings, verifier, environ=None, sessions=None)
         role = "admin" if is_admin_email(email, admins) else "viewer"
         return Identity(email, role, mode, "iap:" + email)
     if mode == "local":
-        role = "admin" if is_loopback(peer) else "viewer"
+        # Development on one computer: only a direct loopback caller is the administrator. A request
+        # forwarded by a proxy is never treated as loopback, even when the proxy runs on this computer.
+        forwarded = any(headers.get(name) for name in FORWARDING_HEADERS)
+        role = "admin" if is_loopback(peer) and not forwarded else "viewer"
         return Identity(LOCAL_IDENTITY, role, mode, "local:%s" % peer)
-    return Identity(ANONYMOUS_IDENTITY, "viewer", mode, "anon:%s" % peer)
+    raise ApiError("unauthenticated", "Authentication is required.")
 
 
 # ---------------------------------------------------------------------------

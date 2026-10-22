@@ -1,36 +1,10 @@
-# Docker build context exclusions. The image only needs config.yaml, requirements.txt and src/.
-.git
-.github
-.gitignore
-.gcloudignore
-.vscode
-.idea
-**/.DS_Store
+# Docker build context: only what the image needs (config.yaml, requirements.txt and src/).
+# Everything else (local configuration, documents, tests, evaluation files, Terraform) is excluded.
+*
+!Dockerfile
+!requirements.txt
+!config.yaml
+!src/
 **/__pycache__
 **/*.py[cod]
-*.log
-*.pdf
-*.csv
-.env
-.env.*
-env
-venv
-.venv
-node_modules
-
-# Local-only configuration and runtime data (never baked into the image)
-config.local.yaml
-data
-*.env
-deploy.env.example
-config.local.yaml.example
-client_secret*.json
-*oauth-client*.json
-.github
-LICENSE
-
-# Not needed at runtime
-tests
-terraform
-README.md
-scripts
+**/.DS_Store

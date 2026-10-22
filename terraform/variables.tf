@@ -108,11 +108,11 @@ variable "agent_engine_regions" {
 variable "auth_mode" {
   type        = string
   default     = "iap"
-  description = "Application authentication mode: iap, auto, local or public_readonly."
+  description = "Application authentication mode. This module deploys IAP mode only (auto also resolves to iap on Cloud Run)."
 
   validation {
-    condition     = contains(["auto", "iap", "local", "public_readonly"], var.auth_mode)
-    error_message = "auth_mode must be one of auto, iap, local, public_readonly."
+    condition     = contains(["iap", "auto"], var.auth_mode)
+    error_message = "auth_mode must be iap (or auto, which resolves to iap on Cloud Run). Use scripts/deploy.sh for Google sign-in."
   }
 }
 

@@ -1,7 +1,7 @@
 # AI Control Plane container image.
 #
 # Build: docker build -t ai-control-plane:2.0.0 .
-# Run:   docker run --rm -p 8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=local ai-control-plane:2.0.0
+# Run:   docker run --rm -p 127.0.0.1:8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=local ai-control-plane:2.0.0
 #
 # Configuration is read from /app/config.yaml (placeholders) and overridden with environment
 # variables (PROJECT_ID, AUDIT_DATASET_ID, BILLING_*, AUTH_MODE, ADMIN_EMAILS, SETTINGS_BUCKET, ...).

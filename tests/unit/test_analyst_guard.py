@@ -102,3 +102,29 @@ class RejectTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ViewerAccessTest(unittest.TestCase):
+    """Viewers get the AI Analyst only when allowed: results can contain free text the dashboards withhold."""
+
+    def settings(self, allow_viewers=False, mask=True):
+        return {"analyst": {"allow_viewers": allow_viewers}, "security": {"mask_pii_for_viewers": mask}}
+
+    def test_admin_always_allowed(self):
+        from controlplane.security import Identity
+        from controlplane.services.analyst import available_to
+        admin = Identity("admin@example.com", "admin", "google", "google:admin@example.com")
+        self.assertTrue(available_to(admin, self.settings()))
+
+    def test_viewer_denied_by_default_and_allowed_when_opted_in(self):
+        from controlplane.security import Identity
+        from controlplane.services.analyst import available_to
+        viewer = Identity("viewer@example.com", "viewer", "google", "google:viewer@example.com")
+        self.assertFalse(available_to(viewer, self.settings()))
+        self.assertTrue(available_to(viewer, self.settings(allow_viewers=True)))
+        # Without viewer masking the dashboards already show raw text, so the analyst adds no exposure.
+        self.assertTrue(available_to(viewer, self.settings(mask=False)))
+
+    def test_setting_is_validated_as_boolean(self):
+        from controlplane import config
+        self.assertIn("analyst.allow_viewers", config.VALIDATORS)

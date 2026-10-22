@@ -24,7 +24,7 @@ const MAX_WIDGETS = 24;
 /* ------------------------------------------------------------------ layouts (per person, server side) */
 
 let layouts = null;      // {page: [widget]} once loaded
-let editable = true;     // false for shared read-only sessions
+let editable = true;     // false when this session cannot save layouts (remote viewer in local development mode)
 let readFailed = false;  // saved layouts could not be read (storage unavailable)
 let pending = null;
 
@@ -53,7 +53,8 @@ export function newWidgetId() {
   return `w_${[...bytes].map((b) => b.toString(16).padStart(2, '0')).join('')}`;
 }
 
-/** False for shared read-only sessions, which cannot save layouts (known once layouts are loaded). */
+/** False when this session cannot save layouts, for example a remote viewer in local development mode
+ * (known once layouts are loaded). */
 export function canEditLayouts() {
   return editable;
 }
