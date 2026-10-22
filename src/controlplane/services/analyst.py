@@ -486,8 +486,7 @@ def available_to(identity, settings):
 
 
 def chat(ctx):
-    if not available_to(ctx.identity, ctx.settings):
-        raise ApiError("forbidden", VIEWER_DENIED)
+    # Role policy (available_to) is declared on the route in app.py and enforced before this runs.
     started = time.monotonic()
     question, history, locale = validate_request(ctx.body)
     model = ctx.app.ai.resolve_model(ctx.settings, ctx.body.get("model"))

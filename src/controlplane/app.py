@@ -51,7 +51,8 @@ _route("POST", "/api/v1/access/users", access.save_user, admin=True, mask=False)
 _route("POST", "/api/v1/access/users/delete", access.delete_user, admin=True, mask=False)
 _route("POST", "/api/v1/access/requests/dismiss", access.dismiss_request, admin=True, mask=False)
 _route("GET", "/api/v1/health", system.health)
-_route("GET", "/api/v1/settings", system.settings_get, mask=False)
+# Viewers get the read-only settings view (deployment identifiers hidden, storage details reduced).
+_route("GET", "/api/v1/settings", system.settings_get, mask=False, viewer_view=system.settings_viewer_view)
 _route("POST", "/api/v1/settings", system.settings_post, admin=True, mask=False)
 _route("POST", "/api/v1/settings/reset", system.settings_reset, admin=True, mask=False)
 _route("GET", "/api/v1/ai/models", system.ai_models)
@@ -107,7 +108,10 @@ _route("POST", "/api/v1/telemetry/connectors", telemetry.save_connector, module=
 _route("POST", "/api/v1/telemetry/connectors/delete", telemetry.delete_connector, module="telemetry", admin=True)
 _route("GET", "/api/v1/telemetry/connectors/data", telemetry.connector_data, module="telemetry", range=True,
        cache=True, mask={"nulls": ("payload", "message")})
-_route("POST", "/api/v1/analyst/chat", analyst.chat, module="analyst", rate="ai")
+# Results can contain free text that the dashboards withhold from viewers: administrators always, viewers
+# only when an administrator allows it (analyst.available_to).
+_route("POST", "/api/v1/analyst/chat", analyst.chat, module="analyst", rate="ai", allow=analyst.available_to,
+       deny=analyst.VIEWER_DENIED)
 
 
 class App:
@@ -189,6 +193,9 @@ class ControlPlaneHandler(BaseHandler):
                 raise ApiError("module_disabled", "This module is disabled in the workspace settings.")
             if not config.workspace_configured(settings):
                 raise ApiError("not_configured", "The workspace is not configured. Set workspace.project_id first.")
+        allow = opts.get("allow")
+        if allow is not None and not allow(identity, settings):
+            raise ApiError("forbidden", opts.get("deny") or "This feature is not available to your role.")
         params = parse_query(query)
         rng = None
         if opts.get("range"):
@@ -221,6 +228,9 @@ class ControlPlaneHandler(BaseHandler):
             if err.kind == "credentials":
                 raise ApiError("upstream_error", "Google Cloud credentials are unavailable.")
             raise ApiError("upstream_error", "An upstream Google Cloud service is unavailable.")
+        viewer_view = opts.get("viewer_view")
+        if viewer_view is not None and identity.role != "admin":
+            data = viewer_view(data)
         mask = opts.get("mask")
         if mask is not False and identity.role != "admin" and settings["security"].get("mask_pii_for_viewers", True):
             data = mask_for_viewer(data, restrict_keys=mask.get("restrict", ()),

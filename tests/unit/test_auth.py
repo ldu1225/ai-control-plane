@@ -257,6 +257,9 @@ class GoogleSignInFlowTest(unittest.TestCase):
         text = json.dumps(view)
         for secret in ("admin@example.com", "ABCDEF-123456-ABCDEF", CLIENT_ID):
             self.assertNotIn(secret, text)
+        denied = self.post("/api/v1/analyst/chat", viewer, {"question": "How many prompts last week?"})
+        self.assertEqual(denied.status, 403)
+        self.assertIn("available to administrators", denied.json()["error"]["message"])
         full = self.request("GET", "/api/v1/settings", cookies={"cp_session": admin}).json()["data"]
         self.assertEqual(full["overrides"]["workspace"]["billing"]["account_id"], "ABCDEF-123456-ABCDEF")
         self.assertEqual(full["persistence"]["updatedBy"], "admin@example.com")

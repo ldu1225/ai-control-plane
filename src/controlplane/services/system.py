@@ -258,17 +258,20 @@ def health(ctx):
 # ---------------------------------------------------------------------------
 
 def settings_payload(ctx):
+    """Full settings payload. GET /api/v1/settings declares settings_viewer_view for viewers in the registry;
+    the write routes that also return this payload are administrator-only."""
     effective, _ = ctx.app.settings.snapshot()
-    overrides = ctx.app.settings.overrides()
-    persistence = ctx.app.settings.persistence()
-    if ctx.identity.role == "admin":
-        return {"effective": effective, "overrides": overrides, "persistence": persistence,
-                "editable": ctx.identity.can_write}
-    # Viewer view: the same masking for effective settings and for overrides (a value saved in the UI must not
-    # bypass it), and storage details reduced to whether settings persist: no bucket or object name and no
-    # administrator e-mail.
-    return {"effective": mask_for_viewer(config.mask_settings_for_viewer(effective)),
-            "overrides": mask_for_viewer(config.mask_settings_for_viewer(overrides)),
+    return {"effective": effective, "overrides": ctx.app.settings.overrides(),
+            "persistence": ctx.app.settings.persistence(), "editable": ctx.identity.can_write}
+
+
+def settings_viewer_view(payload):
+    """Read-only settings view for viewers: the same masking for effective settings and for overrides (a value
+    saved in the UI must not bypass it), and storage details reduced to whether settings persist (no bucket or
+    object name, no administrator e-mail)."""
+    persistence = payload.get("persistence") or {}
+    return {"effective": mask_for_viewer(config.mask_settings_for_viewer(payload.get("effective") or {})),
+            "overrides": mask_for_viewer(config.mask_settings_for_viewer(payload.get("overrides") or {})),
             "persistence": {"backend": persistence.get("backend"), "durable": persistence.get("durable"),
                             "updatedAt": persistence.get("updatedAt")},
             "editable": False}
