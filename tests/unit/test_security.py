@@ -48,20 +48,22 @@ class AuthModeTest(unittest.TestCase):
         for host in ("0.0.0.0", "::", "10.0.0.5", "dashboard.example.com", ""):
             self.assertFalse(security.is_loopback_host(host), host)
 
-    def test_local_mode_admin_only_on_loopback(self):
+    def test_local_mode_accepts_only_this_computer(self):
         s = settings_with(auth_mode="local")
         for peer in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
             ident = security.authenticate({}, peer, s, FakeVerifier())
             self.assertEqual((ident.email, ident.role, ident.can_write), ("local-admin@localhost", "admin", True))
-        ident = security.authenticate({}, "10.1.2.3", s, FakeVerifier())
-        self.assertEqual(ident.role, "viewer")
-        self.assertFalse(ident.can_write)
+        for peer in ("10.1.2.3", "172.17.0.1", "", None):
+            with self.assertRaises(ApiError) as ctx:
+                security.authenticate({}, peer, s, FakeVerifier())
+            self.assertEqual(ctx.exception.code, "forbidden")
 
     def test_local_mode_never_trusts_a_proxy(self):
         s = settings_with(auth_mode="local")
         for header in ("X-Forwarded-For", "Forwarded", "X-Real-IP"):
-            ident = security.authenticate({header: "203.0.113.7"}, "127.0.0.1", s, FakeVerifier())
-            self.assertEqual((ident.role, ident.can_write), ("viewer", False), header)
+            with self.assertRaises(ApiError) as ctx:
+                security.authenticate({header: "203.0.113.7"}, "127.0.0.1", s, FakeVerifier())
+            self.assertEqual(ctx.exception.code, "forbidden", header)
 
     def test_iap_roles(self):
         s = settings_with(auth_mode="iap", admins=["boss@example.com", "*@admins.example.com"], iap_audience="/aud")

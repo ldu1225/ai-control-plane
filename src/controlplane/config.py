@@ -909,8 +909,9 @@ def mask_settings_for_viewer(effective):
         host = urllib.parse.urlsplit(hook).hostname or "webhook"
         set_path(out, "governance.antigravity.webhook_url", "https://%s/***" % host)
     for dotted in MEMBER_LIST_KEYS:
-        members = get_path(out, dotted) or []
-        set_path(out, dotted, [a if a.startswith("*@") else mask_email(a) for a in members])
+        members = get_path(out, dotted)
+        if members:  # absent keys stay absent (this also masks partial override documents)
+            set_path(out, dotted, [a if a.startswith("*@") else mask_email(a) for a in members])
     invokers = get_path(out, "governance.antigravity.scheduler_invokers") or []
     if invokers:
         # mask_email keeps service accounts unchanged, so mask their local part here.

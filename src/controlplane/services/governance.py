@@ -1732,10 +1732,11 @@ def setup(ctx):
                               "message": "The role could not be created (%s)." % err.kind}
                     break
             results.append(status or {"role": role_id, "status": "failed", "message": "The role could not be created."})
-        write_audit(ctx, "setup", {"result": "success" if all(r["status"] != "failed" for r in results) else "partial",
-                                   "target": "marker roles", "results": results})
+        audit_logged = write_audit(ctx, "setup", {
+            "result": "success" if all(r["status"] != "failed" for r in results) else "partial",
+            "target": "marker roles", "results": results})
     ctx.app.invalidate_governance()
-    return {"results": results}
+    return {"results": results, "auditLogged": audit_logged}
 
 
 # ---------------------------------------------------------------------------

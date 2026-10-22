@@ -113,7 +113,8 @@ flowchart LR
 |-- scripts/
 |   |-- deploy.sh               # one-command deployment (safe to re-run)
 |   |-- teardown.sh             # deletes the deployed resources
-|   `-- prepublish_scan.py      # release gate: secrets and deployment identifiers (also runs in CI)
+|   |-- prepublish_scan.py      # release gate: secrets and deployment identifiers (also runs in CI)
+|   `-- git-hooks/pre-push      # opt-in hook that runs the scan before every push
 |-- terraform/                  # Terraform deployment (IAP mode, optional)
 |-- src/
 |   |-- backend_server.py       # entry point
@@ -129,7 +130,7 @@ flowchart LR
 |   |   `-- services/           # per-module services (governance, pricing, gemini_enterprise, ...)
 |   `-- web/                    # frontend SPA (index.html, login.html, assets/)
 |-- eval/analyst/               # AI Analyst golden dataset and evaluation harness (16.1)
-|-- tests/unit/                 # unit tests (268)
+|-- tests/unit/                 # unit tests (269)
 `-- .github/workflows/tests.yml # unit tests, prepublish scan and dataset validation on every push
 ```
 
@@ -278,7 +279,7 @@ You can also enter the billing values after deployment in **Settings > Workspace
 
 Other `security.auth_mode` values (set only in `config.yaml` or the `AUTH_MODE` environment variable, never in the UI):
 
-- `local`: for development on one computer ([11](#11-running-locally)). Only a direct request from a loopback address is the administrator; a request forwarded by a proxy (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) never is. Cloud Run refuses this mode at startup. `auto` falls back to `local` only when the server listens on a loopback address (`127.0.0.1`, `::1`, `localhost`); a server bound to another address stops at startup and asks you to choose `google` or `iap`.
+- `local`: for development on one computer ([11](#11-running-locally)). Only direct requests from this computer (a loopback address) are accepted, as the administrator. Requests from other computers, and requests forwarded by a proxy (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`), are refused. Cloud Run refuses this mode at startup. `auto` falls back to `local` only when the server listens on a loopback address (`127.0.0.1`, `::1`, `localhost`); a server bound to another address stops at startup and asks you to choose `google` or `iap`.
 
 There is no anonymous mode: on every deployment, only approved Google accounts can open the dashboard.
 
@@ -439,7 +440,7 @@ Brings the key KPIs of each module together on one page and shows the change com
 - Select **Add widget** and choose the dashboard, what it shows (summary, events per day, breakdown, status breakdown or latest entries) and its size (small, medium, wide). The **Add to Overview** button on a dashboard page pins it too.
 - Drag a widget by its handle to change the order. With the keyboard, press the arrow keys on the handle, or use Move earlier / Move later in the widget menu.
 - Other pages (Gemini Enterprise, Users & Access and so on) can hold widgets too, with **Add a widget to this page** at the bottom.
-- Layouts are saved per person (`GET/POST /api/v1/layouts`) in `users/<user hash>.json` in the settings bucket; file names never contain email addresses. Shared read-only sessions cannot save.
+- Layouts are saved per person (`GET/POST /api/v1/layouts`) in `users/<user hash>.json` in the settings bucket; file names never contain email addresses. Every signed-in person saves only their own layout.
 - Widget data uses the same API as the Telemetry Extensions dashboards, so the selected period, caching and viewer masking apply in the same way.
 
 ### 7.2 Gemini Enterprise
@@ -715,9 +716,9 @@ gcloud auth application-default login            # read real data with your own 
 python3 src/backend_server.py
 ```
 
-Open `http://127.0.0.1:8088`. In local mode (`auth_mode: auto`, outside Cloud Run), administrator access is given only to connections from a loopback address. Locally, too, the UI shows only real data from the connected project. Settings are saved in `data/settings.json` (excluded from Git).
+Open `http://127.0.0.1:8088`. In local mode (`auth_mode: auto`, outside Cloud Run), only connections from this computer (a loopback address) are accepted, as the administrator. Locally, too, the UI shows only real data from the connected project. Settings are saved in `data/settings.json` (excluded from Git).
 
-Running as a container (to check read features):
+Running as a container (to check that the image starts):
 
 ```bash
 docker build -t ai-control-plane .
@@ -727,7 +728,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=loc
   ai-control-plane
 ```
 
-Inside a container, browser requests do not come from a loopback address, so you are signed in as a viewer. `-p 127.0.0.1:8080:8080` publishes the port on this computer only, so other computers on the network cannot open it. To change settings, use the `python3` run above or a Cloud Run deployment.
+Check it with `curl http://127.0.0.1:8080/healthz`, which returns `{"status": "ok"}`. Inside a container, browser requests do not come from a loopback address, so local mode refuses them; use the dashboard through the `python3` run above or a Cloud Run deployment. `-p 127.0.0.1:8080:8080` publishes the port on this computer only.
 
 ---
 
@@ -826,6 +827,8 @@ The unit tests verify code behavior and do not connect to Google Cloud. Test inp
 ```bash
 python3 scripts/prepublish_scan.py
 ```
+
+To run it automatically before each push, enable the bundled hook once per clone: `git config core.hooksPath scripts/git-hooks`.
 
 It scans the files Git would publish and fails on secrets (private keys, API keys, OAuth client secrets, tokens, webhooks), on values from your git-ignored `deploy.env`, `config.local.yaml` and `terraform/terraform.tfvars`, on e-mail addresses outside the example domains, on Cloud Run URLs that contain a project number and on home directory paths. Put other words that must never be published (for example personal account names) in a git-ignored `.prepublish-terms` file, one per line.
 

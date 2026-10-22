@@ -3,7 +3,7 @@
 A layout lists widgets in display order. Each widget shows one Telemetry Extensions connector in one view
 (summary, daily chart, a breakdown or the latest entries) and one size. Layouts belong to the signed-in
 person: they are stored per user, keyed by a hash of the email (never the email itself), next to the settings
-document in the same storage backend (settings_store.UserDocStore). Shared read-only sessions cannot save.
+document in the same storage backend (settings_store.UserDocStore). Only a signed-in person can save.
 
 GET  /api/v1/layouts  -> {"layouts": {page: [widget, ...]}, "editable": bool}
 POST /api/v1/layouts  {"page": ..., "widgets": [...]} -> the same shape after saving
@@ -32,10 +32,8 @@ def _key(ctx):
 
 
 def _editable(ctx):
-    """Layouts are per person. In local development mode every caller shares one identity, so only the
-    loopback administrator may save there."""
-    if ctx.identity.auth_mode == "local":
-        return ctx.identity.is_admin
+    """Layouts are per person: every signed-in identity can save its own (local mode has one identity,
+    the developer at this computer)."""
     return bool(ctx.identity.email)
 
 
@@ -90,7 +88,7 @@ def get_layouts(ctx):
 
 def save_layout(ctx):
     if not _editable(ctx):
-        raise ApiError("forbidden", "Widget layouts cannot be saved in a shared read-only session.")
+        raise ApiError("forbidden", "Widget layouts can be saved only by a signed-in person.")
     body = ctx.body or {}
     page = body.get("page")
     if page not in PAGES:

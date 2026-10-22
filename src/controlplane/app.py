@@ -326,7 +326,8 @@ def main():
              __version__, host, port, mode, settings["workspace"]["project_id"], persistence["backend"],
              ",".join(app.loaded_files) or "defaults")
     if mode == "local":
-        LOG.warning("auth_mode=local: loopback clients are administrators; remote clients are read-only viewers")
+        LOG.warning("auth_mode=local: development mode; only loopback clients are accepted (as administrators), "
+                    "other clients and proxied requests are refused")
     if mode == "iap" and not settings["security"].get("iap_audience"):
         LOG.warning("auth_mode=iap without security.iap_audience: signature, expiry and issuer are verified but "
                     "the audience is not; set IAP_AUDIENCE")

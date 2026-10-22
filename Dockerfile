@@ -2,6 +2,8 @@
 #
 # Build: docker build -t ai-control-plane:2.0.0 .
 # Run:   docker run --rm -p 127.0.0.1:8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=local ai-control-plane:2.0.0
+#        then: curl http://127.0.0.1:8080/healthz  (local mode refuses browser requests from outside the
+#        container; use the dashboard through `python3 src/backend_server.py` or a Cloud Run deployment)
 #
 # Configuration is read from /app/config.yaml (placeholders) and overridden with environment
 # variables (PROJECT_ID, AUDIT_DATASET_ID, BILLING_*, AUTH_MODE, ADMIN_EMAILS, SETTINGS_BUCKET, ...).

@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-import urllib.parse
 
 from .. import __version__, config, timeutil
 from ..gcp import GcpError
@@ -261,19 +260,18 @@ def health(ctx):
 def settings_payload(ctx):
     effective, _ = ctx.app.settings.snapshot()
     overrides = ctx.app.settings.overrides()
-    is_admin = ctx.identity.role == "admin"
-    if is_admin:
-        effective_out, overrides_out = effective, overrides
-    else:
-        effective_out = mask_for_viewer(config.mask_settings_for_viewer(effective))
-        hook = config.get_path(overrides, "governance.antigravity.webhook_url")
-        if hook:
-            host = urllib.parse.urlsplit(hook).hostname or "webhook"
-            config.set_path(overrides, "governance.antigravity.webhook_url", "https://%s/***" % host)
-        overrides_out = mask_for_viewer(overrides)
     persistence = ctx.app.settings.persistence()
-    return {"effective": effective_out, "overrides": overrides_out, "persistence": persistence,
-            "editable": ctx.identity.can_write}
+    if ctx.identity.role == "admin":
+        return {"effective": effective, "overrides": overrides, "persistence": persistence,
+                "editable": ctx.identity.can_write}
+    # Viewer view: the same masking for effective settings and for overrides (a value saved in the UI must not
+    # bypass it), and storage details reduced to whether settings persist: no bucket or object name and no
+    # administrator e-mail.
+    return {"effective": mask_for_viewer(config.mask_settings_for_viewer(effective)),
+            "overrides": mask_for_viewer(config.mask_settings_for_viewer(overrides)),
+            "persistence": {"backend": persistence.get("backend"), "durable": persistence.get("durable"),
+                            "updatedAt": persistence.get("updatedAt")},
+            "editable": False}
 
 
 def settings_get(ctx):

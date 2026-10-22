@@ -30,6 +30,8 @@ LOCAL_IDENTITY = "local-admin@localhost"
 
 AUTH_MODES = ("auto", "iap", "google", "local")
 # A request that carries one of these headers came through a proxy, so its peer address is not the client.
+LOCAL_ONLY_MESSAGE = ("Local development mode accepts only connections from this computer. Use Google sign-in "
+                      "or IAP for shared access.")
 FORWARDING_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP")
 
 
@@ -249,11 +251,13 @@ def authenticate(headers, peer, settings, verifier, environ=None, sessions=None)
         role = "admin" if is_admin_email(email, admins) else "viewer"
         return Identity(email, role, mode, "iap:" + email)
     if mode == "local":
-        # Development on one computer: only a direct loopback caller is the administrator. A request
-        # forwarded by a proxy is never treated as loopback, even when the proxy runs on this computer.
+        # Development on one computer: only a direct loopback caller is accepted, as the administrator.
+        # Other computers, and requests forwarded by a proxy (even one on this computer), are refused,
+        # so nobody reaches the dashboard without a Google identity except the developer at this machine.
         forwarded = any(headers.get(name) for name in FORWARDING_HEADERS)
-        role = "admin" if is_loopback(peer) and not forwarded else "viewer"
-        return Identity(LOCAL_IDENTITY, role, mode, "local:%s" % peer)
+        if not is_loopback(peer) or forwarded:
+            raise ApiError("forbidden", LOCAL_ONLY_MESSAGE)
+        return Identity(LOCAL_IDENTITY, "admin", mode, "local:%s" % peer)
     raise ApiError("unauthenticated", "Authentication is required.")
 
 

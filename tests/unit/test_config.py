@@ -213,6 +213,9 @@ class SettingsUpdateTest(unittest.TestCase):
         self.assertEqual(masked["governance"]["antigravity"]["scheduler_invokers"],
                          ["cp***@acme.iam.gserviceaccount.com"])
         self.assertEqual(masked["security"]["iap_audience"], eff["security"]["iap_audience"] and "***")
+        # A partial override document is masked without gaining keys.
+        partial = {"workspace": {"billing": {"account_id": "ABCDEF-123456-ABCDEF"}}}
+        self.assertEqual(config.mask_settings_for_viewer(partial), {"workspace": {"billing": {"account_id": "***"}}})
         # Policy values stay visible to viewers.
         self.assertEqual(masked["governance"]["antigravity"]["token_cap"], eff["governance"]["antigravity"]["token_cap"])
 

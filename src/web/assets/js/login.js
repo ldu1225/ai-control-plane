@@ -272,9 +272,9 @@ function otherModeView(mode) {
       note(t('Access is managed by your Google Cloud administrators.'), 'shield'),
     ];
   }
-  // local development mode (the only other mode): the loopback caller is the administrator.
+  // local development mode (the only other mode): only this computer can open the dashboard.
   return [
-    heading(t('No sign-in required'), t('This deployment runs in local development mode. Administrator access is limited to this computer.')),
+    heading(t('No sign-in required'), t('This deployment runs in local development mode. Only this computer can open it.')),
     noticeAlert(),
     h('div', { class: 'login-actions' }, linkButton(t('Open the dashboard'), '/', 'primary', 'arrow-right')),
   ];

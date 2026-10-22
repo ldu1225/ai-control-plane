@@ -242,6 +242,25 @@ class GoogleSignInFlowTest(unittest.TestCase):
                          403)
         self.assertEqual(self.request("GET", "/", cookies={"cp_session": session + "x"}).status, 302)
 
+    def test_viewer_settings_view_hides_identifiers(self):
+        admin = self.session_cookie("admin@example.com")
+        saved = self.post("/api/v1/settings", admin,
+                          {"section": "workspace", "values": {"billing": {"account_id": "ABCDEF-123456-ABCDEF"}}})
+        self.assertEqual(saved.status, 200, saved.body if hasattr(saved, "body") else None)
+        viewer = self.session_cookie("person@example.org")
+        view = self.request("GET", "/api/v1/settings", cookies={"cp_session": viewer}).json()["data"]
+        self.assertEqual(set(view["persistence"]), {"backend", "durable", "updatedAt"})
+        self.assertEqual(view["overrides"]["workspace"]["billing"]["account_id"], "***")
+        self.assertEqual(view["effective"]["workspace"]["billing"]["account_id"], "***")
+        for member in ((view["overrides"].get("security") or {}).get("admins") or []):
+            self.assertTrue(member.startswith("*@") or "***@" in member, member)
+        text = json.dumps(view)
+        for secret in ("admin@example.com", "ABCDEF-123456-ABCDEF", CLIENT_ID):
+            self.assertNotIn(secret, text)
+        full = self.request("GET", "/api/v1/settings", cookies={"cp_session": admin}).json()["data"]
+        self.assertEqual(full["overrides"]["workspace"]["billing"]["account_id"], "ABCDEF-123456-ABCDEF")
+        self.assertEqual(full["persistence"]["updatedBy"], "admin@example.com")
+
     def test_admin_approves_removes_and_guards(self):
         admin = self.session_cookie("admin@example.com")
         self.assertEqual(self.sign_in("stranger2@example.net").header("Location"), "/login?error=not_approved")

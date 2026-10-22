@@ -113,7 +113,8 @@ flowchart LR
 |-- scripts/
 |   |-- deploy.sh               # 명령 한 번 배포 (다시 실행해도 안전)
 |   |-- teardown.sh             # 배포한 리소스 삭제
-|   `-- prepublish_scan.py      # 배포 전 검사: 비밀 정보와 배포 식별자 (CI에서도 실행)
+|   |-- prepublish_scan.py      # 배포 전 검사: 비밀 정보와 배포 식별자 (CI에서도 실행)
+|   `-- git-hooks/pre-push      # 푸시마다 검사를 실행하는 선택형 훅
 |-- terraform/                  # Terraform 배포 (IAP 방식, 선택)
 |-- src/
 |   |-- backend_server.py       # 진입점
@@ -129,7 +130,7 @@ flowchart LR
 |   |   `-- services/           # 모듈별 서비스 (governance, pricing, gemini_enterprise, ...)
 |   `-- web/                    # 프런트엔드 SPA (index.html, login.html, assets/)
 |-- eval/analyst/               # AI 애널리스트 골든 데이터셋과 평가 하네스 (16.1)
-|-- tests/unit/                 # 단위 테스트 (268개)
+|-- tests/unit/                 # 단위 테스트 (269개)
 `-- .github/workflows/tests.yml # 푸시마다 단위 테스트, 배포 전 검사, 데이터셋 검증 실행
 ```
 
@@ -278,7 +279,7 @@ scripts/deploy.sh              # 실제 배포 (보통 3~8분)
 
 그 밖의 `security.auth_mode` 값(`config.yaml` 또는 `AUTH_MODE` 환경 변수로만 설정, 화면에서는 바꿀 수 없음):
 
-- `local`: 컴퓨터 한 대에서 개발할 때 씁니다([11](#11-로컬-실행)). 루프백 주소에서 직접 온 요청만 관리자로 처리하고, 프록시를 거친 요청(`X-Forwarded-For`, `Forwarded`, `X-Real-IP`)은 관리자로 보지 않습니다. Cloud Run에서는 시작 단계에서 이 모드를 거부합니다. `auto`는 서버가 루프백 주소(`127.0.0.1`, `::1`, `localhost`)에서 대기할 때만 `local`이 되고, 다른 주소에 바인딩하면 시작을 멈추고 `google` 또는 `iap`를 고르라고 안내합니다.
+- `local`: 컴퓨터 한 대에서 개발할 때 씁니다([11](#11-로컬-실행)). 이 컴퓨터(루프백 주소)에서 직접 온 요청만 관리자로 받고, 다른 컴퓨터에서 온 요청과 프록시를 거친 요청(`X-Forwarded-For`, `Forwarded`, `X-Real-IP`)은 거부합니다. Cloud Run에서는 시작 단계에서 이 모드를 거부합니다. `auto`는 서버가 루프백 주소(`127.0.0.1`, `::1`, `localhost`)에서 대기할 때만 `local`이 되고, 다른 주소에 바인딩하면 시작을 멈추고 `google` 또는 `iap`를 고르라고 안내합니다.
 
 익명 접속 모드는 없습니다. 어떤 배포에서든 승인된 Google 계정만 대시보드를 열 수 있습니다.
 
@@ -439,7 +440,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 - **위젯 추가**를 누르고 대시보드, 보여줄 내용(요약, 일별 건수, 항목별 분포, 상태별 분포, 최근 로그), 크기(작게, 보통, 넓게)를 고릅니다. 대시보드 화면의 **개요에 추가** 버튼으로도 고정할 수 있습니다.
 - 위젯 왼쪽 손잡이를 끌어 놓으면 순서가 바뀝니다. 키보드로는 손잡이에서 화살표 키를, 메뉴에서는 앞으로·뒤로 이동을 씁니다.
 - 다른 화면(Gemini Enterprise, 사용자 및 액세스 등)도 아래쪽의 **이 화면에 위젯 추가**로 같은 위젯을 둘 수 있습니다.
-- 배치는 사람마다 따로 저장됩니다(`GET/POST /api/v1/layouts`). 설정 버킷의 `users/<사용자 해시>.json`에 저장되며 파일 이름에 이메일을 쓰지 않습니다. 공유 읽기 전용 세션은 저장할 수 없습니다.
+- 배치는 사람마다 따로 저장됩니다(`GET/POST /api/v1/layouts`). 설정 버킷의 `users/<사용자 해시>.json`에 저장되며 파일 이름에 이메일을 쓰지 않습니다. 로그인한 사람은 자기 배치만 저장합니다.
 - 위젯 데이터는 텔레메트리 확장 대시보드와 같은 API를 쓰므로 기간 선택, 캐시, 뷰어 마스킹이 똑같이 적용됩니다.
 
 ### 7.2 Gemini Enterprise
@@ -715,9 +716,9 @@ gcloud auth application-default login            # 본인 계정으로 실제 �
 python3 src/backend_server.py
 ```
 
-`http://127.0.0.1:8088`에 접속합니다. 로컬 모드(`auth_mode: auto`, Cloud Run 밖)에서는 루프백 주소에서 접속한 경우에만 관리자 권한이 주어집니다. 로컬에서도 화면에는 연결한 프로젝트의 실제 데이터만 표시됩니다. 설정은 `data/settings.json`(Git 제외)에 저장됩니다.
+`http://127.0.0.1:8088`에 접속합니다. 로컬 모드(`auth_mode: auto`, Cloud Run 밖)에서는 이 컴퓨터(루프백 주소)에서 접속한 경우만 관리자로 허용합니다. 로컬에서도 화면에는 연결한 프로젝트의 실제 데이터만 표시됩니다. 설정은 `data/settings.json`(Git 제외)에 저장됩니다.
 
-컨테이너로 실행(조회 확인용):
+컨테이너로 실행(이미지가 뜨는지 확인용):
 
 ```bash
 docker build -t ai-control-plane .
@@ -727,7 +728,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=loc
   ai-control-plane
 ```
 
-컨테이너 안에서는 브라우저 요청이 루프백 주소로 보이지 않으므로 viewer로 접속됩니다. `-p 127.0.0.1:8080:8080`은 이 컴퓨터에만 포트를 열기 때문에 네트워크의 다른 컴퓨터는 접속할 수 없습니다. 설정을 바꾸려면 위의 `python3` 실행이나 Cloud Run 배포를 씁니다.
+`curl http://127.0.0.1:8080/healthz`로 확인하면 `{"status": "ok"}`가 나옵니다. 컨테이너 안에서는 브라우저 요청이 루프백 주소로 보이지 않으므로 로컬 모드가 거부합니다. 대시보드는 위의 `python3` 실행이나 Cloud Run 배포로 씁니다. `-p 127.0.0.1:8080:8080`은 이 컴퓨터에만 포트를 엽니다.
 
 ---
 
@@ -826,6 +827,8 @@ python3 -m unittest discover -s tests/unit -v
 ```bash
 python3 scripts/prepublish_scan.py
 ```
+
+푸시할 때마다 자동으로 실행하려면 저장소를 복제한 뒤 한 번만 `git config core.hooksPath scripts/git-hooks`로 포함된 훅을 켭니다.
 
 Git이 공개할 파일을 검사해 비밀 정보(개인 키, API 키, OAuth 클라이언트 보안 비밀, 토큰, 웹훅), Git에서 제외된 `deploy.env`·`config.local.yaml`·`terraform/terraform.tfvars`의 값, 예시 도메인 밖의 이메일 주소, 프로젝트 번호가 들어간 Cloud Run URL, 홈 디렉터리 경로가 있으면 실패합니다. 그 밖에 절대 공개하면 안 되는 단어(예: 개인 계정 이름)는 Git에서 제외되는 `.prepublish-terms` 파일에 한 줄에 하나씩 적습니다.
 
