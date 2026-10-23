@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..schema import expr
 
-AI_SERVICE_RE = r"(?i)(vertex ai|gemini|generative|anthropic|claude|model garden|llama|mistral|ai platform)"
+AI_SERVICE_RE = r"(?i)(vertex ai|agent platform|gemini|generative|anthropic|claude|model garden|llama|mistral|ai platform)"
 AI_SKU_RE = r"(?i)(gemini|claude|llama|mistral|gemma|imagen|veo|chirp|lyria|token)"
 INFRA_SKU_RE = (r"(?i)(data index|reasoningengine|reasoning engine|agent engine|vertex ai search|vcpu|memory|"
                 r"storage|training|endpoint|node hour)")

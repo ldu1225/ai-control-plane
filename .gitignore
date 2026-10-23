@@ -59,6 +59,8 @@ crash.log
 /engagement/
 # Terms that scripts/prepublish_scan.py must never find in published files (personal identifiers)
 /.prepublish-terms
+# Local agent rules (naming conventions for the coding agent)
+/_agents/
 # AI Analyst evaluation outputs (real answers and rows from your workspace)
 /eval/analyst/out/
 

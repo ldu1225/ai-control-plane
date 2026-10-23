@@ -60,7 +60,7 @@ locals {
     "roles/logging.logWriter",                 # governance audit entries (always, with or without IAM write roles)
   ]
 
-  # APIs the dashboards call (BigQuery, Cloud Logging and Monitoring, Gemini Enterprise, Vertex AI,
+  # APIs the dashboards call (BigQuery, Cloud Logging and Monitoring, Gemini Enterprise, Agent Platform,
   # IAM policy reads, the settings bucket and the public price list used for per-user cost caps).
   required_apis = concat([
     "bigquery.googleapis.com",

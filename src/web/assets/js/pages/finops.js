@@ -45,7 +45,7 @@ function renderPage(ctx, body, d) {
     kpi({ label: t('Gross cost'), value: moneyC(k.gross), tip: t('Sum of cost in the billing export for the selected scope and period.') }),
     k.hasCredits ? kpi({ label: t('Credits'), value: money(k.credits), meta: h('span', null, t('Applied from credit rows in the export')), goodWhen: null }) : null,
     kpi({ label: k.hasCredits ? t('Net cost') : t('Cost vs previous period'), value: k.hasCredits ? moneyC(k.net) : moneyC(k.gross), delta: k.change, goodWhen: 'down', meta: isNum(k.previousNet) ? h('span', null, t('Previous {v}', { v: moneyC(k.previousNet) })) : null }),
-    kpi({ label: t('AI share of spend'), value: fmt.pct(k.aiShare), tip: t('Share of cost from AI model SKUs (Vertex AI, Gemini and partner models).') }),
+    kpi({ label: t('AI share of spend'), value: fmt.pct(k.aiShare), tip: t('Share of cost from AI model SKUs (Agent Platform, Gemini and partner models).') }),
     kpi({ label: t('Spikes detected'), value: fmt.int(k.spikes), goodWhen: null, meta: h('span', null, t('Day-over-day increase at or above threshold')) })));
 
   const trendSeries = (key) => ((d.trend && d.trend.series) || []).find((s) => s.key === key);

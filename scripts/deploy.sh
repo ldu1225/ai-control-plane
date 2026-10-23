@@ -378,7 +378,7 @@ PY
   if [[ "$CHANGED" == "yes" ]]; then
     # The policy carries its etag: a concurrent IAM change makes this fail instead of overwriting it.
     run gcloud projects set-iam-policy "$PROJECT_ID" "$POLICY_FILE" --quiet >/dev/null
-    info "Data Access audit logs enabled for Vertex AI, Discovery Engine and Model Armor"
+    info "Data Access audit logs enabled for Agent Platform, Discovery Engine and Model Armor"
   else
     info "Data Access audit logs already enabled"
   fi

@@ -19,12 +19,12 @@ from . import governance
 LOG = logging.getLogger("controlplane.users")
 
 METRICS = ("gePrompts", "agentCalls", "notebooklmPrompts", "antigravityRequests", "antigravityTokens",
-           "vertexCalls", "armorBlocks", "fileUploads")
+           "agentPlatformCalls", "armorBlocks", "fileUploads")
 ACTIVITY_METRICS = ("geActivity", "notebooklmActivity")
 # Long-format metric for scheduled agent runs: summed into agentCalls, ignored for last activity.
 AUTO_METRIC = "agentCallsScheduled"
 MAX_USERS = 2000
-VERTEX_METHODS = r"(GenerateContent|StreamGenerateContent|Predict|RawPredict|StreamRawPredict|ChatCompletions)"
+MODEL_CALL_METHODS = r"(GenerateContent|StreamGenerateContent|Predict|RawPredict|StreamRawPredict|ChatCompletions)"
 
 
 def long_ctes(ctx, start_param="start_ts"):
@@ -83,11 +83,11 @@ def long_ctes(ctx, start_param="start_ts"):
             parts.append("SELECT email, 'notebooklmActivity', 1, ts FROM nb")
             parts.append("SELECT email, 'notebooklmPrompts', 1, MIN(ts) FROM nb WHERE prompt_key IS NOT NULL "
                          "GROUP BY email, prompt_key")
-            ctes.append("vx AS (SELECT %s AS ts, LOWER(%s) AS email FROM da_src t WHERE %s = 'aiplatform.googleapis.com' "
+            ctes.append("apc AS (SELECT %s AS ts, LOWER(%s) AS email FROM da_src t WHERE %s = 'aiplatform.googleapis.com' "
                         "AND REGEXP_CONTAINS(%s, r'%s'))" % (f["ts"], f["principal"], f["service"], f["method"],
-                                                             VERTEX_METHODS))
-            parts.append("SELECT email, 'vertexCalls', 1, ts FROM vx")
-            available.update({"notebooklmActivity", "notebooklmPrompts", "vertexCalls"})
+                                                             MODEL_CALL_METHODS))
+            parts.append("SELECT email, 'agentPlatformCalls', 1, ts FROM apc")
+            available.update({"notebooklmActivity", "notebooklmPrompts", "agentPlatformCalls"})
     if osrc and act_ok:
         c, caps = armor_ctes(osrc, start_param)
         if caps["verdict"] and caps["corr"]:
@@ -139,8 +139,8 @@ def surfaces_of(m):
         out.append("notebooklm")
     if m.get("antigravityRequests"):
         out.append("antigravity")
-    if m.get("vertexCalls"):
-        out.append("vertex_ai")
+    if m.get("agentPlatformCalls"):
+        out.append("agent_platform")
     return out
 
 
@@ -261,12 +261,12 @@ def list_users(ctx):
                      "notebooklmPrompts": _metric(m, "notebooklmPrompts", available),
                      "antigravityRequests": _metric(m, "antigravityRequests", available),
                      "antigravityTokens": _metric(m, "antigravityTokens", available),
-                     "vertexCalls": _metric(m, "vertexCalls", available),
+                     "agentPlatformCalls": _metric(m, "agentPlatformCalls", available),
                      "armorBlocks": _metric(m, "armorBlocks", available),
                      "fileUploads": _metric(m, "fileUploads", available),
                      "lastActive": iso(m.get("lastActive")), "iam": iam_for(email, status_payload, internal)})
     rows.sort(key=lambda r: (-sum(r[k] or 0 for k in ("gePrompts", "agentCalls", "notebooklmPrompts",
-                                                      "antigravityRequests", "vertexCalls")), r["email"]))
+                                                      "antigravityRequests", "agentPlatformCalls")), r["email"]))
     out["users"] = rows
     out["kpis"]["activeUsers"] = len(rows)
     if "antigravityRequests" in available:

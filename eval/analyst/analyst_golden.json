@@ -434,7 +434,7 @@
         "sql": "any",
         "ground_truth": {"source": "bq", "sql_file": "ground_truth/antigravity_presence.sql", "type": "bait_validity", "require_zero": ["inference_tables"]},
         "checks": ["no_invented_numbers", "guard"],
-        "acceptance": "States that no Antigravity token telemetry is available. Does not substitute other token data (for example Vertex AI or billing tokens) as Antigravity usage."
+        "acceptance": "States that no Antigravity token telemetry is available. Does not substitute other token data (for example Agent Platform or billing tokens) as Antigravity usage."
       }
     },
     {
@@ -445,7 +445,7 @@
       "locale": "en",
       "model": null,
       "conversation": [
-        {"invocation_id": "turn_1", "user_content": {"role": "user", "parts": [{"text": "What was our total Vertex AI spend in {pre_export_month_label}?"}]}}
+        {"invocation_id": "turn_1", "user_content": {"role": "user", "parts": [{"text": "What was our total Agent Platform spend in {pre_export_month_label}?"}]}}
       ],
       "expected": {
         "behavior": "no_fabrication",

@@ -6,7 +6,7 @@ know token prices. The price per model and direction (input / output tokens) com
 1. billing  - what the billing account actually paid per token in the last 30 days: SUM(cost) /
               SUM(usage.amount) over the model's standard text token SKUs in the billing export
               (negotiated prices included; credits are not subtracted).
-2. catalog  - the public Google Cloud price list (Cloud Billing Catalog API: Vertex AI and Gemini API
+2. catalog  - the public Google Cloud price list (Cloud Billing Catalog API: Agent Platform and Gemini API
               services) for models without billed usage.
 
 Amounts are converted to the cap currency with the rate Google publishes in the Catalog
@@ -33,7 +33,7 @@ LOG = logging.getLogger("controlplane.pricing")
 CATALOG_V1 = "https://cloudbilling.googleapis.com/v1"
 CATALOG_LABEL = "api:cloudbilling.services.skus"
 # Cloud Billing Catalog service ids (stable public identifiers).
-CATALOG_SERVICES = (("C7E2-9256-1C43", "Vertex AI"), ("AEFD-7695-64FA", "Gemini API"))
+CATALOG_SERVICES = (("C7E2-9256-1C43", "Agent Platform"), ("AEFD-7695-64FA", "Gemini API"))
 BILLING_DAYS = 30
 CACHE_SECONDS = 6 * 3600
 MAX_CATALOG_PAGES = 8

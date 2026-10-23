@@ -1,4 +1,4 @@
-"""Gemini engine on Vertex AI via google-genai: model discovery, allowlisting and JSON generation."""
+"""Gemini engine on Agent Platform via google-genai: model discovery, allowlisting and JSON generation."""
 
 from __future__ import annotations
 

@@ -444,14 +444,15 @@ def usage_data(ctx, rng):
 
 
 def _monitored_service(service):
-    """True when the billing service reports tokens to the Vertex AI publisher metrics in Cloud Monitoring
-    (Vertex AI and partner models served on Vertex AI). Gemini API (generativelanguage) traffic is not."""
+    """True when the billing service reports tokens to the Agent Platform publisher metrics in Cloud Monitoring
+    (Agent Platform and partner models served on Agent Platform). Gemini API (generativelanguage) traffic is not."""
     name = (service or "").strip().lower()
-    return name == "vertex ai" or _is_model_service(service)
+    # The billing export may name Agent Platform by its former service name.
+    return name == "vertex ai" or "agent platform" in name or _is_model_service(service)
 
 
 def _model_tokens(entry):
-    """Token figures for one model. Monitoring covers Vertex AI traffic; billing token SKUs of services that
+    """Token figures for one model. Monitoring covers Agent Platform traffic; billing token SKUs of services that
     Monitoring does not report (Gemini API) are added on top. Without Monitoring, all billing token SKUs are
     used. Antigravity inference tokens are added in every case."""
     agy_total = sum(v["tokens"] for v in entry["agy"].values())

@@ -55,15 +55,15 @@ Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registr
 | Gemini Enterprise | `gemini_enterprise` | 활성 사용자, 프롬프트, 에이전트별 호출, 라이선스 좌석 할당과 휴면 좌석, 업로드 파일 | BigQuery(Gemini Enterprise 로그), Discovery Engine API |
 | NotebookLM | `notebooklm` | 활성 노트북, 사용자, 프롬프트 | BigQuery `cloudaudit_googleapis_com_data_access` |
 | Agent Gateway | `agent_gateway` | AI 서비스 호출 주체, 서비스와 메서드, 성공/거부/제한/오류, 실패 이력, 모델 호출 | BigQuery 감사 로그, Cloud Monitoring |
-| Agent Registry | `agent_registry` | Agent Engine과 Gemini Enterprise 에이전트 통합 카탈로그, 휴면과 폐기 권고, 생성 이력 | Vertex AI API, Discovery Engine API, 감사 로그 |
-| 에이전트 배포 | `agent_deployments` | Agent Engine 런타임, 실행 ID(서비스 계정), 호출량, ID별 모델 사용량, 런타임 비용 | Vertex AI API, 감사 로그, 결제 내보내기 |
+| Agent Registry | `agent_registry` | Agent Engine과 Gemini Enterprise 에이전트 통합 카탈로그, 휴면과 폐기 권고, 생성 이력 | Agent Platform API, Discovery Engine API, 감사 로그 |
+| 에이전트 배포 | `agent_deployments` | Agent Engine 런타임, 실행 ID(서비스 계정), 호출량, ID별 모델 사용량, 런타임 비용 | Agent Platform API, 감사 로그, 결제 내보내기 |
 | Model Armor | `model_armor` | 판정 추이, 필터 일치, 애플리케이션과 사용자별 차단, 이벤트 상세 | BigQuery `modelarmor_googleapis_com_sanitize_operations` |
 | 모델 및 토큰 | `model_usage` | 모델 자동 탐지, 모델별 입력/출력/캐시 토큰, 호출 수, 오류율, 비용, 카탈로그 관리 | Cloud Monitoring, 결제 내보내기, Antigravity 로그 |
 | 비용 및 FinOps | `finops` | 총 비용, 크레딧, 순 비용, 서비스와 SKU별 비용, 급증 감지와 AI 원인 분석 | 결제 내보내기 |
 | 사용자 및 액세스 | `users` | 사용자 360 뷰(서비스 전체 사용량), Antigravity IAM 상태, 개별 허용과 차단 | 전체 소스, Resource Manager IAM |
 | Antigravity 통제 | `antigravity` | 사용자별 비용/토큰/요청 한도, 자동 또는 수동 정지, 예외 규칙, 정산 기간, 안전 게이트, 클라우드에서 에이전트가 실행한 작업, 감사 로그 | Cloud Logging 또는 BigQuery, IAM, 결제 내보내기, Cloud Billing Catalog API |
 | 텔레메트리 확장 | `telemetry` | 로그·테이블 자동 발견과 쉬운 설명, 클릭 한 번으로 만드는 표준 대시보드, BigQuery 내보내기 명령 | BigQuery, Cloud Logging, Cloud Monitoring |
-| AI 애널리스트 | `analyst` | 자연어 질문, 검증된 읽기 전용 SQL, 결과 표와 차트, 요약 | BigQuery, Vertex AI Gemini |
+| AI 애널리스트 | `analyst` | 자연어 질문, 검증된 읽기 전용 SQL, 결과 표와 차트, 요약 | BigQuery, Gemini on Agent Platform |
 
 공통 기능: 라이트/다크 테마, 한국어/영어 전환, 명령 팔레트(Ctrl/Cmd+K), 기간 선택(프리셋과 직접 지정), 표 검색/정렬/CSV 내보내기, 데이터 소스 상태 패널.
 
@@ -85,7 +85,7 @@ flowchart LR
   run --> logging["Cloud Logging API"]
   run --> monitoring["Cloud Monitoring API"]
   run --> de["Discovery Engine API"]
-  run --> vertex["Vertex AI API: Agent Engine, Gemini"]
+  run --> agentplatform["Agent Platform API: Agent Engine, Gemini"]
   run --> rm["Resource Manager / IAM API"]
   run --> catalog["Cloud Billing Catalog API (공개 가격표)"]
   run --> gcs["Cloud Storage: 설정 저장소"]
@@ -166,7 +166,7 @@ scripts/deploy.sh              # 실제 배포 (보통 3~8분)
 
 | 단계 | 내용 |
 |---|---|
-| 1. API 사용 설정 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Vertex AI, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing(가격표), Service Usage, 필요하면 IAP와 Cloud Scheduler |
+| 1. API 사용 설정 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing(가격표), Service Usage, 필요하면 IAP와 Cloud Scheduler |
 | 2. 컨테이너 이미지 | Artifact Registry 저장소(`ai-control-plane`)를 만들고 Cloud Build로 이미지를 빌드합니다. `IMAGE`를 지정하면 빌드를 건너뜁니다. |
 | 3. 런타임 서비스 계정 | 전용 서비스 계정을 만들고 읽기 역할과 감사 로그 쓰기 역할을 부여합니다. `ENABLE_GOVERNANCE_ACTIONS=true`이면 IAM 쓰기 역할을 추가합니다([6.6](#66-런타임-서비스-계정-권한)). `google` 방식에서는 로그인 브리지용 서비스 계정을 따로 만들고, 세션 서명 키만 읽을 수 있게 합니다. |
 | 4. 설정 버킷 | 비공개(공개 접근 차단), 버전 관리되는 Cloud Storage 버킷을 만듭니다. 화면에서 바꾼 설정, 예외 규칙, 정지 기록, 사람별 위젯 배치가 저장됩니다. |
@@ -234,7 +234,7 @@ scripts/deploy.sh              # 실제 배포 (보통 3~8분)
 | `AUDIT_DATASET` | `ge_analytics` | 감사 로그가 들어오는 BigQuery 데이터셋 |
 | `CREATE_LOG_SINK` | `true` | 데이터셋과 Log Router 싱크 생성. 이미 싱크가 있으면 `false` |
 | `DATASET_LOCATION` | `US` | 새로 만드는 데이터셋 위치 |
-| `ENABLE_DATA_ACCESS_LOGS` | `false` | Vertex AI, Discovery Engine, Model Armor의 Data Access 감사 로그 켜기(로그 양과 비용 증가) |
+| `ENABLE_DATA_ACCESS_LOGS` | `false` | Agent Platform, Discovery Engine, Model Armor의 Data Access 감사 로그 켜기(로그 양과 비용 증가) |
 | `BILLING_PROJECT_ID` | 비어 있음 | 결제 내보내기가 있는 프로젝트(비우면 `PROJECT_ID`) |
 | `BILLING_DATASET` | 비어 있음 | 결제 내보내기 데이터셋. 예: `billing_detailed_usage` |
 | `BILLING_TABLE` | 비어 있음 | `gcp_billing_export_resource_v1_XXXXXX_XXXXXX_XXXXXX` |
@@ -369,7 +369,7 @@ gcloud logging sinks describe ai-control-plane-ai-logs --project=PROJECT_ID --fo
 
 Agent Gateway, NotebookLM, 에이전트 배포, ID별 모델 사용량은 Data Access 감사 로그를 씁니다. `ENABLE_DATA_ACCESS_LOGS=true`로 다시 배포하거나, 콘솔의 **IAM 및 관리자 > 감사 로그**에서 아래 서비스의 `Data Read`, `Data Write`를 켭니다.
 
-- Vertex AI API (`aiplatform.googleapis.com`)
+- Agent Platform API (`aiplatform.googleapis.com`)
 - Discovery Engine API (`discoveryengine.googleapis.com`)
 - Model Armor API (`modelarmor.googleapis.com`)
 
@@ -457,7 +457,7 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.5 Agent Registry와 에이전트 배포
 
-- **Agent Registry**: Agent Engine(Vertex AI)과 Gemini Enterprise 에이전트를 하나의 카탈로그로 합칩니다. 마지막 호출 이후 `agent_lifecycle.idle_days`(기본 14일)가 지나면 휴면, `deprecation_days`(기본 50일)가 지나면 폐기 권고로 분류합니다.
+- **Agent Registry**: Agent Engine(Agent Platform)과 Gemini Enterprise 에이전트를 하나의 카탈로그로 합칩니다. 마지막 호출 이후 `agent_lifecycle.idle_days`(기본 14일)가 지나면 휴면, `deprecation_days`(기본 50일)가 지나면 폐기 권고로 분류합니다.
 - **에이전트 배포**: Agent Engine 런타임별 실행 ID(서비스 계정), 호출량, ID별 모델 사용량, 런타임 비용(resource 수준 결제 내보내기)을 보여 줍니다.
 
 ### 7.6 Model Armor
@@ -466,8 +466,8 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.7 모델 및 토큰
 
-- 모델은 결제 SKU, Cloud Monitoring `model_user_id`, Antigravity `model_id`에서 자동으로 발견됩니다. SKU 설명에서 모델 계열 단어(Gemini, Claude, Llama 등)를 찾고 리전, 모달리티, 입출력, 컨텍스트 구간 같은 수식어를 빼서 하나의 키(예: `gemini-3.8-flash`)로 묶습니다. Vertex AI 형식(`Gemini 3.8 Flash Global Text Input`), Gemini API 형식, Monitoring 모델 ID가 같은 모델로 합쳐집니다.
-- 모델별 토큰은 Cloud Monitoring `publisher/online_serving/token_count`(Vertex AI)를 기준으로 하고, Monitoring에 잡히지 않는 Gemini API 결제 토큰을 더합니다. Monitoring 지표가 없는 모델은 결제 SKU의 토큰 사용량을 씁니다. 호출 수와 오류율은 `model_invocation_count`에서 계산합니다.
+- 모델은 결제 SKU, Cloud Monitoring `model_user_id`, Antigravity `model_id`에서 자동으로 발견됩니다. SKU 설명에서 모델 계열 단어(Gemini, Claude, Llama 등)를 찾고 리전, 모달리티, 입출력, 컨텍스트 구간 같은 수식어를 빼서 하나의 키(예: `gemini-3.8-flash`)로 묶습니다. Agent Platform 형식(`Gemini 3.8 Flash Global Text Input`), Gemini API 형식, Monitoring 모델 ID가 같은 모델로 합쳐집니다.
+- 모델별 토큰은 Cloud Monitoring `publisher/online_serving/token_count`(Agent Platform)를 기준으로 하고, Monitoring에 잡히지 않는 Gemini API 결제 토큰을 더합니다. Monitoring 지표가 없는 모델은 결제 SKU의 토큰 사용량을 씁니다. 호출 수와 오류율은 `model_invocation_count`에서 계산합니다.
 - 제품이 모델 사용량을 자체 SKU로 다시 청구하는 경우 "제품별 사용량" 카드에 따로 표시하고, 같은 토큰이 기반 모델에도 청구되므로 모델 토큰 합계에는 더하지 않습니다.
 - 새 모델이 처음 발견되면 "새 모델 감지" 알림이 뜹니다. `auto_enable_new_models: true`이면 바로 추적하고, `false`이면 관리자가 켤 때까지 합계에서 뺍니다.
 - 카탈로그 관리(또는 설정 > 모델 카탈로그)에서 모델별 추적을 끌 수 있습니다.
@@ -537,7 +537,7 @@ flowchart TD
 - 사용자별 비용 = 모델별로 입력(프롬프트) 토큰 x 입력 단가 + 나머지 토큰(응답, thinking) x 출력 단가.
 - 단가는 모델과 방향(입력/출력)별로 다음 순서로 찾습니다.
   1. **실제 청구 단가**: 최근 30일 결제 내보내기에서 해당 모델 표준 텍스트 토큰 SKU의 `SUM(cost) / SUM(usage.amount)`. 협상 가격이 반영되며 크레딧은 빼지 않습니다. batch, flex, priority, 캐시, 장문 컨텍스트, 튜닝, 오디오/이미지/비디오 같은 변형 SKU는 제외합니다.
-  2. **Google 공개 가격표**: 청구 기록이 없는 모델은 Cloud Billing Catalog API(Vertex AI, Gemini API)의 공개 가격을 씁니다.
+  2. **Google 공개 가격표**: 청구 기록이 없는 모델은 Cloud Billing Catalog API(Agent Platform, Gemini API)의 공개 가격을 씁니다.
 - 통화가 다르면 Google이 가격표에 게시하는 환율로 환산합니다. 화면에 `1 USD = ₩1,359 (Google 환율, 날짜)`처럼 근거를 표시합니다.
 - 단가는 6시간 동안 캐시됩니다. 한도 정책 카드의 **이번 기간에 사용한 모델 단가** 표에 모델별 단가와 출처(청구 단가, Google 가격표, 단가 없음)가 표시됩니다.
 - 어느 쪽에서도 단가를 찾지 못한 모델은 "단가 없음"으로 표시되고 그 토큰은 비용에 들어가지 않습니다. 비용 한도만 켠 상태에서 비용을 계산할 수 없는 사용자는 한도 사용률이 0%가 아니라 `—`로 표시되고 정지되지 않습니다.
@@ -757,7 +757,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=loc
 | Cloud Logging | Data Access 감사 로그 수집량 | 필요한 서비스만 켜기(`ENABLE_DATA_ACCESS_LOGS`) |
 | Cloud Build, Artifact Registry | 배포할 때 빌드 시간, 이미지 저장 | 오래된 이미지 정리 |
 | Cloud Scheduler, Secret Manager, Cloud Storage | 작업, 시크릿, 설정 파일 | 매우 적음 |
-| Vertex AI Gemini | AI 애널리스트 질문, 급증 원인 분석 | 사용하지 않으면 비용 없음, 모듈 끄기 가능 |
+| Gemini on Agent Platform | AI 애널리스트 질문, 급증 원인 분석 | 사용하지 않으면 비용 없음, 모듈 끄기 가능 |
 
 감사 로그 테이블 보존 기간 제한 예(120일):
 

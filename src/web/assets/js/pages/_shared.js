@@ -105,7 +105,7 @@ const SURFACE_LABELS = {
   gemini_enterprise: 'Gemini Enterprise',
   notebooklm: 'NotebookLM',
   antigravity: 'Antigravity',
-  vertex_ai: 'Vertex AI',
+  agent_platform: 'Agent Platform',
 };
 
 export function surfaceChips(list) {
@@ -116,7 +116,7 @@ const SURFACE_ITEMS = [
   { key: 'gemini_enterprise', short: 'GE', label: 'Gemini Enterprise' },
   { key: 'notebooklm', short: 'NB', label: 'NotebookLM' },
   { key: 'antigravity', short: 'AG', label: 'Antigravity' },
-  { key: 'vertex_ai', short: 'VX', label: 'Vertex AI' },
+  { key: 'agent_platform', short: 'AP', label: 'Agent Platform' },
 ];
 
 /** Legend text for the compact surface matrix (used as a column header tooltip). */

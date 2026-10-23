@@ -11,13 +11,13 @@ import {
 } from './_shared.js';
 
 const SURFACES = [
-  ['all', 'All surfaces'], ['gemini_enterprise', 'Gemini Enterprise'], ['notebooklm', 'NotebookLM'], ['antigravity', 'Antigravity'], ['vertex_ai', 'Vertex AI'],
+  ['all', 'All surfaces'], ['gemini_enterprise', 'Gemini Enterprise'], ['notebooklm', 'NotebookLM'], ['antigravity', 'Antigravity'], ['agent_platform', 'Agent Platform'],
 ];
 
 export default async function render(ctx) {
   const header = pageHeader({
     title: t('Users & Access'),
-    desc: t('One view of every person using Gemini Enterprise, NotebookLM, Antigravity and Vertex AI, with their access enforcement state.'),
+    desc: t('One view of every person using Gemini Enterprise, NotebookLM, Antigravity and Agent Platform, with their access enforcement state.'),
   });
   return pageFlow(ctx, {
     header,
@@ -74,7 +74,7 @@ function renderPage(ctx, body, d) {
         { key: 'agentCalls', label: t('Agent calls'), align: 'num', format: fmt.int },
         { key: 'notebooklmPrompts', label: t('NotebookLM'), align: 'num', format: fmt.int },
         { key: 'antigravityTokens', label: t('AG tokens'), align: 'num', format: fmt.compact },
-        { key: 'vertexCalls', label: t('Vertex calls'), align: 'num', format: fmt.int },
+        { key: 'agentPlatformCalls', label: t('Agent Platform calls'), align: 'num', format: fmt.int },
         { key: 'armorBlocks', label: t('Blocks'), align: 'num', render: (u) => (u.armorBlocks ? h('span', { class: 'text-danger fw-600' }, fmt.int(u.armorBlocks)) : fmt.int(u.armorBlocks || 0)), value: (u) => u.armorBlocks },
         { key: 'iam', label: t('Access state'), render: (u) => iamBadge(u.iam), value: (u) => (u.iam && u.iam.state) || '', csv: (u) => (u.iam && u.iam.state) || '' },
         { key: 'lastActive', label: t('Last active'), render: (u) => (u.lastActive ? fmt.relative(u.lastActive) : DASH), value: (u) => u.lastActive },

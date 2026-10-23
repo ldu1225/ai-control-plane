@@ -309,7 +309,8 @@ def analyze_spike(ctx):
               "inside it. Write in %s. Do not use emojis. Return JSON with 'primaryDriver' (one sentence naming "
               "the SKU with the largest increase and the amount) and 'checkpoints' (exactly three concise, "
               "actionable checks tailored to the SKUs, for example prompt length or context caching for input "
-              "tokens, max output tokens or loops for output tokens, batch jobs for analysis SKUs)." % language)
+              "tokens, max output tokens or loops for output tokens, batch jobs for analysis SKUs). A service named "
+              "'Vertex AI' in the data is Agent Platform: call it Agent Platform." % language)
     data_block = "\n".join("- sku: %s | service: %s | previous: %.2f | current: %.2f | delta: %.2f" % (
         r["sku"], r["service"], r["previous"], r["current"], r["delta"]) for r in rising)
     prompt = ("Date: %s (compared with the previous day). Amounts are in the billing account currency.\n"

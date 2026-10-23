@@ -295,9 +295,9 @@ async function ai(ctx, panel, data, editable) {
     title: t('AI engine'), subtitle: t('Gemini model used by AI Analyst, FinOps spike analysis and optional SKU grouping. Users can switch among allowed models.'), section: 'ai_engine', data, editable,
     fields: [
       { path: ['default_model'], label: t('Default model'), type: 'select', options: ids.map((id) => ({ value: id, label: id })) },
-      { path: ['location'], label: t('Vertex AI location'), mono: true, help: t('global is recommended for the latest Gemini models.') },
+      { path: ['location'], label: t('Agent Platform location'), mono: true, help: t('global is recommended for the latest Gemini models.') },
       { path: ['models'], label: t('Allowed models'), type: 'list', mono: true, help: t('Comma separated model IDs users may select.') },
-      { path: ['discover_models'], label: t('Discover available models'), type: 'switch', help: t('List Gemini models available to the project through the Vertex AI Models API.') },
+      { path: ['discover_models'], label: t('Discover available models'), type: 'switch', help: t('List Gemini models available to the project through the Agent Platform Models API.') },
       { path: ['restrict_to_allowed'], label: t('Restrict to allowed models'), type: 'switch', help: t('Reject requests for models that are not in the allowed list.') },
     ],
   }));

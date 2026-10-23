@@ -71,7 +71,7 @@ NUMERIC = {"n", "calls", "cost", "amount", "gross", "credits", "ai_gross", "toke
            "uploads", "agent_calls", "principals", "humans", "services", "callers", "code", "row_count",
            "size_bytes", "prev_calls", "model_calls", "invocations", "prompt_blocks", "response_blocks",
            "geactivity", "notebooklmactivity", "geprompts", "agentcalls", "notebooklmprompts",
-           "antigravityrequests", "antigravitytokens", "vertexcalls", "armorblocks", "fileuploads"}
+           "antigravityrequests", "antigravitytokens", "agentplatformcalls", "armorblocks", "fileuploads"}
 CONFIG = """workspace:
   project_id: demo-project
   audit_dataset: ge_analytics

@@ -55,15 +55,15 @@ Download this repository, fill in one settings file (`deploy.env`) and run one s
 | Gemini Enterprise | `gemini_enterprise` | Active users, prompts, calls per agent, license seat assignment and idle seats, uploaded files | BigQuery (Gemini Enterprise logs), Discovery Engine API |
 | NotebookLM | `notebooklm` | Active notebooks, users, prompts | BigQuery `cloudaudit_googleapis_com_data_access` |
 | Agent Gateway | `agent_gateway` | Principals calling AI services, services and methods, success/denied/throttled/error, failure history, model invocations | BigQuery audit logs, Cloud Monitoring |
-| Agent Registry | `agent_registry` | Unified catalog of Agent Engine and Gemini Enterprise agents, idle agents and deprecation candidates, creation history | Vertex AI API, Discovery Engine API, audit logs |
-| Deployments | `agent_deployments` | Agent Engine runtimes, runtime identities (service accounts), invocation volume, model usage by identity, runtime cost | Vertex AI API, audit logs, billing export |
+| Agent Registry | `agent_registry` | Unified catalog of Agent Engine and Gemini Enterprise agents, idle agents and deprecation candidates, creation history | Agent Platform API, Discovery Engine API, audit logs |
+| Deployments | `agent_deployments` | Agent Engine runtimes, runtime identities (service accounts), invocation volume, model usage by identity, runtime cost | Agent Platform API, audit logs, billing export |
 | Model Armor | `model_armor` | Verdicts over time, matched filters, blocks by application and user, event details | BigQuery `modelarmor_googleapis_com_sanitize_operations` |
 | Models & Tokens | `model_usage` | Automatic model discovery, input/output/cached tokens per model, invocations, error rate, cost, catalog management | Cloud Monitoring, billing export, Antigravity logs |
 | Cost & FinOps | `finops` | Gross cost, credits, net cost, cost by service and SKU, spike detection and AI root-cause analysis | Billing export |
 | Users & Access | `users` | 360-degree user view (usage across all services), Antigravity IAM state, individual allow and disallow | All sources, Resource Manager IAM |
 | Antigravity Controls | `antigravity` | Per-user cost/token/request caps, automatic or manual suspension, exception rules, settlement periods, safety gates, Agent activity in your cloud, audit log | Cloud Logging or BigQuery, IAM, billing export, Cloud Billing Catalog API |
 | Telemetry Extensions | `telemetry` | Automatic discovery of logs and tables with plain-language descriptions, one-click standard dashboards, BigQuery export commands | BigQuery, Cloud Logging, Cloud Monitoring |
-| AI Analyst | `analyst` | Natural language questions, validated read-only SQL, result tables and charts, summaries | BigQuery, Vertex AI Gemini |
+| AI Analyst | `analyst` | Natural language questions, validated read-only SQL, result tables and charts, summaries | BigQuery, Gemini on Agent Platform |
 
 Common features: light/dark theme, Korean/English switching, command palette (Ctrl/Cmd+K), date range selection (presets and custom range), table search/sort/CSV export, data source health panel.
 
@@ -85,7 +85,7 @@ flowchart LR
   run --> logging["Cloud Logging API"]
   run --> monitoring["Cloud Monitoring API"]
   run --> de["Discovery Engine API"]
-  run --> vertex["Vertex AI API: Agent Engine, Gemini"]
+  run --> agentplatform["Agent Platform API: Agent Engine, Gemini"]
   run --> rm["Resource Manager / IAM API"]
   run --> catalog["Cloud Billing Catalog API (public price list)"]
   run --> gcs["Cloud Storage: settings store"]
@@ -166,7 +166,7 @@ What the script does:
 
 | Step | Details |
 |---|---|
-| 1. Enable APIs | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Vertex AI, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing (price list), Service Usage, and IAP and Cloud Scheduler when needed |
+| 1. Enable APIs | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing (price list), Service Usage, and IAP and Cloud Scheduler when needed |
 | 2. Container image | Creates an Artifact Registry repository (`ai-control-plane`) and builds the image with Cloud Build. If `IMAGE` is set, the build is skipped. |
 | 3. Runtime service account | Creates a dedicated service account and grants it read roles plus the audit log writer. If `ENABLE_GOVERNANCE_ACTIONS=true`, IAM write roles are added ([6.6](#66-runtime-service-account-permissions)). In `google` mode, the sign-in bridge gets its own service account that can read only the session signing key. |
 | 4. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. It stores settings changed in the UI, exception rules, suspension records and personal widget layouts. |
@@ -234,7 +234,7 @@ What the script does:
 | `AUDIT_DATASET` | `ge_analytics` | BigQuery dataset that receives the audit logs |
 | `CREATE_LOG_SINK` | `true` | Creates the dataset and the Log Router sink. Use `false` if a sink already exists |
 | `DATASET_LOCATION` | `US` | Location of the new dataset |
-| `ENABLE_DATA_ACCESS_LOGS` | `false` | Turns on Data Access audit logs for Vertex AI, Discovery Engine and Model Armor (more log volume and cost) |
+| `ENABLE_DATA_ACCESS_LOGS` | `false` | Turns on Data Access audit logs for Agent Platform, Discovery Engine and Model Armor (more log volume and cost) |
 | `BILLING_PROJECT_ID` | Empty | Project that holds the billing export (if empty, `PROJECT_ID`) |
 | `BILLING_DATASET` | Empty | Billing export dataset. Example: `billing_detailed_usage` |
 | `BILLING_TABLE` | Empty | `gcp_billing_export_resource_v1_XXXXXX_XXXXXX_XXXXXX` |
@@ -369,7 +369,7 @@ Each table is created when its log is first written. If a table is missing, only
 
 Agent Gateway, NotebookLM, Deployments and model usage by identity use Data Access audit logs. Redeploy with `ENABLE_DATA_ACCESS_LOGS=true`, or turn on `Data Read` and `Data Write` for the services below in **IAM & Admin > Audit Logs** in the console.
 
-- Vertex AI API (`aiplatform.googleapis.com`)
+- Agent Platform API (`aiplatform.googleapis.com`)
 - Discovery Engine API (`discoveryengine.googleapis.com`)
 - Model Armor API (`modelarmor.googleapis.com`)
 
@@ -457,7 +457,7 @@ Shows the calling principals, services and methods, outcomes (success, denied, t
 
 ### 7.5 Agent Registry and Deployments
 
-- **Agent Registry**: Combines Agent Engine (Vertex AI) and Gemini Enterprise agents into one catalog. An agent is classified as idle when `agent_lifecycle.idle_days` (default 14 days) have passed since its last call, and as a deprecation candidate when `deprecation_days` (default 50 days) have passed.
+- **Agent Registry**: Combines Agent Engine (Agent Platform) and Gemini Enterprise agents into one catalog. An agent is classified as idle when `agent_lifecycle.idle_days` (default 14 days) have passed since its last call, and as a deprecation candidate when `deprecation_days` (default 50 days) have passed.
 - **Deployments**: Shows, for each Agent Engine runtime, the runtime identities (service accounts), invocation volume, model usage by identity and runtime cost (resource-level billing export).
 
 ### 7.6 Model Armor
@@ -466,8 +466,8 @@ Shows verdicts over time, matched filters (prompt injection, sensitive data and 
 
 ### 7.7 Models & Tokens
 
-- Models are discovered automatically from billing SKUs, Cloud Monitoring `model_user_id` and Antigravity `model_id`. The SKU description is searched for a model family word (Gemini, Claude, Llama and others), and qualifiers such as region, modality, input/output and context tier are removed to group the SKUs under one key (for example, `gemini-3.8-flash`). The Vertex AI format (`Gemini 3.8 Flash Global Text Input`), the Gemini API format and the Monitoring model ID are merged into the same model.
-- Tokens per model are based on Cloud Monitoring `publisher/online_serving/token_count` (Vertex AI), plus billed Gemini API tokens that Monitoring does not capture. For models without Monitoring metrics, token usage from billing SKUs is used. Invocations and error rate are calculated from `model_invocation_count`.
+- Models are discovered automatically from billing SKUs, Cloud Monitoring `model_user_id` and Antigravity `model_id`. The SKU description is searched for a model family word (Gemini, Claude, Llama and others), and qualifiers such as region, modality, input/output and context tier are removed to group the SKUs under one key (for example, `gemini-3.8-flash`). The Agent Platform format (`Gemini 3.8 Flash Global Text Input`), the Gemini API format and the Monitoring model ID are merged into the same model.
+- Tokens per model are based on Cloud Monitoring `publisher/online_serving/token_count` (Agent Platform), plus billed Gemini API tokens that Monitoring does not capture. For models without Monitoring metrics, token usage from billing SKUs is used. Invocations and error rate are calculated from `model_invocation_count`.
 - When a product re-bills model usage under its own SKUs, that usage is shown separately in the "Usage by product" card. The same tokens are also billed to the underlying model, so they are not added to the model token total.
 - When a new model is discovered for the first time, a "new models detected" notice appears. With `auto_enable_new_models: true`, the model is tracked immediately. With `false`, it is left out of totals until an administrator turns it on.
 - You can turn off tracking for individual models in Manage catalog (or Settings > Model catalog).
@@ -537,7 +537,7 @@ flowchart TD
 - Cost per user = for each model, input (prompt) tokens x input price + remaining tokens (response, thinking) x output price.
 - Unit prices are looked up per model and per direction (input/output) in the following order.
   1. **Actual billed price**: `SUM(cost) / SUM(usage.amount)` for the model's standard text token SKUs in the billing export over the last 30 days. Negotiated prices are reflected, and credits are not subtracted. Variant SKUs such as batch, flex, priority, cache, long context, tuning and audio/image/video are excluded.
-  2. **Public Google price list**: Models without billing records use the public prices from the Cloud Billing Catalog API (Vertex AI, Gemini API).
+  2. **Public Google price list**: Models without billing records use the public prices from the Cloud Billing Catalog API (Agent Platform, Gemini API).
 - If the currency is different, amounts are converted with the exchange rate that Google publishes in its price list. The UI shows the basis, for example `1 USD = ₩1,359 (Google rate, date)`.
 - Unit prices are cached for 6 hours. The **Prices of models used in this period** table in the Cap policy card shows the price of each model and its source (Billed price, Google price list, No price).
 - Models with no price from either source are shown as "No price", and their tokens are not included in the cost. When only the cost cap is on, users whose cost cannot be calculated show `—` for cap usage instead of 0%, and they are not suspended.
@@ -757,7 +757,7 @@ Most of the costs that this dashboard creates are small. Actual amounts depend o
 | Cloud Logging | Data Access audit log ingestion volume | Turn on only the services you need (`ENABLE_DATA_ACCESS_LOGS`) |
 | Cloud Build, Artifact Registry | Build time during deployment, image storage | Clean up old images |
 | Cloud Scheduler, Secret Manager, Cloud Storage | Jobs, secrets, settings files | Very small |
-| Vertex AI Gemini | AI Analyst questions, spike cause analysis | No cost when not used; the module can be turned off |
+| Gemini on Agent Platform | AI Analyst questions, spike cause analysis | No cost when not used; the module can be turned off |
 
 Example of limiting the retention period of audit log tables (120 days):
 

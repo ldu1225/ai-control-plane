@@ -66,22 +66,22 @@ ENTRIES = {
     # -- AI and agents ---------------------------------------------------------------------------
     "aiplatform_googleapis_com_reasoning_engine_stdout": _entry(
         "Agent Engine output logs",
-        "Standard output of agents deployed to Vertex AI Agent Engine: what each agent printed while it handled "
+        "Standard output of agents deployed to Agent Engine (Agent Platform): what each agent printed while it handled "
         "requests.",
         AI, operation=("resource.labels.reasoning_engine_id", "Agent Engine"), status=None, names="reasoning_engine"),
     "aiplatform_googleapis_com_reasoning_engine_stderr": _entry(
         "Agent Engine error and startup logs",
-        "Standard error of agents deployed to Vertex AI Agent Engine, including startup messages and exceptions. "
+        "Standard error of agents deployed to Agent Engine (Agent Platform), including startup messages and exceptions. "
         "A sudden rise usually means an agent is failing.",
         AI, operation=("resource.labels.reasoning_engine_id", "Agent Engine"), status=None, names="reasoning_engine"),
     "aiplatform_googleapis_com_online_evaluator": _entry(
         "Agent quality evaluation runs",
-        "Runs of Vertex AI online evaluators, which score agent traces against quality metrics. Shows which agents "
+        "Runs of Agent Platform online evaluators, which score agent traces against quality metrics. Shows which agents "
         "were evaluated and how each run went.",
         AI, operation=("labels.agent_resource", "Agent"), names="reasoning_engine"),
     "aiplatform_googleapis_com_prediction_container": _entry(
-        "Vertex AI endpoint container logs",
-        "Logs written by the containers that serve models on Vertex AI endpoints.",
+        "Agent Platform endpoint container logs",
+        "Logs written by the containers that serve models on Agent Platform endpoints.",
         AI, operation=("resource.labels.endpoint_id", "Endpoint")),
     "gen_ai_user_message": _entry(
         "Agent prompts (OpenTelemetry)",
@@ -154,7 +154,7 @@ ENTRIES = {
         user="protoPayload.authenticationInfo.principalEmail"),
     "cloudaudit_googleapis_com_data_access": _entry(
         "Data Access audit logs",
-        "API calls that read data or use AI services, such as Vertex AI model calls and Gemini Enterprise or "
+        "API calls that read data or use AI services, such as Agent Platform model calls and Gemini Enterprise or "
         "NotebookLM requests, with the caller identity.",
         SECURITY, operation=("protoPayload.methodName", "API method"),
         user="protoPayload.authenticationInfo.principalEmail"),
@@ -263,7 +263,7 @@ BUILT_IN = {
 
 # Product names for sources without an entry: (log id prefix, product, category).
 PRODUCTS = (
-    ("aiplatform.googleapis.com", "Vertex AI", AI),
+    ("aiplatform.googleapis.com", "Agent Platform", AI),
     ("discoveryengine.googleapis.com", "Gemini Enterprise", AI),
     ("modelarmor.googleapis.com", "Model Armor", AI),
     ("generativelanguage.googleapis.com", "Gemini API", AI),
