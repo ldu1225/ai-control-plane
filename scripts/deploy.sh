@@ -387,9 +387,30 @@ case "$ACCESS_MODE" in
     for member in "${members[@]}"; do
       member="${member// /}"
       [[ -n "$member" ]] || continue
-      run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
-        --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null \
-        || warn "IAP access for ${member} was refused (an organization policy may restrict it); set BRIDGE_MEMBERS, for example domain:example.com"
+      if ! run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
+          --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1; then
+        warn "IAP access for ${member} was refused by an organization policy; granting domain/user bindings from ADMIN_EMAILS and ALLOWED_USERS instead"
+        while IFS= read -r fallback_member; do
+          [[ -n "$fallback_member" ]] || continue
+          run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
+            --project="$PROJECT_ID" --member="$fallback_member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 \
+            && info "sign-in bridge IAP access: ${fallback_member}" || true
+        done < <(python3 - "$ADMIN_EMAILS" "$ALLOWED_USERS" <<'PY'
+import sys
+seen = set()
+for raw in sys.argv[1:]:
+    for token in raw.split(","):
+        token = token.strip().lower()
+        if "@" not in token:
+            continue
+        domain = token.rpartition("@")[2]
+        for cand in (f"domain:{domain}", None if token.startswith("*@") else f"user:{token}"):
+            if cand and cand not in seen:
+                seen.add(cand)
+                print(cand)
+PY
+        )
+      fi
     done
     ENV_VARS+="##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
     run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --no-iap --no-invoker-iam-check \

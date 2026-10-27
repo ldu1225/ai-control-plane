@@ -10,18 +10,18 @@ import { api, isAbort } from '../core/api.js';
 import { store, isAdmin, session } from '../core/state.js';
 import {
   pageHeader, card, button, banner, badge, statusBadge, switchInput, selectInput, field, textInput, toast, setBusy, kv, chip,
-  errorState, skeleton, confirmDialog, emptyState, dataTable,
+  errorState, skeleton, confirmDialog, emptyState, dataTable, openDrawer,
 } from '../core/components.js';
 import { errorText, serverText } from '../core/messages.js';
 
 const TABS = [
   ['general', 'General', 'grid'],
+  ['access', 'Access control', 'lock'],
   ['workspace', 'Workspace and data sources', 'database'],
   ['modules', 'Modules', 'power'],
   ['models', 'Model catalog', 'layers'],
   ['ai', 'AI engine', 'spark'],
   ['governance', 'Governance policy', 'sliders'],
-  ['access', 'Access control', 'lock'],
   ['about', 'About', 'info'],
 ];
 
@@ -403,7 +403,7 @@ function access(ctx, panel, data, editable) {
       google ? [t('Session length'), t('{n} hours', { n: sec.session_hours || 12 })] : [t('IAP audience'), sec.iap_audience ? h('span', { class: 'mono' }, sec.iap_audience) : t('Not configured')],
     ]),
   }));
-  if (google && isAdmin()) {
+  if (isAdmin()) {
     panel.append(accessMembers(ctx, editable));
     panel.append(sectionForm(ctx, {
       title: t('Privacy'), subtitle: t('Applies to every viewer account.'), section: 'security', data, editable,
@@ -422,12 +422,18 @@ function access(ctx, panel, data, editable) {
 
 const MEMBER_RE = /^(?:[A-Za-z0-9._%+\-']+|\*)@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
 
+export function parseMemberTokens(raw) {
+  return [...new Set(String(raw || '').split(/[,;\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean))];
+}
+
 /** Approved Google accounts, roles and pending access requests (administrators only). */
-function accessMembers(ctx, editable) {
+export function accessMembers(ctx = {}, editable = true) {
+  const signal = ctx && ctx.signal;
+  const rerender = (ctx && ctx.rerender) || (() => {});
   const requestsSlot = h('div', { class: 'access-requests' });
   const tableSlot = h('div', null, skeleton('table'));
   const formError = h('div', { class: 'field-error', role: 'alert' });
-  const emailInput = textInput({ value: '', placeholder: 'name@example.com  /  *@example.com', mono: true, attrs: { 'aria-label': t('Email or domain'), autocomplete: 'off', spellcheck: 'false', inputmode: 'email', maxlength: 254, disabled: !editable || null } });
+  const emailInput = textInput({ value: '', placeholder: 'user1@example.com, user2@example.com  /  *@example.com', mono: true, attrs: { 'aria-label': t('Email or domain'), autocomplete: 'off', spellcheck: 'false', inputmode: 'email', maxlength: 2000, disabled: !editable || null } });
   let newRole = 'viewer';
   const roleSelect = selectInput([{ value: 'viewer', label: t('Viewer') }, { value: 'admin', label: t('Administrator') }], 'viewer', (v) => { newRole = v; }, { 'aria-label': t('Role'), disabled: !editable || null });
   const addBtn = button({ label: t('Add account'), icon: 'plus', variant: 'primary', disabled: !editable });
@@ -441,6 +447,7 @@ function accessMembers(ctx, editable) {
     bordered: true,
     body: h('div', { class: 'access-body' }, requestsSlot, editable ? addForm : null, tableSlot),
   });
+  c.emailInput = emailInput;
 
   const apply = (data) => {
     renderRequests(data);
@@ -463,17 +470,19 @@ function accessMembers(ctx, editable) {
 
   addBtn.addEventListener('click', async () => {
     formError.textContent = '';
-    const member = emailInput.value.trim().toLowerCase();
-    if (!MEMBER_RE.test(member)) {
+    const members = parseMemberTokens(emailInput.value);
+    if (!members.length || members.some((m) => !MEMBER_RE.test(m))) {
       formError.textContent = t('Enter a valid email address or a *@domain pattern.');
       emailInput.focus();
       return;
     }
-    if (member.startsWith('*@')) {
-      const ok = await confirmDialog({ title: t('Approve an entire domain'), message: t('Every Google account in {domain} will be able to sign in as {role}. Continue?', { domain: member.slice(2), role: newRole === 'admin' ? t('Administrator') : t('Viewer') }), confirmLabel: t('Approve domain') });
+    const domainEntry = members.find((m) => m.startsWith('*@'));
+    if (domainEntry) {
+      const ok = await confirmDialog({ title: t('Approve an entire domain'), message: t('Every Google account in {domain} will be able to sign in as {role}. Continue?', { domain: domainEntry.slice(2), role: newRole === 'admin' ? t('Administrator') : t('Viewer') }), confirmLabel: t('Approve domain') });
       if (!ok) return;
     }
-    const done = await post('/api/v1/access/users', { email: member, role: newRole }, t('Account approved'), addBtn);
+    const payload = members.length === 1 ? { email: members[0], role: newRole } : { emails: members, role: newRole };
+    const done = await post('/api/v1/access/users', payload, t('Account approved'), addBtn);
     if (done) { setBusy(addBtn, false); emailInput.value = ''; }
   });
   emailInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') addBtn.click(); });
@@ -558,16 +567,33 @@ function accessMembers(ctx, editable) {
     }));
   }
 
-  (async () => {
+  const load = async () => {
     try {
-      const res = await api.get('/api/v1/access', null, { signal: ctx.signal });
-      if (!ctx.signal.aborted) apply(res.data);
+      const res = await api.get('/api/v1/access', null, signal ? { signal } : undefined);
+      if (!signal || !signal.aborted) apply(res.data);
     } catch (err) {
-      if (isAbort(err) || ctx.signal.aborted) return;
-      mount(tableSlot, errorState(err, { onRetry: () => ctx.rerender(), compact: true }));
+      if (isAbort(err) || (signal && signal.aborted)) return;
+      mount(tableSlot, errorState(err, { onRetry: () => { mount(tableSlot, skeleton('table')); load(); rerender(); }, compact: true }));
     }
-  })();
+  };
+  load();
   return c;
+}
+
+export function openAccessDrawer({ onChanged } = {}) {
+  const controller = new AbortController();
+  const block = accessMembers({ signal: controller.signal, rerender: () => { if (onChanged) onChanged(); } }, isAdmin());
+  openDrawer({
+    title: t('Approved accounts'),
+    subtitle: t('Pre-register Google account emails or *@domain rules so users can immediately sign in with Google OAuth.'),
+    body: block,
+    wide: true,
+    onClose: () => {
+      controller.abort();
+      if (onChanged) onChanged();
+    },
+  });
+  setTimeout(() => { if (block.emailInput) block.emailInput.focus(); }, 60);
 }
 
 function about(ctx, panel, data) {

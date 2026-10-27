@@ -10,6 +10,7 @@ its existing sessions.
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 from .. import config
@@ -28,6 +29,29 @@ def _norm_member(value):
     if not (config.EMAIL_RE.match(member) or config.ADMIN_PATTERN_RE.match(member)):
         raise ApiError("bad_request", "Field 'email' must be an email address or a *@domain pattern.")
     return member
+
+
+def _norm_members(body):
+    """Accepts either a single email/pattern, a comma/newline/whitespace-separated string in 'email',
+    or a list in 'emails'. Returns a deduplicated list of validated members."""
+    raw_list = body.get("emails")
+    if isinstance(raw_list, list):
+        tokens = [str(x).strip() for x in raw_list if str(x).strip()]
+    else:
+        raw = body.get("email")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ApiError("bad_request", "Field 'email' must be an email address or a *@domain pattern.")
+        tokens = [t.strip() for t in re.split(r"[,;\s]+", raw) if t.strip()]
+    if not tokens or len(tokens) > 200:
+        raise ApiError("bad_request", "Provide between 1 and 200 email addresses or *@domain patterns.")
+    out = []
+    seen = set()
+    for token in tokens:
+        member = _norm_member(token)
+        if member not in seen:
+            seen.add(member)
+            out.append(member)
+    return out
 
 
 def _ui_lists(mgr):
@@ -79,35 +103,52 @@ def _save_lists(ctx, admins, allowed):
     ctx.app.on_settings_changed()
 
 
-def _drop_request(ctx, member):
+def _drop_requests(ctx, members):
+    exact = {m for m in members if not m.startswith("*@")}
+    domains = {m[2:] for m in members if m.startswith("*@")}
+    if not exact and not domains:
+        return
+
     def apply(auth):
-        auth["requests"] = [r for r in auth["requests"] if r.get("email") != member]
+        kept = []
+        for r in auth["requests"]:
+            em = (r.get("email") or "").strip().lower()
+            dom = em.rpartition("@")[2] if "@" in em else ""
+            if em in exact or (dom and dom in domains):
+                continue
+            kept.append(r)
+        auth["requests"] = kept
     ctx.app.settings.mutate_auth(apply, ctx.identity.email)
 
 
 def save_user(ctx):
-    """POST /api/v1/access/users {email, role}: approve an account or change its role."""
-    member = _norm_member(ctx.body.get("email"))
+    """POST /api/v1/access/users {email|emails, role}: approve one or more accounts or change their role."""
+    members = _norm_members(ctx.body)
     role = ctx.body.get("role")
     if role not in ROLES:
         raise ApiError("bad_request", "Field 'role' must be 'admin' or 'viewer'.")
     base = ctx.app.settings.base["security"]
-    if member == ctx.identity.email and role != "admin":
-        raise ApiError("conflict", "You cannot remove your own administrator role.")
-    if role == "viewer" and member in (base.get("admins") or []):
-        raise ApiError("conflict", "This administrator is defined in the deployment configuration and cannot be "
-                                   "changed here.")
+    base_admins = list(base.get("admins") or [])
+    base_allowed = list(base.get("allowed_users") or [])
+    for member in members:
+        if member == ctx.identity.email and role != "admin":
+            raise ApiError("conflict", "You cannot remove your own administrator role.")
+        if role == "viewer" and member in base_admins:
+            raise ApiError("conflict", "This administrator is defined in the deployment configuration and cannot be "
+                                       "changed here.")
     admins, allowed = _ui_lists(ctx.app.settings)
-    admins = [m for m in admins if m != member]
-    allowed = [m for m in allowed if m != member]
-    if role == "admin" and member not in (base.get("admins") or []):
-        admins.append(member)
-    if role == "viewer" and member not in (base.get("allowed_users") or []):
-        allowed.append(member)
+    member_set = set(members)
+    admins = [m for m in admins if m not in member_set]
+    allowed = [m for m in allowed if m not in member_set]
+    for member in members:
+        if role == "admin" and member not in base_admins:
+            admins.append(member)
+        elif role == "viewer" and member not in base_allowed:
+            allowed.append(member)
     _save_lists(ctx, admins, allowed)
-    if not member.startswith("*@"):
-        _drop_request(ctx, member)
-    LOG.info("access granted member=%s role=%s", uid_for(member), role)
+    _drop_requests(ctx, members)
+    for member in members:
+        LOG.info("access granted member=%s role=%s", uid_for(member), role)
     return summary(ctx)
 
 
@@ -137,5 +178,5 @@ def delete_user(ctx):
 def dismiss_request(ctx):
     """POST /api/v1/access/requests/dismiss {email}."""
     member = _norm_member(ctx.body.get("email"))
-    _drop_request(ctx, member)
+    _drop_requests(ctx, [member])
     return summary(ctx)

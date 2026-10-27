@@ -4,11 +4,13 @@
 import { h, mount } from '../core/dom.js';
 import { t } from '../core/i18n.js';
 import { fmt, isNum, DASH } from '../core/format.js';
-import { pageHeader, kpi, card, dataTable, chip, banner, userCell, selectInput, progress, emptyState } from '../core/components.js';
+import { isAdmin } from '../core/state.js';
+import { pageHeader, kpi, card, dataTable, chip, banner, button, userCell, selectInput, progress, emptyState } from '../core/components.js';
 import { proportionBar } from '../core/charts.js';
 import {
   pageFlow, fetchRange, rangeText, surfaceMatrix, surfaceLegend, iamBadge, openUserDrawer, IAM_STATE_COLORS, IAM_STATE_LABELS,
 } from './_shared.js';
+import { accessMembers, openAccessDrawer } from './settings.js';
 
 const SURFACES = [
   ['all', 'All surfaces'], ['gemini_enterprise', 'Gemini Enterprise'], ['notebooklm', 'NotebookLM'], ['antigravity', 'Antigravity'], ['agent_platform', 'Agent Platform'],
@@ -18,6 +20,14 @@ export default async function render(ctx) {
   const header = pageHeader({
     title: t('Users & Access'),
     desc: t('One view of every person using Gemini Enterprise, NotebookLM, Antigravity and Agent Platform, with their access enforcement state.'),
+    actions: isAdmin() ? [
+      button({
+        label: t('Add account'),
+        icon: 'plus',
+        variant: 'primary',
+        onClick: () => openAccessDrawer({ onChanged: () => ctx.rerender() }),
+      }),
+    ] : null,
   });
   return pageFlow(ctx, {
     header,
@@ -37,6 +47,10 @@ function renderPage(ctx, body, d) {
     kpi({ label: t('Over cap'), value: fmt.int(k.overCap), meta: h('span', null, t('Against the active Antigravity cap policy')), onClick: () => ctx.navigate('#/antigravity') }),
     kpi({ label: t('Manual action required'), value: fmt.int(k.manualActionRequired), meta: h('span', null, t('Access cannot be enforced per user')), onClick: () => ctx.navigate('#/antigravity') }),
     kpi({ label: t('Enforceable coverage'), value: fmt.pct(k.enforceableCoverage), meta: isNum(k.enforceableCoverage) ? progress(k.enforceableCoverage, k.enforceableCoverage >= 0.8 ? 'success' : 'warning') : null, tip: t('Share of users whose access can be safely controlled through individual project bindings.') })));
+
+  if (isAdmin()) {
+    body.append(accessMembers(ctx, true));
+  }
 
   if (d.iamAvailable === false) {
     body.append(banner({ tone: 'warning', title: t('IAM state unavailable'), text: t('The project IAM policy could not be read, so enforcement states are shown as Unknown. Grant the control plane identity resourcemanager.projects.getIamPolicy.') }));

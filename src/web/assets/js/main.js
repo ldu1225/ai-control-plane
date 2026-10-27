@@ -15,6 +15,7 @@ import {
 import { errorText, serverText } from './core/messages.js';
 import { applyAccent, brandMark as brandMarkFor, accountAvatar } from './core/brand.js';
 import { widgetBoard } from './core/widgets.js';
+import { openAccessDrawer } from './pages/settings.js';
 
 export const ROUTES = [
   { path: 'overview', label: 'Overview', icon: 'grid', module: 'overview', group: null, range: true, load: () => import('./pages/overview.js') },
@@ -166,6 +167,13 @@ function buildShell() {
       shell.updated,
       iconButton('refresh', { title: t('Refresh data'), onClick: () => renderPage(true) }),
       h('span', { class: ['topbar-divider', 'hide-mobile'] }),
+      isAdmin() ? button({
+        label: t('Add account'),
+        icon: 'plus',
+        size: 'sm',
+        cls: 'hide-mobile',
+        onClick: () => openAccessDrawer({ onChanged: () => { if (current.route && (current.route.path === 'users' || current.route.path === 'settings')) renderPage(); } }),
+      }) : null,
       shell.healthBtn,
       iconButton('search', { title: `${t('Search and commands')} (Ctrl K)`, onClick: openPalette }),
       h('button', { type: 'button', class: 'avatar-btn', onclick: (e) => openUserMenu(e.currentTarget), 'aria-label': t('Account menu') },
@@ -400,6 +408,8 @@ function openUserMenu(anchor) {
     menuItem({ label: 'English', iconName: 'globe', checked: getLocale() === 'en', onClick: () => { close(); switchLocale('en'); } }),
     menuItem({ label: '\ud55c\uad6d\uc5b4', iconName: 'globe', checked: getLocale() === 'ko', onClick: () => { close(); switchLocale('ko'); } }),
     h('div', { class: 'menu-sep' }),
+    isAdmin() ? menuItem({ label: t('Add account'), iconName: 'plus', onClick: () => { close(); openAccessDrawer({ onChanged: () => { if (current.route && (current.route.path === 'users' || current.route.path === 'settings')) renderPage(); } }); } }) : null,
+    isAdmin() ? menuItem({ label: t('Access control'), iconName: 'lock', onClick: () => { close(); window.location.hash = '#/settings/access'; } }) : null,
     menuItem({ label: t('Settings'), iconName: 'settings', onClick: () => { close(); window.location.hash = '#/settings'; } }),
     guest
       ? menuItem({ label: t('Sign in'), iconName: 'arrow-right', onClick: () => { close(); goToSignIn(null); } })
@@ -448,8 +458,11 @@ function switchLocale(locale) {
 
 function paletteItems() {
   const items = visibleRoutes().map((r) => ({ label: t(r.label), group: r.group ? t(r.group) : t('Navigation'), iconName: r.icon, run: () => { window.location.hash = `#/${r.path}`; } }));
-  const settingsTabs = [['general', 'General'], ['workspace', 'Workspace and data sources'], ['modules', 'Modules'], ['models', 'Model catalog'], ['ai', 'AI engine'], ['governance', 'Governance policy'], ['access', 'Access control'], ['about', 'About']];
+  const settingsTabs = [['general', 'General'], ['access', 'Access control'], ['workspace', 'Workspace and data sources'], ['modules', 'Modules'], ['models', 'Model catalog'], ['ai', 'AI engine'], ['governance', 'Governance policy'], ['about', 'About']];
   settingsTabs.forEach(([id, label]) => items.push({ label: `${t('Settings')}: ${t(label)}`, group: t('Settings'), iconName: 'settings', run: () => { window.location.hash = `#/settings/${id}`; } }));
+  if (isAdmin()) {
+    items.push({ label: `${t('Add account')} (${t('Approved accounts')})`, group: t('Actions'), iconName: 'plus', run: () => openAccessDrawer() });
+  }
   items.push({ label: t('Refresh data'), group: t('Actions'), iconName: 'refresh', run: () => renderPage(true) });
   items.push({ label: t('Use light theme'), group: t('Actions'), iconName: 'sun', run: () => applyTheme('light') });
   items.push({ label: t('Use dark theme'), group: t('Actions'), iconName: 'moon', run: () => applyTheme('dark') });

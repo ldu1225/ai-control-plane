@@ -300,6 +300,42 @@ class GoogleSignInFlowTest(unittest.TestCase):
         self.assertEqual(self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": stranger}).status, 401)
         self.assertEqual(self.request("GET", "/", cookies={"cp_session": stranger}).status, 302)
 
+    def test_bulk_pre_add_users_and_oauth_sign_in(self):
+        admin = self.session_cookie("admin@example.com")
+        # 1. Pre-add multiple viewer accounts via comma/newline-separated email string
+        res = self.post("/api/v1/access/users", admin, {
+            "email": "pre1@example.com, pre2@example.com;\npre3@example.com",
+            "role": "viewer",
+        })
+        self.assertEqual(res.status, 200)
+        users_map = {u["email"]: u["role"] for u in res.json()["data"]["users"]}
+        for email in ("pre1@example.com", "pre2@example.com", "pre3@example.com"):
+            self.assertEqual(users_map.get(email), "viewer")
+            sess = self.session_cookie(email)
+            boot = self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": sess})
+            self.assertEqual(boot.status, 200)
+            self.assertEqual(boot.json()["data"]["session"]["role"], "viewer")
+            self.assertEqual(boot.json()["data"]["session"]["email"], email)
+
+        # 2. Pre-add multiple admin accounts and a domain pattern via emails array
+        res2 = self.post("/api/v1/access/users", admin, {
+            "emails": ["lead1@example.com", "*@partner.example.org"],
+            "role": "admin",
+        })
+        self.assertEqual(res2.status, 200)
+        for email in ("lead1@example.com", "member99@partner.example.org"):
+            sess = self.session_cookie(email)
+            boot = self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": sess})
+            self.assertEqual(boot.status, 200)
+            self.assertEqual(boot.json()["data"]["session"]["role"], "admin")
+
+        # 3. Unregistered user is still blocked when guest_access is false
+        self.assertEqual(self.sign_in("unlisted@example.net").header("Location"), "/login?error=not_approved")
+
+        # 4. Cleanup added entries
+        for entry in ("pre1@example.com", "pre2@example.com", "pre3@example.com", "lead1@example.com", "*@partner.example.org"):
+            self.post("/api/v1/access/users/delete", admin, {"email": entry})
+
     def test_sign_out_revokes_every_session(self):
         first = self.session_cookie("admin@example.com")
         time.sleep(0.01)
