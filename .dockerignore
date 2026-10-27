@@ -1,9 +1,10 @@
-.git
-.github
-node_modules
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.ds_store
-*.log
+# Docker build context: only what the image needs (config.yaml, requirements.txt and src/).
+# Everything else (local configuration, documents, tests, evaluation files, Terraform) is excluded.
+*
+!Dockerfile
+!requirements.txt
+!config.yaml
+!src/
+**/__pycache__
+**/*.py[cod]
+**/.DS_Store

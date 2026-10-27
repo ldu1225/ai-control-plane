@@ -1,0 +1,27 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Unit tests
+        run: python -m unittest discover -s tests/unit -v
+      - name: Shell scripts parse
+        run: for f in scripts/deploy.sh scripts/prepare.sh scripts/teardown.sh scripts/lib/common.sh; do bash -n "$f"; done
+      - name: Prepublish scan (secrets, e-mail addresses, Cloud Run URLs, local paths)
+        run: python scripts/prepublish_scan.py
+      - name: AI Analyst golden dataset (offline validation, no network)
+        run: python eval/analyst/run_eval.py validate

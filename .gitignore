@@ -16,6 +16,16 @@ ENV/
 .env.test.local
 .env.production.local
 
+# Local configuration and runtime data (customer identifiers, persisted UI settings)
+/config.local.yaml
+/data/
+# Deployment values for scripts/deploy.sh and downloaded OAuth client files (secrets)
+/deploy.env
+/*.env
+!/deploy.env.example
+client_secret*.json
+*oauth-client*.json
+
 # Node / JS
 node_modules/
 npm-debug.log*
@@ -24,13 +34,35 @@ yarn-error.log*
 dist/
 build/
 
-# Temporary & Data files
-*.csv
-check_*.py
-inspect_*.py
-merge_*.py
-scan_*.py
-test_*.py
+# Terraform local state and plugin cache (the dependency lock file is committed)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# Ad-hoc scripts and data files at the repository root only
+# (anchored so that tests/unit/test_*.py remain tracked)
+/*.csv
+/*.pdf
+/check_*.py
+/inspect_*.py
+/merge_*.py
+/scan_*.py
+/test_*.py
+
+# Engagement documents (customer-specific: discovery, solution design, evaluation reports) stay local
+/Discovery Document*.md
+/Solution Design Document*.md
+/* Evaluation Report*.md
+/Architecture Drift Report*.md
+/engagement/
+# Terms that scripts/prepublish_scan.py must never find in published files (personal identifiers)
+/.prepublish-terms
+# Local agent rules (naming conventions for the coding agent)
+/_agents/
+# AI Analyst evaluation outputs (real answers and rows from your workspace)
+/eval/analyst/out/
 
 # OS / IDE
 .DS_Store

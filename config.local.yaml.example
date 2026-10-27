@@ -1,0 +1,22 @@
+# Local values for development (python3 src/backend_server.py).
+# Copy to config.local.yaml (ignored by git) and replace the placeholders. Only keys that differ from
+# config.yaml are needed; environment variables and settings saved in the UI still take precedence.
+
+branding:
+  organization_name: "Your Organization"
+  default_locale: "ko"
+
+workspace:
+  project_id: "your-project-id"
+  timezone: "Asia/Seoul"
+  audit_dataset: "ge_analytics"
+  discovery_engine_locations: ["global"]
+  agent_engine_regions: ["us-central1"]
+  billing:
+    project_id: ""                  # empty = workspace project
+    dataset: "billing_detailed_usage"
+    table: "gcp_billing_export_resource_v1_XXXXXX_XXXXXX_XXXXXX"
+    account_id: ""                  # XXXXXX-XXXXXX-XXXXXX
+
+security:
+  admins: ["admin@example.com"]

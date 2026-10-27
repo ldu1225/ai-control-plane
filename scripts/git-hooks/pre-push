@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+# Opt-in release gate: blocks a push when scripts/prepublish_scan.py finds secrets or deployment identifiers.
+# Enable it once per clone:   git config core.hooksPath scripts/git-hooks
+# Bypass for one push only when you are sure:   git push --no-verify
+exec python3 "$(git rev-parse --show-toplevel)/scripts/prepublish_scan.py"
