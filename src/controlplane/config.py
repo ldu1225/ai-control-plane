@@ -70,7 +70,7 @@ DEFAULTS = {
         "session_hours": 12,
         "sign_in_bridge_url": "",
         "bridge_return_url": "",
-        "mask_pii_for_viewers": True,
+        "mask_pii_for_viewers": False,
         "guest_access": False,
         "guest_redact_terms": [],
     },
@@ -395,6 +395,12 @@ def _admin_entry(value):
     raise Invalid("must be an email address or a *@domain pattern")
 
 
+def _allowed_user_entry(value):
+    if isinstance(value, str) and value.strip() in ("*", "*@*"):
+        return "*"
+    return _admin_entry(value)
+
+
 def _dataset_ref(value):
     if not isinstance(value, str) or parse_dataset_ref(value, "placeholder-project") is None:
         raise Invalid("must be 'dataset', 'project.dataset' or 'project:dataset'")
@@ -467,7 +473,7 @@ VALIDATORS = {
     "security.auth_mode": _enum("auto", "iap", "google", "local"),
     "security.iap_audience": _text(300),
     "security.admins": _list(_admin_entry, 200),
-    "security.allowed_users": _list(_admin_entry, 1000),
+    "security.allowed_users": _list(_allowed_user_entry, 1000),
     "security.google_client_id": _regex(GOOGLE_CLIENT_ID_RE, "OAuth client id (*.apps.googleusercontent.com)"),
     "security.public_base_url": _pred(lambda v: valid_base_url(v), "https base URL (or http://localhost)"),
     "security.session_hours": _int(1, 168),

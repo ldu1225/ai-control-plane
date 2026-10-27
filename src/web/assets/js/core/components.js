@@ -6,6 +6,7 @@ import { icon } from './icons.js';
 import { t } from './i18n.js';
 import { fmt, isNum, initials, DASH } from './format.js';
 import { isAbort } from './api.js';
+import { session, isAdmin } from './state.js';
 import { sparkline } from './charts.js';
 import { noticeText, serverText } from './messages.js';
 
@@ -619,6 +620,49 @@ export function confirmDialog({ title, message, details, confirmLabel, tone = 'p
     cancelBtn.addEventListener('click', () => { finish(false); m.close(); });
     confirmBtn.addEventListener('click', () => { finish(true); m.close(); });
   });
+}
+
+/**
+ * Modal alert displayed when a Read-Only Viewer attempts to change settings or run a control action.
+ */
+export function alertPermissionRequired({ action, iamPermission, reason } = {}) {
+  if (document.querySelector('dialog.perm-alert-modal')) return null;
+  const s = session();
+  const email = s.email || t('Viewer');
+  const m = openModal({
+    title: t('Permission required'),
+    subtitle: t('Read-only account (Viewer)'),
+    body: (el, dialog) => {
+      dialog.classList.add('perm-alert-modal');
+      append(el, [
+        banner({
+          tone: 'warning',
+          iconName: 'lock',
+          title: t('Administrator permissions required'),
+          text: t('Your Google account has Read-Only (Viewer) access. You can view all dashboards and analytics without masking, but modifying settings or running controls requires Administrator permissions.'),
+        }),
+        kv([
+          action ? [t('Requested action'), action] : null,
+          [t('Current account'), h('span', { class: 'mono' }, email)],
+          [t('Current role'), badge(t('Viewer (Read-only)'), 'neutral', { size: 'sm' })],
+          [t('Required role'), badge(t('Administrator'), 'accent', { size: 'sm' })],
+          iamPermission ? [t('Required Google Cloud IAM'), h('code', { class: 'cell-mono' }, iamPermission)] : null,
+          reason ? [t('Details'), serverText(reason)] : null,
+        ]),
+        h('p', { class: 'muted' }, t('To control or change this setting, ask a workspace administrator to grant Administrator permissions to your account in Settings > Access control (or grant the required Google Cloud IAM permissions).')),
+      ]);
+    },
+    footer: (el, dialog) => append(el, [
+      button({ label: t('OK'), variant: 'primary', onClick: () => dialog.close() }),
+    ]),
+  });
+  return m;
+}
+
+export function requireAdmin(action, iamPermission) {
+  if (isAdmin()) return true;
+  alertPermissionRequired({ action, iamPermission });
+  return false;
 }
 
 let activePopover = null;

@@ -13,7 +13,7 @@ import { api, isAbort } from '../core/api.js';
 import { store, isAdmin, isModuleEnabled, rangeParams } from '../core/state.js';
 import {
   pageHeader, kpi, card, dataTable, badge, button, banner, switchInput, openModal, openDrawer, toast, setBusy, field, textInput,
-  selectInput, errorState, warningsNotice, confirmDialog, codeBlock, chip, userCell, searchBox, skeleton,
+  selectInput, errorState, warningsNotice, confirmDialog, codeBlock, chip, userCell, searchBox, skeleton, requireAdmin,
 } from '../core/components.js';
 import { errorText } from '../core/messages.js';
 import { barChart, hbarList, mapList, sparkline, fromTimeline, TONES, colorAt } from '../core/charts.js';
@@ -290,17 +290,19 @@ function volumeNote(s, env) {
   if (s.kind !== 'logging' || !isNum(s.entries7d) || (s.entries7d / env.days) * rangeDays() <= MAX_LOG_READ) return null;
   return h('div', { class: 'src-note' }, icon('info', { size: 13 }),
     h('span', null, t('High volume: its dashboard counts only the latest {n} entries of a period. Export it to BigQuery for complete counts.', { n: fmt.int(MAX_LOG_READ) })),
-    env.admin && s.logName ? button({ label: t('Export to BigQuery'), size: 'xs', variant: 'ghost', icon: 'code', onClick: () => openSinkGenerator([s.logName], env.logs) }) : null);
+    s.logName ? button({ label: t('Export to BigQuery'), size: 'xs', variant: 'ghost', icon: 'code', onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator([s.logName], env.logs); } }) : null);
 }
 
-function sourceAction(ctx, s, admin) {
+function sourceAction(ctx, s) {
   if (s.connectorId) {
     return button({ label: t('Open dashboard'), icon: 'arrow-right', size: 'sm', onClick: () => ctx.navigate(`#/extensions/${encodeURIComponent(s.connectorId)}`) });
   }
-  if (!admin) return h('span', { class: 'src-hint' }, t('An administrator can add this.'));
   if (!s.quick) return h('span', { class: 'src-hint' }, t('This source cannot be added automatically. Use Custom setup below.'));
   const btn = button({ label: t('Add to dashboard'), icon: 'plus', variant: 'primary', size: 'sm' });
-  btn.addEventListener('click', () => quickAdd(ctx, s, btn));
+  btn.addEventListener('click', () => {
+    if (!requireAdmin(t('Add to dashboard'))) return;
+    quickAdd(ctx, s, btn);
+  });
   return btn;
 }
 
@@ -379,9 +381,9 @@ function notListedCard(ctx, env) {
       h('p', { class: 'src-what' }, t('New logs appear here automatically within about 10 minutes after a product starts writing to Cloud Logging.')),
       h('p', { class: 'src-what' }, t('Log dashboards read Cloud Logging directly, so they cover its retention period (30 days by default) and count at most {n} entries per view. To keep longer history or count everything, export the log to BigQuery; the exported table then appears in this list.', { n: fmt.int(MAX_LOG_READ) })),
       h('p', { class: 'src-what' }, t('To chart only part of a log, use Custom setup. To list the tables of another BigQuery dataset, add it under Settings > Workspace and data sources > Additional telemetry datasets.')),
-      env.admin ? h('div', { class: 'row' },
-        button({ label: t('Custom setup'), icon: 'edit', onClick: () => openConnectorForm(ctx, null, null) }),
-        button({ label: t('Export logs to BigQuery'), icon: 'code', onClick: () => openSinkGenerator([], env.logs) })) : null),
+      h('div', { class: 'row' },
+        button({ label: t('Custom setup'), icon: 'edit', onClick: () => { if (requireAdmin(t('Custom setup'))) openConnectorForm(ctx, null, null); } }),
+        button({ label: t('Export logs to BigQuery'), icon: 'code', onClick: () => { if (requireAdmin(t('Export logs to BigQuery'))) openSinkGenerator([], env.logs); } }))),
   });
 }
 
@@ -460,7 +462,6 @@ function breakdownCard(title, list, key, subtitle, labelOf = shortValue) {
 }
 
 async function renderConnector(ctx, id) {
-  const admin = isAdmin();
   const body = h('div', { class: 'stack-lg' });
   const headerSlot = h('div');
   mount(ctx.root, headerSlot, body);
@@ -489,8 +490,9 @@ async function renderConnector(ctx, id) {
   const opLabelOf = (v) => (v && opNames[v] ? `${opNames[v]} \u00b7 ${shortValue(v)}` : shortValue(v));
   const statusOf = (v) => statusText(v, statusKey);
   const toggle = switchInput({
-    checked: c.enabled, disabled: !admin, label: t('Enabled'),
+    checked: c.enabled, label: t('Enabled'),
     onChange: async (v, input) => {
+      if (!requireAdmin(t('Enabled'))) { input.checked = !v; return; }
       try {
         await api.post('/api/v1/telemetry/connectors', { ...c, enabled: v });
         toast({ title: v ? t('Dashboard turned on') : t('Dashboard turned off'), tone: 'success' });
@@ -507,8 +509,8 @@ async function renderConnector(ctx, id) {
       backButton(ctx),
       h('label', { class: 'row' }, h('span', { class: 'muted' }, t('Enabled')), toggle),
       c.id ? pinControl(c) : null,
-      admin ? button({ label: t('Edit'), icon: 'edit', onClick: () => openConnectorForm(ctx, c, null) }) : null,
-      admin ? button({ label: t('Delete'), icon: 'trash', variant: 'danger', onClick: () => deleteConnector(ctx, c) }) : null,
+      button({ label: t('Edit'), icon: 'edit', onClick: () => { if (requireAdmin(t('Edit'))) openConnectorForm(ctx, c, null); } }),
+      button({ label: t('Delete'), icon: 'trash', variant: 'danger', onClick: () => { if (requireAdmin(t('Delete'))) deleteConnector(ctx, c); } }),
     ],
   }));
   mount(body);
@@ -525,7 +527,7 @@ async function renderConnector(ctx, id) {
       tone: 'warning',
       title: t('Only the latest {n} entries of this period were counted', { n: fmt.int(sample.limit) }),
       text: t('This log has more entries in the selected period than a dashboard reads from Cloud Logging. Counts start at {time}; earlier days have no bars. Export the log to BigQuery for complete counts.', { time: fmt.dateTime(sample.since, true) }),
-      actions: admin && logName ? button({ label: t('Export to BigQuery'), icon: 'code', size: 'sm', onClick: () => openSinkGenerator([logName], []) }) : null,
+      actions: logName ? button({ label: t('Export to BigQuery'), icon: 'code', size: 'sm', onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator([logName], []); } }) : null,
     }));
   }
   if (cat && cat.sensitive) {

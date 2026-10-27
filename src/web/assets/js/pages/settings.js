@@ -10,7 +10,7 @@ import { api, isAbort } from '../core/api.js';
 import { store, isAdmin, session } from '../core/state.js';
 import {
   pageHeader, card, button, banner, badge, statusBadge, switchInput, selectInput, field, textInput, toast, setBusy, kv, chip,
-  errorState, skeleton, confirmDialog, emptyState, dataTable, openDrawer,
+  errorState, skeleton, confirmDialog, emptyState, dataTable, openDrawer, alertPermissionRequired, requireAdmin,
 } from '../core/components.js';
 import { errorText, serverText } from '../core/messages.js';
 
@@ -79,7 +79,15 @@ export default async function render(ctx) {
   if (ctx.signal.aborted) return null;
   const editable = Boolean(data.editable) && isAdmin();
   mount(panel);
-  if (!editable) panel.append(banner({ tone: 'neutral', iconName: 'lock', title: t('Read-only'), text: t('Only administrators can change settings. Values are shown for reference.') }));
+  if (!editable) {
+    panel.append(banner({
+      tone: 'neutral',
+      iconName: 'lock',
+      title: t('Read-only'),
+      text: t('Only administrators can change settings. Values are shown for reference.'),
+      actions: button({ label: t('Why is this read-only?'), size: 'sm', onClick: () => alertPermissionRequired({ action: t('Change workspace settings') }) }),
+    }));
+  }
   if (data.persistence && data.persistence.durable === false) {
     panel.append(banner({ tone: 'warning', title: t('Settings are not persisted durably'), text: t('Changes are stored in {backend} and may be lost when the service restarts. Configure a Cloud Storage bucket (storage.gcs_bucket) for durable settings.', { backend: data.persistence.backend }) }));
   }
@@ -138,10 +146,14 @@ function sectionForm(ctx, { title, subtitle, section, data, fields, editable, ex
     const label = h('span', { class: 'row' }, f.label, overridden ? h('span', { class: 'override-tag', title: t('Changed from the deployment default') }, t('Customized')) : null);
     return field({ label, help: f.help, control });
   });
-  const save = button({ label: t('Save changes'), variant: 'primary', disabled: !editable });
+  const save = button({ label: t('Save changes'), variant: 'primary' });
   const hasOverrides = Object.keys(overrides).length > 0;
   const reset = hasOverrides && editable ? button({ label: t('Reset to defaults'), variant: 'ghost', icon: 'refresh' }) : null;
   save.addEventListener('click', async () => {
+    if (!editable) {
+      alertPermissionRequired({ action: `${t('Save changes')}: ${title}` });
+      return;
+    }
     err.textContent = '';
     if (!Object.keys(values).length) { toast({ title: t('No changes to save'), tone: 'info', timeout: 2500 }); return; }
     if (section === 'workspace' || section === 'security') {
@@ -255,8 +267,12 @@ function modules(ctx, panel, data, editable) {
       h('div', { class: 'setting-title' }, t(label), over[id] !== undefined ? h('span', { class: 'override-tag' }, t('Customized')) : null),
       h('div', { class: 'setting-desc' }, t(desc))),
     h('div', { class: 'setting-control' }, switchInput({ checked: eff[id] !== false, disabled: !editable, label: t(label), onChange: (v) => { values[id] = v; } }))));
-  const save = button({ label: t('Save modules'), variant: 'primary', disabled: !editable });
+  const save = button({ label: t('Save modules'), variant: 'primary' });
   save.addEventListener('click', async () => {
+    if (!editable) {
+      alertPermissionRequired({ action: t('Save modules') });
+      return;
+    }
     if (!Object.keys(values).length) { toast({ title: t('No changes to save'), tone: 'info', timeout: 2500 }); return; }
     setBusy(save, true, t('Saving'));
     try {
@@ -305,8 +321,12 @@ async function ai(ctx, panel, data, editable) {
   let pick = eff.default_model || ids[0];
   mount(testModel, selectInput(ids.map((id) => ({ value: id, label: id })), pick, (v) => { pick = v; }, { 'aria-label': t('Model to test') }));
   const result = h('div');
-  const testBtn = button({ label: t('Run test'), icon: 'play', disabled: !editable });
+  const testBtn = button({ label: t('Run test'), icon: 'play' });
   testBtn.addEventListener('click', async () => {
+    if (!editable) {
+      alertPermissionRequired({ action: t('Run test') });
+      return;
+    }
     setBusy(testBtn, true, t('Testing'));
     try {
       const r = (await api.post('/api/v1/ai/test', { model: pick })).data;
@@ -395,6 +415,16 @@ function access(ctx, panel, data, editable) {
   const google = s.authMode === 'google';
   panel.append(card({
     title: t('Current session'),
+    actions: button({
+      label: t('Add account'),
+      icon: 'plus',
+      size: 'sm',
+      variant: 'primary',
+      onClick: () => {
+        if (!requireAdmin(t('Add account / Manage access control'))) return;
+        openAccessDrawer({ onChanged: () => ctx.rerender() });
+      },
+    }),
     body: kv([
       [t('Signed in as'), s.email || DASH],
       [t('Role'), s.role === 'admin' ? badge(t('Administrator'), 'accent', { size: 'sm' }) : badge(t('Viewer'), 'neutral', { size: 'sm' })],
@@ -420,7 +450,7 @@ function access(ctx, panel, data, editable) {
   }));
 }
 
-const MEMBER_RE = /^(?:[A-Za-z0-9._%+\-']+|\*)@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+const MEMBER_RE = /^(?:\*|(?:[A-Za-z0-9._%+\-']+|\*)@[A-Za-z0-9.-]+\.[A-Za-z]{2,})$/;
 
 export function parseMemberTokens(raw) {
   return [...new Set(String(raw || '').split(/[,;\s]+/).map((s) => s.trim().toLowerCase()).filter(Boolean))];
@@ -471,7 +501,7 @@ export function accessMembers(ctx = {}, editable = true) {
   addBtn.addEventListener('click', async () => {
     formError.textContent = '';
     const members = parseMemberTokens(emailInput.value);
-    if (!members.length || members.some((m) => !MEMBER_RE.test(m))) {
+    if (!members.length || members.some((m) => !MEMBER_RE.test(m) || (m === '*' && newRole === 'admin'))) {
       formError.textContent = t('Enter a valid email address or a *@domain pattern.');
       emailInput.focus();
       return;
@@ -524,8 +554,8 @@ export function accessMembers(ctx = {}, editable = true) {
           render: (u) => h('div', { class: 'user-cell' },
             u.pattern ? h('span', { class: 'avatar muted', 'aria-hidden': 'true' }, icon('globe', { size: 14 })) : h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(u.email)),
             h('div', { class: 'cell-stack' },
-              h('span', { class: ['cell-main', 'truncate'], title: u.email }, u.email, u.self ? h('span', { class: 'access-you' }, t('You')) : null),
-              u.pattern ? h('span', { class: 'cell-sub' }, t('Every account in this domain')) : null)),
+              h('span', { class: ['cell-main', 'truncate'], title: u.email }, u.email === '*' ? `* (${t('Every Google account (Signed-in Viewer)')})` : u.email, u.self ? h('span', { class: 'access-you' }, t('You')) : null),
+              u.pattern ? h('span', { class: 'cell-sub' }, u.email === '*' ? t('Every Google account (Signed-in Viewer)') : t('Every account in this domain')) : null)),
         },
         {
           key: 'role', label: t('Role'), width: '170px',
@@ -581,17 +611,18 @@ export function accessMembers(ctx = {}, editable = true) {
 }
 
 export function openAccessDrawer({ onChanged } = {}) {
+  if (!requireAdmin(t('Add account / Manage access control'))) return;
   const controller = new AbortController();
   const block = accessMembers({ signal: controller.signal, rerender: () => { if (onChanged) onChanged(); } }, isAdmin());
-  openDrawer({
+  const d = openDrawer({
     title: t('Approved accounts'),
     subtitle: t('Pre-register Google account emails or *@domain rules so users can immediately sign in with Google OAuth.'),
-    body: block,
-    wide: true,
-    onClose: () => {
-      controller.abort();
-      if (onChanged) onChanged();
-    },
+    content: block,
+    width: 780,
+  });
+  d.dialog.addEventListener('close', () => {
+    controller.abort();
+    if (onChanged) onChanged();
   });
   setTimeout(() => { if (block.emailInput) block.emailInput.focus(); }, 60);
 }

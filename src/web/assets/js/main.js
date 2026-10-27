@@ -5,12 +5,13 @@ import { h, mount, append } from './core/dom.js';
 import { icon } from './core/icons.js';
 import { t, setLocale, getLocale } from './core/i18n.js';
 import { fmt, setTimezone, parseDate } from './core/format.js';
-import { api, setCsrfToken, setUnauthenticatedHandler, isAbort } from './core/api.js';
+import { api, setCsrfToken, setUnauthenticatedHandler, setForbiddenHandler, isAbort } from './core/api.js';
 import {
   store, on, initState, setRange, setGranularity, setModel, isModuleEnabled, session, isAdmin, PRESETS, computeRange, savePrefs,
 } from './core/state.js';
 import {
   button, iconButton, segmented, openPopover, closePopover, menuItem, badge, banner, toast, initTooltips, statusBadge, errorState,
+  alertPermissionRequired, requireAdmin,
 } from './core/components.js';
 import { errorText, serverText } from './core/messages.js';
 import { applyAccent, brandMark as brandMarkFor, accountAvatar } from './core/brand.js';
@@ -103,6 +104,7 @@ function goToSignIn(reason) {
 async function boot() {
   initTooltips();
   setUnauthenticatedHandler(() => goToSignIn('session'));
+  setForbiddenHandler((err) => alertPermissionRequired({ reason: err && err.message }));
   let bootRes;
   try {
     bootRes = await api.get('/api/v1/bootstrap');
@@ -167,13 +169,16 @@ function buildShell() {
       shell.updated,
       iconButton('refresh', { title: t('Refresh data'), onClick: () => renderPage(true) }),
       h('span', { class: ['topbar-divider', 'hide-mobile'] }),
-      isAdmin() ? button({
+      button({
         label: t('Add account'),
         icon: 'plus',
         size: 'sm',
         cls: 'hide-mobile',
-        onClick: () => openAccessDrawer({ onChanged: () => { if (current.route && (current.route.path === 'users' || current.route.path === 'settings')) renderPage(); } }),
-      }) : null,
+        onClick: () => {
+          if (!requireAdmin(t('Add account / Manage access control'))) return;
+          openAccessDrawer({ onChanged: () => { if (current.route && (current.route.path === 'users' || current.route.path === 'settings')) renderPage(); } });
+        },
+      }),
       shell.healthBtn,
       iconButton('search', { title: `${t('Search and commands')} (Ctrl K)`, onClick: openPalette }),
       h('button', { type: 'button', class: 'avatar-btn', onclick: (e) => openUserMenu(e.currentTarget), 'aria-label': t('Account menu') },
@@ -243,7 +248,7 @@ function renderBanners() {
       tone: 'warning',
       title: t('Workspace not configured'),
       text: t('Connect a Google Cloud project, the audit log dataset and the billing export table to start collecting governance data.'),
-      actions: isAdmin() ? button({ label: t('Configure'), size: 'sm', variant: 'primary', onClick: () => { window.location.hash = '#/settings/workspace'; } }) : null,
+      actions: button({ label: t('Configure'), size: 'sm', variant: 'primary', onClick: () => { if (!requireAdmin(t('Configure workspace'))) return; window.location.hash = '#/settings/workspace'; } }),
     }));
   }
   const s = session();
@@ -408,8 +413,8 @@ function openUserMenu(anchor) {
     menuItem({ label: 'English', iconName: 'globe', checked: getLocale() === 'en', onClick: () => { close(); switchLocale('en'); } }),
     menuItem({ label: '\ud55c\uad6d\uc5b4', iconName: 'globe', checked: getLocale() === 'ko', onClick: () => { close(); switchLocale('ko'); } }),
     h('div', { class: 'menu-sep' }),
-    isAdmin() ? menuItem({ label: t('Add account'), iconName: 'plus', onClick: () => { close(); openAccessDrawer({ onChanged: () => { if (current.route && (current.route.path === 'users' || current.route.path === 'settings')) renderPage(); } }); } }) : null,
-    isAdmin() ? menuItem({ label: t('Access control'), iconName: 'lock', onClick: () => { close(); window.location.hash = '#/settings/access'; } }) : null,
+    menuItem({ label: t('Add account'), iconName: 'plus', onClick: () => { close(); if (!requireAdmin(t('Add account / Manage access control'))) return; openAccessDrawer({ onChanged: () => { if (current.route && (current.route.path === 'users' || current.route.path === 'settings')) renderPage(); } }); } }),
+    menuItem({ label: t('Access control'), iconName: 'lock', onClick: () => { close(); window.location.hash = '#/settings/access'; } }),
     menuItem({ label: t('Settings'), iconName: 'settings', onClick: () => { close(); window.location.hash = '#/settings'; } }),
     guest
       ? menuItem({ label: t('Sign in'), iconName: 'arrow-right', onClick: () => { close(); goToSignIn(null); } })

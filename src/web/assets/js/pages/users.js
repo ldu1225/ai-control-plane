@@ -5,7 +5,7 @@ import { h, mount } from '../core/dom.js';
 import { t } from '../core/i18n.js';
 import { fmt, isNum, DASH } from '../core/format.js';
 import { isAdmin } from '../core/state.js';
-import { pageHeader, kpi, card, dataTable, chip, banner, button, userCell, selectInput, progress, emptyState } from '../core/components.js';
+import { pageHeader, kpi, card, dataTable, chip, banner, button, userCell, selectInput, progress, emptyState, requireAdmin } from '../core/components.js';
 import { proportionBar } from '../core/charts.js';
 import {
   pageFlow, fetchRange, rangeText, surfaceMatrix, surfaceLegend, iamBadge, openUserDrawer, IAM_STATE_COLORS, IAM_STATE_LABELS,
@@ -20,14 +20,17 @@ export default async function render(ctx) {
   const header = pageHeader({
     title: t('Users & Access'),
     desc: t('One view of every person using Gemini Enterprise, NotebookLM, Antigravity and Agent Platform, with their access enforcement state.'),
-    actions: isAdmin() ? [
+    actions: [
       button({
         label: t('Add account'),
         icon: 'plus',
         variant: 'primary',
-        onClick: () => openAccessDrawer({ onChanged: () => ctx.rerender() }),
+        onClick: () => {
+          if (!requireAdmin(t('Add account / Manage access control'))) return;
+          openAccessDrawer({ onChanged: () => ctx.rerender() });
+        },
       }),
-    ] : null,
+    ],
   });
   return pageFlow(ctx, {
     header,

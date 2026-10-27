@@ -22,7 +22,7 @@ def session_object(ctx, handler):
     token, cookie = issue_csrf_token(handler.headers, handler.is_https)
     identity = ctx.identity
     masked = identity.role != "admin" and (identity.auth_mode == GUEST_MODE or
-                                           bool(ctx.settings["security"].get("mask_pii_for_viewers", True)))
+                                           bool(ctx.settings["security"].get("mask_pii_for_viewers", False)))
     return {"email": identity.email, "role": identity.role, "authMode": identity.auth_mode, "csrfToken": token,
             "canWrite": identity.can_write, "piiMasked": masked, "name": identity.name,
             "picture": identity.picture}, cookie

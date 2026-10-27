@@ -12,7 +12,7 @@ import { api, isAbort } from '../core/api.js';
 import { isAdmin, rangeParams, store } from '../core/state.js';
 import {
   pageHeader, kpi, card, dataTable, badge, statusBadge, button, banner, segmented, selectInput, progress, userCell, confirmDialog, openModal,
-  toast, setBusy, field, textInput, emptyState, warningsNotice, errorState, skeleton, load, kv, listCell,
+  toast, setBusy, field, textInput, emptyState, warningsNotice, errorState, skeleton, load, kv, listCell, requireAdmin,
 } from '../core/components.js';
 import { abortReasonText, errorText, serverText } from '../core/messages.js';
 import { proportionBar } from '../core/charts.js';
@@ -40,7 +40,7 @@ const SUSPENDED = 'CAPPED_BY_TOOL';
 export default async function render(ctx) {
   const admin = isAdmin();
   const dryBtn = button({ label: t('Dry run'), icon: 'play' });
-  const runBtn = button({ label: t('Run enforcement now'), icon: 'zap', variant: 'primary', disabled: !admin, title: admin ? null : t('Administrator role required') });
+  const runBtn = button({ label: t('Run enforcement now'), icon: 'zap', variant: 'primary' });
   const header = pageHeader({
     title: t('Antigravity Controls'),
     desc: t('Per-user caps on tokens, requests and estimated cost within a settlement period. Users over their cap are suspended through project IAM until the period resets, automatically or after administrator review, with exception rules for specific users.'),
@@ -64,8 +64,14 @@ export default async function render(ctx) {
     return null;
   }
 
-  dryBtn.addEventListener('click', () => runEnforce(ctx, status, true, dryBtn));
-  runBtn.addEventListener('click', () => runEnforce(ctx, status, false, runBtn));
+  dryBtn.addEventListener('click', () => {
+    if (!requireAdmin(t('Dry run'), 'resourcemanager.projects.getIamPolicy')) return;
+    runEnforce(ctx, status, true, dryBtn);
+  });
+  runBtn.addEventListener('click', () => {
+    if (!requireAdmin(t('Run enforcement now'), 'resourcemanager.projects.setIamPolicy')) return;
+    runEnforce(ctx, status, false, runBtn);
+  });
   if (admin && status.plan && status.plan.aborted) {
     runBtn.disabled = true;
     runBtn.title = t('A safety gate failed. Resolve it before running enforcement.');
@@ -234,7 +240,13 @@ function renderStatus(ctx, body, s) {
   const pricing = policy.pricing || {};
   const policyCard = card({
     title: t('Cap policy'), subtitle: t('Default caps per user and settlement period'),
-    actions: admin ? button({ label: t('Edit policy'), icon: 'edit', size: 'sm', onClick: () => editPolicy(ctx, policy) }) : null,
+    actions: button({
+      label: t('Edit policy'), icon: 'edit', size: 'sm',
+      onClick: () => {
+        if (!requireAdmin(t('Edit policy'))) return;
+        editPolicy(ctx, policy);
+      },
+    }),
     body: kv([
       [t('Token cap'), policy.tokenCap ? fmt.int(policy.tokenCap) : t('Disabled')],
       [t('Request cap'), policy.requestCap ? fmt.int(policy.requestCap) : t('Disabled')],
@@ -282,8 +294,13 @@ function renderStatus(ctx, body, s) {
             const label = h('div', { class: 'cell-stack' },
               h('span', { class: own ? 'fw-600' : '' }, isNum(capValue) && capValue > 0 ? fmt.currency(capValue, ccy) : t('None')),
               h('span', { class: 'cell-sub' }, own ? t('Individual') : t('Default')));
-            if (!admin) return label;
-            return h('div', { class: 'row nowrap cap-cell' }, label, button({ icon: 'edit', size: 'sm', title: t('Change cost cap'), onClick: () => editPersonCap(ctx, s, u) }));
+            return h('div', { class: 'row nowrap cap-cell' }, label, button({
+              icon: 'edit', size: 'sm', title: t('Change cost cap'),
+              onClick: () => {
+                if (!requireAdmin(t('Change cost cap'))) return;
+                editPersonCap(ctx, s, u);
+              },
+            }));
           },
           csv: (u) => (u.caps ? u.caps.costCap : ''),
         },
@@ -381,12 +398,13 @@ function enforcementCard(ctx, s) {
   const mode = policy.enforcementMode || 'manual';
   const last = enforcement.lastRun;
   const sched = enforcement.scheduler || {};
-  const control = isAdmin()
-    ? segmented([
-      { value: 'manual', label: t('Manual review'), title: t('Over-cap users wait for an administrator decision') },
-      { value: 'auto', label: t('Automatic suspension'), title: t('Over-cap users are suspended by every enforcement run') },
-    ], mode, (v) => setMode(ctx, v), { label: t('Enforcement mode') })
-    : badge(mode === 'auto' ? t('Automatic suspension') : t('Manual review'), mode === 'auto' ? 'accent' : 'neutral');
+  const control = segmented([
+    { value: 'manual', label: t('Manual review'), title: t('Over-cap users wait for an administrator decision') },
+    { value: 'auto', label: t('Automatic suspension'), title: t('Over-cap users are suspended by every enforcement run') },
+  ], mode, (v) => {
+    if (!requireAdmin(t('Enforcement mode'))) { ctx.rerender(); return; }
+    setMode(ctx, v);
+  }, { label: t('Enforcement mode') });
   let schedSub;
   if (sched.lastRun) schedSub = t('Last scheduled run {when}', { when: fmt.relative(sched.lastRun.at) });
   else if (sched.configured) schedSub = t('Waiting for the first scheduled run');
@@ -491,7 +509,6 @@ function queueCard(ctx, s) {
   const policy = s.policy || {};
   const manual = (policy.enforcementMode || 'manual') === 'manual';
   const ccy = ccyOf(policy);
-  const admin = isAdmin();
   const rows = manual ? s.reviewQueue : (Array.isArray(s.users) ? s.users.filter((u) => u.plannedAction === 'block') : null);
   let content;
   if (rows === null || rows === undefined) {
@@ -507,12 +524,12 @@ function queueCard(ctx, s) {
       { key: 'capUsage', label: t('Cap usage'), align: 'num', render: (r) => capUsageCell(r.capUsage), value: (r) => r.capUsage },
       { key: 'overCapReasons', label: t('Cap reached'), sortable: false, render: (r) => reasonBadges(r.overCapReasons), csv: (r) => (r.overCapReasons || []).join('|') },
     ];
-    if (admin && manual) {
+    if (manual) {
       columns.push({
         key: 'actions', label: '', actions: true,
         render: (r) => h('div', { class: 'row nowrap' },
-          button({ label: t('Suspend'), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => decide(ctx, [r], 'suspend') }),
-          button({ label: t('Allow this period'), size: 'sm', onClick: () => decide(ctx, [r], 'allow') })),
+          button({ label: t('Suspend'), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => { if (requireAdmin(t('Suspend'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, [r], 'suspend'); } }),
+          button({ label: t('Allow this period'), size: 'sm', onClick: () => { if (requireAdmin(t('Allow this period'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, [r], 'allow'); } })),
       });
     }
     content = dataTable({
@@ -521,9 +538,9 @@ function queueCard(ctx, s) {
       onRowClick: (r) => r.uid && openUserDrawer(r.uid, { onChanged: () => ctx.rerender() }),
     });
   }
-  const bulk = admin && manual && rows && rows.length > 1 ? h('div', { class: 'row' },
-    button({ label: t('Suspend all ({n})', { n: rows.length }), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => decide(ctx, rows, 'suspend') }),
-    button({ label: t('Allow all this period'), size: 'sm', onClick: () => decide(ctx, rows, 'allow') })) : null;
+  const bulk = manual && rows && rows.length > 1 ? h('div', { class: 'row' },
+    button({ label: t('Suspend all ({n})', { n: rows.length }), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => { if (requireAdmin(t('Suspend'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, rows, 'suspend'); } }),
+    button({ label: t('Allow all this period'), size: 'sm', onClick: () => { if (requireAdmin(t('Allow this period'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, rows, 'allow'); } })) : null;
   return card({
     title: manual ? t('Review queue') : t('Suspended at the next run'),
     subtitle: manual
@@ -571,7 +588,6 @@ async function decide(ctx, rows, decision) {
 function suspendedCard(ctx, s) {
   const policy = s.policy || {};
   const ccy = ccyOf(policy);
-  const admin = isAdmin();
   const rows = Array.isArray(s.users) ? s.users.filter((u) => u.state === SUSPENDED) : null;
   let content;
   if (rows === null) {
@@ -594,10 +610,8 @@ function suspendedCard(ctx, s) {
       { key: 'reasons', label: t('Cap reached'), sortable: false, render: (u) => reasonBadges((u.suspension && u.suspension.reasons && u.suspension.reasons.length) ? u.suspension.reasons : u.overCapReasons) },
       { key: 'trigger', label: t('Suspended by'), render: (u) => (u.suspension ? h('div', { class: 'cell-stack' }, h('span', null, t(TRIGGER_LABELS[u.suspension.trigger] || u.suspension.trigger || DASH)), u.suspension.by ? h('span', { class: 'cell-sub truncate' }, u.suspension.by) : null) : h('span', { class: 'text-muted' }, DASH)), value: (u) => (u.suspension ? u.suspension.trigger : '') },
       { key: 'usage', label: t('Usage now'), align: 'num', render: (u) => h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600' }, isNum(u.tokens) ? fmt.compact(u.tokens) : DASH), isNum(u.estimatedCost) ? h('span', { class: 'cell-sub' }, money(u.estimatedCost, ccy)) : null), value: (u) => u.tokens },
+      { key: 'actions', label: '', actions: true, render: (u) => button({ label: t('Restore now'), icon: 'unlock', size: 'sm', onClick: () => { if (requireAdmin(t('Restore now'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, [u], 'allow'); } }) },
     ];
-    if (admin) {
-      columns.push({ key: 'actions', label: '', actions: true, render: (u) => button({ label: t('Restore now'), icon: 'unlock', size: 'sm', onClick: () => decide(ctx, [u], 'allow') }) });
-    }
     content = dataTable({ columns, rows, pageSize: 8, searchable: rows.length > 8, exportName: 'antigravity-suspended', initialSort: { key: 'restoreAt', dir: 'asc' }, onRowClick: (u) => u.uid && openUserDrawer(u.uid, { onChanged: () => ctx.rerender() }) });
   }
   return card({ title: t('Suspended users'), subtitle: resetText(policy), flush: true, body: content });
@@ -608,9 +622,8 @@ function suspendedCard(ctx, s) {
 function exceptionsCard(ctx, s) {
   const policy = s.policy || {};
   const ccy = ccyOf(policy);
-  const admin = isAdmin();
   const rows = s.exceptions || [];
-  const add = admin ? button({ label: t('Add rule'), icon: 'plus', size: 'sm', onClick: () => editException(ctx, s, null) }) : null;
+  const add = button({ label: t('Add rule'), icon: 'plus', size: 'sm', onClick: () => { if (requireAdmin(t('Add rule'), 'resourcemanager.projects.setIamPolicy')) editException(ctx, s, null); } });
   let content;
   if (!rows.length) {
     content = emptyState({ icon: 'shield', compact: true, title: t('No exception rules'), body: t('Add a rule to always allow a user, always block a user, or give a user an individual cap. Rules apply in both enforcement modes.') });
@@ -622,15 +635,13 @@ function exceptionsCard(ctx, s) {
       { key: 'note', label: t('Note'), sortable: false, wrap: true, render: (r) => h('span', { class: 'cell-sub' }, r.note || DASH) },
       { key: 'createdAt', label: t('Added'), render: (r) => h('div', { class: 'cell-stack' }, h('span', null, r.createdAt ? fmt.dateTime(r.createdAt) : DASH), r.createdBy ? h('span', { class: 'cell-sub truncate' }, r.createdBy) : null), value: (r) => r.createdAt },
       { key: 'state', label: t('Access state'), render: (r) => statusBadge(r.state, { size: 'sm' }) },
-    ];
-    if (admin) {
-      columns.push({
+      {
         key: 'actions', label: '', actions: true,
         render: (r) => h('div', { class: 'row nowrap' },
-          button({ icon: 'edit', size: 'sm', title: t('Edit rule'), onClick: () => editException(ctx, s, r) }),
-          button({ icon: 'trash', size: 'sm', title: t('Remove rule'), onClick: () => removeException(ctx, r) })),
-      });
-    }
+          button({ icon: 'edit', size: 'sm', title: t('Edit rule'), onClick: () => { if (requireAdmin(t('Edit rule'), 'resourcemanager.projects.setIamPolicy')) editException(ctx, s, r); } }),
+          button({ icon: 'trash', size: 'sm', title: t('Remove rule'), onClick: () => { if (requireAdmin(t('Remove rule'), 'resourcemanager.projects.setIamPolicy')) removeException(ctx, r); } })),
+      },
+    ];
     content = dataTable({ columns, rows, pageSize: 8, searchable: rows.length > 8, exportName: 'antigravity-exception-rules', initialSort: { key: 'createdAt', dir: 'desc' } });
   }
   return card({ title: t('Exception rules'), subtitle: t('Per-user rules that take precedence over the default cap policy'), actions: add, flush: true, body: content });
@@ -752,9 +763,10 @@ function prerequisites(ctx, p) {
   Object.entries(p.permissions || {}).forEach(([perm, ok]) => items.push([ok, perm, ok ? t('Granted') : t('Not granted to the control plane identity')]));
   items.push([p.telemetryDetected, t('Antigravity inference telemetry'), p.telemetryDetected ? t('Detected') : t('Not detected')]);
   const missingRoles = (p.markerRoles || []).some((r) => !r.exists);
-  const btn = missingRoles && isAdmin() ? button({ label: t('Create marker roles'), icon: 'key', size: 'sm' }) : null;
+  const btn = missingRoles ? button({ label: t('Create marker roles'), icon: 'key', size: 'sm' }) : null;
   if (btn) {
     btn.addEventListener('click', async () => {
+      if (!requireAdmin(t('Create marker roles'), 'iam.roles.create')) return;
       const ok = await confirmDialog({
         title: t('Create marker roles'),
         message: t('Custom roles will be created in the project with the permissions of the access role minus businessaicode.* permissions.'),

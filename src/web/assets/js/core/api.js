@@ -14,6 +14,7 @@ export class ApiError extends Error {
 
 let csrfToken = null;
 let onUnauthenticated = null;
+let onForbidden = null;
 
 export function setCsrfToken(token) {
   csrfToken = token || null;
@@ -21,6 +22,10 @@ export function setCsrfToken(token) {
 
 export function setUnauthenticatedHandler(fn) {
   onUnauthenticated = fn;
+}
+
+export function setForbiddenHandler(fn) {
+  onForbidden = fn;
 }
 
 async function request(method, path, { params, body, signal } = {}) {
@@ -65,6 +70,7 @@ async function request(method, path, { params, body, signal } = {}) {
     const e = (json && json.error) || {};
     const error = new ApiError(res.status, e.code || (res.status === 429 ? 'rate_limited' : 'internal'), e.message || res.statusText);
     if (res.status === 401 && onUnauthenticated) onUnauthenticated(error);
+    if (res.status === 403 && method === 'POST' && onForbidden) onForbidden(error);
     throw error;
   }
   if (!json || typeof json !== 'object') throw new ApiError(res.status, 'internal', 'Malformed response');

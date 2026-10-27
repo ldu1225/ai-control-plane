@@ -9,7 +9,7 @@ import { api, isAbort } from '../core/api.js';
 import { store, rangeParams, isAdmin, session } from '../core/state.js';
 import {
   card, kpi, kpiSkeleton, warningsNotice, errorState, skeleton, openDrawer, avatar, badge, statusBadge, dataTable,
-  confirmDialog, toast, button, kv, emptyState, banner, stat, tagMatrix, tagLegend, segmented,
+  confirmDialog, toast, button, kv, emptyState, banner, stat, tagMatrix, tagLegend, segmented, requireAdmin,
 } from '../core/components.js';
 import { errorText, serverText } from '../core/messages.js';
 import { lineChart, barChart, donutChart, fromTimeline, colorAt, TONES } from '../core/charts.js';
@@ -302,7 +302,7 @@ function capRuleText(rule) {
 function iamCard(drawer, d, onChanged) {
   const iam = d.iam;
   const actions = [];
-  if (isAdmin() && iam.actions) {
+  if (iam.actions) {
     if (iam.actions.allow) actions.push(button({ label: iam.state === 'CAPPED_BY_TOOL' ? t('Restore now') : t('Allow access'), icon: 'unlock', size: 'sm', onClick: () => userAction(drawer, d, 'allow', onChanged) }));
     if (iam.actions.disallow) actions.push(button({ label: t('Disallow'), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => userAction(drawer, d, 'disallow', onChanged) }));
   }
@@ -335,6 +335,7 @@ function iamCard(drawer, d, onChanged) {
 }
 
 async function userAction(drawer, d, action, onChanged) {
+  if (!requireAdmin(action === 'allow' ? t('Allow / Restore Antigravity access') : t('Disallow Antigravity access'), 'resourcemanager.projects.setIamPolicy')) return;
   const email = d.user.email;
   const capped = d.iam && d.iam.state === 'CAPPED_BY_TOOL';
   let message;

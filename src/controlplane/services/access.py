@@ -22,16 +22,18 @@ LOG = logging.getLogger("controlplane.access")
 ROLES = ("admin", "viewer")
 
 
-def _norm_member(value):
+def _norm_member(value, allow_wildcard=False):
     if not isinstance(value, str) or len(value) > 254:
         raise ApiError("bad_request", "Field 'email' must be an email address or a *@domain pattern.")
     member = value.strip().lower()
+    if allow_wildcard and member in ("*", "*@*"):
+        return "*"
     if not (config.EMAIL_RE.match(member) or config.ADMIN_PATTERN_RE.match(member)):
         raise ApiError("bad_request", "Field 'email' must be an email address or a *@domain pattern.")
     return member
 
 
-def _norm_members(body):
+def _norm_members(body, allow_wildcard=False):
     """Accepts either a single email/pattern, a comma/newline/whitespace-separated string in 'email',
     or a list in 'emails'. Returns a deduplicated list of validated members."""
     raw_list = body.get("emails")
@@ -47,7 +49,7 @@ def _norm_members(body):
     out = []
     seen = set()
     for token in tokens:
-        member = _norm_member(token)
+        member = _norm_member(token, allow_wildcard=allow_wildcard)
         if member not in seen:
             seen.add(member)
             out.append(member)
@@ -81,11 +83,12 @@ def summary(ctx):
             return
         seen.add(member)
         in_config = member in base_admins or member in base_allowed
+        is_pattern = member == "*" or member.startswith("*@")
         users.append({"email": member, "role": role, "source": "config" if member in base_list else "ui",
-                      "pattern": member.startswith("*@"), "lastLogin": last.get(member),
+                      "pattern": is_pattern, "lastLogin": last.get(member),
                       "self": member == actor,
                       "canRemove": not in_config and member != actor,
-                      "canChangeRole": member != actor and member not in base_admins})
+                      "canChangeRole": member != actor and member not in base_admins and member != "*"})
 
     for member in sec.get("admins") or []:
         add(member, "admin", base_admins)
@@ -104,12 +107,16 @@ def _save_lists(ctx, admins, allowed):
 
 
 def _drop_requests(ctx, members):
-    exact = {m for m in members if not m.startswith("*@")}
+    wildcard = "*" in members
+    exact = {m for m in members if m != "*" and not m.startswith("*@")}
     domains = {m[2:] for m in members if m.startswith("*@")}
-    if not exact and not domains:
+    if not wildcard and not exact and not domains:
         return
 
     def apply(auth):
+        if wildcard:
+            auth["requests"] = []
+            return
         kept = []
         for r in auth["requests"]:
             em = (r.get("email") or "").strip().lower()
@@ -123,10 +130,10 @@ def _drop_requests(ctx, members):
 
 def save_user(ctx):
     """POST /api/v1/access/users {email|emails, role}: approve one or more accounts or change their role."""
-    members = _norm_members(ctx.body)
     role = ctx.body.get("role")
     if role not in ROLES:
         raise ApiError("bad_request", "Field 'role' must be 'admin' or 'viewer'.")
+    members = _norm_members(ctx.body, allow_wildcard=(role == "viewer"))
     base = ctx.app.settings.base["security"]
     base_admins = list(base.get("admins") or [])
     base_allowed = list(base.get("allowed_users") or [])
@@ -154,7 +161,7 @@ def save_user(ctx):
 
 def delete_user(ctx):
     """POST /api/v1/access/users/delete {email}: remove an account and revoke its sessions."""
-    member = _norm_member(ctx.body.get("email"))
+    member = _norm_member(ctx.body.get("email"), allow_wildcard=True)
     if member == ctx.identity.email:
         raise ApiError("conflict", "You cannot remove your own access.")
     base = ctx.app.settings.base["security"]
@@ -165,7 +172,7 @@ def delete_user(ctx):
     if member not in admins and member not in allowed:
         raise ApiError("not_found", "Account not found.")
     _save_lists(ctx, [m for m in admins if m != member], [m for m in allowed if m != member])
-    if not member.startswith("*@"):
+    if member != "*" and not member.startswith("*@"):
         epoch = int(time.time() * 1000)
 
         def apply(auth):

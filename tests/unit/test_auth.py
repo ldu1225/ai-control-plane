@@ -232,6 +232,7 @@ class GoogleSignInFlowTest(unittest.TestCase):
         boot = self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": session}).json()["data"]
         self.assertEqual((boot["session"]["email"], boot["session"]["role"], boot["session"]["authMode"]),
                          ("person@example.org", "viewer", "google"))
+        self.assertFalse(boot["session"]["piiMasked"])
         self.assertEqual(boot["workspace"]["billing"]["accountId"], "")
         # Viewers get the read-only settings view without deployment identifiers.
         view = self.request("GET", "/api/v1/settings", cookies={"cp_session": session}).json()["data"]
@@ -257,9 +258,11 @@ class GoogleSignInFlowTest(unittest.TestCase):
         text = json.dumps(view)
         for secret in ("admin@example.com", "ABCDEF-123456-ABCDEF", CLIENT_ID):
             self.assertNotIn(secret, text)
+        self.post("/api/v1/settings", admin, {"section": "security", "values": {"mask_pii_for_viewers": True}})
         denied = self.post("/api/v1/analyst/chat", viewer, {"question": "How many prompts last week?"})
         self.assertEqual(denied.status, 403)
         self.assertIn("available to administrators", denied.json()["error"]["message"])
+        self.post("/api/v1/settings", admin, {"section": "security", "values": {"mask_pii_for_viewers": False}})
         full = self.request("GET", "/api/v1/settings", cookies={"cp_session": admin}).json()["data"]
         self.assertEqual(full["overrides"]["workspace"]["billing"]["account_id"], "ABCDEF-123456-ABCDEF")
         self.assertEqual(full["persistence"]["updatedBy"], "admin@example.com")
@@ -316,6 +319,7 @@ class GoogleSignInFlowTest(unittest.TestCase):
             self.assertEqual(boot.status, 200)
             self.assertEqual(boot.json()["data"]["session"]["role"], "viewer")
             self.assertEqual(boot.json()["data"]["session"]["email"], email)
+            self.assertFalse(boot.json()["data"]["session"]["piiMasked"])
 
         # 2. Pre-add multiple admin accounts and a domain pattern via emails array
         res2 = self.post("/api/v1/access/users", admin, {
@@ -329,11 +333,21 @@ class GoogleSignInFlowTest(unittest.TestCase):
             self.assertEqual(boot.status, 200)
             self.assertEqual(boot.json()["data"]["session"]["role"], "admin")
 
-        # 3. Unregistered user is still blocked when guest_access is false
+        # 3. Unregistered user is still blocked when guest_access is false and * is not in allowed_users
         self.assertEqual(self.sign_in("unlisted@example.net").header("Location"), "/login?error=not_approved")
 
-        # 4. Cleanup added entries
-        for entry in ("pre1@example.com", "pre2@example.com", "pre3@example.com", "lead1@example.com", "*@partner.example.org"):
+        # 4. Wildcard "*" in allowed_users lets any Google ID sign in as unmasked Viewer (but never as Admin)
+        self.assertEqual(self.post("/api/v1/access/users", admin, {"email": "*", "role": "admin"}).status, 400)
+        res3 = self.post("/api/v1/access/users", admin, {"email": "*", "role": "viewer"})
+        self.assertEqual(res3.status, 200)
+        any_sess = self.session_cookie("anybody@example.net")
+        any_boot = self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": any_sess}).json()["data"]
+        self.assertEqual((any_boot["session"]["email"], any_boot["session"]["role"], any_boot["session"]["piiMasked"]),
+                         ("anybody@example.net", "viewer", False))
+        self.assertEqual(self.post("/api/v1/settings", any_sess, {"section": "security", "values": {}}).status, 403)
+
+        # 5. Cleanup added entries
+        for entry in ("*", "pre1@example.com", "pre2@example.com", "pre3@example.com", "lead1@example.com", "*@partner.example.org"):
             self.post("/api/v1/access/users/delete", admin, {"email": entry})
 
     def test_sign_out_revokes_every_session(self):

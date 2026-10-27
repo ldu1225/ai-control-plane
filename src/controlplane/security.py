@@ -80,6 +80,8 @@ def is_admin_email(email, admins):
     domain = email.rpartition("@")[2]
     for entry in admins or []:
         entry = str(entry).strip().lower()
+        if entry in ("*", "*@*"):
+            return True
         if entry.startswith("*@"):
             if domain == entry[2:]:
                 return True

@@ -179,7 +179,8 @@ class ControlPlaneHandler(BaseHandler):
         guest = identity.auth_mode == GUEST_MODE
         app.limiter.check(identity.rate_key, "general")
         if opts.get("admin_read") and not identity.is_admin:
-            raise ApiError("forbidden", "Administrator privileges are required.")
+            raise ApiError("forbidden", "Administrator privileges are required to view or manage access settings. "
+                                        "Grant Administrator permissions to this account to proceed.")
         body = None
         if method == "POST":
             if guest and not opts.get("guest"):
@@ -187,7 +188,8 @@ class ControlPlaneHandler(BaseHandler):
             if not bearer and not csrf_valid(self.headers, self.is_https):
                 raise ApiError("csrf_failed", "CSRF validation failed. Reload the page and try again.")
             if opts.get("admin") and not identity.can_write:
-                raise ApiError("forbidden", "Administrator privileges are required.")
+                raise ApiError("forbidden", "Administrator privileges are required to change settings or run controls. "
+                                            "Grant the required Administrator / IAM permissions to proceed.")
             body = parse_json_object(raw)
         if opts.get("rate"):
             app.limiter.check(identity.rate_key, opts["rate"])
@@ -239,7 +241,7 @@ class ControlPlaneHandler(BaseHandler):
             data = viewer_view(data)
         mask = opts.get("mask")
         if mask is not False and identity.role != "admin" and \
-                (guest or settings["security"].get("mask_pii_for_viewers", True)):
+                (guest or settings["security"].get("mask_pii_for_viewers", False)):
             data = mask_for_viewer(data, restrict_keys=mask.get("restrict", ()),
                                    ip_keys=mask.get("ips", ("callerIp",)), null_keys=mask.get("nulls", ()))
             warnings = mask_for_viewer(warnings)

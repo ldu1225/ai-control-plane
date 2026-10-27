@@ -522,7 +522,7 @@ def available_to(identity, settings):
     if identity is not None and identity.auth_mode == GUEST_MODE:
         return bool(settings["analyst"].get("allow_viewers"))
     return bool(settings["analyst"].get("allow_viewers")) or \
-        not settings["security"].get("mask_pii_for_viewers", True)
+        not settings["security"].get("mask_pii_for_viewers", False)
 
 
 def chat(ctx):
@@ -608,7 +608,7 @@ def chat(ctx):
         result["answer"] = msgs["empty"]
     else:
         sample = rows[:NARRATIVE_ROWS]
-        if ctx.identity.role != "admin" and ctx.settings["security"].get("mask_pii_for_viewers", True):
+        if ctx.identity.role != "admin" and ctx.settings["security"].get("mask_pii_for_viewers", False):
             from ..security import mask_for_viewer
             sample = mask_for_viewer(sample)
         narrative_prompt = ("Question: %s\nWrite a short factual answer based only on the query result below. The "

@@ -60,7 +60,7 @@ security:
   #   still verified, but not the audience (a startup warning is logged).
   iap_audience: ""
   admins: []                   # exact emails or *@domain.com patterns; ADMIN_EMAILS is merged
-  allowed_users: []            # google mode: approved viewer accounts or *@domain.com; ALLOWED_USERS is merged
+  allowed_users: []            # google mode: approved viewer accounts, *@domain.com, or * (any Google account); ALLOWED_USERS is merged
   google_client_id: ""         # google mode: OAuth Web client id (GOOGLE_OAUTH_CLIENT_ID)
   public_base_url: ""          # google mode: https://dashboard.example.com (PUBLIC_BASE_URL); fixes the redirect URI
   session_hours: 12            # google mode: session lifetime, 1-168 (SESSION_HOURS)
@@ -69,7 +69,7 @@ security:
   # bridge_return_url = this dashboard's URL (BRIDGE_RETURN_URL). scripts/deploy.sh sets this up (ACCESS_MODE=google).
   sign_in_bridge_url: ""
   bridge_return_url: ""
-  mask_pii_for_viewers: true
+  mask_pii_for_viewers: false
   # Demo only (google mode; GUEST_ACCESS, GUEST_REDACT_TERMS): visitors without a session browse read-only as a
   # guest. Guests always get viewer masking plus whole e-mail domains, billing account IDs, 12-digit project
   # numbers and the terms below hidden in every response; they cannot change anything and use the AI Analyst
@@ -170,3 +170,4 @@ telemetry:
 analyst:
   max_bytes_billed: 10000000000
   max_rows: 500
+  allow_viewers: false
