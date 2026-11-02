@@ -111,9 +111,10 @@ class Identity:
 def admin_guard(identity):
     """Settings write check: refuses changes that would remove the caller's own administrator role.
     google and iap derive roles from security.admins (exact emails and *@domain patterns); local mode
-    derives the role from the loopback peer and is not affected."""
+    derives the role from the loopback peer and is not affected. Non-email ID accounts (like built-in
+    'admin') derive their role from the internal account store and are not affected by security.admins."""
     def check(effective):
-        if identity.auth_mode in ("google", "iap") and \
+        if identity.auth_mode in ("google", "iap") and "@" in (identity.email or "") and \
                 not is_admin_email(identity.email, (effective.get("security") or {}).get("admins")):
             raise ApiError("conflict", "This change would remove your own administrator access.")
     return check
@@ -260,7 +261,8 @@ def authenticate(headers, peer, settings, verifier, environ=None, sessions=None)
                 return guest_identity(headers, peer)
             raise ApiError("unauthenticated", "Sign in to continue.")
         email = user["email"]
-        role = "admin" if is_admin_email(email, admins) else "viewer"
+        role = "admin" if (email == "admin" or user.get("role") == "admin" or
+                           is_admin_email(email, admins)) else "viewer"
         return Identity(email, role, mode, "google:" + email, name=str(user.get("name") or ""),
                         picture=str(user.get("picture") or ""))
     if mode == "iap":

@@ -6,16 +6,29 @@ import { icon } from './icons.js';
 import { t } from './i18n.js';
 import { fmt, isNum, initials, DASH } from './format.js';
 import { isAbort } from './api.js';
-import { session, isAdmin } from './state.js';
+import { session, isAdmin, store } from './state.js';
 import { sparkline } from './charts.js';
 import { noticeText, serverText } from './messages.js';
 
 /* ------------------------------------------------------------------ layout */
 
-export function pageHeader({ title, desc, actions }) {
+export function pageHeader({ title, desc, actions, project }) {
+  const ws = (store && store.boot && store.boot.workspace) || {};
+  const projects = (Array.isArray(ws.projects) && ws.projects.length ? ws.projects : [ws.projectId]).filter(Boolean);
+  const sel = store ? store.selectedProject : null;
+  let scopeBadge = null;
+  if (!project) {
+    if (sel) {
+      scopeBadge = badge(t('Scope: Single project ({id})', { id: sel }), 'info', { size: 'sm', dot: true });
+    } else if (projects.length > 1) {
+      scopeBadge = badge(t('All {n} projects integrated', { n: projects.length }), 'success', { size: 'sm', dot: true, title: projects.join(', ') });
+    }
+  }
   return h('div', { class: 'page-header' },
     h('div', { class: 'page-heading' },
-      h('h1', { class: 'page-title' }, title),
+      h('div', { class: 'row', style: { gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+        h('h1', { class: 'page-title' }, title),
+        scopeBadge),
       desc ? h('p', { class: 'page-desc' }, desc) : null),
     actions ? h('div', { class: 'page-actions' }, actions) : null);
 }
@@ -25,8 +38,8 @@ export function card({ title, subtitle, actions, body, footer, source, cls, flus
   if (body) append(bodyEl, [body]);
   const header = (title || actions) ? h('div', { class: ['card-header', bordered ? 'bordered' : ''] },
     h('div', { class: 'card-heading' },
-      title ? h('h3', { class: 'card-title' }, title) : null,
-      subtitle ? h('p', { class: 'card-subtitle' }, subtitle) : null),
+      title ? h('h3', { class: 'card-title', title: typeof title === 'string' ? title : null }, title) : null,
+      subtitle ? h('p', { class: 'card-subtitle', title: typeof subtitle === 'string' ? subtitle : null }, subtitle) : null),
     actions ? h('div', { class: 'card-actions' }, actions) : null) : null;
   const foot = (footer || source) ? h('div', { class: 'card-footer' },
     source ? sourceNote(source) : h('span'),

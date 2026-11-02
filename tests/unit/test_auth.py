@@ -372,6 +372,72 @@ class GoogleSignInFlowTest(unittest.TestCase):
         res = self.request("POST", "/api/v1/auth/logout", cookies={"cp_session": session}, body={})
         self.assertEqual(res.status, 403)
 
+    def test_password_login_and_account_management(self):
+        # 1. Initial auth state advertises passwordEnabled and defaultAdminPassword
+        state = self.request("GET", "/api/v1/auth/state").json()["data"]
+        self.assertTrue(state.get("passwordEnabled"))
+        self.assertTrue(state.get("defaultAdminPassword"))
+        csrf = state["csrfToken"]
+
+        # 2. Default admin/admin login succeeds and grants administrator access
+        bad = self.request("POST", "/api/v1/auth/login",
+                           cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
+                           body={"username": "admin", "password": "wrong"})
+        self.assertEqual(bad.status, 401)
+        ok = self.request("POST", "/api/v1/auth/login",
+                          cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
+                          body={"username": "admin", "password": "admin", "next": "/"})
+        self.assertEqual(ok.status, 200)
+        self.assertEqual(ok.json()["data"]["user"]["email"], "admin")
+        self.assertEqual(ok.json()["data"]["user"]["role"], "admin")
+        admin_sess = ok.cookies()["cp_session"][0]
+        boot = self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": admin_sess}).json()["data"]
+        self.assertEqual((boot["session"]["email"], boot["session"]["role"], boot["session"]["canWrite"]),
+                         ("admin", "admin", True))
+
+        # 3. Built-in admin can create custom ID/Password accounts (admin & viewer) and change admin password
+        r1 = self.post("/api/v1/access/users", admin_sess,
+                       {"email": "team-viewer", "role": "viewer", "password": "viewer-pass-123"})
+        self.assertEqual(r1.status, 200)
+        r2 = self.post("/api/v1/access/users", admin_sess,
+                       {"email": "team-admin", "role": "admin", "password": "admin-pass-456"})
+        self.assertEqual(r2.status, 200)
+
+        # 4. Log in with team-viewer and verify read-only viewer role
+        v_login = self.request("POST", "/api/v1/auth/login",
+                               cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
+                               body={"username": "team-viewer", "password": "viewer-pass-123"})
+        self.assertEqual(v_login.status, 200)
+        v_sess = v_login.cookies()["cp_session"][0]
+        v_boot = self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": v_sess}).json()["data"]
+        self.assertEqual((v_boot["session"]["email"], v_boot["session"]["role"], v_boot["session"]["canWrite"]),
+                         ("team-viewer", "viewer", False))
+        self.assertEqual(self.post("/api/v1/settings", v_sess, {"section": "product", "values": {"name": "X"}}).status,
+                         403)
+
+        # 5. Update built-in admin password; default "admin" password stops working, new password works
+        r3 = self.post("/api/v1/access/users", admin_sess,
+                       {"email": "admin", "role": "admin", "password": "new-admin-pw"})
+        self.assertEqual(r3.status, 200)
+        state2 = self.request("GET", "/api/v1/auth/state").json()["data"]
+        self.assertFalse(state2.get("defaultAdminPassword"))
+        self.assertEqual(self.request("POST", "/api/v1/auth/login",
+                                      cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
+                                      body={"username": "admin", "password": "admin"}).status, 401)
+        self.assertEqual(self.request("POST", "/api/v1/auth/login",
+                                      cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
+                                      body={"username": "admin", "password": "new-admin-pw"}).status, 200)
+
+        # 6. Built-in admin cannot be deleted or demoted
+        self.assertEqual(self.post("/api/v1/access/users/delete", admin_sess, {"email": "admin"}).status, 409)
+        self.assertEqual(self.post("/api/v1/access/users", admin_sess, {"email": "admin", "role": "viewer"}).status, 409)
+
+        # 7. Delete custom ID account and verify immediate session revocation
+        del_res = self.post("/api/v1/access/users/delete", admin_sess, {"email": "team-viewer"})
+        self.assertEqual(del_res.status, 200)
+        self.assertEqual(self.request("GET", "/api/v1/bootstrap", cookies={"cp_session": v_sess}).status, 401)
+        self.post("/api/v1/access/users/delete", admin_sess, {"email": "team-admin"})
+
 
 class GoogleModeConfigTest(unittest.TestCase):
     def test_canonical_host_redirect(self):
@@ -542,5 +608,40 @@ class SignInBridgeTest(unittest.TestCase):
                                         "SIGN_IN_BRIDGE_URL": "https://bridge.example.com",
                                         "BRIDGE_RETURN_URL": "https://dash.example.com"})
 
+    def test_oauth_redirect_and_start_url_precedence_over_bridge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "c.yaml")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write(CONFIG)
+            environ = dict(
+                ENV,
+                CONFIG_PATH=cfg,
+                GOOGLE_OAUTH_CLIENT_ID=CLIENT_ID,
+                GOOGLE_OAUTH_REDIRECT_URI="https://relay.example.com/__/auth/handler",
+                GOOGLE_OAUTH_START_URL="https://relay.example.com/auth/bridge",
+                SIGN_IN_BRIDGE_URL="https://iap-bridge.example.com",
+                PUBLIC_BASE_URL="https://dash.example.com",
+            )
+            with mock.patch.dict(os.environ, {"CONFIG_PATH": cfg}):
+                custom_app = app_module.App(environ=environ)
+            srv = app_module.make_server(custom_app, "127.0.0.1", 0)
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                start = _get(port, "/auth/google/start", headers={"Host": "dash.example.com"})
+                self.assertEqual(start.status, 302)
+                loc = start.header("Location")
+                self.assertTrue(loc.startswith("https://relay.example.com/auth/bridge?"), loc)
+                outer_q = urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query)
+                self.assertEqual(outer_q["return_to"], ["https://dash.example.com/auth/google/callback"])
+                self.assertEqual(outer_q["redirect_uri"], ["https://relay.example.com/__/auth/handler"])
+                self.assertEqual(outer_q["client_id"], [CLIENT_ID])
+                self.assertEqual(outer_q["code_challenge_method"], ["S256"])
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()
+

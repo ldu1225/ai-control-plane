@@ -46,7 +46,7 @@ function renderPage(body, d) {
   }
 
   const agents = d.agents || [];
-  const filters = { status: 'all', platform: 'all' };
+  const filters = { status: 'all', platform: 'all', project: 'all' };
   const tableHost = h('div');
   const statusChips = h('div', { class: 'chips' });
   const platformChips = h('div', { class: 'chips' });
@@ -54,14 +54,20 @@ function renderPage(body, d) {
     const counts = (key, v) => agents.filter((a) => v === 'all' || a[key] === v).length;
     mount(statusChips, [['all', 'All statuses'], ['active', 'Active'], ['idle', 'Idle'], ['deprecation_candidate', 'Deprecation candidate']].map(([v, l]) => chip(`${t(l)} ${counts('status', v)}`, { pressed: filters.status === v, onClick: () => { filters.status = v; renderChips(); renderTable(); } })));
     const platforms = ['all', ...new Set(agents.map((a) => a.platform))];
-    mount(platformChips, platforms.map((v) => chip(v === 'all' ? t('All platforms') : t(PLATFORM_LABELS[v] || v), { pressed: filters.platform === v, onClick: () => { filters.platform = v; renderChips(); renderTable(); } })));
+    const projects = [...new Set(agents.map((a) => a.project).filter(Boolean))];
+    const rightChips = platforms.map((v) => chip(v === 'all' ? t('All platforms') : t(PLATFORM_LABELS[v] || v), { pressed: filters.platform === v, onClick: () => { filters.platform = v; renderChips(); renderTable(); } }));
+    if (projects.length > 1) {
+      rightChips.push(...['all', ...projects].map((p) => chip(p === 'all' ? t('All projects') : `${p} ${counts('project', p)}`, { pressed: filters.project === p, onClick: () => { filters.project = p; renderChips(); renderTable(); } })));
+    }
+    mount(platformChips, rightChips);
   };
   const renderTable = () => {
-    const rows = agents.filter((a) => (filters.status === 'all' || a.status === filters.status) && (filters.platform === 'all' || a.platform === filters.platform));
+    const rows = agents.filter((a) => (filters.status === 'all' || a.status === filters.status) && (filters.platform === 'all' || a.platform === filters.platform) && (filters.project === 'all' || a.project === filters.project));
     mount(tableHost, dataTable({
       columns: [
         { key: 'name', label: t('Agent'), render: (a) => h('div', { class: 'cell-stack' }, h('span', { class: 'cell-main truncate', title: a.name }, a.name || a.id), h('span', { class: 'cell-sub truncate', title: a.description || '' }, a.description || a.id)) },
         { key: 'platform', label: t('Platform'), render: (a) => h('div', { class: 'cell-stack' }, h('span', null, t(PLATFORM_LABELS[a.platform] || a.platform)), h('span', { class: 'cell-sub' }, a.type || '')) },
+        { key: 'project', label: t('Project'), render: (a) => h('span', { class: 'cell-mono' }, a.project || DASH) },
         { key: 'region', label: t('Region'), render: (a) => h('span', { class: 'cell-mono' }, a.region || DASH) },
         { key: 'owner', label: t('Owner'), render: (a) => h('span', { class: 'truncate', title: a.owner || '' }, a.owner || DASH) },
         { key: 'calls', label: t('Calls'), align: 'num', format: fmt.int },
@@ -112,7 +118,7 @@ function openAgent(a, th) {
     width: 680,
     content: (body) => {
       body.append(
-        h('div', { class: 'row wrap' }, statusBadge(a.status), a.type ? badge(a.type, 'neutral') : null, a.region ? badge(a.region, 'neutral') : null),
+        h('div', { class: 'row wrap' }, statusBadge(a.status), a.project ? badge(a.project, 'neutral') : null, a.type ? badge(a.type, 'neutral') : null, a.region ? badge(a.region, 'neutral') : null),
         a.description ? h('p', { class: 'muted' }, a.description) : null,
         card({
           title: t('Lifecycle'),
@@ -127,6 +133,7 @@ function openAgent(a, th) {
         card({
           title: t('Registration'),
           body: kv([
+            [t('Project'), a.project ? h('span', { class: 'mono' }, a.project) : null],
             [t('Agent ID'), h('span', { class: 'mono' }, a.id)],
             [t('Resource name'), a.resourceName ? h('span', { class: 'mono' }, a.resourceName) : null],
             [t('Owner'), a.owner],

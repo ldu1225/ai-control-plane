@@ -39,6 +39,8 @@ def bootstrap(ctx, handler):
                      "accentColor": s["branding"]["accent_color"], "defaultLocale": s["branding"]["default_locale"],
                      "defaultTheme": s["branding"]["default_theme"]},
         "workspace": {"configured": config.workspace_configured(s), "projectId": ws["project_id"],
+                      "projects": list(getattr(ctx, "all_projects", None) or getattr(ctx, "projects", None) or [ws["project_id"]]),
+                      "scanAllProjects": bool(ws.get("scan_all_projects", True)),
                       "auditDataset": ws["audit_dataset"],
                       # The billing account ID is an administrator detail; viewers do not receive it.
                       "billing": {"projectId": config.billing_project(s), "dataset": ws["billing"]["dataset"],
@@ -71,8 +73,10 @@ def auth_state(ctx, handler):
     if mode == "google" and sign_in is not None:
         claims = sign_in.user_from_headers(handler.headers, s)
         if claims:
+            role = "admin" if (claims["email"] == "admin" or claims.get("role") == "admin" or
+                               is_admin_email(claims["email"], s["security"].get("admins"))) else "viewer"
             user = {"email": claims["email"], "name": claims.get("name") or "", "picture": claims.get("picture") or "",
-                    "role": "admin" if is_admin_email(claims["email"], s["security"].get("admins")) else "viewer"}
+                    "role": role}
         else:
             denied = sign_in.denied_email(handler.headers)
     data = {
@@ -82,6 +86,9 @@ def auth_state(ctx, handler):
                      "defaultTheme": s["branding"]["default_theme"]},
         "authMode": mode,
         "googleEnabled": bool(mode == "google" and sign_in is not None),
+        "passwordEnabled": bool(mode == "google" and sign_in is not None),
+        "defaultAdminPassword": bool(mode == "google" and sign_in is not None and
+                                     sign_in.default_admin_password_active()),
         "guestAccess": bool(mode == "google" and s["security"].get("guest_access")),
         "switchAccountUrl": sign_in.switch_account_url() if mode == "google" and sign_in is not None else None,
         "user": user,
@@ -89,6 +96,22 @@ def auth_state(ctx, handler):
         "csrfToken": token,
     }
     return data, [("Set-Cookie", cookie)]
+
+
+def password_login(ctx, handler):
+    """POST /api/v1/auth/login (public): sign in with an account ID/email and password."""
+    s = ctx.settings
+    app = ctx.app
+    mode = resolve_auth_mode(s["security"]["auth_mode"], app.environ)
+    sign_in = getattr(app, "auth", None)
+    if mode != "google" or sign_in is None:
+        raise ApiError("bad_request", "Password sign-in is not enabled on this deployment.")
+    body = ctx.body or {}
+    username = body.get("username") if "username" in body else body.get("email")
+    password = body.get("password")
+    next_path = body.get("next") or "/"
+    user, redirect_to, cookies = sign_in.password_login(username, password, next_path, handler.headers, s)
+    return {"user": user, "redirect": redirect_to}, [("Set-Cookie", c) for c in cookies]
 
 
 def logout(ctx, handler):
@@ -203,9 +226,21 @@ def run_health(ctx):
         if not configured:
             return unconfigured
         model = s["ai_engine"]["default_model"]
-        client = ctx.app.ai.client(ctx.project, s["ai_engine"].get("location") or "global", ctx.quota_project)
+        loc = s["ai_engine"].get("location") or "global"
+        client = ctx.app.ai.client(ctx.project, loc, ctx.quota_project)
         try:
-            client.models.get(model=model)
+            client.models.get(model=model, config={"http_options": {"timeout": 12000}})
+        except TypeError:
+            try:
+                client.models.get(model=model)
+            except Exception as err:  # pylint: disable=broad-except
+                status = getattr(err, "code", None) or getattr(err, "status_code", None)
+                LOG.info("ai engine health check failed status=%s", status)
+                if status in (401, 403):
+                    return "error", "Access to the AI engine was denied for the service identity."
+                if status == 404:
+                    return "error", "The default model %s is not available in %s." % (model, s["ai_engine"]["location"])
+                return "error", "The AI engine is temporarily unavailable."
         except Exception as err:  # pylint: disable=broad-except
             status = getattr(err, "code", None) or getattr(err, "status_code", None)
             LOG.info("ai engine health check failed status=%s", status)
@@ -214,7 +249,7 @@ def run_health(ctx):
             if status == 404:
                 return "error", "The default model %s is not available in %s." % (model, s["ai_engine"]["location"])
             return "error", "The AI engine is temporarily unavailable."
-        return "ok", "%s reachable in %s" % (model, s["ai_engine"].get("location") or "global")
+        return "ok", "%s reachable in %s" % (model, loc)
 
     def store():
         p = ctx.app.settings.persistence()

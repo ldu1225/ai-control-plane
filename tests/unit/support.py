@@ -73,6 +73,14 @@ class FakeCtx:
         return self.ws["project_id"]
 
     @property
+    def projects(self):
+        out = [self.project]
+        for p in self.ws.get("projects") or []:
+            if p and p not in out:
+                out.append(p)
+        return out
+
+    @property
     def quota_project(self):
         return self.project
 

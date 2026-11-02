@@ -269,15 +269,19 @@ def billing_rows(ctx, src, rng, per_bucket=True):
         ctx.warn(src.label, "unsupported_schema", "The billing table is missing sku.description or cost.")
         return None
     bucket = bucket_sql(f["ts"]) if per_bucket else "DATE '1970-01-01'"
+    sel_proj = getattr(ctx, "selected_project", "all") or "all"
+    proj_clause = (" AND %s = @project" % f["project"]) if (sel_proj != "all" and f.get("project")) else ""
     sql = ("WITH %s\nSELECT %s AS bucket, %s AS sku, %s AS service, %s AS unit, %s AS pricing_unit, "
            "SUM(IFNULL(%s, 0)) AS amount, SUM(IFNULL(%s, 0)) AS cost, ANY_VALUE(%s) AS currency\n"
-           "FROM bil b WHERE %s AND %s\nGROUP BY bucket, sku, service, unit, pricing_unit"
+           "FROM bil b WHERE %s AND %s%s\nGROUP BY bucket, sku, service, unit, pricing_unit"
            % (src.cte("bil", start="start_ts"), bucket, f["sku"], f["service"] or "CAST(NULL AS STRING)",
               f["unit"] or "CAST(NULL AS STRING)", f["pricing_unit"] or "CAST(NULL AS STRING)",
               f["amount"] or "0", f["cost"], f["currency"] or "CAST(NULL AS STRING)", ai_clause(f),
-              excluded_clause(f)))
+              excluded_clause(f), proj_clause))
     params = range_params(rng, with_prev=False)
     params["excluded"] = ctx.excluded_patterns
+    if sel_proj != "all" and f.get("project"):
+        params["project"] = sel_proj
     return ctx.query(sql, params, "model_usage")
 
 

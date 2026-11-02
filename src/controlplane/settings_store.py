@@ -19,6 +19,7 @@ import copy
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -30,7 +31,8 @@ from .httpkit import ApiError, now_iso
 LOG = logging.getLogger("controlplane.settings")
 
 RELOAD_SECONDS = 30
-EMPTY_AUTH = {"requests": [], "lastLogin": {}, "revoked": {}}
+ACCOUNT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._@\-]{1,127}$")
+EMPTY_AUTH = {"requests": [], "lastLogin": {}, "revoked": {}, "accounts": {}}
 EMPTY_GOVERNANCE = {"exceptions": [], "suspensions": [], "notified": {}, "lastRun": None, "lastScheduledRun": None}
 EMPTY_DOC = {"version": 1, "overrides": {}, "connectors": [], "updatedAt": None, "updatedBy": None,
              "auth": EMPTY_AUTH, "governance": EMPTY_GOVERNANCE}
@@ -41,6 +43,10 @@ REVOCATION_RETENTION_MS = 8 * 24 * 3600 * 1000  # longer than the maximum sessio
 EXCEPTION_TYPES = ("allow", "block", "limit")
 SUSPENSION_TRIGGERS = ("auto", "review", "admin", "bulk")
 CAP_REASONS = ("tokens", "requests", "cost")
+
+
+def _valid_account_key(key):
+    return isinstance(key, str) and bool(config.EMAIL_RE.match(key) or ACCOUNT_ID_RE.match(key))
 
 
 def sanitize_auth(auth):
@@ -60,14 +66,24 @@ def sanitize_auth(auth):
     requests = requests[-MAX_ACCESS_REQUESTS:]
     last_login = {}
     for email, when in list((auth.get("lastLogin") or {}).items())[-MAX_AUTH_ENTRIES:]:
-        if isinstance(email, str) and config.EMAIL_RE.match(email) and isinstance(when, str):
+        if _valid_account_key(email) and isinstance(when, str):
             last_login[email] = when[:40]
     revoked = {}
     floor = int(time.time() * 1000) - REVOCATION_RETENTION_MS
     for email, epoch in list((auth.get("revoked") or {}).items())[-MAX_AUTH_ENTRIES:]:
-        if isinstance(email, str) and config.EMAIL_RE.match(email) and isinstance(epoch, int) and epoch > floor:
+        if _valid_account_key(email) and isinstance(epoch, int) and epoch > floor:
             revoked[email] = epoch
-    return {"requests": requests, "lastLogin": last_login, "revoked": revoked}
+    accounts = {}
+    for acct, meta in list((auth.get("accounts") or {}).items())[-MAX_AUTH_ENTRIES:]:
+        key = str(acct or "").strip().lower()
+        if not _valid_account_key(key) or not isinstance(meta, dict):
+            continue
+        role = "admin" if meta.get("role") == "admin" or key == "admin" else "viewer"
+        pw_hash = str(meta.get("passwordHash") or "")[:256]
+        name = str(meta.get("name") or "")[:120]
+        updated_at = str(meta.get("updatedAt") or "")[:40]
+        accounts[key] = {"role": role, "passwordHash": pw_hash, "name": name, "updatedAt": updated_at}
+    return {"requests": requests, "lastLogin": last_login, "revoked": revoked, "accounts": accounts}
 
 
 def _opt_str(value, limit=40):

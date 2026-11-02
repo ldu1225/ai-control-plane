@@ -297,9 +297,10 @@ def detail(ctx):
         raise ApiError("not_found", "User not found.")
     params = dict(range_params(rng, with_prev=False), email=email)
     ctes, parts, labels, agy_in_sql, available = long_ctes(ctx)
-    from .gemini_enterprise import GE_ACTIVITY, GE_MESSAGE
+    from .gemini_enterprise import GE_ACTIVITY, GE_INFERENCE, GE_MESSAGE
     msrc = ctx.audit_source(GE_MESSAGE)
     asrc = ctx.audit_source(GE_ACTIVITY)
+    isrc = ctx.audit_source(GE_INFERENCE, optional=True)
     osrc = ctx.audit_source(ARMOR_OPS)
     tasks = {}
     if parts:
@@ -318,7 +319,7 @@ def detail(ctx):
         if fsql:
             tasks["files"] = lambda: ctx.query(fsql, params, "users")
     if asrc:
-        asql = activity_upload_sql(asrc, email_filter=True, limit=200)
+        asql = activity_upload_sql(asrc, email_filter=True, limit=200, isrc=isrc)
         if asql:
             tasks["files_act"] = lambda: ctx.query(asql, params, "users")
     if osrc and attribution_ctes(asrc):
@@ -398,7 +399,6 @@ def detail(ctx):
         ok, rows = res["files_act"]
         if ok:
             if rows and act_counted:
-                ctx.warn(asrc.label, "partial_data", ACTIVITY_UPLOAD_NOTE)
                 files = file_rows_to_items(rows)
             elif files is None:
                 files = []

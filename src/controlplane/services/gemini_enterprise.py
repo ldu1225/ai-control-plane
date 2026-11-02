@@ -10,7 +10,7 @@ from .. import timeutil
 from ..gcp import GcpError
 from ..schema import expr, quote_ident
 from ..security import uid_for
-from .base import (GE_ACTIVITY, GE_MESSAGE, bucket_or_sentinel, bucket_sql, bucket_values, discovery_host,
+from .base import (GE_ACTIVITY, GE_INFERENCE, GE_MESSAGE, bucket_or_sentinel, bucket_sql, bucket_values, discovery_host,
                    discovery_locations, human_sql, iso, num, parse_rfc3339, period_sql, range_params, split_rollup,
                    to_int)
 
@@ -358,9 +358,10 @@ def _date_str(value):
     return None
 
 
-def license_configs(ctx, location="global"):
+def license_configs(ctx, location="global", project=None):
     """License configurations distributed to this project in one location: (configs, active seats or None)."""
-    url = "%s/v1alpha/projects/%s/locations/%s/licenseConfigs" % (discovery_host(location), ctx.project, location)
+    project = project or ctx.project
+    url = "%s/v1alpha/projects/%s/locations/%s/licenseConfigs" % (discovery_host(location), project, location)
     items, _ = ctx.gcp.paginate(url, quota_project=ctx.quota_project, items_key="licenseConfigs", max_pages=5)
     configs = []
     active = {}
@@ -371,7 +372,7 @@ def license_configs(ctx, location="global"):
         cfg = {"name": item.get("name"), "displayName": item.get("displayName"), "state": item.get("state"),
                "licenseCount": count, "subscriptionTier": item.get("subscriptionTier"),
                "startDate": _date_str(item.get("startDate")), "endDate": _date_str(item.get("endDate")),
-               "location": location}
+               "location": location, "project": project}
         configs.append(cfg)
         if item.get("state") == "ACTIVE":
             key = item.get("name") or "config-%d" % len(active)
@@ -380,61 +381,80 @@ def license_configs(ctx, location="global"):
     return configs, purchased
 
 
-def user_licenses(ctx, location="global"):
+def user_licenses(ctx, location="global", project=None):
+    project = project or ctx.project
     url = ("%s/v1alpha/projects/%s/locations/%s/userStores/default_user_store/userLicenses"
-           % (discovery_host(location), ctx.project, location))
+           % (discovery_host(location), project, location))
     return ctx.gcp.paginate(url, quota_project=ctx.quota_project, items_key="userLicenses", page_size=500,
                             max_pages=20)
 
 
 def licenses(ctx):
-    """Seats in every configured location. Subscriptions are distributed to a project per location (global,
-    us, eu), so purchased and assigned seats are summed over DISCOVERY_ENGINE_LOCATIONS."""
+    """Seats in every configured location across scanned projects. Subscriptions are distributed to a project per
+    location (global, us, eu), so purchased and assigned seats are summed over DISCOVERY_ENGINE_LOCATIONS."""
     today = timeutil.today_in(ctx.tz_name)
     tz = timeutil.get_zone(ctx.tz_name)
     locations = discovery_locations(ctx)
+    projects = getattr(ctx, "projects", None) or [ctx.project]
     out = {"configs": None, "purchased": None, "assigned": None, "unassigned": None, "users": None,
            "idleThresholdDays": IDLE_LICENSE_DAYS, "idleAssigned": None, "userLicensesAvailable": False,
            "locations": locations}
     tasks = {}
-    for loc in locations:
-        tasks["configs:" + loc] = (lambda where=loc: license_configs(ctx, where))
-        tasks["users:" + loc] = (lambda where=loc: user_licenses(ctx, where))
+    for proj in projects:
+        for loc in locations:
+            tasks[("configs", proj, loc)] = (lambda where=loc, p=proj: license_configs(ctx, where, p))
+            tasks[("users", proj, loc)] = (lambda where=loc, p=proj: user_licenses(ctx, where, p))
     res = ctx.run(tasks)
     configs, purchased, configs_ok = [], None, False
+    seen_configs = set()
     users, users_ok = [], False
-    for loc in locations:
-        ok, value = res["configs:" + loc]
-        if ok:
-            configs_ok = True
-            loc_configs, loc_purchased = value
-            configs.extend(loc_configs)
-            if loc_purchased is not None:
-                purchased = (purchased or 0) + loc_purchased
-            ctx.add_source("api:discoveryengine.licenseConfigs")
-        else:
-            ctx.warn_error("api:discoveryengine.licenseConfigs", value, "The Discovery Engine license API (%s)" % loc)
-        ok, value = res["users:" + loc]
-        if not ok:
-            ctx.warn_error("api:discoveryengine.userLicenses", value,
-                           "The Discovery Engine user license API (%s)" % loc)
-            continue
-        users_ok = True
-        items, truncated = value
-        ctx.add_source("api:discoveryengine.userLicenses")
-        if truncated:
-            ctx.warn("api:discoveryengine.userLicenses", "truncated",
-                     "Only the first 10000 user licenses in %s are shown." % loc)
-        for item in items:
-            if not isinstance(item, dict):
+    seen_users = set()
+    for proj in projects:
+        is_primary = proj == ctx.project
+        for loc in locations:
+            ok, value = res[("configs", proj, loc)]
+            if ok:
+                configs_ok = True
+                loc_configs, _loc_purchased = value
+                for cfg in loc_configs:
+                    ckey = (cfg.get("name") or "", loc)
+                    if ckey in seen_configs:
+                        continue
+                    seen_configs.add(ckey)
+                    configs.append(cfg)
+                    if cfg.get("state") == "ACTIVE":
+                        purchased = (purchased or 0) + to_int(cfg.get("licenseCount"))
+                if loc_configs and purchased is None:
+                    purchased = 0
+                ctx.add_source("api:discoveryengine.licenseConfigs")
+            elif is_primary:
+                ctx.warn_error("api:discoveryengine.licenseConfigs", value, "The Discovery Engine license API (%s)" % loc)
+            ok, value = res[("users", proj, loc)]
+            if not ok:
+                if is_primary:
+                    ctx.warn_error("api:discoveryengine.userLicenses", value,
+                                   "The Discovery Engine user license API (%s)" % loc)
                 continue
-            email = (item.get("userPrincipal") or "").strip().lower()
-            if not email:
-                continue
-            last = parse_rfc3339(item.get("lastLoginTime"))
-            idle = (today - last.astimezone(tz).date()).days if last else None
-            users.append({"uid": uid_for(email), "email": email, "state": item.get("licenseAssignmentState"),
-                          "lastLogin": iso(last), "idleDays": idle, "location": loc})
+            users_ok = True
+            items, truncated = value
+            ctx.add_source("api:discoveryengine.userLicenses")
+            if truncated and is_primary:
+                ctx.warn("api:discoveryengine.userLicenses", "truncated",
+                         "Only the first 10000 user licenses in %s are shown." % loc)
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                email = (item.get("userPrincipal") or "").strip().lower()
+                if not email:
+                    continue
+                ukey = (email, loc)
+                if ukey in seen_users:
+                    continue
+                seen_users.add(ukey)
+                last = parse_rfc3339(item.get("lastLoginTime"))
+                idle = (today - last.astimezone(tz).date()).days if last else None
+                users.append({"uid": uid_for(email), "email": email, "state": item.get("licenseAssignmentState"),
+                              "lastLogin": iso(last), "idleDays": idle, "location": loc, "project": proj})
     if configs_ok:
         out["configs"], out["purchased"] = configs, purchased
     if users_ok:
@@ -508,12 +528,72 @@ def file_items_sql(msrc, asrc, email_filter=False, limit=200):
     return sql
 
 
-def activity_upload_sql(asrc, email_filter=False, limit=200):
-    """Upload events from the activity log: who and when. File names are not recorded in that log."""
+_EXT_MIMES = {
+    ".pdf": "application/pdf",
+    ".doc": "application/msword",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xls": "application/vnd.ms-excel",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".ppt": "application/vnd.ms-powerpoint",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".svg": "image/svg+xml",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".json": "application/json",
+}
+
+
+def _inf_msgs_json(isrc, alias="i"):
+    if isrc is None or isrc.schema is None:
+        return None
+    jp = isrc.schema.node("jsonPayload")
+    msgs = isrc.schema.node("jsonPayload.gen_ai_input_messages")
+    if jp is None or msgs is None:
+        return None
+    return "TO_JSON_STRING(%s.%s.%s)" % (alias, quote_ident(jp.name), quote_ident(msgs.name))
+
+
+def activity_upload_sql(asrc, email_filter=False, limit=200, isrc=None):
+    """Upload events from the activity log, enriched with filenames from gen_ai_client_inference_operation_details when present."""
     ctes, caps = act_ctes(asrc, start_param="start_ts")
     if not caps["upload"]:
         return None
     where = "is_upload AND email = @email" if email_filter else "is_upload"
+    msgs_json = _inf_msgs_json(isrc) if (isrc and caps.get("trace") and caps.get("user")) else None
+    if msgs_json:
+        i_ts = "i.%s" % quote_ident(isrc.time_column())
+        i_trace = expr("i", isrc.schema, "trace", cast="STRING")
+        i_user = expr("i", isrc.schema, "jsonPayload.user_id", "jsonPayload.user", cast="STRING")
+        user_sql = "COALESCE(au.a_email, LOWER(%s))" % i_user if i_user else "au.a_email"
+        join_au = ("LEFT JOIN act_users au ON au.trace = %s" % i_trace) if i_trace else ""
+        ctes.append("act_users AS (SELECT trace, ANY_VALUE(email) AS a_email FROM act "
+                    "WHERE trace IS NOT NULL AND email IS NOT NULL GROUP BY trace)")
+        ctes.append(isrc.cte("i_src", start="start_ts"))
+        ctes.append(
+            "inf_files AS (SELECT %s AS ts, %s AS email, "
+            "TRIM(COALESCE(REGEXP_EXTRACT(%s, r'original_filename:\\s*([^,>\"\\\\]+)'), "
+            "REGEXP_EXTRACT(%s, r'<start_of_user_uploaded_file:\\s*([^,>\"\\\\]+)'))) AS file_name, "
+            "REGEXP_EXTRACT(%s, r'mime type:\\s*([A-Za-z0-9_./+-]+)') AS mime "
+            "FROM i_src i %s WHERE %s LIKE %s)"
+            % (i_ts, user_sql, msgs_json, msgs_json, msgs_json, join_au, msgs_json, UPLOAD_LIKE)
+        )
+        ctes.append(
+            "act_up AS (SELECT u.ts, u.email, f.file_name, f.mime, u.file_id "
+            "FROM (SELECT * FROM act WHERE %s) u "
+            "LEFT JOIN inf_files f ON f.email = u.email AND f.file_name IS NOT NULL "
+            "AND f.ts BETWEEN TIMESTAMP_SUB(u.ts, INTERVAL 1 MINUTE) AND TIMESTAMP_ADD(u.ts, INTERVAL 30 MINUTE) "
+            "QUALIFY ROW_NUMBER() OVER (PARTITION BY u.file_id, u.ts "
+            "ORDER BY ABS(TIMESTAMP_DIFF(f.ts, u.ts, SECOND)) ASC NULLS LAST) = 1)" % where
+        )
+        return ("WITH %s\nSELECT ts, email, file_name, mime, file_id, COUNT(*) OVER () AS total FROM act_up\n"
+                "ORDER BY ts DESC\nLIMIT %d" % (",\n".join(ctes), int(limit)))
     return ("WITH %s\nSELECT ts, email, CAST(NULL AS STRING) AS file_name, CAST(NULL AS STRING) AS mime, file_id, "
             "COUNT(*) OVER () AS total FROM act WHERE %s\nORDER BY ts DESC\nLIMIT %d"
             % (",\n".join(ctes), where, int(limit)))
@@ -529,6 +609,10 @@ def file_rows_to_items(rows):
         email = row.get("email")
         name = row.get("file_name")
         mime = row.get("mime")
+        if name and "." in name:
+            ext = "." + name.rsplit(".", 1)[-1].lower()
+            if not mime or (ext in (".xlsx", ".xls") and mime == "text/csv"):
+                mime = _EXT_MIMES.get(ext, mime)
         category = file_category(name, mime)
         items.append({"time": iso(row.get("ts")), "uid": uid_for(email) if email else None, "email": email,
                       "fileName": name, "fileId": row.get("file_id"), "mimeType": mime, "category": category,
@@ -540,6 +624,7 @@ def file_rows_to_items(rows):
 def file_uploads(ctx):
     rng = ctx.range
     msrc, asrc = ge_sources(ctx)
+    isrc = ctx.audit_source(GE_INFERENCE, optional=True)
     params = range_params(rng, with_prev=False)
     rows = None
     if msrc:
@@ -554,8 +639,8 @@ def file_uploads(ctx):
             except GcpError as err:
                 ctx.warn_error(msrc.label, err, "Gemini Enterprise file uploads")
     if not rows and asrc:
-        # The message log is optional: fall back to upload calls in the activity log.
-        a_sql = activity_upload_sql(asrc)
+        # The message log is optional: fall back to upload calls in the activity log (enriched with inference details).
+        a_sql = activity_upload_sql(asrc, isrc=isrc)
         if a_sql:
             try:
                 a_rows = ctx.query(a_sql, params, "gemini_enterprise")
@@ -563,8 +648,9 @@ def file_uploads(ctx):
                 ctx.warn_error(asrc.label, err, "Gemini Enterprise activity logs")
             else:
                 ctx.add_source(asrc.label)
+                if isrc:
+                    ctx.add_source(isrc.label)
                 if a_rows:
-                    ctx.warn(asrc.label, "partial_data", ACTIVITY_UPLOAD_NOTE)
                     rows = a_rows
                 elif rows is None:
                     rows = []

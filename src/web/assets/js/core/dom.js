@@ -28,8 +28,22 @@ function setAttrs(el, attrs, isSvg) {
       }
     } else if (key === 'style') {
       // CSSOM only (allowed by CSP); never the style attribute string.
-      for (const [prop, v] of Object.entries(value)) {
-        if (v !== null && v !== undefined) el.style.setProperty(prop, String(v));
+      if (typeof value === 'string') {
+        for (const part of value.split(';')) {
+          const idx = part.indexOf(':');
+          if (idx > 0) {
+            const prop = part.slice(0, idx).trim();
+            const val = part.slice(idx + 1).trim();
+            if (prop && val) el.style.setProperty(prop, val);
+          }
+        }
+      } else if (typeof value === 'object') {
+        for (const [prop, v] of Object.entries(value)) {
+          if (v !== null && v !== undefined) {
+            const kebab = prop.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
+            el.style.setProperty(kebab, String(v));
+          }
+        }
       }
     } else if (key === 'text') {
       el.textContent = String(value);

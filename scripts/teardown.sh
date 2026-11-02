@@ -27,34 +27,25 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
-log()  { printf '\n==> %s\n' "$*"; }
-info() { printf '    %s\n' "$*"; }
-die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+# shellcheck source=lib/common.sh
+source "$ROOT/scripts/lib/common.sh"
 quiet() { "$@" >/dev/null 2>&1; }
-# IAM policy edits can fail transiently (concurrent changes); retry a few times.
-retry() {
-  local n=0
-  until "$@"; do
-    n=$((n + 1))
-    [[ $n -ge 4 ]] && return 1
-    sleep 5
-  done
-}
 
 [[ -f "$CONFIG" ]] || die "configuration file not found: $CONFIG"
 # shellcheck disable=SC1090
 source "$CONFIG"
-PROJECT_ID="${PROJECT_ID:-}"
-REGION="${REGION:-us-central1}"
-SERVICE_NAME="${SERVICE_NAME:-ai-control-plane}"
-AUDIT_DATASET="${AUDIT_DATASET:-ge_analytics}"
-AR_REPOSITORY="${AR_REPOSITORY:-ai-control-plane}"
-BILLING_PROJECT_ID="${BILLING_PROJECT_ID:-}"
-SERVICE_ACCOUNT_ID="${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}"
-SETTINGS_BUCKET="${SETTINGS_BUCKET:-${PROJECT_ID}-${SERVICE_NAME}-settings}"
-SESSION_SECRET_NAME="${SESSION_SECRET_NAME:-${SERVICE_NAME}-session-secret}"
-OAUTH_SECRET_NAME="${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}"
-[[ -n "$PROJECT_ID" && "$PROJECT_ID" != your-* ]] || die "set PROJECT_ID in $CONFIG"
+PROJECT_ID="$(normalize_project_id "${PROJECT_ID:-}")"
+REGION="$(trim_ws "${REGION:-us-central1}")"
+SERVICE_NAME="$(trim_ws "${SERVICE_NAME:-ai-control-plane}")"
+AUDIT_DATASET="$(trim_ws "${AUDIT_DATASET:-ge_analytics}")"
+AR_REPOSITORY="$(trim_ws "${AR_REPOSITORY:-ai-control-plane}")"
+BILLING_PROJECT_ID="$(normalize_project_id "${BILLING_PROJECT_ID:-}")"
+SERVICE_ACCOUNT_ID="$(trim_ws "${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}")"
+SETTINGS_BUCKET="$(trim_ws "${SETTINGS_BUCKET:-}")"
+SESSION_SECRET_NAME="$(trim_ws "${SESSION_SECRET_NAME:-${SERVICE_NAME}-session-secret}")"
+OAUTH_SECRET_NAME="$(trim_ws "${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}")"
+validate_project_id "$PROJECT_ID" "$CONFIG"
+[[ -n "$SETTINGS_BUCKET" ]] || SETTINGS_BUCKET="$(default_settings_bucket "$PROJECT_ID" "$SERVICE_NAME")"
 
 SA_EMAIL="${SERVICE_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 SCHEDULER_SA="${SERVICE_NAME:0:20}-scheduler@${PROJECT_ID}.iam.gserviceaccount.com"

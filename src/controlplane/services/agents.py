@@ -57,34 +57,38 @@ def _agent_type_de(agent):
 
 def reasoning_engines(ctx):
     regions = ctx.ws.get("agent_engine_regions") or []
+    projects = getattr(ctx, "projects", None) or [ctx.project]
     tasks = {}
-    for region in regions:
-        if not config.LOCATION_RE.match(region or ""):
-            continue
-        url = "https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/reasoningEngines" % (
-            region, ctx.project, region)
-        tasks[region] = (lambda u=url: ctx.gcp.paginate(u, quota_project=ctx.quota_project,
-                                                        items_key="reasoningEngines", page_size=100, max_pages=10))
+    for project in projects:
+        for region in regions:
+            if not config.LOCATION_RE.match(region or ""):
+                continue
+            url = "https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/reasoningEngines" % (
+                region, project, region)
+            tasks[(project, region)] = (lambda u=url: ctx.gcp.paginate(
+                u, quota_project=ctx.quota_project, items_key="reasoningEngines", page_size=100, max_pages=10))
     engines = []
     ok_count = 0
     res = ctx.run(tasks)
-    for region, (ok, value) in res.items():
+    for (project, region), (ok, value) in res.items():
         if not ok:
-            ctx.warn_error("api:aiplatform.reasoningEngines", value, "Agent Engine (Agent Platform) in %s" % region)
+            if project == ctx.project:
+                ctx.warn_error("api:aiplatform.reasoningEngines", value, "Agent Engine (Agent Platform) in %s" % region)
             continue
         ok_count += 1
         ctx.add_source("api:aiplatform.reasoningEngines")
         items, truncated = value
-        if truncated:
+        if truncated and project == ctx.project:
             ctx.warn("api:aiplatform.reasoningEngines", "truncated", "Only the first 1000 reasoning engines per "
                                                                      "region are listed.")
         for item in items:
             if isinstance(item, dict) and item.get("name"):
-                engines.append((region, item))
+                enriched = dict(item, _project=project)
+                engines.append((region, enriched))
     return engines, ok_count
 
 
-def _engine_agents(ctx, location, engine_name):
+def _engine_agents(ctx, location, engine_name, warn=True):
     host = de_host(location)
     out = []
     assistants, _ = ctx.gcp.paginate("%s/v1alpha/%s/assistants" % (host, engine_name),
@@ -98,7 +102,8 @@ def _engine_agents(ctx, location, engine_name):
             agents, _ = ctx.gcp.paginate("%s/v1alpha/%s/agents" % (host, name), quota_project=ctx.quota_project,
                                          items_key="agents", page_size=100, max_pages=5)
         except GcpError as err:
-            ctx.warn_error("api:discoveryengine.agents", err, "Discovery Engine agents")
+            if warn:
+                ctx.warn_error("api:discoveryengine.agents", err, "Discovery Engine agents")
             continue
         for agent in agents:
             if isinstance(agent, dict) and agent.get("name"):
@@ -108,32 +113,52 @@ def _engine_agents(ctx, location, engine_name):
 
 def discovery_agents(ctx):
     locations = ctx.ws.get("discovery_engine_locations") or []
+    projects = getattr(ctx, "projects", None) or [ctx.project]
     found = []
     ok_count = 0
-    for location in locations:
-        if not config.LOCATION_RE.match(location or ""):
-            continue
-        url = "%s/v1alpha/projects/%s/locations/%s/collections/default_collection/engines" % (
-            de_host(location), ctx.project, location)
-        try:
-            engines, _ = ctx.gcp.paginate(url, quota_project=ctx.quota_project, items_key="engines", page_size=100,
-                                          max_pages=3)
-        except GcpError as err:
-            ctx.warn_error("api:discoveryengine.engines", err, "Discovery Engine in %s" % location)
+    loc_tasks = {}
+    for project in projects:
+        for location in locations:
+            if not config.LOCATION_RE.match(location or ""):
+                continue
+            url = "%s/v1alpha/projects/%s/locations/%s/collections/default_collection/engines" % (
+                de_host(location), project, location)
+            loc_tasks[(project, location)] = (lambda u=url: ctx.gcp.paginate(
+                u, quota_project=ctx.quota_project, items_key="engines", page_size=100, max_pages=3))
+    loc_res = ctx.run(loc_tasks)
+    engine_tasks = {}
+    engine_meta = {}
+    for (project, location), (ok, value) in loc_res.items():
+        is_primary = project == ctx.project
+        if not ok:
+            if is_primary:
+                ctx.warn_error("api:discoveryengine.engines", value, "Discovery Engine in %s" % location)
             continue
         ctx.add_source("api:discoveryengine.engines")
         ok_count += 1
-        names = [e.get("name") for e in engines if isinstance(e, dict) and ENGINE_NAME_RE.match(e.get("name") or "")]
-        if len(names) > MAX_ENGINES:
+        engines, _ = value
+        engine_by_name = {e.get("name"): e for e in engines if isinstance(e, dict) and ENGINE_NAME_RE.match(e.get("name") or "")}
+        names = list(engine_by_name.keys())
+        if len(names) > MAX_ENGINES and is_primary:
             ctx.warn("api:discoveryengine.engines", "truncated", "Only the first %d engines are inspected." % MAX_ENGINES)
-        tasks = {name: (lambda n=name, loc=location: _engine_agents(ctx, loc, n)) for name in names[:MAX_ENGINES]}
-        for name, (ok, value) in ctx.run(tasks).items():
-            if not ok:
+        for name in names[:MAX_ENGINES]:
+            key = (project, location, name)
+            engine_meta[key] = engine_by_name[name]
+            engine_tasks[key] = (lambda n=name, loc=location, w=is_primary: _engine_agents(ctx, loc, n, warn=w))
+    for (project, location, name), (ok, value) in ctx.run(engine_tasks).items():
+        is_primary = project == ctx.project
+        eng = engine_meta[(project, location, name)]
+        if not ok:
+            if eng.get("solutionType") == "SOLUTION_TYPE_SEARCH":
+                found.append((location, "search_engine", dict(eng, _project=project)))
+            elif is_primary:
                 ctx.warn_error("api:discoveryengine.agents", value, "Discovery Engine assistants")
-                continue
-            ctx.add_source("api:discoveryengine.agents")
-            for kind, item in value:
-                found.append((location, kind, item))
+            continue
+        ctx.add_source("api:discoveryengine.agents")
+        if not value and eng.get("solutionType") == "SOLUTION_TYPE_SEARCH":
+            found.append((location, "search_engine", dict(eng, _project=project)))
+        for kind, item in value:
+            found.append((location, kind, dict(item, _project=project)))
     return found, ok_count
 
 
@@ -172,7 +197,7 @@ def agent_directory(ctx):
     def load(child):
         names = {}
         try:
-            found, _ = discovery_agents(child)
+            found, _ = child.memo("discovery_agents", "all", discovery_agents, ttl=300)
         except Exception:  # pylint: disable=broad-except
             found = []
         for _location, kind, obj in found:
@@ -241,7 +266,10 @@ def registry_data(ctx, rng):
     asrc = ctx.audit_source(GE_ACTIVITY)
     dsrc = ctx.audit_source(AUDIT_DATA_ACCESS)
     acsrc = ctx.audit_source(AUDIT_ACTIVITY)
-    tasks = {"engines": lambda: reasoning_engines(ctx), "de": lambda: discovery_agents(ctx)}
+    tasks = {
+        "engines": lambda: ctx.memo("reasoning_engines", "all", reasoning_engines, ttl=300),
+        "de": lambda: ctx.memo("discovery_agents", "all", discovery_agents, ttl=300),
+    }
     if asrc:
         tasks["activity"] = lambda: activity_calls(ctx, rng, asrc)
     if dsrc:
@@ -300,9 +328,10 @@ def registry_data(ctx, rng):
         framework = (spec.get("agentFramework") or "").lower()
         atype = "ADK" if "adk" in framework else ("A2A" if "a2a" in framework else "Reasoning Engine")
         calls = ecalls.get(engine_id) or {}
+        proj = engine.get("_project") or ctx.project
         item = {"id": "reasoningEngines/%s" % engine_id, "name": engine.get("displayName") or engine_id,
                 "description": engine.get("description") or "", "platform": "agent_engine", "type": atype,
-                "region": region, "owner": owners.get(("engine", engine_id)),
+                "project": proj, "region": region, "owner": owners.get(("engine", engine_id)),
                 "identity": spec.get("effectiveIdentity") or spec.get("serviceAccount") or None,
                 "createTime": iso(parse_rfc3339(engine.get("createTime"))),
                 "updateTime": iso(parse_rfc3339(engine.get("updateTime"))),
@@ -320,9 +349,11 @@ def registry_data(ctx, rng):
             calls = activity.get(agent_id) or {}
             if calls:
                 matched_activity.add(agent_id)
+        proj = obj.get("_project") or ctx.project
         item = {"id": short, "name": obj.get("displayName") or name.rsplit("/", 1)[-1],
                 "description": obj.get("description") or "", "platform": "gemini_enterprise", "type": atype,
-                "region": location, "owner": owners.get(("agent", name.rsplit("/", 1)[-1])) if kind == "agent" else None,
+                "project": proj, "region": location,
+                "owner": owners.get(("agent", name.rsplit("/", 1)[-1])) if kind == "agent" else None,
                 "identity": None, "createTime": iso(parse_rfc3339(obj.get("createTime"))),
                 "updateTime": iso(parse_rfc3339(obj.get("updateTime"))),
                 "calls": to_int(calls.get("calls")) if (kind != "assistant" and activity_ok) else None,
@@ -332,7 +363,7 @@ def registry_data(ctx, rng):
         if agent_id in matched_activity:
             continue
         item = {"id": "observed/%s" % agent_id, "name": row.get("agent_name") or agent_id, "description": "",
-                "platform": "gemini_enterprise_observed", "type": None, "region": None,
+                "platform": "gemini_enterprise_observed", "type": None, "project": ctx.project, "region": None,
                 "owner": owners.get(("agent", agent_id)), "identity": None, "createTime": None, "updateTime": None,
                 "calls": to_int(row.get("calls")), "resourceName": None}
         finish(item, row.get("last_call"))
@@ -459,8 +490,9 @@ def deployments(ctx):
         cost = money(cost_row.get("cost")) if cost_row else (0.0 if costs is not None else None)
         if cost is not None and cost_total is not None:
             cost_total += cost
+        proj = engine.get("_project") or ctx.project
         rows.append({"id": "reasoningEngines/%s" % engine_id, "name": engine.get("displayName") or engine_id,
-                     "region": region, "framework": spec.get("agentFramework") or None,
+                     "project": proj, "region": region, "framework": spec.get("agentFramework") or None,
                      "pythonVersion": pkg.get("pythonVersion") or None,
                      "identity": spec.get("effectiveIdentity") or spec.get("serviceAccount") or None,
                      "minInstances": dep_spec.get("minInstances") if isinstance(dep_spec.get("minInstances"), int)

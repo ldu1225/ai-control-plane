@@ -110,7 +110,8 @@ def rising_skus(ctx, src, days, project, tz_name):
         day = row.get("day")
         if isinstance(day, dt.datetime):
             day = day.date()
-        costs[(day, row.get("sku"), row.get("service"))] = to_float(row.get("cost")) or 0.0
+        svc_name = _display_service(row.get("service"))
+        costs[(day, row.get("sku"), svc_name)] = costs.get((day, row.get("sku"), svc_name), 0.0) + (to_float(row.get("cost")) or 0.0)
     out = {}
     for day in days:
         prev_day = day - dt.timedelta(days=1)
@@ -126,6 +127,12 @@ def rising_skus(ctx, src, days, project, tz_name):
         items.sort(key=lambda x: (-x["delta"], x["sku"] or ""))
         out[day] = items[:5]
     return out
+
+
+def _display_service(name):
+    if isinstance(name, str) and name.strip().lower() in ("vertex ai", "agent platform"):
+        return "Agent Platform"
+    return name
 
 
 def validate_project(value):
@@ -219,8 +226,9 @@ def summary(ctx):
         sku_list = []
         for row in rows:
             cost = to_float(row.get("cost")) or 0.0
-            services[row.get("service")] = services.get(row.get("service"), 0.0) + cost
-            sku_list.append((row.get("sku"), row.get("service"), cost))
+            svc_name = _display_service(row.get("service"))
+            services[svc_name] = services.get(svc_name, 0.0) + cost
+            sku_list.append((row.get("sku"), svc_name, cost))
         gross = s["gross"]
         out["byService"] = [{"service": svc, "cost": money(c), "share": ratio(c, gross) if gross else None}
                             for svc, c in sorted(services.items(), key=lambda kv: -kv[1])[:12]]
@@ -252,7 +260,8 @@ def ai_spend(ctx, rng):
     src = ctx.billing_source()
     if src is None:
         return None
-    daily, currency, has_credit_col = daily_totals(ctx, src, rng, "all", ai_only=True)
+    project_filter = getattr(ctx, "selected_project", "all") or "all"
+    daily, currency, has_credit_col = daily_totals(ctx, src, rng, project_filter, ai_only=True)
     ctx.add_source(src.label)
     s = spend_summary(daily, rng)
     has_credits = has_credit_col and abs(s["credits"]) > 0.0

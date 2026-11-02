@@ -41,7 +41,7 @@ Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registr
 | 원칙 | 의미 |
 |---|---|
 | 실측 데이터만 표시 | 추정치, 예시 값, 데모 데이터를 넣지 않습니다. 읽지 못한 값은 `—`와 원인으로 표시합니다. |
-| 하드코딩 없음 | 모델 목록과 버전을 코드에 두지 않습니다. 결제 SKU, Cloud Monitoring, Antigravity 로그에서 자동으로 발견하므로 새 모델이 나와도 배포 없이 추적됩니다. |
+| 하드코딩 없음 | 모델 목록과 버전을 코드에 두지 않습니다. 결제 SKU, Cloud Monitoring, Antigravity 로그에서 자동으로 발견하므로 Gemini 4 Carbon, Gemini 4 Argon 등 새 모델이 나와도 배포 없이 추적됩니다. |
 | 스키마 적응형 | BigQuery 테이블과 컬럼은 `INFORMATION_SCHEMA`로 확인한 뒤 존재하는 것만 조회합니다. 날짜 분할(sharded) 테이블과 파티션 테이블을 모두 지원합니다. |
 | 모든 기능은 켜고 끔 | 모듈, 모델, 커넥터 단위로 켜고 끕니다. 꺼진 모듈은 데이터 소스를 조회하지 않습니다. |
 | 통제 기능은 안전장치 우선 | IAM 변경은 시뮬레이션, 안전 게이트, 변경 예산, etag 기반 원자적 갱신, 감사 로그를 거칩니다. |
@@ -517,7 +517,7 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 - 모델은 결제 SKU, Cloud Monitoring `model_user_id`, Antigravity `model_id`에서 자동으로 발견됩니다. SKU 설명에서 모델 계열 단어(Gemini, Claude, Llama 등)를 찾고 리전, 모달리티, 입출력, 컨텍스트 구간 같은 수식어를 빼서 하나의 키(예: `gemini-3.8-flash`)로 묶습니다. Agent Platform 형식(`Gemini 3.8 Flash Global Text Input`), Gemini API 형식, Monitoring 모델 ID가 같은 모델로 합쳐집니다.
 - 모델별 토큰은 Cloud Monitoring `publisher/online_serving/token_count`(Agent Platform)를 기준으로 하고, Monitoring에 잡히지 않는 Gemini API 결제 토큰을 더합니다. Monitoring 지표가 없는 모델은 결제 SKU의 토큰 사용량을 씁니다. 호출 수와 오류율은 `model_invocation_count`에서 계산합니다.
 - 제품이 모델 사용량을 자체 SKU로 다시 청구하는 경우 "제품별 사용량" 카드에 따로 표시하고, 같은 토큰이 기반 모델에도 청구되므로 모델 토큰 합계에는 더하지 않습니다.
-- 새 모델이 처음 발견되면 "새 모델 감지" 알림이 뜹니다. `auto_enable_new_models: true`이면 바로 추적하고, `false`이면 관리자가 켤 때까지 합계에서 뺍니다.
+- Gemini 4 Carbon, Gemini 4 Argon처럼 새 모델이 처음 발견되면 "새 모델 감지" 알림이 뜹니다. `auto_enable_new_models: true`이면 바로 추적하고, `false`이면 관리자가 켤 때까지 합계에서 뺍니다.
 - 카탈로그 관리(또는 설정 > 모델 카탈로그)에서 모델별 추적을 끌 수 있습니다.
 
 ### 7.8 비용 및 FinOps

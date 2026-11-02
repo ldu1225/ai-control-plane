@@ -25,6 +25,88 @@ retry() {
   done
 }
 
+# Trims leading and trailing whitespace from $1.
+trim_ws() {
+  local s="${1:-}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+# Strips common copy-paste prefixes (such as "gcloud config set project ", "--project ", "project ",
+# "projects/") and surrounding quotes/whitespace from a project ID, warning when a prefix was removed.
+normalize_project_id() {
+  local raw="${1:-}" cleaned prev
+  cleaned="$(trim_ws "$raw")"
+  while :; do
+    prev="$cleaned"
+    cleaned="${cleaned#\"}"; cleaned="${cleaned%\"}"
+    cleaned="${cleaned#\'}"; cleaned="${cleaned%\'}"
+    cleaned="$(trim_ws "$cleaned")"
+    if [[ "$cleaned" =~ ^[Gg][Cc][Ll][Oo][Uu][Dd][[:space:]]+[Cc][Oo][Nn][Ff][Ii][Gg][[:space:]]+[Ss][Ee][Tt][[:space:]]+[Pp][Rr][Oo][Jj][Ee][Cc][Tt][[:space:]]+(.+)$ ]]; then
+      cleaned="${BASH_REMATCH[1]}"
+    elif [[ "$cleaned" =~ ^--[Pp][Rr][Oo][Jj][Ee][Cc][Tt]([[:space:]]+|=)(.+)$ ]]; then
+      cleaned="${BASH_REMATCH[2]}"
+    elif [[ "$cleaned" =~ ^[Pp][Rr][Oo][Jj][Ee][Cc][Tt](_[Ii][Dd])?([[:space:]]+|=)(.+)$ ]]; then
+      cleaned="${BASH_REMATCH[3]}"
+    elif [[ "$cleaned" =~ ^[Pp][Rr][Oo][Jj][Ee][Cc][Tt][Ss]/(.+)$ ]]; then
+      cleaned="${BASH_REMATCH[1]}"
+    fi
+    cleaned="$(trim_ws "$cleaned")"
+    [[ "$cleaned" == "$prev" ]] && break
+  done
+  if [[ -n "$raw" && "$cleaned" != "$(trim_ws "$raw")" ]]; then
+    warn "normalized PROJECT_ID '${raw}' -> '${cleaned}'"
+  fi
+  printf '%s' "$cleaned"
+}
+
+# Validates a Google Cloud project ID (6-30 lowercase letters, digits or hyphens, starting with a letter).
+validate_project_id() {
+  local pid="${1:-}" where="${2:-configuration}" lower
+  [[ -n "$pid" && "$pid" != your-* && "$pid" != "PROJECT_ID" ]] || die "set PROJECT_ID in ${where}"
+  if [[ "$pid" =~ [A-Z] ]]; then
+    lower="$(printf '%s' "$pid" | tr '[:upper:]' '[:lower:]')"
+    die "PROJECT_ID '${pid}' contains uppercase letters (looks like a project Name). Set the lowercase project ID instead (for example '${lower}')"
+  fi
+  [[ "$pid" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] \
+    || die "invalid PROJECT_ID '${pid}' in ${where}: enter only the lowercase Google Cloud project ID (for example 'my-project-123'), without 'project ' or spaces"
+}
+
+# Builds a <=63-character default Cloud Storage bucket name from PROJECT_ID and SERVICE_NAME.
+default_settings_bucket() {
+  local pid="$1" svc="$2" candidate max_svc short_svc
+  candidate="${pid}-${svc}-settings"
+  if [[ ${#candidate} -le 63 ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  max_svc=$((63 - ${#pid} - 10))
+  short_svc="${svc:0:$max_svc}"
+  short_svc="${short_svc%-}"
+  printf '%s' "${pid}-${short_svc}-settings"
+}
+
+# Normalizes an IAM member entry for BRIDGE_MEMBERS / IAP_MEMBERS so bare emails ("alice@example.com"),
+# wildcard domains ("*@example.com") or bare domains ("example.com") work without failing gcloud iap.
+normalize_iam_member() {
+  local m
+  m="$(trim_ws "${1:-}")"
+  [[ -n "$m" ]] || return 0
+  case "$m" in
+    allUsers|allAuthenticatedUsers|user:*|group:*|domain:*|serviceAccount:*|principal:*|principalSet:*)
+      printf '%s' "$m" ;;
+    \*@*)
+      printf 'domain:%s' "${m#\*@}" ;;
+    *@*)
+      printf 'user:%s' "$m" ;;
+    *.*)
+      printf 'domain:%s' "$m" ;;
+    *)
+      printf '%s' "$m" ;;
+  esac
+}
+
 # Dataset-level BigQuery access (a dataset ACL entry) for one service account; project IAM is not touched.
 # grant_dataset_role PROJECT DATASET ROLE EMAIL, where ROLE is READER (Data Viewer) or WRITER (Data Editor).
 # Returns non-zero when the dataset cannot be read or updated.

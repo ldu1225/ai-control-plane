@@ -24,6 +24,7 @@ class FamilyNameTest(unittest.TestCase):
     def test_no_hard_coded_versions(self):
         cases = {
             "Gemini 3.8 Pro Text Output Tokens >200K": "gemini-3.8-pro",
+            "Gemini 4 Carbon Text Output Tokens": "gemini-4-carbon",
             "Gemini 4 Argon Cached Input Tokens": "gemini-4-argon",
             "Gemini 3.8 Flash - Long Context Input Tokens": "gemini-3.8-flash",
             "Gemini 3.8 Flash Thinking Output Tokens (Priority)": "gemini-3.8-flash",
@@ -46,8 +47,10 @@ class FamilyNameTest(unittest.TestCase):
     def test_monitoring_model_ids(self):
         self.assertEqual(models.normalize_model_id("publishers/google/models/gemini-3.8-flash-001"), "gemini-3.8-flash")
         self.assertEqual(models.normalize_model_id("claude-sonnet-4-5@20250929"), "claude-sonnet-4.5")
+        self.assertEqual(models.normalize_model_id("gemini-4-carbon"), "gemini-4-carbon")
         self.assertEqual(models.normalize_model_id("gemini-4-argon"), "gemini-4-argon")
         self.assertEqual(models.display_from_key("gemini-3.8-flash"), "Gemini 3.8 Flash")
+        self.assertEqual(models.display_from_key("gemini-4-carbon"), "Gemini 4 Carbon")
 
     def test_measure_classification(self):
         self.assertEqual(models.classify_measure("Gemini 3.8 Flash Text Input Tokens", "count"), "input_tokens")
@@ -407,8 +410,7 @@ class GeminiEnterpriseUploadFallbackTest(unittest.TestCase):
         self.assertEqual(out["total"], 2)
         self.assertEqual([i["fileId"] for i in out["items"]], ["f-1", "f-2"])
         self.assertTrue(all(i["fileName"] is None and i["category"] == "other" for i in out["items"]))
-        self.assertEqual([(w["code"], w["message"]) for w in ctx.warnings],
-                         [("partial_data", ge.ACTIVITY_UPLOAD_NOTE)])
+        self.assertEqual(ctx.warnings, [])
 
     def test_activity_only_workspace(self):
         ge = self._ge()

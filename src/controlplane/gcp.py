@@ -109,7 +109,7 @@ def _google_error(payload):
 class Gcp:
     """Shared credentials, thread-local HTTP sessions, BigQuery clients and a worker pool."""
 
-    def __init__(self, max_workers=8):
+    def __init__(self, max_workers=32):
         self._lock = threading.Lock()
         self._refresh_lock = threading.Lock()
         self._base = None
@@ -119,7 +119,9 @@ class Gcp:
         self._local = threading.local()
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers,
                                                           thread_name_prefix="cp-query")
-        self.orchestrator = concurrent.futures.ThreadPoolExecutor(max_workers=6,
+        self.subpool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers,
+                                                             thread_name_prefix="cp-sub")
+        self.orchestrator = concurrent.futures.ThreadPoolExecutor(max_workers=16,
                                                                   thread_name_prefix="cp-orch")
 
     # -- credentials ------------------------------------------------------------
@@ -335,9 +337,12 @@ class Gcp:
     # -- concurrency --------------------------------------------------------------
     def run_parallel(self, tasks, pool=None):
         """Runs {name: callable} concurrently. Returns {name: (ok, value_or_exception)}."""
-        pool = pool or self.pool
         current = threading.current_thread().name
-        inline = current.startswith("cp-query") or (pool is self.orchestrator and current.startswith("cp-orch"))
+        if pool is None:
+            pool = self.subpool if current.startswith("cp-query") else self.pool
+        inline = (current.startswith("cp-sub") or
+                  (pool is self.pool and current.startswith("cp-query")) or
+                  (pool is self.orchestrator and current.startswith("cp-orch")))
         results = {}
         if inline or len(tasks) <= 1:
             for name, fn in tasks.items():

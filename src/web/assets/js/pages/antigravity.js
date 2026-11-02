@@ -39,8 +39,24 @@ const SUSPENDED = 'CAPPED_BY_TOOL';
 
 export default async function render(ctx) {
   const admin = isAdmin();
-  const dryBtn = button({ label: t('Dry run'), icon: 'play' });
-  const runBtn = button({ label: t('Run enforcement now'), icon: 'zap', variant: 'primary' });
+  let status = null;
+  const dryBtn = button({
+    label: t('Dry run'),
+    icon: 'play',
+    onClick: () => {
+      if (!requireAdmin(t('Dry run'), 'resourcemanager.projects.getIamPolicy')) return;
+      if (status) runEnforce(ctx, status, true, dryBtn);
+    },
+  });
+  const runBtn = button({
+    label: t('Run enforcement now'),
+    icon: 'zap',
+    variant: 'primary',
+    onClick: () => {
+      if (!requireAdmin(t('Run enforcement now'), 'resourcemanager.projects.setIamPolicy')) return;
+      if (status) runEnforce(ctx, status, false, runBtn);
+    },
+  });
   const header = pageHeader({
     title: t('Antigravity Controls'),
     desc: t('Per-user caps on tokens, requests and estimated cost within a settlement period. Users over their cap are suspended through project IAM until the period resets, automatically or after administrator review, with exception rules for specific users.'),
@@ -50,7 +66,6 @@ export default async function render(ctx) {
   mount(ctx.root, header, body);
   mount(body, pageSkeleton(6, 2));
 
-  let status;
   try {
     const res = await api.get('/api/v1/governance/antigravity/status', null, { signal: ctx.signal });
     status = res.data;
@@ -64,14 +79,6 @@ export default async function render(ctx) {
     return null;
   }
 
-  dryBtn.addEventListener('click', () => {
-    if (!requireAdmin(t('Dry run'), 'resourcemanager.projects.getIamPolicy')) return;
-    runEnforce(ctx, status, true, dryBtn);
-  });
-  runBtn.addEventListener('click', () => {
-    if (!requireAdmin(t('Run enforcement now'), 'resourcemanager.projects.setIamPolicy')) return;
-    runEnforce(ctx, status, false, runBtn);
-  });
   if (admin && status.plan && status.plan.aborted) {
     runBtn.disabled = true;
     runBtn.title = t('A safety gate failed. Resolve it before running enforcement.');

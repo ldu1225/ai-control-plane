@@ -89,7 +89,7 @@ bigquery:
 ai_engine:
   location: "global"
   default_model: "gemini-3.8-flash"
-  models: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-4-argon"]
+  models: ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-4-carbon", "gemini-4-argon"]
   discover_models: true
   restrict_to_allowed: true       # only configured (and discovered, if enabled) models are accepted
 

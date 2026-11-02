@@ -74,6 +74,11 @@ ENTRIES = {
         "Standard error of agents deployed to Agent Engine (Agent Platform), including startup messages and exceptions. "
         "A sudden rise usually means an agent is failing.",
         AI, operation=("resource.labels.reasoning_engine_id", "Agent Engine"), status=None, names="reasoning_engine"),
+    "aiplatform_googleapis_com_reasoning_engine_build": _entry(
+        "Agent Engine build logs",
+        "Container build steps and status messages when deploying agents to Agent Engine (Agent Platform).",
+        AI, operation=("resource.labels.reasoning_engine_id", "Agent Engine"),
+        status=("labels.build_step", "Build step"), names="reasoning_engine"),
     "aiplatform_googleapis_com_online_evaluator": _entry(
         "Agent quality evaluation runs",
         "Runs of Agent Platform online evaluators, which score agent traces against quality metrics. Shows which agents "
@@ -104,7 +109,9 @@ ENTRIES = {
         "Gemini Enterprise agent model calls",
         "One entry per model call made by agents running in Gemini Enterprise, with the agent name, token usage and "
         "the input and output messages.",
-        AI, operation=(OTEL_AGENT, "Agent"), user=OTEL_USER, tokens=(OTEL_INPUT_TOKENS, "Input tokens"), status=None,
+        AI, operation=(OTEL_AGENT, "Agent"),
+        status=({"logging": None, "bigquery": "jsonPayload.gen_ai_response_finish_reasons[0]"}, "Finish reason"),
+        user=OTEL_USER, tokens=(OTEL_INPUT_TOKENS, "Input tokens"),
         sensitive=True),
     "discoveryengine_googleapis_com_gen_ai_choice": _entry(
         "Gemini Enterprise agent responses",
@@ -116,7 +123,8 @@ ENTRIES = {
         "Gemini Enterprise data connector logs",
         "Sync activity and errors of Gemini Enterprise data connectors, for example Confluence, Jira or Outlook: "
         "which connector ran, which content was synced and whether it failed.",
-        AI, operation=("jsonPayload.connectorRunPayload.dataConnector", "Data connector")),
+        AI, operation=("jsonPayload.connectorRunPayload.dataConnector", "Data connector"),
+        status=("jsonPayload.connectorRunPayload.syncType", "Sync type")),
     "discoveryengine_googleapis_com_api_errors": _entry(
         "Gemini Enterprise API errors",
         "Failed Gemini Enterprise API calls, such as data connector runs and document imports, with the API method "

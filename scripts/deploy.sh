@@ -49,11 +49,11 @@ source "$ROOT/scripts/lib/common.sh"
 source "$CONFIG"
 
 # ------------------------------------------------------------------------------------ settings
-PROJECT_ID="${PROJECT_ID:-}"
-REGION="${REGION:-us-central1}"
-SERVICE_NAME="${SERVICE_NAME:-ai-control-plane}"
+PROJECT_ID="$(normalize_project_id "${PROJECT_ID:-}")"
+REGION="$(trim_ws "${REGION:-us-central1}")"
+SERVICE_NAME="$(trim_ws "${SERVICE_NAME:-ai-control-plane}")"
 ADMIN_EMAILS="${ADMIN_EMAILS:-}"
-ACCESS_MODE="${ACCESS_MODE:-google}"
+ACCESS_MODE="$(trim_ws "${ACCESS_MODE:-google}")"
 ALLOWED_USERS="${ALLOWED_USERS:-}"
 IAP_MEMBERS="${IAP_MEMBERS:-}"
 BRIDGE_MEMBERS="${BRIDGE_MEMBERS:-allAuthenticatedUsers}"
@@ -62,23 +62,26 @@ BRIDGE_MEMBERS="${BRIDGE_MEMBERS:-allAuthenticatedUsers}"
 GUEST_ACCESS="${GUEST_ACCESS:-false}"
 GUEST_REDACT_TERMS="${GUEST_REDACT_TERMS:-}"
 OAUTH_CLIENT_JSON="${OAUTH_CLIENT_JSON:-}"
+GOOGLE_OAUTH_CLIENT_ID="${GOOGLE_OAUTH_CLIENT_ID:-}"
+GOOGLE_OAUTH_REDIRECT_URI="${GOOGLE_OAUTH_REDIRECT_URI:-}"
+GOOGLE_OAUTH_START_URL="${GOOGLE_OAUTH_START_URL:-}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 ORGANIZATION_NAME="${ORGANIZATION_NAME:-Your Organization}"
 PRODUCT_NAME="${PRODUCT_NAME:-}"
 DEFAULT_LOCALE="${DEFAULT_LOCALE:-en}"
 WORKSPACE_TIMEZONE="${WORKSPACE_TIMEZONE:-UTC}"
-AUDIT_DATASET="${AUDIT_DATASET:-ge_analytics}"
+AUDIT_DATASET="$(trim_ws "${AUDIT_DATASET:-ge_analytics}")"
 CREATE_LOG_SINK="${CREATE_LOG_SINK:-true}"
-DATASET_LOCATION="${DATASET_LOCATION:-US}"
+DATASET_LOCATION="$(trim_ws "${DATASET_LOCATION:-US}")"
 ENABLE_DATA_ACCESS_LOGS="${ENABLE_DATA_ACCESS_LOGS:-false}"
 # Usage logs (observability) and user/prompt logging (sensitiveLoggingEnabled) of every Gemini Enterprise
 # app in DISCOVERY_ENGINE_LOCATIONS. Without GE_PROMPT_LOGGING=true, userIamPrincipal is logged as <elided>.
 ENABLE_GE_OBSERVABILITY="${ENABLE_GE_OBSERVABILITY:-true}"
 GE_PROMPT_LOGGING="${GE_PROMPT_LOGGING:-true}"
-BILLING_PROJECT_ID="${BILLING_PROJECT_ID:-}"
-BILLING_DATASET="${BILLING_DATASET:-}"
-BILLING_TABLE="${BILLING_TABLE:-}"
-BILLING_ACCOUNT_ID="${BILLING_ACCOUNT_ID:-}"
+BILLING_PROJECT_ID="$(normalize_project_id "${BILLING_PROJECT_ID:-}")"
+BILLING_DATASET="$(trim_ws "${BILLING_DATASET:-}")"
+BILLING_TABLE="$(trim_ws "${BILLING_TABLE:-}")"
+BILLING_ACCOUNT_ID="$(trim_ws "${BILLING_ACCOUNT_ID:-}")"
 # Empty: step 6 detects the locations with a Gemini Enterprise app or license (global when there is none).
 DISCOVERY_ENGINE_LOCATIONS="${DISCOVERY_ENGINE_LOCATIONS:-}"
 AGENT_ENGINE_REGIONS="${AGENT_ENGINE_REGIONS:-$REGION}"
@@ -87,11 +90,11 @@ ENFORCEMENT_SCHEDULE="${ENFORCEMENT_SCHEDULE:-}"
 AI_DEFAULT_MODEL="${AI_DEFAULT_MODEL:-}"
 AI_LOCATION="${AI_LOCATION:-}"
 IMAGE="${IMAGE:-}"
-AR_REPOSITORY="${AR_REPOSITORY:-ai-control-plane}"
-SERVICE_ACCOUNT_ID="${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}"
-SETTINGS_BUCKET="${SETTINGS_BUCKET:-${PROJECT_ID}-${SERVICE_NAME}-settings}"
-SESSION_SECRET_NAME="${SESSION_SECRET_NAME:-${SERVICE_NAME}-session-secret}"
-OAUTH_SECRET_NAME="${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}"
+AR_REPOSITORY="$(trim_ws "${AR_REPOSITORY:-ai-control-plane}")"
+SERVICE_ACCOUNT_ID="$(trim_ws "${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}")"
+SETTINGS_BUCKET="$(trim_ws "${SETTINGS_BUCKET:-}")"
+SESSION_SECRET_NAME="$(trim_ws "${SESSION_SECRET_NAME:-${SERVICE_NAME}-session-secret}")"
+OAUTH_SECRET_NAME="$(trim_ws "${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}")"
 MEMORY="${MEMORY:-1Gi}"
 CPU="${CPU:-1}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
@@ -99,10 +102,13 @@ MAX_INSTANCES="${MAX_INSTANCES:-3}"
 
 # ---------------------------------------------------------------------------------- validation
 for tool in gcloud bq python3; do command -v "$tool" >/dev/null || die "$tool is required"; done
-[[ -n "$PROJECT_ID" && "$PROJECT_ID" != your-* ]] || die "set PROJECT_ID in $CONFIG"
+validate_project_id "$PROJECT_ID" "$CONFIG"
+[[ -z "$BILLING_PROJECT_ID" ]] || validate_project_id "$BILLING_PROJECT_ID" "$CONFIG (BILLING_PROJECT_ID)"
+[[ "$REGION" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || die "invalid REGION '${REGION}' in $CONFIG (for example 'asia-northeast3')"
 [[ -n "$ADMIN_EMAILS" && "$ADMIN_EMAILS" != *example.com* ]] || die "set ADMIN_EMAILS in $CONFIG"
 [[ "$SERVICE_NAME" =~ ^[a-z]([a-z0-9-]{0,40}[a-z0-9])?$ ]] || die "SERVICE_NAME must be lowercase letters, digits and hyphens"
-[[ ${#SETTINGS_BUCKET} -le 63 ]] || die "SETTINGS_BUCKET is longer than 63 characters; set a shorter SETTINGS_BUCKET"
+[[ -n "$SETTINGS_BUCKET" ]] || SETTINGS_BUCKET="$(default_settings_bucket "$PROJECT_ID" "$SERVICE_NAME")"
+[[ ${#SETTINGS_BUCKET} -le 63 ]] || die "SETTINGS_BUCKET '${SETTINGS_BUCKET}' is longer than 63 characters; set a shorter SETTINGS_BUCKET"
 case "$ACCESS_MODE" in
   google) ;;
   google_oauth) [[ -f "$OAUTH_CLIENT_JSON" ]] || die "ACCESS_MODE=google_oauth needs OAUTH_CLIENT_JSON (downloaded OAuth client JSON)" ;;
@@ -318,6 +324,11 @@ PY
   run retry gcloud secrets add-iam-policy-binding "$OAUTH_SECRET_NAME" --project "$PROJECT_ID" \
     --member "serviceAccount:${SA_EMAIL}" --role roles/secretmanager.secretAccessor --condition=None >/dev/null
   SECRETS="${SECRETS},GOOGLE_OAUTH_CLIENT_SECRET=${OAUTH_SECRET_NAME}:latest"
+elif [[ -n "$GOOGLE_OAUTH_CLIENT_ID" ]] && gcloud secrets describe "$OAUTH_SECRET_NAME" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  info "OAuth client ${GOOGLE_OAUTH_CLIENT_ID} (using Secret Manager secret ${OAUTH_SECRET_NAME})"
+  run retry gcloud secrets add-iam-policy-binding "$OAUTH_SECRET_NAME" --project "$PROJECT_ID" \
+    --member "serviceAccount:${SA_EMAIL}" --role roles/secretmanager.secretAccessor --condition=None >/dev/null
+  SECRETS="${SECRETS},GOOGLE_OAUTH_CLIENT_SECRET=${OAUTH_SECRET_NAME}:latest"
 fi
 
 # ------------------------------------------------------------------------------- 6. data sources
@@ -365,6 +376,9 @@ add_env BILLING_ACCOUNT_ID "$BILLING_ACCOUNT_ID"
 add_env AI_DEFAULT_MODEL "$AI_DEFAULT_MODEL"
 add_env AI_LOCATION "$AI_LOCATION"
 add_env ALLOWED_USERS "$ALLOWED_USERS"
+add_env GOOGLE_OAUTH_CLIENT_ID "$GOOGLE_OAUTH_CLIENT_ID"
+add_env GOOGLE_OAUTH_REDIRECT_URI "$GOOGLE_OAUTH_REDIRECT_URI"
+add_env GOOGLE_OAUTH_START_URL "$GOOGLE_OAUTH_START_URL"
 if [[ "$GUEST_ACCESS" == "true" ]]; then
   add_env GUEST_ACCESS true
   add_env GUEST_REDACT_TERMS "$GUEST_REDACT_TERMS"
@@ -385,18 +399,21 @@ case "$ACCESS_MODE" in
       --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
     IFS=',' read -r -a members <<<"$BRIDGE_MEMBERS"
     for member in "${members[@]}"; do
-      member="${member// /}"
+      member="$(normalize_iam_member "$member")"
       [[ -n "$member" ]] || continue
-      if ! run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
-          --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1; then
-        warn "IAP access for ${member} was refused by an organization policy; granting domain/user bindings from ADMIN_EMAILS and ALLOWED_USERS instead"
-        while IFS= read -r fallback_member; do
-          [[ -n "$fallback_member" ]] || continue
-          run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
-            --project="$PROJECT_ID" --member="$fallback_member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 \
-            && info "sign-in bridge IAP access: ${fallback_member}" || true
-        done < <(python3 - "$ADMIN_EMAILS" "$ALLOWED_USERS" <<'PY'
+      run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
+        --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 || true
+    done
+    # Cloud Run Direct IAP evaluates explicit user:/domain: bindings even when allAuthenticatedUsers is present
+    # in the policy; always bind configured ADMIN_EMAILS and ALLOWED_USERS principals.
+    while IFS= read -r fallback_member; do
+      [[ -n "$fallback_member" ]] || continue
+      run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
+        --project="$PROJECT_ID" --member="$fallback_member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 \
+        && info "sign-in bridge IAP access: ${fallback_member}" || true
+    done < <(python3 - "$ADMIN_EMAILS" "$ALLOWED_USERS" <<'PY'
 import sys
+public_domains = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com", "icloud.com", "naver.com", "daum.net", "hanmail.net", "kakao.com"}
 seen = set()
 for raw in sys.argv[1:]:
     for token in raw.split(","):
@@ -404,14 +421,48 @@ for raw in sys.argv[1:]:
         if "@" not in token:
             continue
         domain = token.rpartition("@")[2]
-        for cand in (f"domain:{domain}", None if token.startswith("*@") else f"user:{token}"):
+        cands = []
+        if domain and domain not in public_domains:
+            cands.append(f"domain:{domain}")
+        if not token.startswith("*@"):
+            cands.append(f"user:{token}")
+        for cand in cands:
             if cand and cand not in seen:
                 seen.add(cand)
                 print(cand)
 PY
-        )
+    )
+    run gcloud projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:${SA_EMAIL}" \
+      --role roles/iap.admin --condition=None --quiet >/dev/null 2>&1 || true
+    # Ensure a custom IAP OAuth client is attached to the sign-in bridge so out-of-org Google accounts
+    # (when permitted by the project's OAuth brand) are not rejected by Cloud Run IAP's default in-org client.
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+      IAP_BRAND="projects/${PROJECT_NUMBER}/brands/${PROJECT_NUMBER}"
+      IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || echo "[]")"
+      if [[ "$IAP_CLIENT_JSON" == "[]" || -z "$IAP_CLIENT_JSON" ]]; then
+        gcloud iap oauth-clients create "$IAP_BRAND" --display_name="${SERVICE_NAME}-iap" --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+        IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || echo "[]")"
       fi
-    done
+      IAP_SETTINGS_FILE="$(mktemp)"
+      if python3 - "$IAP_CLIENT_JSON" "$IAP_SETTINGS_FILE" <<'PY'
+import json, sys
+clients = json.loads(sys.argv[1] or "[]")
+if not clients:
+    sys.exit(1)
+c = clients[0]
+cid = c.get("name", "").rpartition("/")[2]
+secret = c.get("secret", "")
+if not cid or not secret:
+    sys.exit(1)
+with open(sys.argv[2], "w", encoding="utf-8") as fh:
+    fh.write(f"access_settings:\n  oauth_settings:\n    client_id: {cid}\n    client_secret: {secret}\n")
+PY
+      then
+        gcloud iap settings set "$IAP_SETTINGS_FILE" --project="$PROJECT_ID" --resource-type=cloud-run --region="$REGION" --service="$BRIDGE_NAME" --quiet >/dev/null 2>&1 \
+          && info "sign-in bridge custom IAP OAuth client configured" || true
+      fi
+      rm -f "$IAP_SETTINGS_FILE"
+    fi
     ENV_VARS+="##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
     run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --no-iap --no-invoker-iam-check \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
@@ -432,7 +483,7 @@ PY
       --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
     IFS=',' read -r -a members <<<"$IAP_MEMBERS"
     for member in "${members[@]}"; do
-      member="${member// /}"
+      member="$(normalize_iam_member "$member")"
       [[ -n "$member" ]] || continue
       run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$SERVICE_NAME" --region="$REGION" \
         --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null

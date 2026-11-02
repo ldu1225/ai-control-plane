@@ -27,9 +27,8 @@ def _point_value(point):
     return 0
 
 
-def time_series(ctx, metric, group_by, start, end, max_pages=20):
-    """Daily ALIGN_SUM/REDUCE_SUM series. Returns list of (labels dict, [(day, value)])."""
-    url = MONITORING_URL % ctx.project
+def _project_time_series(ctx, project, metric, group_by, start, end, max_pages=20):
+    url = MONITORING_URL % project
     params = [
         ("filter", 'metric.type="%s"' % metric),
         ("interval.startTime", iso(start)),
@@ -42,14 +41,13 @@ def time_series(ctx, metric, group_by, start, end, max_pages=20):
     params += [("aggregation.groupByFields", g) for g in group_by]
     out = []
     token = None
-    tz = None
     from .. import timeutil
     tz = timeutil.get_zone(ctx.tz_name)
     for _ in range(max_pages):
         page_params = list(params) + ([("pageToken", token)] if token else [])
         payload, _ = ctx.gcp.request("GET", url, quota_project=ctx.quota_project, params=page_params, timeout=45)
         for series in payload.get("timeSeries") or []:
-            labels = {}
+            labels = {"resource.label.project_id": project}
             labels.update({"resource.label." + k: v for k, v in ((series.get("resource") or {}).get("labels") or {}).items()})
             labels.update({"metric.label." + k: v for k, v in ((series.get("metric") or {}).get("labels") or {}).items()})
             points = []
@@ -64,6 +62,35 @@ def time_series(ctx, metric, group_by, start, end, max_pages=20):
         if not token:
             break
     return out
+
+
+def time_series(ctx, metric, group_by, start, end, max_pages=20):
+    """Daily ALIGN_SUM/REDUCE_SUM series across scanned projects. Returns list of (labels dict, [(day, value)])."""
+    projects = list(getattr(ctx, "projects", None) or [ctx.project])
+
+    def load():
+        if len(projects) <= 1:
+            return _project_time_series(ctx, projects[0] if projects else ctx.project, metric, group_by, start, end, max_pages=max_pages)
+        tasks = {proj: (lambda p=proj: _project_time_series(ctx, p, metric, group_by, start, end, max_pages=max_pages))
+                 for proj in projects}
+        res = ctx.run(tasks)
+        out = []
+        for proj in projects:
+            ok, value = res[proj]
+            if not ok:
+                if proj == ctx.project:
+                    raise value
+                continue
+            out.extend(value)
+        return out
+
+    cache = getattr(getattr(ctx, "app", None), "cache", None)
+    if cache is not None:
+        key = ("mon_ts", ctx.version, tuple(projects), metric, tuple(group_by), iso(start), iso(end), max_pages)
+        ttl = int(ctx.settings["server"].get("cache_ttl_seconds") or 120)
+        val, _ = cache.get_or_compute(key, ttl, load)
+        return val
+    return load()
 
 
 def token_counts(ctx, start, end):

@@ -35,6 +35,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -45,6 +46,34 @@ from .httpkit import ApiError, now_iso, read_cookie, request_is_https
 from .security import is_admin_email, uid_for
 
 LOG = logging.getLogger("controlplane.auth")
+
+PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password):
+    """PBKDF2-HMAC-SHA256 password hash with a 16-byte random salt."""
+    if not isinstance(password, str) or len(password) < 4 or len(password) > 256:
+        raise ApiError("bad_request", "Password must be between 4 and 256 characters.")
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERATIONS).hex()
+    return "pbkdf2_sha256$%s$%s" % (salt, dk)
+
+
+def verify_password(password, stored_hash):
+    """Constant-time verification of a PBKDF2-HMAC-SHA256 password hash."""
+    if not isinstance(password, str) or not isinstance(stored_hash, str):
+        return False
+    parts = stored_hash.split("$")
+    if len(parts) != 3 or parts[0] != "pbkdf2_sha256":
+        return False
+    try:
+        salt_bytes = bytes.fromhex(parts[1])
+        expected = parts[2]
+    except ValueError:
+        return False
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_bytes, PBKDF2_ITERATIONS).hex()
+    return hmac.compare_digest(dk.encode("ascii"), expected.encode("ascii"))
+
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -147,13 +176,16 @@ def is_approved(email, settings):
 
 
 class GoogleSignIn:
-    """Google OpenID Connect sign-in and session handling (one instance per process)."""
+    """Google OpenID Connect sign-in, built-in ID/Password sign-in, and session handling."""
 
     def __init__(self, base_settings, environ, settings_manager=None):
         sec = base_settings["security"]
+        self.environ = environ
         self.bridge_url = (sec.get("sign_in_bridge_url") or "").rstrip("/")
         self.client_id = sec.get("google_client_id") or ""
         self.client_secret = (environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip()
+        self.oauth_redirect_uri = (environ.get("GOOGLE_OAUTH_REDIRECT_URI") or "").strip()
+        self.oauth_start_url = (environ.get("GOOGLE_OAUTH_START_URL") or "").strip()
         if not self.bridge_url:
             if not self.client_id:
                 raise ValueError("auth_mode=google requires security.google_client_id (GOOGLE_OAUTH_CLIENT_ID) "
@@ -180,7 +212,7 @@ class GoogleSignIn:
             return None
         return (urllib.parse.urlsplit(self.public_base_url).netloc or "").lower() or None
 
-    def redirect_uri(self, headers):
+    def callback_uri(self, headers):
         if self.public_base_url:
             return self.public_base_url + CALLBACK_PATH
         host = (headers.get("Host") or "").strip()
@@ -188,6 +220,11 @@ class GoogleSignIn:
             raise ApiError("bad_request", "The request host is invalid.")
         scheme = "https" if request_is_https(headers) else "http"
         return "%s://%s%s" % (scheme, host, CALLBACK_PATH)
+
+    def redirect_uri(self, headers):
+        if self.oauth_redirect_uri:
+            return self.oauth_redirect_uri
+        return self.callback_uri(headers)
 
     @staticmethod
     def _cookie(base, value, https, max_age, same_site="Lax"):
@@ -212,6 +249,53 @@ class GoogleSignIn:
             return 12
 
     # -- sessions -----------------------------------------------------------------
+    def _accounts(self):
+        if self.settings is None:
+            return {}
+        return (self.settings.auth_state() or {}).get("accounts") or {}
+
+    def default_admin_password_active(self):
+        accounts = self._accounts()
+        admin_meta = accounts.get("admin") or {}
+        return not bool(admin_meta.get("passwordHash"))
+
+    def password_login(self, username, password, next_path, headers, settings):
+        """Authenticates an ID/Email + Password login and returns (user_dict, redirect_path, cookies)."""
+        username = str(username or "").strip().lower()
+        password = str(password or "")
+        if not username or not password or len(username) > 254 or len(password) > 256:
+            raise ApiError("unauthenticated", "Invalid account ID or password.")
+        accounts = self._accounts()
+        meta = accounts.get(username)
+        sec = settings.get("security") or {}
+        verified = False
+        role = "viewer"
+        name = username
+        if meta and meta.get("passwordHash"):
+            verified = verify_password(password, meta["passwordHash"])
+            role = "admin" if (username == "admin" or meta.get("role") == "admin" or
+                               is_admin_email(username, sec.get("admins"))) else "viewer"
+            name = meta.get("name") or username
+        elif username == "admin":
+            default_pw = (self.environ.get("ADMIN_INITIAL_PASSWORD") or "admin")
+            verified = hmac.compare_digest(password.encode("utf-8"), default_pw.encode("utf-8"))
+            role = "admin"
+            name = "Administrator"
+        if not verified:
+            LOG.info("password sign-in rejected uid=%s", uid_for(username))
+            raise ApiError("unauthenticated", "Invalid account ID or password.")
+        https = request_is_https(headers)
+        hours = self.session_hours(settings)
+        claims = {"email": username, "name": name, "picture": "", "sub": "local:" + username,
+                  "pw": True, "role": role, "ims": int(time.time() * 1000)}
+        session = self.sessions.sign(claims, hours * 3600)
+        cookies = [self._cookie(SESSION_COOKIE, session, https, hours * 3600),
+                   self._clear(NOTICE_COOKIE, https)]
+        self._record_login(username)
+        LOG.info("password sign-in ok uid=%s role=%s", uid_for(username), role)
+        return ({"email": username, "name": name, "picture": "", "role": role},
+                safe_next(next_path or "/"), cookies)
+
     def user_from_headers(self, headers, settings):
         """Returns the session claims of an approved, unrevoked account or None."""
         claims = self.sessions.verify(self._read(headers, SESSION_COOKIE))
@@ -221,9 +305,27 @@ class GoogleSignIn:
         issued_ms = claims.get("ims")
         if not isinstance(email, str) or not isinstance(issued_ms, int):
             return None
-        if not is_approved(email, settings):
-            return None
         if self.settings is not None and issued_ms <= self.settings.revoked_at(email):
+            return None
+        if claims.get("pw") is True:
+            accounts = self._accounts()
+            meta = accounts.get(email)
+            sec = settings.get("security") or {}
+            if email == "admin":
+                claims = dict(claims)
+                claims["role"] = "admin"
+                return claims
+            if meta and meta.get("passwordHash"):
+                claims = dict(claims)
+                claims["role"] = "admin" if (meta.get("role") == "admin" or
+                                             is_admin_email(email, sec.get("admins"))) else "viewer"
+                return claims
+            if is_approved(email, settings):
+                claims = dict(claims)
+                claims["role"] = "admin" if is_admin_email(email, sec.get("admins")) else "viewer"
+                return claims
+            return None
+        if not is_approved(email, settings):
             return None
         return claims
 
@@ -239,7 +341,7 @@ class GoogleSignIn:
         next_path = safe_next((params.get("next") or ["/"])[0])
         https = request_is_https(headers)
         state = secrets.token_urlsafe(32)
-        if self.bridge_url:
+        if self.bridge_url and not (self.client_id and self.client_secret):
             txn = self.transactions.sign({"s": state, "next": next_path, "m": "bridge"}, TRANSACTION_TTL)
             cookies = [self._cookie(TRANSACTION_COOKIE, txn, https, TRANSACTION_TTL), self._clear(NOTICE_COOKIE, https)]
             return "%s%s?%s" % (self.bridge_url, BRIDGE_PATH, urllib.parse.urlencode({"state": state})), cookies
@@ -247,13 +349,16 @@ class GoogleSignIn:
         verifier = secrets.token_urlsafe(64)
         challenge = _b64e(hashlib.sha256(verifier.encode("ascii")).digest())
         txn = self.transactions.sign({"s": state, "n": nonce, "v": verifier, "next": next_path}, TRANSACTION_TTL)
-        query_string = urllib.parse.urlencode({
+        oauth_params = {
             "client_id": self.client_id, "redirect_uri": self.redirect_uri(headers), "response_type": "code",
             "scope": SCOPES, "state": state, "nonce": nonce, "code_challenge": challenge,
             "code_challenge_method": "S256", "prompt": "select_account", "access_type": "online",
-            "include_granted_scopes": "false"})
+            "include_granted_scopes": "false"}
+        if self.oauth_start_url:
+            oauth_params["return_to"] = self.callback_uri(headers)
+        query_string = urllib.parse.urlencode(oauth_params)
         cookies = [self._cookie(TRANSACTION_COOKIE, txn, https, TRANSACTION_TTL), self._clear(NOTICE_COOKIE, https)]
-        return "%s?%s" % (GOOGLE_AUTH_URL, query_string), cookies
+        return "%s?%s" % (self.oauth_start_url or GOOGLE_AUTH_URL, query_string), cookies
 
     def callback(self, headers, query, settings):
         """Completes the sign-in. Returns (location, cookies). Never raises for user-caused errors."""
@@ -304,7 +409,7 @@ class GoogleSignIn:
     def logout(self, identity, headers):
         """Revokes every session of the account and clears the cookie. Returns the cookies to set."""
         https = request_is_https(headers)
-        if self.settings is not None and identity.email and "@" in identity.email:
+        if self.settings is not None and identity.email and identity.email != "anonymous":
             epoch = int(time.time() * 1000)
 
             def apply(auth):
@@ -364,7 +469,9 @@ class GoogleSignIn:
 
     def switch_account_url(self):
         """Bridge mode: clears the IAP session on the bridge so the next sign-in asks for an account."""
-        return (self.bridge_url + "/_gcp_iap/clear_login_cookie") if self.bridge_url else None
+        if self.bridge_url and not (self.client_id and self.client_secret):
+            return self.bridge_url + "/_gcp_iap/clear_login_cookie"
+        return None
 
     def verify_id_token(self, id_token):
         """Verifies signature (Google certificates), audience, issuer and expiry; requires a

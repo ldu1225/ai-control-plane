@@ -37,6 +37,7 @@ function renderPage(body, d) {
     body: dataTable({
       columns: [
         { key: 'name', label: t('Deployment'), render: (r) => h('div', { class: 'cell-stack' }, h('span', { class: 'cell-main truncate', title: r.name }, r.name || r.id), h('span', { class: 'cell-sub cell-mono' }, r.id)) },
+        { key: 'project', label: t('Project'), render: (r) => h('span', { class: 'cell-mono' }, r.project || DASH) },
         { key: 'region', label: t('Region'), render: (r) => h('span', { class: 'cell-mono' }, r.region || DASH) },
         { key: 'framework', label: t('Runtime'), render: (r) => h('div', { class: 'cell-stack' }, h('span', null, r.framework || DASH), h('span', { class: 'cell-sub' }, r.pythonVersion ? `Python ${r.pythonVersion}` : '')) },
         { key: 'identity', label: t('Identity'), render: (r) => principalCell(r.identity) },
@@ -91,6 +92,7 @@ function openDeployment(r, ccy) {
       card({
         title: t('Runtime'),
         body: kv([
+          [t('Project'), r.project ? h('span', { class: 'mono' }, r.project) : null],
           [t('Resource'), h('span', { class: 'mono' }, r.id)],
           [t('Region'), r.region],
           [t('Framework'), r.framework],

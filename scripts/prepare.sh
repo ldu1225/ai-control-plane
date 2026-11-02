@@ -58,8 +58,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 for tool in gcloud bq python3; do command -v "$tool" >/dev/null || die "$tool is required (Cloud Shell has all of them)"; done
-[[ -n "$PROJECT_ID" ]] || PROJECT_ID="$(gcloud config get-value project 2>/dev/null || true)"
+PROJECT_ID="$(normalize_project_id "$PROJECT_ID")"
+[[ -n "$PROJECT_ID" ]] || PROJECT_ID="$(normalize_project_id "$(gcloud config get-value project 2>/dev/null || true)")"
 [[ -n "$PROJECT_ID" ]] || die "pass --project PROJECT_ID (no active gcloud project)"
+validate_project_id "$PROJECT_ID" "--project"
 [[ "$DATASET" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && ${#DATASET} -le 1024 ]] || die "--dataset must be letters, digits and underscores"
 [[ "$SERVICE_NAME" =~ ^[a-z]([a-z0-9-]{0,40}[a-z0-9])?$ ]] || die "--service-name must be lowercase letters, digits and hyphens"
 [[ "$GE_LOCATIONS" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] || die "--ge-locations must be a comma-separated list such as global,us,eu"

@@ -46,6 +46,8 @@ DEFAULTS = {
     },
     "workspace": {
         "project_id": "your-gcp-project-id",
+        "projects": [],
+        "scan_all_projects": True,
         "quota_project_id": "",
         "timezone": "UTC",
         "default_range_days": 14,
@@ -86,7 +88,7 @@ DEFAULTS = {
     "ai_engine": {
         "location": "global",
         "default_model": "gemini-3.8-flash",
-        "models": ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-4-argon"],
+        "models": ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-4-carbon", "gemini-4-argon"],
         "discover_models": True,
         "restrict_to_allowed": True,
     },
@@ -458,6 +460,8 @@ VALIDATORS = {
     "server.port": _int(1, 65535),
     "server.cache_ttl_seconds": _int(0, 86400),
     "workspace.project_id": _pred(valid_project, "project id", lower=True),
+    "workspace.projects": _list(_pred(valid_project, "project id", lower=True), 50),
+    "workspace.scan_all_projects": _bool,
     "workspace.quota_project_id": _project_or_empty,
     "workspace.timezone": _timezone,
     "workspace.default_range_days": _int(1, 400),
@@ -711,6 +715,7 @@ ENV_MAP = {
 }
 # Comma-separated list values.
 LIST_ENV_MAP = {
+    "SCAN_PROJECTS": "workspace.projects",
     "DISCOVERY_ENGINE_LOCATIONS": "workspace.discovery_engine_locations",
     "AGENT_ENGINE_REGIONS": "workspace.agent_engine_regions",
     "SCHEDULER_INVOKERS": "governance.antigravity.scheduler_invokers",
@@ -718,6 +723,7 @@ LIST_ENV_MAP = {
 }
 # Boolean values: only explicit true/false spellings are accepted.
 BOOL_ENV_MAP = {
+    "SCAN_ALL_PROJECTS": "workspace.scan_all_projects",
     "GUEST_ACCESS": "security.guest_access",
 }
 _TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off")

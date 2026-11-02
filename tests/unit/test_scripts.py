@@ -248,5 +248,60 @@ class GeminiEnterpriseLocationsWiringTest(unittest.TestCase):
                       read("scripts/lib/common.sh"))
 
 
+class InputValidationHelpersTest(unittest.TestCase):
+    """Customer copy-paste defense in scripts/lib/common.sh and scripts/deploy.sh."""
+
+    def _bash(self, body):
+        import subprocess
+        script = 'set -euo pipefail\nsource "%s"\n%s' % (os.path.join(ROOT, "scripts/lib/common.sh"), body)
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+
+    def test_project_id_strips_common_copy_paste_prefixes(self):
+        cases = (
+            ("project my-demo-project-260520", "my-demo-project-260520"),
+            ("gcloud config set project my-demo-project-260520", "my-demo-project-260520"),
+            ("--project my-demo-project-260520", "my-demo-project-260520"),
+            ("--project=my-demo-project-260520", "my-demo-project-260520"),
+            ("projects/my-demo-project-260520", "my-demo-project-260520"),
+            ("  my-demo-project-260520  ", "my-demo-project-260520"),
+        )
+        for raw, expected in cases:
+            res = self._bash('p="$(normalize_project_id %r)"; validate_project_id "$p" test; printf "%%s" "$p"' % raw)
+            self.assertEqual(res.returncode, 0, msg=(raw, res.stderr))
+            self.assertEqual(res.stdout, expected)
+
+    def test_uppercase_project_name_gives_clear_error(self):
+        res = self._bash('validate_project_id "My-Upper-Project-Name" deploy.env')
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("contains uppercase letters (looks like a project Name)", res.stderr)
+
+    def test_default_settings_bucket_never_exceeds_63_chars(self):
+        pid30 = "a" + "b" * 28 + "9"
+        res = self._bash('default_settings_bucket "%s" "ai-control-plane"' % pid30)
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(res.stdout, "%s-ai-control-plane-settings" % pid30)
+        self.assertLessEqual(len(res.stdout), 63)
+
+        long_svc = "a" + "c" * 38 + "z"
+        res_long = self._bash('default_settings_bucket "%s" "%s"' % (pid30, long_svc))
+        self.assertEqual(res_long.returncode, 0)
+        self.assertLessEqual(len(res_long.stdout), 63)
+        self.assertTrue(res_long.stdout.endswith("-settings"))
+
+    def test_normalize_iam_member_handles_bare_emails_and_domains(self):
+        cases = (
+            ("alice@example.org", "user:alice@example.org"),
+            ("*@example.org", "domain:example.org"),
+            ("example.org", "domain:example.org"),
+            ("user:alice@example.org", "user:alice@example.org"),
+            ("domain:example.org", "domain:example.org"),
+            ("allAuthenticatedUsers", "allAuthenticatedUsers"),
+        )
+        for raw, expected in cases:
+            res = self._bash('normalize_iam_member %r' % raw)
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.stdout, expected)
+
+
 if __name__ == "__main__":
     unittest.main()

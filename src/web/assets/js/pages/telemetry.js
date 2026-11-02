@@ -84,10 +84,15 @@ function logIdOf(conn) {
   try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
 }
 
+const AGENT_FILTER_RE = /^\s*\(?resource\.labels\.job="([A-Za-z0-9_-]+)"\s+OR\s+resource\.labels\.service_name="\1"\)?(?:\s+AND\s+.*)?$/;
+
 /** What a connector reads, for people: the log id, the table reference or the custom filter. */
 function sourceRef(conn) {
   if (conn.source === 'bigquery' && conn.bigquery) return `${conn.bigquery.project}.${conn.bigquery.dataset}.${conn.bigquery.table}`;
-  return logIdOf(conn) || (conn.logging && conn.logging.filter) || '';
+  const flt = (conn.logging && conn.logging.filter) || '';
+  const am = AGENT_FILTER_RE.exec(flt);
+  if (am) return `${am[1]} (CODEMENDER_COST_TELEMETRY)`;
+  return logIdOf(conn) || flt || '';
 }
 
 function rangeDays() {
@@ -154,7 +159,7 @@ function buildSources(discovery) {
   const out = tables.map((tb) => {
     const log = logsById.get(tb.id) || {};
     return {
-      kind: 'bigquery', id: tb.id, card: tb.catalog || null, quick: tb.quickAdd || null,
+      kind: 'bigquery', id: tb.id, project: tb.project || null, card: tb.catalog || null, quick: tb.quickAdd || null,
       connectorId: tb.connectorId || log.connectorId || null, core: Boolean(tb.core),
       tech: `${tb.project}.${tb.dataset}.${tb.table}`, rows: tb.rows, lastModified: tb.lastModified,
       entries7d: tb.entries7d, daily: tb.daily, logName: log.logName || null,
@@ -163,9 +168,9 @@ function buildSources(discovery) {
   logs.forEach((lg) => {
     if (lg.routedToBigQuery && tableIds.has(lg.id)) return;
     out.push({
-      kind: 'logging', id: lg.id, card: lg.catalog || null, quick: lg.quickAdd || null, connectorId: lg.connectorId || null,
+      kind: 'logging', id: lg.id, project: lg.project || null, card: lg.catalog || null, quick: lg.quickAdd || null, connectorId: lg.connectorId || null,
       core: Boolean(lg.core), tech: lg.shortName, rows: null, lastModified: null, entries7d: lg.entries7d, daily: lg.daily,
-      logName: lg.logName,
+      logName: lg.logName, sinkFilter: lg.sinkFilter || null,
     });
   });
   const titles = new Map();
@@ -286,24 +291,34 @@ function activityLine(s, days) {
 }
 
 /** Logs read through the Logging API are capped per view; busy ones are better exported to BigQuery. */
-function volumeNote(s, env) {
+function volumeNote(ctx, s, env) {
   if (s.kind !== 'logging' || !isNum(s.entries7d) || (s.entries7d / env.days) * rangeDays() <= MAX_LOG_READ) return null;
   return h('div', { class: 'src-note' }, icon('info', { size: 13 }),
     h('span', null, t('High volume: its dashboard counts only the latest {n} entries of a period. Export it to BigQuery for complete counts.', { n: fmt.int(MAX_LOG_READ) })),
-    s.logName ? button({ label: t('Export to BigQuery'), size: 'xs', variant: 'ghost', icon: 'code', onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator([s.logName], env.logs); } }) : null);
+    s.logName ? button({ label: t('Export to BigQuery'), size: 'xs', variant: 'ghost', icon: 'code', onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator(ctx, s, env.logs); } }) : null);
 }
 
-function sourceAction(ctx, s) {
+function sourceAction(ctx, s, env) {
+  const btns = [];
   if (s.connectorId) {
-    return button({ label: t('Open dashboard'), icon: 'arrow-right', size: 'sm', onClick: () => ctx.navigate(`#/extensions/${encodeURIComponent(s.connectorId)}`) });
+    btns.push(button({ label: t('Open dashboard'), icon: 'arrow-right', size: 'sm', onClick: () => ctx.navigate(`#/extensions/${encodeURIComponent(s.connectorId)}`) }));
+  } else if (!s.quick) {
+    btns.push(h('span', { class: 'src-hint' }, t('This source cannot be added automatically. Use Custom setup below.')));
+  } else {
+    const btn = button({ label: t('Add to dashboard'), icon: 'plus', variant: 'primary', size: 'sm' });
+    btn.addEventListener('click', () => {
+      if (!requireAdmin(t('Add to dashboard'))) return;
+      quickAdd(ctx, s, btn);
+    });
+    btns.push(btn);
   }
-  if (!s.quick) return h('span', { class: 'src-hint' }, t('This source cannot be added automatically. Use Custom setup below.'));
-  const btn = button({ label: t('Add to dashboard'), icon: 'plus', variant: 'primary', size: 'sm' });
-  btn.addEventListener('click', () => {
-    if (!requireAdmin(t('Add to dashboard'))) return;
-    quickAdd(ctx, s, btn);
-  });
-  return btn;
+  if (s.kind === 'logging' && s.logName) {
+    btns.push(button({
+      label: t('Export to BigQuery'), icon: 'database', size: 'sm', variant: 'ghost',
+      onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator(ctx, s, env && env.logs); },
+    }));
+  }
+  return h('div', { class: 'row', style: { gap: '8px', flexWrap: 'wrap' } }, btns);
 }
 
 function sourceCard(ctx, s, env) {
@@ -313,8 +328,9 @@ function sourceCard(ctx, s, env) {
     h('div', { class: 'src-head' },
       h('span', { class: 'src-icon', 'aria-hidden': 'true' }, icon(cat.icon, { size: 16 })),
       h('div', { class: 'src-heading' },
-        h('h4', { class: 'src-title' }, sourceTitle(s)),
+        h('h4', { class: 'src-title', title: sourceTitle(s) }, sourceTitle(s)),
         h('div', { class: 'src-badges' },
+          s.project ? badge(s.project, 'info', { size: 'sm', dot: true }) : null,
           badge(s.kind === 'bigquery' ? 'BigQuery' : 'Cloud Logging', 'neutral', { size: 'sm' }),
           c.sensitive ? badge(t('Contains prompt or response text'), 'warning', { size: 'sm' }) : null,
           s.connectorId ? badge(t('Added'), 'success', { size: 'sm', dot: true }) : null))),
@@ -323,11 +339,12 @@ function sourceCard(ctx, s, env) {
       h('div', { class: 'src-label' }, t('Its dashboard shows')),
       h('div', { class: 'chips' }, dashboardShows(s).map((x) => chip(x)))),
     activityLine(s, env.days),
-    volumeNote(s, env),
-    h('div', { class: 'src-block' },
-      h('div', { class: 'src-label' }, s.kind === 'bigquery' ? t('BigQuery table') : t('Cloud Logging log name')),
-      h('code', { class: 'src-code' }, s.tech)),
-    h('div', { class: 'src-actions' }, sourceAction(ctx, s, env.admin)));
+    volumeNote(ctx, s, env),
+    h('div', { class: 'src-footer-wrap' },
+      h('div', { class: 'src-block' },
+        h('div', { class: 'src-label' }, s.kind === 'bigquery' ? t('BigQuery table') : t('Cloud Logging log name')),
+        h('code', { class: 'src-code', title: s.tech }, s.tech)),
+      h('div', { class: 'src-actions' }, sourceAction(ctx, s, env))));
 }
 
 async function quickAdd(ctx, s, btn) {
@@ -383,23 +400,34 @@ function notListedCard(ctx, env) {
       h('p', { class: 'src-what' }, t('To chart only part of a log, use Custom setup. To list the tables of another BigQuery dataset, add it under Settings > Workspace and data sources > Additional telemetry datasets.')),
       h('div', { class: 'row' },
         button({ label: t('Custom setup'), icon: 'edit', onClick: () => { if (requireAdmin(t('Custom setup'))) openConnectorForm(ctx, null, null); } }),
-        button({ label: t('Export logs to BigQuery'), icon: 'code', onClick: () => { if (requireAdmin(t('Export logs to BigQuery'))) openSinkGenerator([], env.logs); } }))),
+        button({ label: t('Export logs to BigQuery'), icon: 'code', onClick: () => { if (requireAdmin(t('Export logs to BigQuery'))) openSinkGenerator(ctx, null, env.logs); } }))),
   });
 }
 
 function connectorCard(ctx, c) {
+  const wsProj = ((store.boot && store.boot.workspace) || {}).projectId || '';
+  const projId = c.project || wsProj;
   const stats = h('div', { class: 'connector-stats' },
     h('div', null, h('div', { class: 'cs-label' }, t('Events')), h('div', { class: 'cs-value' }, '\u2026')),
     h('div', null, h('div', { class: 'cs-label' }, t('Users')), h('div', { class: 'cs-value' }, '\u2026')),
     h('div', null, h('div', { class: 'cs-label' }, t('Tokens')), h('div', { class: 'cs-value' }, '\u2026')));
-  const sparkHost = h('div');
+  const sparkHost = h('div', { class: 'connector-spark' });
   sparkHost.style.setProperty('height', '30px');
+  const metaRow = h('div', { class: 'connector-meta' },
+    projId ? badge(projId, 'info', { size: 'sm', dot: true, title: t('Project: {id}', { id: projId }) }) : null,
+    badge(c.source === 'bigquery' ? 'BigQuery' : 'Cloud Logging', 'neutral', { size: 'sm' }),
+    c.source === 'logging' && c.bigquerySink ? badge(t('BQ sink linked'), 'success', { size: 'sm', dot: true, title: t('BigQuery linked: {dest}', { dest: c.bigquerySink }) }) : null);
+  const fullRef = `${c.source === 'bigquery' ? 'BigQuery' : 'Cloud Logging'} \u00b7 ${sourceRef(c)}`;
+  const bottom = h('div', { class: 'connector-bottom' },
+    h('code', { class: 'src-code', title: fullRef }, fullRef),
+    stats,
+    sparkHost);
   const el = card({
     cls: 'connector-card',
     title: c.name,
     subtitle: c.catalog ? cardWhat(c.catalog) : t('Custom connector set up by an administrator.'),
     actions: c.enabled ? badge(t('Enabled'), 'success', { size: 'sm', dot: true }) : badge(t('Disabled'), 'neutral', { size: 'sm' }),
-    body: h('div', null, h('code', { class: 'src-code' }, `${c.source === 'bigquery' ? 'BigQuery' : 'Cloud Logging'} \u00b7 ${sourceRef(c)}`), stats, sparkHost),
+    body: [metaRow, bottom],
     footer: h('span', null, c.lastEvent ? t('Last event {time}', { time: fmt.relative(c.lastEvent) }) : t('No events yet')),
     source: c.health === 'error' ? t('Source error') : null,
   });
@@ -489,6 +517,8 @@ async function renderConnector(ctx, id) {
   const opNames = (d.valueNames && d.valueNames.operation) || {};
   const opLabelOf = (v) => (v && opNames[v] ? `${opNames[v]} \u00b7 ${shortValue(v)}` : shortValue(v));
   const statusOf = (v) => statusText(v, statusKey);
+  const wsProj = ((store.boot && store.boot.workspace) || {}).projectId || '';
+  const connProj = c.project || wsProj;
   const toggle = switchInput({
     checked: c.enabled, label: t('Enabled'),
     onChange: async (v, input) => {
@@ -505,6 +535,9 @@ async function renderConnector(ctx, id) {
   mount(headerSlot, pageHeader({
     title: c.name || id,
     desc: cat ? cardWhat(cat) : t('Custom connector set up by an administrator.'),
+    project: connProj,
+    projectScope: c.projectScope || 'single',
+    bigquerySink: c.bigquerySink || null,
     actions: [
       backButton(ctx),
       h('label', { class: 'row' }, h('span', { class: 'muted' }, t('Enabled')), toggle),
@@ -515,7 +548,9 @@ async function renderConnector(ctx, id) {
   }));
   mount(body);
   body.append(h('div', { class: 'tx-source' },
+    connProj ? badge(t('Project: {id}', { id: connProj }), 'info', { size: 'sm', dot: true }) : null,
     badge(c.source === 'bigquery' ? 'BigQuery' : 'Cloud Logging', 'neutral', { size: 'sm' }),
+    c.bigquerySink ? badge(t('BigQuery linked: {dest}', { dest: c.bigquerySink }), 'success', { size: 'sm', dot: true }) : null,
     h('code', { class: 'src-code' }, sourceRef(c))));
   const sample = d.sample || null;
   const partial = Boolean(sample && sample.partial);
@@ -523,11 +558,15 @@ async function renderConnector(ctx, id) {
   const sampleNote = partial ? t('Latest {n} entries only', { n: fmt.int(sample.limit) }) : null;
   if (partial) {
     const logName = logNameOf(c);
+    const connSource = {
+      kind: 'logging', id: c.id, project: connProj, card: cat, quick: c,
+      tech: sourceRef(c), logName, sinkFilter: c.logging && c.logging.filter,
+    };
     body.append(banner({
       tone: 'warning',
       title: t('Only the latest {n} entries of this period were counted', { n: fmt.int(sample.limit) }),
       text: t('This log has more entries in the selected period than a dashboard reads from Cloud Logging. Counts start at {time}; earlier days have no bars. Export the log to BigQuery for complete counts.', { time: fmt.dateTime(sample.since, true) }),
-      actions: logName ? button({ label: t('Export to BigQuery'), icon: 'code', size: 'sm', onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator([logName], []); } }) : null,
+      actions: logName ? button({ label: t('Export to BigQuery'), icon: 'database', size: 'sm', onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator(ctx, connSource, []); } }) : null,
     }));
   }
   if (cat && cat.sensitive) {
@@ -576,7 +615,7 @@ async function renderConnector(ctx, id) {
   if (m.model) {
     extra.push(card({
       title: t('Top models'), flush: true,
-      body: dataTable({ columns: [{ key: 'model', label: t('Model'), render: (r) => h('span', { class: 'cell-mono cell-wrap' }, r.model || DASH) }, { key: 'events', label: t('Events'), align: 'num', format: fmt.int }, { key: 'tokens', label: tokensLabel, align: 'num', format: fmt.compact }], rows: d.topModels || [], searchable: false, pageSize: 8, initialSort: { key: 'events', dir: 'desc' } }),
+      body: dataTable({ columns: [{ key: 'model', label: t('Model'), render: (r) => h('span', { class: 'cell-mono' }, r.model || DASH) }, { key: 'events', label: t('Events'), align: 'num', format: fmt.int }, { key: 'tokens', label: tokensLabel, align: 'num', format: fmt.compact }], rows: d.topModels || [], searchable: false, pageSize: 8, initialSort: { key: 'events', dir: 'desc' } }),
     }));
   }
   if (extra.length) {
@@ -589,17 +628,20 @@ async function renderConnector(ctx, id) {
   const recent = Array.isArray(d.recent) ? d.recent : null;
   const hasMessage = (recent || []).some((r) => r.message);
   const hasPayload = (recent || []).some((r) => r.payload);
-  const cols = [{ key: 'time', label: t('Time'), render: (r) => fmt.dateTime(r.time, true), value: (r) => r.time }];
-  if (m.user) cols.push({ key: 'user', label: t('User'), render: (r) => h('span', { class: 'cell-wrap' }, r.user || DASH) });
+  const cols = [
+    { key: 'time', label: t('Time'), render: (r) => fmt.dateTime(r.time, true), value: (r) => r.time },
+    { key: 'project', label: t('Project'), render: (r) => badge(r.project || connProj || DASH, 'neutral', { size: 'sm' }), value: (r) => r.project || connProj || '' },
+  ];
+  if (m.user) cols.push({ key: 'user', label: t('User'), render: (r) => h('span', { class: 'cell-mono truncate', style: { maxWidth: '180px' }, title: r.user || '' }, r.user || DASH) });
   if (m.operation) {
     cols.push({
       key: 'operation', label: opLabel,
       render: (r) => (r.operation && opNames[r.operation]
-        ? h('div', { class: 'cell-stack' }, h('span', { class: 'cell-main cell-wrap' }, opNames[r.operation]), h('span', { class: 'cell-sub cell-mono cell-wrap' }, r.operation))
-        : h('span', { class: 'cell-mono cell-wrap' }, r.operation || DASH)),
+        ? h('div', { class: 'cell-stack' }, h('span', { class: 'cell-main truncate', style: { maxWidth: '240px' }, title: opNames[r.operation] }, opNames[r.operation]), h('span', { class: 'cell-sub cell-mono truncate', style: { maxWidth: '240px' }, title: r.operation }, r.operation))
+        : h('span', { class: 'cell-mono truncate', style: { maxWidth: '240px' }, title: r.operation || '' }, r.operation || DASH)),
     });
   }
-  if (m.model) cols.push({ key: 'model', label: t('Model'), render: (r) => h('span', { class: 'cell-mono cell-wrap' }, r.model || DASH) });
+  if (m.model) cols.push({ key: 'model', label: t('Model'), render: (r) => h('span', { class: 'cell-mono' }, r.model || DASH) });
   if (m.tokens) cols.push({ key: 'tokens', label: tokensLabel, align: 'num', format: fmt.int });
   if (m.status) cols.push({ key: 'status', label: statusLabel, render: (r) => (r.status !== null && r.status !== undefined ? badge(statusOf(r.status), 'neutral', { size: 'sm' }) : DASH) });
   if (hasMessage) cols.push({ key: 'message', label: t('Message'), sortable: false, render: (r) => h('span', { class: 'cell-wrap tx-message' }, r.message || DASH) });
@@ -636,12 +678,9 @@ async function deleteConnector(ctx, c) {
 /* ------------------------------------------------------------------ custom setup (manual connector form) */
 
 async function openConnectorForm(ctx, existing, table, logFilter) {
-  let discovery = ctx.discovery;
-  if (!discovery) {
-    try { discovery = (await api.get('/api/v1/telemetry/discover')).data; } catch (e) { discovery = { tables: [], logs: [] }; }
-    ctx.discovery = discovery;
-  }
-  const tables = (discovery.tables || []).filter((tb) => !tb.core || (existing && existing.bigquery && existing.bigquery.table === tb.logical));
+  let discovery = ctx.discovery || { tables: [], logs: [] };
+  const getTables = () => (discovery.tables || []).filter((tb) => !tb.core || (existing && existing.bigquery && existing.bigquery.table === tb.logical));
+  let tables = getTables();
   const st = {
     id: existing ? existing.id : undefined,
     name: existing ? existing.name : (table ? prettyName(table.logical) : ''),
@@ -707,6 +746,14 @@ async function openConnectorForm(ctx, existing, table, logFilter) {
     footer: (el) => append(el, [button({ label: t('Cancel'), onClick: () => m.close() }), save]),
   });
   renderSource();
+  if (!ctx.discovery) {
+    api.get('/api/v1/telemetry/discover').then((res) => {
+      discovery = res.data || { tables: [], logs: [] };
+      ctx.discovery = discovery;
+      tables = getTables();
+      if (st.source === 'bigquery') renderSource();
+    }).catch(() => {});
+  }
   save.addEventListener('click', async () => {
     err.textContent = '';
     if (!st.name.trim()) { err.textContent = t('Enter a display name.'); return; }
@@ -739,55 +786,182 @@ function prettyName(logical) {
   return String(logical || '').replace(/_googleapis_com/g, '').split('_').filter(Boolean).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
-/* ------------------------------------------------------------------ export logs to BigQuery (sink commands) */
+/* ------------------------------------------------------------------ export logs to BigQuery (one-click sink + dashboard) */
 
-function openSinkGenerator(preselected = [], logs = []) {
+function mappedFieldsSummary(s) {
+  const m = (s && s.quick && s.quick.mapping) || {};
+  const c = (s && s.card) || {};
+  const items = [
+    [t('Timestamp'), m.time || 'timestamp'],
+    m.operation ? [t(c.operationLabel || 'Operation'), m.operation] : null,
+    m.status ? [t(c.statusLabel || 'Status'), m.status] : null,
+    m.user ? [t('User'), m.user] : null,
+    m.model ? [t('Model'), m.model] : null,
+    m.tokens ? [t(c.tokensLabel || 'Tokens'), m.tokens] : null,
+  ].filter(Boolean);
+  return h('div', { class: 'chips' }, items.map(([k, v]) => chip(`${k}: ${v}`)));
+}
+
+function openSinkGenerator(ctx, source = null, logs = []) {
   const ws = (store.boot && store.boot.workspace) || {};
-  const project = ws.projectId || 'PROJECT_ID';
-  const selected = new Set(preselected);
-  const st = { dataset: ws.auditDataset || 'ge_analytics', sink: 'control-plane-telemetry', custom: '' };
-  const out = h('div', { class: 'stack' });
-  const known = [...new Set([...(logs || []).filter((l) => !l.routedToBigQuery).map((l) => l.logName), ...preselected])];
+  const destProject = ws.projectId || 'PROJECT_ID';
+  const candidateSources = (logs || []).filter((l) => !l.routedToBigQuery).map((lg) => ({
+    kind: 'logging', id: lg.id, project: lg.project || destProject, card: lg.catalog || null,
+    quick: lg.quickAdd || null, tech: lg.shortName, logName: lg.logName, sinkFilter: lg.sinkFilter || null,
+  }));
+  let activeSource = source || candidateSources[0] || null;
+  const defaultSinkName = (s) => {
+    const slug = String((s && s.id) || 'telemetry').replace(/[^a-zA-Z0-9_]+/g, '_').replace(/^_+|_+$/g, '').toLowerCase();
+    return `cp_sink_${slug || 'telemetry'}`.slice(0, 80);
+  };
+  const st = {
+    dataset: ws.auditDataset || 'ge_analytics',
+    sink: defaultSinkName(activeSource),
+    custom: '',
+  };
+  const errEl = h('div', { class: 'field-error' });
+  const summaryHost = h('div', { class: 'stack' });
+  const advOut = h('div', { class: 'stack' });
+  const sinkIn = textInput({ value: st.sink, mono: true, onInput: (v) => { st.sink = v.replace(/[^A-Za-z0-9_\-.]/g, ''); build(); } });
+  const datasetIn = textInput({ value: st.dataset, mono: true, onInput: (v) => { st.dataset = v.replace(/[^A-Za-z0-9_]/g, ''); build(); } });
+
+  const buildFilter = () => {
+    let base = '';
+    if (activeSource && activeSource.sinkFilter) {
+      base = activeSource.sinkFilter;
+    } else if (activeSource && activeSource.logName) {
+      base = `logName="${activeSource.logName}"`;
+    } else {
+      base = `logName="projects/${destProject}/logs/LOG_ID"`;
+    }
+    if (st.custom.trim()) {
+      return `(${base}) AND (${st.custom.trim()})`;
+    }
+    return base;
+  };
+
   const build = () => {
-    const parts = [...selected].map((ln) => `logName="${ln}"`);
-    if (st.custom.trim()) parts.push(`(${st.custom.trim()})`);
-    const filter = parts.join(' OR ') || `logName="projects/${project}/logs/LOG_ID"`;
+    const srcProj = (activeSource && activeSource.project) || destProject;
+    const filter = buildFilter();
+    const titleText = activeSource ? sourceTitle(activeSource) : t('Telemetry logs');
+    const metrics = activeSource ? dashboardShows(activeSource) : [t('Events per day'), t('Latest entries')];
+    mount(summaryHost,
+      h('div', { class: 'card', style: { padding: '14px 16px', background: 'var(--bg-subtle, rgba(99,102,241,0.05))' } },
+        h('div', { class: 'stack-sm' },
+          h('div', { class: 'row', style: { justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '8px' } },
+            h('strong', { style: { fontSize: '14px' } }, titleText),
+            h('div', { class: 'row', style: { gap: '6px' } },
+              badge(srcProj, 'neutral', { size: 'sm', mono: true }),
+              badge('Cloud Logging \u2192 BigQuery', 'info', { size: 'sm' }))),
+          activeSource && activeSource.card ? h('p', { class: 'src-what', style: { margin: '2px 0 6px' } }, cardWhat(activeSource.card)) : null,
+          h('div', { class: 'src-label' }, t('Metrics & charts for this source')),
+          h('div', { class: 'chips' }, metrics.map((x) => chip(x))),
+          activeSource ? h('div', { class: 'stack-xs', style: { marginTop: '6px' } },
+            h('div', { class: 'src-label' }, t('Auto-mapped telemetry fields')),
+            mappedFieldsSummary(activeSource)) : null,
+          h('div', { class: 'stack-xs', style: { marginTop: '6px' } },
+            h('div', { class: 'src-label' }, t('What will be configured automatically when you click the button')),
+            h('ul', { style: { margin: '4px 0 0 18px', padding: 0, fontSize: '12.5px', lineHeight: '1.6' } },
+              h('li', null, t('Create or update Cloud Logging sink {sink} in project {project}', { sink: st.sink || 'cp_sink', project: srcProj })),
+              h('li', null, t('Connect partitioned tables in BigQuery dataset {dataset} and grant the sink service account write access automatically', { dataset: `${destProject}.${st.dataset}` })),
+              h('li', null, t('Create and open the {title} dashboard immediately', { title: titleText })))))),
+    );
     const cmd = [
       `gcloud logging sinks create ${st.sink} \\`,
-      `  bigquery.googleapis.com/projects/${project}/datasets/${st.dataset} \\`,
+      `  bigquery.googleapis.com/projects/${destProject}/datasets/${st.dataset} \\`,
       `  --log-filter='${filter.replace(/'/g, "'\\''")}' \\`,
       '  --use-partitioned-tables \\',
-      `  --project=${project}`,
-      '',
-      '# The sink writes as its own service account. Print it:',
-      `gcloud logging sinks describe ${st.sink} --project=${project} --format='value(writerIdentity)'`,
-      `# Then grant it BigQuery Data Editor on the dataset only: BigQuery console > ${project} > ${st.dataset} >`,
-      '#   Sharing > Permissions > Add principal (the identity above without the "serviceAccount:" prefix).',
+      `  --project=${srcProj}`,
     ].join('\n');
-    mount(out,
+    mount(advOut,
       field({ label: t('Log Router filter'), control: codeBlock(filter, { wrap: true }) }),
-      field({ label: t('gcloud commands'), control: codeBlock(cmd) }));
+      field({ label: t('gcloud commands (reference only — executed automatically by the button below)'), control: codeBlock(cmd) }));
   };
-  const datasetIn = textInput({ value: st.dataset, mono: true, onInput: (v) => { st.dataset = v.replace(/[^A-Za-z0-9_]/g, ''); build(); } });
-  const sinkIn = textInput({ value: st.sink, mono: true, onInput: (v) => { st.sink = v.replace(/[^A-Za-z0-9_\-.]/g, ''); build(); } });
-  const custom = h('textarea', { class: 'textarea mono', rows: 2, placeholder: 'logName:"codemender"' });
-  custom.addEventListener('input', () => { st.custom = custom.value; build(); });
-  openModal({
-    title: t('Export logs to BigQuery'),
-    subtitle: t('A Log Router sink copies new entries of the selected logs to BigQuery. The exported table then appears in Telemetry Extensions with complete history and counts.'),
+
+  const runBtn = button({ label: t('Auto-configure BigQuery & open dashboard'), icon: 'check', variant: 'primary' });
+  const modalTitle = source ? `${sourceTitle(source)} \u00b7 ${t('Export to BigQuery')}` : t('Export logs to BigQuery');
+  const modalSub = source && source.card
+    ? cardWhat(source.card)
+    : t('Select a telemetry source below and click the button to automatically create the Cloud Logging sink, grant BigQuery permissions, and open its dashboard.');
+
+  const m = openModal({
+    title: modalTitle,
+    subtitle: modalSub,
     wide: true,
     body: (el) => {
+      const sourcePicker = (!source && candidateSources.length) ? field({
+        label: t('Select telemetry source'),
+        control: selectInput(
+          candidateSources.map((s) => ({
+            value: s.id,
+            label: `${sourceTitle(s)} (${s.project || destProject}) \u2014 ${dashboardShows(s).slice(0, 3).join(' \u00b7 ')}`,
+          })),
+          activeSource ? activeSource.id : '',
+          (val) => {
+            const found = candidateSources.find((s) => s.id === val);
+            if (found) {
+              activeSource = found;
+              st.sink = defaultSinkName(found);
+              sinkIn.value = st.sink;
+              build();
+            }
+          },
+        ),
+      }) : null;
+      const custom = h('textarea', { class: 'textarea mono', rows: 2, placeholder: 'severity>="DEFAULT"' });
+      custom.addEventListener('input', () => { st.custom = custom.value; build(); });
       append(el, [
-        h('div', { class: 'field-row' }, field({ label: t('Sink name'), control: sinkIn }), field({ label: t('Destination dataset'), control: datasetIn })),
-        known.length ? field({ label: t('Logs to export'), control: h('div', { class: 'stack-sm' }, known.map((ln) => {
-          const cb = h('input', { type: 'checkbox', class: 'checkbox', checked: selected.has(ln) });
-          cb.addEventListener('change', () => { if (cb.checked) selected.add(ln); else selected.delete(ln); build(); });
-          return h('label', { class: 'row' }, cb, h('span', { class: 'cell-mono cell-wrap' }, ln));
-        })) }) : null,
-        field({ label: t('Additional filter (optional)'), help: t('For example a product log name or resource type.'), control: custom }),
-        out,
-      ]);
+        sourcePicker,
+        summaryHost,
+        h('div', { class: 'field-row' },
+          field({ label: t('Sink name'), control: sinkIn }),
+          field({ label: t('Destination dataset'), control: datasetIn })),
+        h('details', { class: 'src-more' },
+          h('summary', null, t('Advanced filter & CLI reference (optional)')),
+          h('div', { class: 'stack', style: { marginTop: '10px' } },
+            field({ label: t('Additional filter (optional)'), help: t('For example a product log name or resource type.'), control: custom }),
+            advOut)),
+        errEl,
+      ].filter(Boolean));
       build();
     },
+    footer: (el) => append(el, [button({ label: t('Cancel'), onClick: () => m.close() }), runBtn]),
+  });
+
+  runBtn.addEventListener('click', async () => {
+    errEl.textContent = '';
+    const srcProj = (activeSource && activeSource.project) || destProject;
+    const quick = activeSource && activeSource.quick
+      ? { ...activeSource.quick, name: (sourceTitle(activeSource) || activeSource.quick.name || '').slice(0, 80) }
+      : null;
+    setBusy(runBtn, true, t('Configuring automatically'));
+    try {
+      const res = await api.post('/api/v1/telemetry/sinks', {
+        sourceId: activeSource ? activeSource.id : 'telemetry',
+        sinkName: st.sink,
+        dataset: st.dataset,
+        project: srcProj,
+        filter: buildFilter(),
+        logNames: activeSource && activeSource.logName && !activeSource.sinkFilter ? [activeSource.logName] : [],
+        quickAdd: quick,
+        createConnector: true,
+      });
+      const data = res.data || {};
+      const conn = data.connector;
+      m.close();
+      toast({
+        title: t('BigQuery sink and dashboard configured'),
+        text: `${st.sink} \u2192 ${destProject}.${st.dataset}`,
+        tone: 'success',
+      });
+      if (conn && conn.id && ctx && typeof ctx.navigate === 'function') {
+        ctx.navigate(`#/extensions/${encodeURIComponent(conn.id)}`);
+      } else if (ctx && typeof ctx.rerender === 'function') {
+        ctx.rerender();
+      }
+    } catch (e) {
+      setBusy(runBtn, false);
+      errEl.textContent = errorText(e);
+    }
   });
 }

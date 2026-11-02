@@ -11,6 +11,7 @@ export const store = {
   boot: null,
   range: { preset: '14d', start: null, end: null },
   granularity: 'day',
+  project: 'all',
   model: null,
   locale: 'en',
   sidebarCollapsed: false,
@@ -46,6 +47,7 @@ export function savePrefs() {
       start: store.range.preset === 'custom' ? store.range.start : null,
       end: store.range.preset === 'custom' ? store.range.end : null,
       granularity: store.granularity,
+      project: store.project,
       model: store.model,
       locale: store.locale,
       sidebarCollapsed: store.sidebarCollapsed,
@@ -85,6 +87,8 @@ export function initState(boot) {
   store.locale = prefs.locale || (boot.branding && boot.branding.defaultLocale) || 'en';
   store.granularity = prefs.granularity === 'week' ? 'week' : 'day';
   store.sidebarCollapsed = Boolean(prefs.sidebarCollapsed);
+  const wsProjects = (boot.workspace && Array.isArray(boot.workspace.projects) && boot.workspace.projects) || [];
+  store.project = prefs.project && prefs.project !== 'all' && wsProjects.includes(prefs.project) ? prefs.project : 'all';
   const allowed = (boot.aiEngine && boot.aiEngine.models) || [];
   store.model = prefs.model && allowed.includes(prefs.model) ? prefs.model : (boot.aiEngine && boot.aiEngine.defaultModel) || null;
 
@@ -112,6 +116,13 @@ export function setGranularity(g) {
   emit('range', store.range);
 }
 
+export function setProject(project) {
+  store.project = project || 'all';
+  savePrefs();
+  emit('project', store.project);
+  emit('range', store.range);
+}
+
 export function setModel(model) {
   store.model = model;
   savePrefs();
@@ -119,7 +130,9 @@ export function setModel(model) {
 }
 
 export function rangeParams(extra = {}) {
-  return { start: store.range.start, end: store.range.end, granularity: store.granularity, ...extra };
+  const base = { start: store.range.start, end: store.range.end, granularity: store.granularity };
+  if (store.project && store.project !== 'all') base.project = store.project;
+  return { ...base, ...extra };
 }
 
 export function isModuleEnabled(id) {

@@ -225,18 +225,103 @@ function accountBox(user) {
       user.role === 'admin' ? t('Administrator') : t('Viewer')));
 }
 
+function passwordFormView() {
+  const userInput = h('input', {
+    type: 'text',
+    class: 'input login-input',
+    name: 'username',
+    placeholder: 'admin',
+    autocomplete: 'username',
+    autocapitalize: 'none',
+    spellcheck: 'false',
+    required: 'required',
+    'aria-label': t('Account ID or email'),
+  });
+  const passInput = h('input', {
+    type: 'password',
+    class: 'input login-input',
+    name: 'password',
+    placeholder: '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022',
+    autocomplete: 'current-password',
+    required: 'required',
+    'aria-label': t('Password'),
+  });
+  const errSlot = h('div', { class: 'login-form-error' });
+  const submitBtn = h('button', {
+    type: 'submit',
+    class: ['btn', 'btn-primary', 'btn-block', 'login-btn'],
+  }, icon('lock', { size: 15 }), t('Sign in'));
+
+  const form = h('form', { class: 'login-form', novalidate: 'novalidate' },
+    errSlot,
+    h('label', { class: 'login-field' },
+      h('span', { class: 'login-label' }, t('Account ID or email')),
+      userInput),
+    h('label', { class: 'login-field' },
+      h('span', { class: 'login-label' }, t('Password')),
+      passInput),
+    submitBtn);
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    mount(errSlot);
+    const username = userInput.value.trim();
+    const password = passInput.value;
+    if (!username || !password) {
+      mount(errSlot, alertBox({
+        tone: 'danger',
+        title: t('Enter your account ID and password'),
+        text: t('Both fields are required to sign in.'),
+      }));
+      if (!username) userInput.focus();
+      else passInput.focus();
+      return;
+    }
+    submitBtn.disabled = true;
+    submitBtn.classList.add('is-busy');
+    try {
+      const res = await api.post('/api/v1/auth/login', {
+        username,
+        password,
+        next: nextTarget(),
+      });
+      const target = res && res.data && res.data.redirect;
+      window.location.replace(isSameOriginPath(target) ? target : nextTarget());
+    } catch (err) {
+      submitBtn.disabled = false;
+      submitBtn.classList.remove('is-busy');
+      mount(errSlot, alertBox({
+        tone: 'danger',
+        title: t('Sign-in failed'),
+        text: (err && err.message) ? t(err.message) : t('Invalid account ID or password.'),
+      }));
+      passInput.select();
+    }
+  });
+
+  return form;
+}
+
 function signInView() {
   const guest = Boolean(state && state.guestAccess);
+  const defaultAdmin = Boolean(state && state.defaultAdminPassword);
   return [
-    heading(t('Sign in'), t('Use your Google account to continue to {product}.', { product: productName() })),
+    heading(t('Sign in'), t('Sign in with your account ID and password to continue to {product}.', { product: productName() })),
     noticeAlert(),
+    defaultAdmin ? alertBox({
+      tone: 'info',
+      title: t('Initial administrator account'),
+      text: t('Default login: ID "admin" / Password "admin". You can change this password and create customer accounts in Settings > Access control.'),
+    }) : null,
+    passwordFormView(),
+    h('div', { class: 'login-divider' }, h('span', null, t('or'))),
     h('div', { class: 'login-actions' },
       googleButton(),
       guest ? linkButton(t('Continue as guest'), nextTarget(), 'ghost', 'arrow-right') : null,
       notice.error === 'not_approved' && state && state.switchAccountUrl ? switchAccountButton(t('Use another account')) : null),
     note(guest
       ? t('Guests can look around with identifiers hidden. Administration needs an account approved by your administrators.')
-      : t('Only accounts approved by your administrators can open this workspace. New accounts can request access by signing in.')),
+      : t('Sign in with your assigned ID and password, or use an approved Google account.')),
   ];
 }
 
