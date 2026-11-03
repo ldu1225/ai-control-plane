@@ -437,7 +437,7 @@ def bigquery_connector(card, project, dataset, logical, schema, suggested):
     Known sources use their catalog paths and fall back to the automatic suggestions; other tables use the
     suggestions and fall back to resource type and severity. The time column comes from the suggestions
     (None lets the server pick the table time column)."""
-    if schema is None:
+    if schema is None or not any(n.type == "TIMESTAMP" and n.mode != "REPEATED" for n in schema.tree.values()):
         return None, card
     suggested = suggested or {}
     entry = lookup(card["id"])

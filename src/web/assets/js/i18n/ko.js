@@ -980,6 +980,8 @@ const KO = {
   'Added to the Overview': '개요에 추가했습니다',
   'Removed from the Overview': '개요에서 뺐습니다',
   'Drag it on the Overview to change its place.': '개요에서 끌어서 위치를 바꿀 수 있습니다.',
+  'AI profiled': 'AI 자동 분석',
+  'AI grouped ({model})': 'AI 자동 그룹화 ({model})',
   // Telemetry source catalog (server text, services/telemetry_catalog.py)
   'Agent Engine output logs': 'Agent Engine 출력 로그',
   'Standard output of agents deployed to Agent Engine (Agent Platform): what each agent printed while it handled requests.': 'Agent Engine (Agent Platform)에 배포한 에이전트의 표준 출력입니다. 각 에이전트가 요청을 처리하면서 남긴 출력을 볼 수 있습니다.',

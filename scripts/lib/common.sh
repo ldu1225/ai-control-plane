@@ -447,11 +447,12 @@ PYBILL
     fi
   fi
   ds_list="$(bq --project_id="$project" ls --format=json 2>/dev/null || true)"
-  [[ -n "$ds_list" && "$ds_list" == \[* ]] || return 0
+  [[ -n "$ds_list" && "$ds_list" == *"["* ]] || return 0
   for ds in $(python3 -c '
 import json, sys
 try:
-    items = json.loads(sys.argv[1]) or []
+    raw = sys.argv[1]
+    items = json.loads(raw[raw.index("["):]) or []
     names = [d.get("datasetReference", {}).get("datasetId", "") for d in items]
     for n in sorted([x for x in names if x], key=lambda s: (0 if "billing" in s.lower() else 1, s)):
         print(n)
@@ -459,12 +460,12 @@ except Exception:
     pass
 ' "$ds_list"); do
     tbl_json="$(bq --project_id="$project" ls --max_results=200 --format=json "${project}:${ds}" 2>/dev/null || true)"
-    [[ -n "$tbl_json" && "$tbl_json" == \[* ]] || continue
+    [[ -n "$tbl_json" && "$tbl_json" == *"["* ]] || continue
     found="$(python3 -c '
 import json, sys
 ds, raw = sys.argv[1], sys.argv[2]
 fallback = ""
-for t in (json.loads(raw) or []):
+for t in (json.loads(raw[raw.index("["):]) or []):
     tid = t.get("tableReference", {}).get("tableId", "")
     if tid.startswith("gcp_billing_export_resource_v1_"):
         print("%s|%s" % (ds, tid)); sys.exit(0)
@@ -848,12 +849,13 @@ grant_dataset_role() {
 import json, sys
 path, role, email = sys.argv[1], sys.argv[2], sys.argv[3].lower()
 enough = {"READER": ("READER", "WRITER", "OWNER"), "WRITER": ("WRITER", "OWNER")}[role]
-dataset = json.load(open(path))
+raw = open(path, encoding="utf-8", errors="replace").read()
+dataset = json.loads(raw[raw.index("{"):])
 access = dataset.setdefault("access", [])
 if any((a.get("userByEmail") or "").lower() == email and a.get("role") in enough for a in access):
     sys.exit(3)  # already granted
 access.append({"role": role, "userByEmail": email})
-json.dump(dataset, open(path, "w"))
+json.dump(dataset, open(path, "w", encoding="utf-8"))
 PYCODE
   if [[ $rc -eq 0 ]]; then
     bq --project_id "$1" update --source "$file" "${1}:${2}" >/dev/null 2>&1 || rc=1

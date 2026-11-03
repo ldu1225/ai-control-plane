@@ -15,7 +15,7 @@ import { isModuleEnabled, rangeParams } from './state.js';
 import { button, iconButton, badge, openModal, openPopover, menuItem, toast, segmented, field } from './components.js';
 import { errorText } from './messages.js';
 import { barChart, hbarList, mapList, fromTimeline, TONES, colorAt } from './charts.js';
-import { cardWhat, shortValue, statusText } from './telemetry_view.js';
+import { cardWhat, cardFieldLabel, shortValue, statusText } from './telemetry_view.js';
 
 const VIEWS = ['summary', 'trend', 'operations', 'statuses', 'recent'];
 const SIZES = [['s', 'Small'], ['m', 'Medium'], ['l', 'Wide']];
@@ -86,8 +86,8 @@ function viewLabel(view, conn) {
   const cat = conn && conn.catalog;
   if (view === 'summary') return t('Summary');
   if (view === 'trend') return t('Events per day');
-  if (view === 'operations') return t('By {label}', { label: t((cat && cat.operationLabel) || 'Operation') });
-  if (view === 'statuses') return t('By {label}', { label: t((cat && cat.statusLabel) || 'Status') });
+  if (view === 'operations') return t('By {label}', { label: cardFieldLabel(cat, 'operation', 'Operation') });
+  if (view === 'statuses') return t('By {label}', { label: cardFieldLabel(cat, 'status', 'Status') });
   return t('Latest entries');
 }
 
@@ -119,7 +119,7 @@ function renderView(body, sub, w, conn, d) {
     const stats = h('div', { class: 'wb-stats' },
       stat(t('Events'), isNum(k.events && k.events.value) ? `${fmt.compact(k.events.value)}${plus}` : DASH),
       m.user ? stat(t('Users'), isNum(k.users) ? `${fmt.int(k.users)}${plus}` : DASH) : null,
-      m.tokens ? stat(t((cat && cat.tokensLabel) || 'Tokens'), isNum(k.tokens) ? `${fmt.compact(k.tokens)}${plus}` : DASH) : null,
+      m.tokens ? stat(cardFieldLabel(cat, 'tokens', 'Tokens'), isNum(k.tokens) ? `${fmt.compact(k.tokens)}${plus}` : DASH) : null,
       stat(t('Last event'), k.lastEvent ? fmt.relative(k.lastEvent) : DASH));
     const host = h('div', { class: 'wb-chart' });
     mount(body, stats, host);

@@ -18,7 +18,7 @@ import {
 import { errorText } from '../core/messages.js';
 import { barChart, hbarList, mapList, sparkline, fromTimeline, TONES, colorAt } from '../core/charts.js';
 import { rangeText, chartCard, mountCharts, pageSkeleton, deltaOf } from './_shared.js';
-import { cardTitle, cardWhat, shortValue, statusText } from '../core/telemetry_view.js';
+import { cardTitle, cardWhat, cardGroup, cardFieldLabel, shortValue, statusText } from '../core/telemetry_view.js';
 import { loadLayouts, isPinned, togglePin, canEditLayouts } from '../core/widgets.js';
 
 const MAPPING_FIELDS = [
@@ -84,15 +84,17 @@ function logIdOf(conn) {
   try { return decodeURIComponent(m[1]); } catch (e) { return m[1]; }
 }
 
-const AGENT_FILTER_RE = /^\s*\(?resource\.labels\.job="([A-Za-z0-9_-]+)"\s+OR\s+resource\.labels\.service_name="\1"\)?(?:\s+AND\s+.*)?$/;
+const WORKLOAD_FILTER_RE = /resource\.labels\.[A-Za-z0-9_]+="([A-Za-z0-9_-]+)"/;
 
-/** What a connector reads, for people: the log id, the table reference or the custom filter. */
+/** What a connector reads, for people: the log id, the table reference or the workload/custom filter. */
 function sourceRef(conn) {
   if (conn.source === 'bigquery' && conn.bigquery) return `${conn.bigquery.project}.${conn.bigquery.dataset}.${conn.bigquery.table}`;
   const flt = (conn.logging && conn.logging.filter) || '';
-  const am = AGENT_FILTER_RE.exec(flt);
-  if (am) return `${am[1]} (CODEMENDER_COST_TELEMETRY)`;
-  return logIdOf(conn) || flt || '';
+  const lid = logIdOf(conn);
+  if (lid) return lid;
+  const wm = WORKLOAD_FILTER_RE.exec(flt);
+  if (wm) return wm[1];
+  return flt || '';
 }
 
 function rangeDays() {
@@ -139,6 +141,7 @@ async function renderList(ctx) {
     days: (discovery && discovery.activityDays) || 7,
     logs: (discovery && Array.isArray(discovery.logs)) ? discovery.logs : [],
     listed: Boolean(discovery && (Array.isArray(discovery.tables) || Array.isArray(discovery.logs))),
+    aiGrouping: (discovery && discovery.aiGrouping) || null,
   };
   pending.replaceWith(...[
     warningsNotice((dRes.meta && dRes.meta.warnings) || []),
@@ -215,6 +218,13 @@ function dashboardsSection(ctx, connectors) {
     connectors.length ? grid : h('div', { class: 'src-empty' }, t('No dashboards yet. Choose a source below and select Add to dashboard.')));
 }
 
+function groupIcon(items) {
+  const counts = {};
+  items.forEach((s) => { const id = categoryOf(s).id; counts[id] = (counts[id] || 0) + 1; });
+  const top = CATEGORIES.slice().sort((a, b) => (counts[b.id] || 0) - (counts[a.id] || 0))[0];
+  return (top && top.icon) || 'database';
+}
+
 function sourcesSection(ctx, sources, env) {
   const addable = sources.filter((s) => !s.core);
   const st = { cat: 'all', q: '' };
@@ -222,7 +232,7 @@ function sourcesSection(ctx, sources, env) {
   addable.forEach((s) => { const id = categoryOf(s).id; counts[id] = (counts[id] || 0) + 1; });
   const chipsHost = h('div', { class: 'chips', role: 'group', 'aria-label': t('Filter by category') });
   const listHost = h('div', { class: 'stack-lg' });
-  const matches = (s) => !st.q || [sourceTitle(s), cardWhat(s.card), s.tech].some((x) => String(x || '').toLowerCase().includes(st.q));
+  const matches = (s) => !st.q || [sourceTitle(s), cardWhat(s.card), cardGroup(s.card), s.tech].some((x) => String(x || '').toLowerCase().includes(st.q));
   const draw = () => {
     mount(chipsHost, [{ id: 'all', label: 'All' }, ...CATEGORIES].filter((c) => c.id === 'all' || counts[c.id]).map((c) => chip(
       `${t(c.label)} ${c.id === 'all' ? addable.length : counts[c.id]}`,
@@ -231,13 +241,34 @@ function sourcesSection(ctx, sources, env) {
     const active = visible.filter((s) => !isStale(s, env.days));
     const stale = visible.filter((s) => isStale(s, env.days)).sort(byActivity);
     const nodes = [];
-    CATEGORIES.forEach((c) => {
-      const items = active.filter((s) => categoryOf(s).id === c.id).sort(byActivity);
-      if (!items.length) return;
-      nodes.push(h('div', { class: 'stack' },
-        h('h3', { class: 'src-group-title' }, icon(c.icon, { size: 14 }), t(c.label), h('span', { class: 'muted' }, String(items.length))),
-        h('div', { class: 'src-grid' }, items.map((s) => sourceCard(ctx, s, env)))));
-    });
+    const hasAiGroups = active.some((s) => Boolean(cardGroup(s.card)));
+    if (hasAiGroups) {
+      const buckets = new Map();
+      active.forEach((s) => {
+        const gLabel = cardGroup(s.card) || t(categoryOf(s).label);
+        if (!buckets.has(gLabel)) buckets.set(gLabel, []);
+        buckets.get(gLabel).push(s);
+      });
+      const ordered = [...buckets.entries()].sort((a, b) => {
+        const scoreA = a[1].reduce((acc, s) => acc + Math.max(0, activityScore(s)), 0);
+        const scoreB = b[1].reduce((acc, s) => acc + Math.max(0, activityScore(s)), 0);
+        return scoreB - scoreA || a[0].localeCompare(b[0]);
+      });
+      ordered.forEach(([gLabel, items]) => {
+        items.sort(byActivity);
+        nodes.push(h('div', { class: 'stack' },
+          h('h3', { class: 'src-group-title' }, icon(groupIcon(items), { size: 14 }), gLabel, h('span', { class: 'muted' }, String(items.length))),
+          h('div', { class: 'src-grid' }, items.map((s) => sourceCard(ctx, s, env)))));
+      });
+    } else {
+      CATEGORIES.forEach((c) => {
+        const items = active.filter((s) => categoryOf(s).id === c.id).sort(byActivity);
+        if (!items.length) return;
+        nodes.push(h('div', { class: 'stack' },
+          h('h3', { class: 'src-group-title' }, icon(c.icon, { size: 14 }), t(c.label), h('span', { class: 'muted' }, String(items.length))),
+          h('div', { class: 'src-grid' }, items.map((s) => sourceCard(ctx, s, env)))));
+      });
+    }
     if (!active.length) {
       const text = !env.listed ? t('The sources could not be listed. See the notices above.')
         : addable.length ? t('No source matches the filter.') : t('Every source of this project is already shown on the built-in pages.');
@@ -252,10 +283,13 @@ function sourcesSection(ctx, sources, env) {
   };
   const search = searchBox({ placeholder: t('Search sources'), onInput: (v) => { st.q = v.trim().toLowerCase(); draw(); } });
   draw();
+  const aiModel = env.aiGrouping && env.aiGrouping.enabled && env.aiGrouping.model ? env.aiGrouping.model : null;
   return h('section', { class: 'stack' },
     h('div', { class: 'src-toolbar' },
       h('div', { class: 'stack-sm' },
-        h('h2', { class: 'section-title' }, t('Data you can add'), h('span', { class: 'muted' }, String(addable.length))),
+        h('div', { class: 'row', style: { gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+          h('h2', { class: 'section-title', style: { margin: 0 } }, t('Data you can add'), h('span', { class: 'muted' }, String(addable.length))),
+          aiModel ? badge(t('AI grouped ({model})', { model: aiModel }), 'info', { size: 'sm', dot: true }) : null),
         h('p', { class: 'src-what' }, t('Collected in this project but not shown on the built-in pages. Sorted by recent volume.'))),
       addable.length ? search : null),
     addable.length ? chipsHost : null,
@@ -266,11 +300,11 @@ function dashboardShows(s) {
   const m = (s.quick && s.quick.mapping) || {};
   const c = s.card || {};
   const out = [t('Events per day')];
-  if (m.operation) out.push(t('By {label}', { label: t(c.operationLabel || 'Operation') }));
-  if (m.status) out.push(t('By {label}', { label: t(c.statusLabel || 'Status') }));
+  if (m.operation) out.push(t('By {label}', { label: cardFieldLabel(c, 'operation', 'Operation') }));
+  if (m.status) out.push(t('By {label}', { label: cardFieldLabel(c, 'status', 'Status') }));
   if (m.user) out.push(t('Top users'));
   if (m.model) out.push(t('Top models'));
-  if (m.tokens) out.push(t(c.tokensLabel || 'Tokens'));
+  if (m.tokens) out.push(cardFieldLabel(c, 'tokens', 'Tokens'));
   out.push(t('Latest entries'));
   return out;
 }
@@ -295,7 +329,7 @@ function volumeNote(ctx, s, env) {
   if (s.kind !== 'logging' || !isNum(s.entries7d) || (s.entries7d / env.days) * rangeDays() <= MAX_LOG_READ) return null;
   return h('div', { class: 'src-note' }, icon('info', { size: 13 }),
     h('span', null, t('High volume: its dashboard counts only the latest {n} entries of a period. Export it to BigQuery for complete counts.', { n: fmt.int(MAX_LOG_READ) })),
-    s.logName ? button({ label: t('Export to BigQuery'), size: 'xs', variant: 'ghost', icon: 'code', onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator(ctx, s, env.logs); } }) : null);
+    (s.logName || s.sinkFilter) ? button({ label: t('Export to BigQuery'), size: 'xs', variant: 'ghost', icon: 'code', onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator(ctx, s, env.logs); } }) : null);
 }
 
 function sourceAction(ctx, s, env) {
@@ -312,7 +346,7 @@ function sourceAction(ctx, s, env) {
     });
     btns.push(btn);
   }
-  if (s.kind === 'logging' && s.logName) {
+  if (s.kind === 'logging' && (s.logName || s.sinkFilter)) {
     btns.push(button({
       label: t('Export to BigQuery'), icon: 'database', size: 'sm', variant: 'ghost',
       onClick: () => { if (requireAdmin(t('Export to BigQuery'))) openSinkGenerator(ctx, s, env && env.logs); },
@@ -332,6 +366,7 @@ function sourceCard(ctx, s, env) {
         h('div', { class: 'src-badges' },
           s.project ? badge(s.project, 'info', { size: 'sm', dot: true }) : null,
           badge(s.kind === 'bigquery' ? 'BigQuery' : 'Cloud Logging', 'neutral', { size: 'sm' }),
+          c.aiProfiled ? badge(t('AI profiled'), 'info', { size: 'sm', title: c.aiModel || '' }) : null,
           c.sensitive ? badge(t('Contains prompt or response text'), 'warning', { size: 'sm' }) : null,
           s.connectorId ? badge(t('Added'), 'success', { size: 'sm', dot: true }) : null))),
     h('p', { class: 'src-what' }, cardWhat(c)),
@@ -416,6 +451,7 @@ function connectorCard(ctx, c) {
   const metaRow = h('div', { class: 'connector-meta' },
     projId ? badge(projId, 'info', { size: 'sm', dot: true, title: t('Project: {id}', { id: projId }) }) : null,
     badge(c.source === 'bigquery' ? 'BigQuery' : 'Cloud Logging', 'neutral', { size: 'sm' }),
+    cardGroup(c.catalog) ? badge(cardGroup(c.catalog), 'info', { size: 'sm' }) : null,
     c.source === 'logging' && c.bigquerySink ? badge(t('BQ sink linked'), 'success', { size: 'sm', dot: true, title: t('BigQuery linked: {dest}', { dest: c.bigquerySink }) }) : null);
   const fullRef = `${c.source === 'bigquery' ? 'BigQuery' : 'Cloud Logging'} \u00b7 ${sourceRef(c)}`;
   const bottom = h('div', { class: 'connector-bottom' },
@@ -424,7 +460,7 @@ function connectorCard(ctx, c) {
     sparkHost);
   const el = card({
     cls: 'connector-card',
-    title: c.name,
+    title: (c.catalog && c.catalog.aiProfiled && cardTitle(c.catalog)) ? cardTitle(c.catalog) : c.name,
     subtitle: c.catalog ? cardWhat(c.catalog) : t('Custom connector set up by an administrator.'),
     actions: c.enabled ? badge(t('Enabled'), 'success', { size: 'sm', dot: true }) : badge(t('Disabled'), 'neutral', { size: 'sm' }),
     body: [metaRow, bottom],
@@ -509,9 +545,9 @@ async function renderConnector(ctx, id) {
   const c = d.connector || {};
   const cat = c.catalog || null;
   const m = c.mapping || {};
-  const opLabel = t((cat && cat.operationLabel) || 'Operation');
-  const statusLabel = t((cat && cat.statusLabel) || 'Status');
-  const tokensLabel = t((cat && cat.tokensLabel) || 'Tokens');
+  const opLabel = cardFieldLabel(cat, 'operation', 'Operation');
+  const statusLabel = cardFieldLabel(cat, 'status', 'Status');
+  const tokensLabel = cardFieldLabel(cat, 'tokens', 'Tokens');
   const statusKey = (cat && cat.statusLabel) || 'Status';
   // Agent Engine IDs and similar values are shown with their display names when the server could resolve them.
   const opNames = (d.valueNames && d.valueNames.operation) || {};
@@ -533,7 +569,7 @@ async function renderConnector(ctx, id) {
     },
   });
   mount(headerSlot, pageHeader({
-    title: c.name || id,
+    title: (cat && cat.aiProfiled && cardTitle(cat)) ? cardTitle(cat) : (c.name || id),
     desc: cat ? cardWhat(cat) : t('Custom connector set up by an administrator.'),
     project: connProj,
     projectScope: c.projectScope || 'single',
@@ -550,6 +586,7 @@ async function renderConnector(ctx, id) {
   body.append(h('div', { class: 'tx-source' },
     connProj ? badge(t('Project: {id}', { id: connProj }), 'info', { size: 'sm', dot: true }) : null,
     badge(c.source === 'bigquery' ? 'BigQuery' : 'Cloud Logging', 'neutral', { size: 'sm' }),
+    cardGroup(cat) ? badge(cardGroup(cat), 'info', { size: 'sm' }) : null,
     c.bigquerySink ? badge(t('BigQuery linked: {dest}', { dest: c.bigquerySink }), 'success', { size: 'sm', dot: true }) : null,
     h('code', { class: 'src-code' }, sourceRef(c))));
   const sample = d.sample || null;
@@ -759,6 +796,7 @@ async function openConnectorForm(ctx, existing, table, logFilter) {
     if (!st.name.trim()) { err.textContent = t('Enter a display name.'); return; }
     if (!st.mapping.time) { err.textContent = t('Map the timestamp field.'); return; }
     const payload = { id: st.id, name: st.name.trim(), enabled: st.enabled, source: st.source, mapping: st.mapping };
+    if (existing && existing.meta) payload.meta = existing.meta;
     if (st.source === 'bigquery') {
       const tb = findTable();
       if (!tb) { err.textContent = t('Select a BigQuery table.'); return; }
@@ -793,11 +831,11 @@ function mappedFieldsSummary(s) {
   const c = (s && s.card) || {};
   const items = [
     [t('Timestamp'), m.time || 'timestamp'],
-    m.operation ? [t(c.operationLabel || 'Operation'), m.operation] : null,
-    m.status ? [t(c.statusLabel || 'Status'), m.status] : null,
+    m.operation ? [cardFieldLabel(c, 'operation', 'Operation'), m.operation] : null,
+    m.status ? [cardFieldLabel(c, 'status', 'Status'), m.status] : null,
     m.user ? [t('User'), m.user] : null,
     m.model ? [t('Model'), m.model] : null,
-    m.tokens ? [t(c.tokensLabel || 'Tokens'), m.tokens] : null,
+    m.tokens ? [cardFieldLabel(c, 'tokens', 'Tokens'), m.tokens] : null,
   ].filter(Boolean);
   return h('div', { class: 'chips' }, items.map(([k, v]) => chip(`${k}: ${v}`)));
 }

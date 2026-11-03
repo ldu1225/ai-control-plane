@@ -50,6 +50,7 @@ class AiEngine:
         self.gcp = gcp
         self._lock = threading.Lock()
         self._clients = {}
+        self._unavailable = set()
         self._cache = TTLCache(32)
 
     def client(self, project, location, quota_project):
@@ -142,6 +143,39 @@ class AiEngine:
                 raise ApiError("bad_request", "The requested model is not allowed in this workspace.")
         return model
 
+    def fallback_model(self, settings, failed_model):
+        """Picks a working Gemini model when an internal-only or preview model returns 404 on an external GCP org."""
+        project = settings["workspace"]["project_id"]
+        location = settings["ai_engine"].get("location") or "global"
+        default_m = settings["ai_engine"].get("default_model") or ""
+        base = [default_m] if default_m and default_m != failed_model else []
+        candidates = tuple(base) + ("gemini-2.5-flash", "gemini-3-flash-preview", "gemini-2.5-pro",
+                                    "gemini-2.5-flash-lite")
+        with self._lock:
+            dead = set(self._unavailable)
+        if settings["ai_engine"].get("discover_models"):
+            discovered, status = self.discover(settings)
+            if status == "ok" and discovered:
+                for cand in candidates:
+                    if cand in discovered and cand != failed_model and (project, location, cand) not in dead:
+                        return cand
+                for cand in reversed(discovered):
+                    if cand != failed_model and (project, location, cand) not in dead:
+                        return cand
+        for cand in candidates:
+            if cand != failed_model and (project, location, cand) not in dead:
+                return cand
+        return None
+
+    def effective_model(self, settings, preferred):
+        project = settings["workspace"]["project_id"]
+        location = settings["ai_engine"].get("location") or "global"
+        with self._lock:
+            is_dead = (project, location, preferred) in self._unavailable
+        if is_dead:
+            return self.fallback_model(settings, preferred) or preferred
+        return preferred
+
     # -- generation ---------------------------------------------------------------
     def generate(self, settings, model, contents, *, system=None, schema=None, temperature=0.2,
                  max_output_tokens=4096, module="ai"):
@@ -160,15 +194,49 @@ class AiEngine:
             cfg["response_schema"] = schema
         attempts = 2 if schema is not None else 1
         started = time.monotonic()
+        active_model = self.effective_model(settings, model) if type(self.gcp).__name__ == "Gcp" else model
         for attempt in range(1, attempts + 1):
             try:
-                resp = client.models.generate_content(model=model, contents=contents,
+                resp = client.models.generate_content(model=active_model, contents=contents,
                                                       config=types.GenerateContentConfig(**cfg))
             except Exception as err:  # pylint: disable=broad-except
                 status = getattr(err, "code", None) or getattr(err, "status_code", None)
-                LOG.warning("generate_content failed model=%s error=%s status=%s", model, type(err).__name__, status)
-                kind = "denied" if status in (401, 403) else ("not_found" if status == 404 else "unavailable")
-                raise GcpError(kind, status=status if isinstance(status, int) else None, message=type(err).__name__)
+                if (status == 404 and type(self.gcp).__name__ == "Gcp"
+                        and (active_model == settings["ai_engine"].get("default_model")
+                             or active_model.startswith("gemini-4-")
+                             or active_model.startswith("gemini-3.8-"))):
+                    with self._lock:
+                        self._unavailable.add((project, location, active_model))
+                    fb = self.fallback_model(settings, active_model)
+                    if fb:
+                        LOG.info("model %s returned 404; falling back to %s", active_model, fb)
+                        active_model = fb
+                        try:
+                            resp = client.models.generate_content(model=active_model, contents=contents,
+                                                                  config=types.GenerateContentConfig(**cfg))
+                        except Exception as fb_err:  # pylint: disable=broad-except
+                            fb_st = getattr(fb_err, "code", None) or getattr(fb_err, "status_code", None)
+                            if fb_st == 404:
+                                with self._lock:
+                                    self._unavailable.add((project, location, active_model))
+                                fb2 = self.fallback_model(settings, active_model)
+                                if fb2 and fb2 != active_model:
+                                    active_model = fb2
+                                    resp = client.models.generate_content(model=active_model, contents=contents,
+                                                                          config=types.GenerateContentConfig(**cfg))
+                                else:
+                                    raise GcpError("not_found", status=404, message=type(fb_err).__name__)
+                            else:
+                                kind = "denied" if fb_st in (401, 403) else "unavailable"
+                                raise GcpError(kind, status=fb_st if isinstance(fb_st, int) else None,
+                                               message=type(fb_err).__name__)
+                    else:
+                        raise GcpError("not_found", status=404, message=type(err).__name__)
+                else:
+                    LOG.warning("generate_content failed model=%s error=%s status=%s", active_model,
+                                type(err).__name__, status)
+                    kind = "denied" if status in (401, 403) else ("not_found" if status == 404 else "unavailable")
+                    raise GcpError(kind, status=status if isinstance(status, int) else None, message=type(err).__name__)
             text = (getattr(resp, "text", None) or "").strip()
             if schema is None:
                 return strip_emoji(text)

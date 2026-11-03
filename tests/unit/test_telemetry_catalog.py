@@ -294,5 +294,196 @@ class ValueNamesTest(unittest.TestCase):
             self.assertIsNone(telemetry._value_names(None, conn, out))
 
 
+class IdleDatasetDiscoveryTest(unittest.TestCase):
+    def test_table_without_timestamp_column_has_no_quick_add(self):
+        static_schema = schema_mod.TableSchema.from_dicts([col("customer_id"), col("plan")])
+        card = catalog.describe("customers", dataset="crm")
+        self.assertEqual(catalog.bigquery_connector(card, "demo-project", "crm", "customers", static_schema, {}),
+                         (None, card))
+
+    def test_live_gcp_auto_discovers_idle_datasets_except_billing(self):
+        Gcp = type("Gcp", (), {})
+
+        class Ctx:
+            gcp = Gcp()
+            project = "demo-project"
+            audit_dataset = "ge_analytics"
+            selected_project = "all"
+            settings = {"workspace": {"project_id": "demo-project", "projects": [],
+                                      "billing": {"project_id": "", "dataset": "billing_detailed_usage", "table": "t"}}}
+            ws = settings["workspace"]
+
+            def rest(self, _method, _url, **_kw):
+                return {"datasets": [
+                    {"datasetReference": {"datasetId": "billing_detailed_usage"}},
+                    {"datasetReference": {"datasetId": "idle_marketing"}},
+                    {"datasetReference": {"datasetId": "custom_agent_logs"}},
+                ]}
+
+        found = telemetry.discover_datasets(Ctx())
+        self.assertEqual(found, [
+            ("demo-project", "ge_analytics"),
+            ("demo-project", "custom_agent_logs"),
+            ("demo-project", "idle_marketing"),
+        ])
+
+    def test_ai_enrich_sources_clusters_and_validates_schema_fields(self):
+        rag_schema = schema_mod.TableSchema.from_dicts([
+            col("event_ts", "TIMESTAMP"),
+            col("actor_email", "STRING"),
+            col("pipeline_step", "STRING"),
+            col("llm_model", "STRING"),
+            col("token_usage", "INTEGER"),
+            col("outcome", "STRING"),
+            col("summary_text", "STRING"),
+        ])
+        mapping = telemetry.suggested_mapping(rag_schema.leaf_types(50))
+        base_card = catalog.describe("rag_pipeline_events", dataset="agent_ops_archive", built_in=[])
+        quick, card = catalog.bigquery_connector(
+            base_card, "demo-project", "agent_ops_archive", "rag_pipeline_events", rag_schema, mapping
+        )
+        tables = [{
+            "id": "rag_pipeline_events",
+            "project": "demo-project",
+            "dataset": "agent_ops_archive",
+            "table": "rag_pipeline_events",
+            "logical": "rag_pipeline_events",
+            "core": False,
+            "registered": False,
+            "connectorId": None,
+            "suggestedMapping": mapping,
+            "columns": rag_schema.leaf_paths(50),
+            "catalog": card,
+            "quickAdd": quick,
+        }]
+
+        class MockAi:
+            def effective_model(self, _settings, preferred):
+                return preferred
+
+            def generate(self, _settings, model, _prompt, **kwargs):
+                assert model == "gemini-4-argon"
+                assert kwargs.get("module") == "telemetry_ai"
+                return {
+                    "sources": [{
+                        "key": "bq:demo-project.agent_ops_archive.rag_pipeline_events",
+                        "category": "ai",
+                        "group": "RAG Pipeline Telemetry",
+                        "groupKo": "RAG 파이프라인 텔레메트리",
+                        "title": "RAG Pipeline Execution Events",
+                        "titleKo": "RAG 파이프라인 실행 이벤트",
+                        "what": "Tracks custom RAG retrieval and generation steps with token usage.",
+                        "whatKo": "커스텀 RAG 검색·생성 단계와 토큰 사용량을 추적합니다.",
+                        "sensitive": False,
+                        "time": "nonexistent_ts",  # hallucinated -> must keep verified event_ts
+                        "operation": "pipeline_step",
+                        "operationLabel": "Pipeline step",
+                        "operationLabelKo": "파이프라인 단계",
+                        "status": "outcome",
+                        "statusLabel": "Outcome",
+                        "statusLabelKo": "처리 결과",
+                        "user": "actor_email",
+                        "model": "llm_model",
+                        "tokens": "summary_text",  # STRING column -> must reject and keep numeric token_usage
+                        "tokensLabel": "Tokens",
+                        "tokensLabelKo": "토큰 수",
+                    }]
+                }
+
+        class App:
+            ai = MockAi()
+            cache = None
+
+        class FakeRegistry:
+            @staticmethod
+            def source(_p, _d, _t, _q, _m):
+                return type("Src", (), {"schema": rag_schema, "time_column": lambda self: "event_ts"})()
+
+        class Ctx:
+            app = App()
+            gcp = object()
+            project = "demo-project"
+            quota_project = "demo-project"
+            max_bytes = 0
+            registry = FakeRegistry()
+            settings = {}
+
+        info = telemetry._ai_enrich_sources(
+            Ctx(), tables, [], {("demo-project", "agent_ops_archive", "rag_pipeline_events"): rag_schema}, {}
+        )
+        self.assertEqual(info, {"enabled": True, "model": "gemini-4-argon"})
+        enriched_card = tables[0]["catalog"]
+        self.assertTrue(enriched_card["aiProfiled"])
+        self.assertEqual(enriched_card["group"], "RAG Pipeline Telemetry")
+        self.assertEqual(enriched_card["groupKo"], "RAG 파이프라인 텔레메트리")
+        self.assertEqual(enriched_card["titleKo"], "RAG 파이프라인 실행 이벤트")
+        self.assertEqual(enriched_card["operationLabelKo"], "파이프라인 단계")
+        q = tables[0]["quickAdd"]
+        self.assertEqual(q["mapping"]["time"], "event_ts")
+        self.assertEqual(q["mapping"]["operation"], "pipeline_step")
+        self.assertEqual(q["mapping"]["status"], "outcome")
+        self.assertEqual(q["mapping"]["user"], "actor_email")
+        self.assertEqual(q["mapping"]["model"], "llm_model")
+        self.assertEqual(q["mapping"]["tokens"], "token_usage")
+        # Round-trip connector validation preserves AI meta and restores localized catalog fields.
+        saved = telemetry.validate_connector(Ctx(), q)
+        self.assertIn("meta", saved)
+        restored = telemetry._card_with_meta(catalog.for_connector(saved), saved.get("meta"), saved)
+        self.assertEqual(restored["titleKo"], "RAG 파이프라인 실행 이벤트")
+        self.assertEqual(restored["groupKo"], "RAG 파이프라인 텔레메트리")
+        self.assertEqual(restored["operationLabelKo"], "파이프라인 단계")
+        # Manual custom filter without meta keeps catalog=None.
+        manual = {"source": "logging", "logging": {"filter": 'severity>="ERROR"'}, "mapping": {"time": "timestamp"}}
+        self.assertIsNone(telemetry._card_with_meta(catalog.for_connector(manual), None, manual))
+
+    def test_sample_logs_and_workloads_discovers_structured_json_service(self):
+        Gcp = type("Gcp", (), {})
+        now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        class Ctx:
+            gcp = Gcp()
+            project = "demo-project"
+            projects = ["demo-project"]
+            tz_name = "UTC"
+
+            def rest(self, _method, _url, **_kw):
+                return {"entries": [
+                    {
+                        "timestamp": now_iso,
+                        "logName": "projects/demo-project/logs/run.googleapis.com%2Fstdout",
+                        "severity": "INFO",
+                        "resource": {"type": "cloud_run_revision", "labels": {"service_name": "rag-orchestrator"}},
+                        "jsonPayload": {
+                            "step_name": "rerank",
+                            "actor_email": "alice@example.org",
+                            "model_id": "gemini-2.5-flash",
+                            "total_tokens": 512,
+                            "status": "OK",
+                        },
+                    },
+                    {
+                        "timestamp": now_iso,
+                        "logName": "projects/demo-project/logs/run.googleapis.com%2Fstdout",
+                        "severity": "INFO",
+                        "resource": {"type": "cloud_run_revision", "labels": {"service_name": "rag-orchestrator"}},
+                        "jsonPayload": {
+                            "step_name": "generate",
+                            "actor_email": "bob@example.org",
+                            "model_id": "gemini-2.5-flash",
+                            "total_tokens": 920,
+                            "status": "OK",
+                        },
+                    },
+                ]}
+
+        streams, _counts, _leaves = telemetry._sample_logs_and_workloads(Ctx())
+        self.assertEqual(len(streams), 1)
+        st = streams[0]
+        self.assertIn('resource.labels.service_name="rag-orchestrator"', st["quickAdd"]["logging"]["filter"])
+        self.assertEqual(st["quickAdd"]["mapping"]["tokens"], "jsonPayload.total_tokens")
+        self.assertEqual(st["quickAdd"]["mapping"]["user"], "jsonPayload.actor_email")
+        self.assertEqual(st["quickAdd"]["mapping"]["model"], "jsonPayload.model_id")
+
+
 if __name__ == "__main__":
     unittest.main()

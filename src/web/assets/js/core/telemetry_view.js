@@ -2,7 +2,7 @@
  * Shared text helpers for telemetry sources and their dashboards (Telemetry Extensions and widget boards).
  * Catalog text comes from the server in English and is translated here.
  */
-import { t } from './i18n.js';
+import { t, getLocale } from './i18n.js';
 
 /** gRPC canonical codes, used to explain numeric error codes such as 13 (INTERNAL). */
 export const GRPC_CODES = ['OK', 'CANCELLED', 'UNKNOWN', 'INVALID_ARGUMENT', 'DEADLINE_EXCEEDED', 'NOT_FOUND', 'ALREADY_EXISTS',
@@ -10,11 +10,26 @@ export const GRPC_CODES = ['OK', 'CANCELLED', 'UNKNOWN', 'INVALID_ARGUMENT', 'DE
   'UNAVAILABLE', 'DATA_LOSS', 'UNAUTHENTICATED'];
 
 export function cardTitle(c) {
-  return c && c.title ? t(c.title, c.titleParams || undefined) : '';
+  if (!c) return '';
+  if (getLocale() === 'ko' && c.titleKo) return c.titleKo;
+  return c.title ? t(c.title, c.titleParams || undefined) : '';
 }
 
 export function cardWhat(c) {
-  return c && c.what ? t(c.what, c.whatParams || undefined) : '';
+  if (!c) return '';
+  if (getLocale() === 'ko' && c.whatKo) return c.whatKo;
+  return c.what ? t(c.what, c.whatParams || undefined) : '';
+}
+
+export function cardGroup(c) {
+  if (!c) return '';
+  if (getLocale() === 'ko' && c.groupKo) return c.groupKo;
+  return c.group ? t(c.group) : '';
+}
+
+export function cardFieldLabel(c, fieldKey, fallback) {
+  if (c && getLocale() === 'ko' && c[`${fieldKey}LabelKo`]) return c[`${fieldKey}LabelKo`];
+  return t((c && c[`${fieldKey}Label`]) || fallback);
 }
 
 /** Shortens long identifiers for chart labels; the full value stays in the tooltip and the tables. */

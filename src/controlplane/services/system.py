@@ -228,28 +228,32 @@ def run_health(ctx):
         model = s["ai_engine"]["default_model"]
         loc = s["ai_engine"].get("location") or "global"
         client = ctx.app.ai.client(ctx.project, loc, ctx.quota_project)
-        try:
-            client.models.get(model=model, config={"http_options": {"timeout": 12000}})
-        except TypeError:
+
+        def _probe(target):
             try:
-                client.models.get(model=model)
-            except Exception as err:  # pylint: disable=broad-except
-                status = getattr(err, "code", None) or getattr(err, "status_code", None)
-                LOG.info("ai engine health check failed status=%s", status)
-                if status in (401, 403):
-                    return "error", "Access to the AI engine was denied for the service identity."
-                if status == 404:
-                    return "error", "The default model %s is not available in %s." % (model, s["ai_engine"]["location"])
-                return "error", "The AI engine is temporarily unavailable."
+                client.models.get(model=target, config={"http_options": {"timeout": 12000}})
+            except TypeError:
+                client.models.get(model=target)
+
+        try:
+            _probe(model)
+            return "ok", "%s reachable in %s" % (model, loc)
         except Exception as err:  # pylint: disable=broad-except
             status = getattr(err, "code", None) or getattr(err, "status_code", None)
+            if status == 404 and type(ctx.gcp).__name__ == "Gcp" and hasattr(ctx.app.ai, "fallback_model"):
+                fb = ctx.app.ai.fallback_model(s, model)
+                if fb:
+                    try:
+                        _probe(fb)
+                        return "ok", "%s reachable in %s" % (fb, loc)
+                    except Exception:  # pylint: disable=broad-except
+                        pass
             LOG.info("ai engine health check failed status=%s", status)
             if status in (401, 403):
                 return "error", "Access to the AI engine was denied for the service identity."
             if status == 404:
                 return "error", "The default model %s is not available in %s." % (model, s["ai_engine"]["location"])
             return "error", "The AI engine is temporarily unavailable."
-        return "ok", "%s reachable in %s" % (model, loc)
 
     def store():
         p = ctx.app.settings.persistence()
