@@ -1,8 +1,10 @@
 # AI Control Plane
 
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/ldu1225/ai-control-plane.git&cloudshell_tutorial=TUTORIAL.md)
+
 This is an AI governance dashboard for viewing and controlling Gemini Enterprise, Gemini Enterprise Agent Platform (Agent Gateway, Agent Registry, Agent Engine deployments, Model Armor), token usage per model, NotebookLM, Antigravity and cloud costs in **one management console**.
 
-Download this repository, fill in one settings file (`deploy.env`) and run one script (`scripts/deploy.sh`). The dashboard is then deployed directly to your Google Cloud project. You do not need to change any code. The product name, organization name, logo, colors, language, modules to use and models to track can all be changed in settings.
+Click **Open in Cloud Shell** above or run `scripts/install.sh` in Cloud Shell to enable all required APIs, provision service agents and least-privilege identities, configure audit log routing, Data Access audit logs and Gemini Enterprise prompt logging, and deploy the dashboard to Cloud Run in one step. The product name, organization name, logo, colors, language, modules to use and models to track can all be changed in settings.
 
 > [!IMPORTANT]
 > **There is no sample data, no demo mode and no fake data.** Every number in the UI is a value actually read from the connected Google Cloud project. If a data source is missing or access is denied, the value is not estimated or filled in. It is left empty as `—`, and the notice at the top of the page and the data source health panel show the cause and how to fix it.
@@ -151,17 +153,28 @@ flowchart LR
 
 It runs as is on macOS, Linux and Cloud Shell. Cloud Shell already has all the required tools. To start collecting logs before the dashboard is deployed, run [3.5](#35-start-collecting-logs-before-deployment) first.
 
-### 3.2 Deploy
+### 3.2 Deploy (One-click / One-liner)
 
+**Option A — Run directly in Cloud Shell with zero config editing (interactive project selector)**
+```bash
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
+```
+
+**Option B — Unattended single or multi-project deployment**
+```bash
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --projects my-project-1,my-project-2 \
+  --admins admin@example.org \
+  --viewers viewer@example.org
+```
+
+**Option C — Clone and run with CLI flags or `deploy.env`**
 ```bash
 git clone https://github.com/ldu1225/ai-control-plane.git
 cd ai-control-plane
 
-cp deploy.env.example deploy.env
-# change at least 3 values in deploy.env: PROJECT_ID, REGION, ADMIN_EMAILS
-
-scripts/deploy.sh --dry-run    # preview the commands that would run (changes nothing)
-scripts/deploy.sh              # real deployment (usually 3-8 minutes)
+scripts/deploy.sh --project my-project-1 --admins admin@example.org
+# or copy deploy.env.example -> deploy.env and run scripts/deploy.sh
 ```
 
 What the script does:

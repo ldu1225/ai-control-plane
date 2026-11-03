@@ -1,5 +1,6 @@
 # shellcheck shell=bash
-# Shared helpers for scripts/deploy.sh and scripts/prepare.sh. Source this file; do not execute it.
+# Shared helpers for scripts/install.sh, scripts/deploy.sh and scripts/prepare.sh.
+# Source this file; do not execute it directly.
 #
 # Callers set DRY_RUN (0 or 1) before calling run() or any ensure_* function. With DRY_RUN=1 commands
 # that change anything are printed instead of executed.
@@ -118,6 +119,287 @@ caller_iam_member() {
   fi
 }
 
+# Ensures gcloud has an authenticated active account; runs `gcloud auth login` interactively when needed.
+# Prints the active account email to stdout.
+ensure_gcloud_auth() {
+  local acct
+  acct="$(trim_ws "$(gcloud config get-value account 2>/dev/null || true)")"
+  [[ "$acct" == "(unset)" ]] && acct=""
+  if [[ -z "$acct" ]]; then
+    if [[ -t 0 && "${DRY_RUN:-0}" != "1" ]]; then
+      info "no active gcloud account found; starting interactive sign-in..." >&2
+      gcloud auth login --quiet >&2 || die "gcloud authentication failed"
+      acct="$(trim_ws "$(gcloud config get-value account 2>/dev/null || true)")"
+      [[ "$acct" == "(unset)" ]] && acct=""
+    fi
+  fi
+  [[ -n "$acct" ]] || die "no active gcloud account (run: gcloud auth login)"
+  printf '%s' "$acct"
+}
+
+# Enables the 4 foundational control-plane APIs first so projects.testIamPermissions, IAM inspection and
+# batch API enabling never fail on a brand-new empty project.
+bootstrap_foundation_apis() {
+  local project="$1"
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  gcloud services enable \
+    serviceusage.googleapis.com \
+    cloudresourcemanager.googleapis.com \
+    iam.googleapis.com \
+    iamcredentials.googleapis.com \
+    --project "$project" --quiet >/dev/null 2>&1 || true
+}
+
+# Enables all required and extended AI/governance APIs with per-service fallback so a single unavailable
+# preview service or org restriction never aborts the entire batch.
+# Usage: enable_project_apis PROJECT NEED_IAP NEED_SCHEDULER [PREPARE_ONLY]
+enable_project_apis() {
+  local project="$1" need_iap="${2:-1}" need_sched="${3:-0}" prepare_only="${4:-0}"
+  local core_apis=() optional_apis=() api
+  if [[ "$prepare_only" == "1" ]]; then
+    core_apis=(
+      serviceusage.googleapis.com
+      cloudresourcemanager.googleapis.com
+      iam.googleapis.com
+      logging.googleapis.com
+      bigquery.googleapis.com
+      monitoring.googleapis.com
+      discoveryengine.googleapis.com
+      aiplatform.googleapis.com
+    )
+    optional_apis=(
+      modelarmor.googleapis.com
+      dlp.googleapis.com
+      generativelanguage.googleapis.com
+      geminidataanalytics.googleapis.com
+      cloudtrace.googleapis.com
+      cloudasset.googleapis.com
+      bigquerydatatransfer.googleapis.com
+    )
+  else
+    core_apis=(
+      serviceusage.googleapis.com
+      cloudresourcemanager.googleapis.com
+      iam.googleapis.com
+      iamcredentials.googleapis.com
+      sts.googleapis.com
+      run.googleapis.com
+      artifactregistry.googleapis.com
+      bigquery.googleapis.com
+      logging.googleapis.com
+      monitoring.googleapis.com
+      cloudtrace.googleapis.com
+      clouderrorreporting.googleapis.com
+      discoveryengine.googleapis.com
+      aiplatform.googleapis.com
+      storage.googleapis.com
+      secretmanager.googleapis.com
+      cloudbilling.googleapis.com
+    )
+    # Cloud Build, IAP and Cloud Scheduler have automatic runtime fallbacks (local Docker build, ID/Password
+    # login and manual enforcement), so enable them in core when requested and fall back gracefully if blocked.
+    optional_apis=(
+      cloudbuild.googleapis.com
+      iap.googleapis.com
+      cloudscheduler.googleapis.com
+      modelarmor.googleapis.com
+      dlp.googleapis.com
+      generativelanguage.googleapis.com
+      geminidataanalytics.googleapis.com
+      cloudasset.googleapis.com
+      bigquerydatatransfer.googleapis.com
+      orgpolicy.googleapis.com
+    )
+    [[ "$need_iap" == "1" ]] && core_apis+=(iap.googleapis.com)
+    [[ "$need_sched" == "1" ]] && core_apis+=(cloudscheduler.googleapis.com)
+    core_apis+=(cloudbuild.googleapis.com)
+  fi
+
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    run gcloud services enable "${core_apis[@]}" "${optional_apis[@]}" --project "$project"
+    return 0
+  fi
+
+  if ! gcloud services enable "${core_apis[@]}" --project "$project" --quiet >/dev/null 2>&1; then
+    for api in "${core_apis[@]}"; do
+      if ! gcloud services enable "$api" --project "$project" --quiet >/dev/null 2>&1; then
+        case "$api" in
+          cloudbuild.googleapis.com|iap.googleapis.com|cloudscheduler.googleapis.com|cloudtrace.googleapis.com|clouderrorreporting.googleapis.com|sts.googleapis.com)
+            warn "could not enable ${api} on ${project} (continuing with built-in fallback)" ;;
+          *)
+            gcloud services enable "$api" --project "$project" \
+              || die "could not enable required API ${api} on ${project}" ;;
+        esac
+      fi
+    done
+  fi
+
+  if ! gcloud services enable "${optional_apis[@]}" --project "$project" --quiet >/dev/null 2>&1; then
+    for api in "${optional_apis[@]}"; do
+      gcloud services enable "$api" --project "$project" --quiet >/dev/null 2>&1 || true
+    done
+  fi
+}
+
+# Verifies that Cloud Billing is linked to PROJECT. When unlinked and exactly one open billing account is
+# accessible to the caller, links it automatically. Prints the linked billing account ID (XXXXXX-XXXXXX-XXXXXX)
+# on stdout when readable, or empty string when billing metadata is not visible to the caller.
+ensure_project_billing() {
+  local project="$1" info_json enabled acct_name open_accts count first_ba
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  info_json="$(gcloud billing projects describe "$project" --format=json 2>/dev/null || true)"
+  if [[ -z "$info_json" ]]; then
+    return 0
+  fi
+  enabled="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("true" if d.get("billingEnabled") else "false")' "$info_json" 2>/dev/null || echo "unknown")"
+  acct_name="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print((d.get("billingAccountName") or "").rsplit("/",1)[-1])' "$info_json" 2>/dev/null || true)"
+  if [[ "$enabled" == "false" ]]; then
+    open_accts="$(gcloud billing accounts list --filter="open=true" --format="value(name)" 2>/dev/null || true)"
+    count="$(printf '%s\n' "$open_accts" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
+    if [[ "$count" == "1" ]]; then
+      first_ba="$(printf '%s\n' "$open_accts" | head -n 1 | awk -F/ '{print $NF}')"
+      info "linking open billing account ${first_ba} to ${project}..." >&2
+      if gcloud billing projects link "$project" --billing-account="$first_ba" --quiet >/dev/null 2>&1; then
+        acct_name="$first_ba"
+        enabled="true"
+      fi
+    fi
+    if [[ "$enabled" == "false" ]]; then
+      die "Cloud Billing is not enabled on project ${project}. Enable billing in Google Cloud Console (Billing > Link a billing account) and re-run."
+    fi
+  fi
+  printf '%s' "$acct_name"
+}
+
+# Scans BigQuery datasets in PROJECT for a Cloud Billing export table (detailed resource export preferred,
+# standard export fallback). Prints "DATASET|TABLE" when found, or nothing.
+auto_detect_billing_export() {
+  local project="$1" token
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  token="$(gcloud auth print-access-token 2>/dev/null || true)"
+  [[ -n "$token" ]] || return 0
+  ACP_ACCESS_TOKEN="$token" python3 - "$project" <<'PYBILL' || true
+import json, os, sys, urllib.request
+
+project = sys.argv[1]
+token = os.environ["ACP_ACCESS_TOKEN"]
+base = "https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets" % project
+
+
+def get(url):
+    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.load(resp)
+
+
+try:
+    datasets = (get(base + "?maxResults=200").get("datasets") or [])
+except Exception:  # pylint: disable=broad-except
+    sys.exit(0)
+
+# Prioritize datasets commonly named *billing* first, then any other dataset.
+ordered = sorted(
+    [d.get("datasetReference", {}).get("datasetId", "") for d in datasets],
+    key=lambda name: (0 if "billing" in name.lower() else 1, name),
+)
+fallback = ""
+for ds in ordered:
+    if not ds:
+        continue
+    try:
+        tables = (get("%s/%s/tables?maxResults=200" % (base, ds)).get("tables") or [])
+    except Exception:  # pylint: disable=broad-except
+        continue
+    for t in tables:
+        tid = t.get("tableReference", {}).get("tableId", "")
+        if tid.startswith("gcp_billing_export_resource_v1_"):
+            print("%s|%s" % (ds, tid))
+            sys.exit(0)
+        if tid.startswith("gcp_billing_export_v1_") and not fallback:
+            fallback = "%s|%s" % (ds, tid)
+if fallback:
+    print(fallback)
+PYBILL
+}
+
+# Detects a human-friendly organization display name from PROJECT's ancestor GCP Organization or Project Name.
+auto_detect_org_name() {
+  local project="$1" org_id disp proj_name
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  org_id="$(gcloud projects get-ancestors "$project" --format=json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for item in json.load(sys.stdin):
+        if item.get("type") == "organization" and item.get("id"):
+            print(item["id"]); break
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  if [[ -n "$org_id" ]]; then
+    disp="$(gcloud organizations describe "$org_id" --format='value(displayName)' 2>/dev/null || true)"
+    disp="$(trim_ws "${disp%.*}")"
+    if [[ -n "$disp" ]]; then
+      printf '%s' "$disp"
+      return 0
+    fi
+  fi
+  proj_name="$(gcloud projects describe "$project" --format='value(name)' 2>/dev/null || true)"
+  proj_name="$(trim_ws "$proj_name")"
+  [[ -n "$proj_name" ]] && printf '%s' "$proj_name"
+}
+
+# Probes Agent Platform endpoints to pick reachable AGENT_ENGINE_REGIONS and AI_LOCATION automatically.
+# Prints "AGENT_ENGINE_REGIONS|AI_LOCATION".
+auto_detect_ai_locations() {
+  local project="$1" region="$2" token
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    printf '%s|global' "$region"
+    return 0
+  fi
+  token="$(gcloud auth print-access-token 2>/dev/null || true)"
+  if [[ -z "$token" ]]; then
+    printf '%s|global' "$region"
+    return 0
+  fi
+  ACP_ACCESS_TOKEN="$token" python3 - "$project" "$region" <<'PYAI' || printf '%s|global' "$region"
+import os, sys, urllib.error, urllib.request
+
+project, region = sys.argv[1], sys.argv[2]
+token = os.environ["ACP_ACCESS_TOKEN"]
+
+
+def ok(url):
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer " + token,
+        "X-Goog-User-Project": project,
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as err:
+        # 404 or 400 on reasoningEngines or publishers means endpoint/location constraint; 200 means reachable.
+        return err.code in (200,)
+    except Exception:  # pylint: disable=broad-except
+        return False
+
+
+ae_candidates = [region] + (["us-central1"] if region != "us-central1" else [])
+ae_ok = []
+for cand in ae_candidates:
+    if ok("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/reasoningEngines?pageSize=1"
+          % (cand, project, cand)):
+        ae_ok.append(cand)
+ae_regions = ",".join(ae_ok) if ae_ok else region
+
+ai_loc = "global"
+if not ok("https://aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=1"):
+    if ok("https://%s-aiplatform.googleapis.com/v1beta1/publishers/google/models?pageSize=1" % region):
+        ai_loc = region
+
+print("%s|%s" % (ae_regions, ai_loc))
+PYAI
+}
+
 # _check_project_permissions MODE PROJECT NEED_BUILD NEED_SINK NEED_IAP NEED_SCHEDULER NEED_AUDIT_ADMIN
 # Calls Cloud Resource Manager projects.testIamPermissions and prints a single-line JSON verdict:
 #   status="ok"         every required permission is already present
@@ -140,6 +422,7 @@ need_sink = sys.argv[4] == "1"
 need_iap = sys.argv[5] == "1"
 need_scheduler = sys.argv[6] == "1"
 need_audit_admin = sys.argv[7] == "1"
+has_local_docker = os.environ.get("ACP_HAS_LOCAL_DOCKER") == "1"
 token = os.environ["ACP_ACCESS_TOKEN"]
 
 # Ordered pairs of (permission, minimal predefined role that grants it).
@@ -237,6 +520,12 @@ missing_perms = []
 missing_roles = []
 for perm, role in checks:
     if perm in valid_perms and perm not in granted:
+        # When local Docker is running and Artifact Registry upload is permitted, Cloud Build restriction
+        # does not block deployment unless the caller can self-grant Cloud Build Editor.
+        if perm == "cloudbuild.builds.create" and has_local_docker \
+                and "artifactregistry.repositories.uploadArtifacts" in granted \
+                and "resourcemanager.projects.setIamPolicy" not in granted:
+            continue
         missing_perms.append(perm)
         if role not in missing_roles:
             missing_roles.append(role)
@@ -245,6 +534,9 @@ if not missing_perms:
     print(json.dumps({"status": "ok", "missing_perms": [], "missing_roles": []}))
 elif "resourcemanager.projects.setIamPolicy" in granted:
     bootstrap_roles = [r for r in missing_roles if r != "roles/resourcemanager.projectIamAdmin"]
+    for extra in ("roles/discoveryengine.admin",):
+        if extra not in bootstrap_roles:
+            bootstrap_roles.append(extra)
     print(json.dumps({"status": "bootstrap", "missing_perms": missing_perms, "missing_roles": bootstrap_roles}))
 else:
     print(json.dumps({"status": "denied", "missing_perms": missing_perms, "missing_roles": missing_roles}))
@@ -259,9 +551,12 @@ PYPREFLIGHT
 preflight_caller_permissions() {
   local mode="$1" project="$2" account="$3"
   local need_build="${4:-1}" need_sink="${5:-1}" need_iap="${6:-0}" need_sched="${7:-0}" need_audit="${8:-0}"
-  local verdict status member roles_csv perms_csv role attempt
+  local verdict status member roles_csv perms_csv role attempt docker_avail=0
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    docker_avail=1
+  fi
   member="$(caller_iam_member "$account")"
-  verdict="$(_check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit")"
+  verdict="$(ACP_HAS_LOCAL_DOCKER="$docker_avail" _check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit")"
   status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status","skip"))' "$verdict" 2>/dev/null || echo "skip")"
   if [[ "$status" == "ok" || "$status" == "skip" ]]; then
     return 0
@@ -272,13 +567,13 @@ preflight_caller_permissions() {
     info "account ${account} has IAM admin access; granting missing deployment roles: ${roles_csv}"
     for role in $roles_csv; do
       run retry gcloud projects add-iam-policy-binding "$project" --member "$member" --role "$role" \
-        --condition=None --quiet >/dev/null \
+        --condition=None --quiet >/dev/null 2>&1 \
         || warn "could not grant ${role} to ${member}; continuing"
     done
     if [[ "${DRY_RUN:-0}" != "1" ]]; then
       for attempt in 1 2 3 4 5 6; do
         sleep 5
-        verdict="$(_check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit")"
+        verdict="$(ACP_HAS_LOCAL_DOCKER="$docker_avail" _check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit")"
         status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status","skip"))' "$verdict" 2>/dev/null || echo "skip")"
         [[ "$status" == "ok" ]] && break
       done
@@ -308,7 +603,7 @@ ensure_service_identities() {
   token="$(gcloud auth print-access-token 2>/dev/null || true)"
   [[ -n "$token" ]] || return 0
   ACP_ACCESS_TOKEN="$token" python3 - "$project" "$project_number" "$@" <<'PYSID' || true
-import json, os, sys, urllib.error, urllib.request
+import os, sys, urllib.request
 
 project, project_number, services = sys.argv[1], sys.argv[2], sys.argv[3:]
 token = os.environ["ACP_ACCESS_TOKEN"]
@@ -413,7 +708,9 @@ ensure_ai_log_sink() {
     info "dataset ${project}:${dataset} exists"
   else
     run bq --project_id "$project" --location "$location" mk --dataset \
-      --description "AI audit logs routed for AI Control Plane" "${project}:${dataset}"
+      --description "AI audit logs routed for AI Control Plane" "${project}:${dataset}" \
+      || run bq --project_id "$project" --location "US" mk --dataset \
+        --description "AI audit logs routed for AI Control Plane" "${project}:${dataset}"
   fi
   dest="bigquery.googleapis.com/projects/${project}/datasets/${dataset}"
   filter="$(ai_log_filter)"
@@ -434,50 +731,66 @@ ensure_ai_log_sink() {
 }
 
 # enable_data_access_logs PROJECT
-# Data Read and Data Write audit logs for Agent Platform, Discovery Engine and Model Armor. Only the
-# auditConfigs section changes; the policy keeps its etag, so a concurrent IAM change makes this fail
-# instead of overwriting it.
+# Enables ADMIN_READ, DATA_READ and DATA_WRITE Cloud Audit Logs across all 7 AI services routed by
+# ai_log_filter (Agent Platform, Discovery Engine, Model Armor, Antigravity, NotebookLM, Gemini Data
+# Analytics and Gemini API). Retries on concurrent IAM etag conflicts so parallel bindings never fail.
 enable_data_access_logs() {
-  local project="$1" file changed
-  file="$(mktemp)"
-  if ! gcloud projects get-iam-policy "$project" --format=json >"$file"; then
-    rm -f "$file"
-    die "cannot read the IAM policy of ${project} (Data Access audit logs need Owner or Project IAM Admin)"
-  fi
-  changed="$(python3 - "$file" <<'PY'
+  local project="$1" file changed attempt
+  for attempt in 1 2 3 4; do
+    file="$(mktemp)"
+    if ! gcloud projects get-iam-policy "$project" --format=json >"$file" 2>/dev/null; then
+      rm -f "$file"
+      warn "cannot read IAM policy of ${project} to update Data Access audit logs; continuing"
+      return 0
+    fi
+    changed="$(python3 - "$file" <<'PYAUDIT'
 import json, sys
 path = sys.argv[1]
 policy = json.load(open(path))
 configs = policy.setdefault("auditConfigs", [])
 changed = False
-for service in ("aiplatform.googleapis.com", "discoveryengine.googleapis.com", "modelarmor.googleapis.com"):
+services = (
+    "aiplatform.googleapis.com",
+    "discoveryengine.googleapis.com",
+    "modelarmor.googleapis.com",
+    "businessaicode.googleapis.com",
+    "notebooklm.googleapis.com",
+    "geminidataanalytics.googleapis.com",
+    "generativelanguage.googleapis.com",
+)
+for service in services:
     entry = next((c for c in configs if c.get("service") == service), None)
     if entry is None:
         entry = {"service": service, "auditLogConfigs": []}
         configs.append(entry)
     present = {c.get("logType") for c in entry.setdefault("auditLogConfigs", [])}
-    for log_type in ("DATA_READ", "DATA_WRITE"):
+    for log_type in ("ADMIN_READ", "DATA_READ", "DATA_WRITE"):
         if log_type not in present:
             entry["auditLogConfigs"].append({"logType": log_type})
             changed = True
 json.dump(policy, open(path, "w"))
 print("yes" if changed else "no")
-PY
+PYAUDIT
 )"
-  if [[ "$changed" == "yes" ]]; then
-    if ! run gcloud projects set-iam-policy "$project" "$file" --quiet >/dev/null; then
+    if [[ "$changed" != "yes" ]]; then
       rm -f "$file"
-      die "could not update the audit log configuration of ${project}"
+      info "Data Access audit logs already enabled across all AI services"
+      return 0
     fi
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
-      info "[dry-run] Data Access audit logs would be enabled for Agent Platform, Discovery Engine and Model Armor"
-    else
-      info "Data Access audit logs enabled for Agent Platform, Discovery Engine and Model Armor"
+      rm -f "$file"
+      info "[dry-run] Data Access audit logs would be enabled across all AI services"
+      return 0
     fi
-  else
-    info "Data Access audit logs already enabled for Agent Platform, Discovery Engine and Model Armor"
-  fi
-  rm -f "$file"
+    if gcloud projects set-iam-policy "$project" "$file" --quiet >/dev/null 2>&1; then
+      rm -f "$file"
+      info "Data Access audit logs enabled across all AI services (Agent Platform, Gemini Enterprise, Model Armor, NotebookLM, Antigravity)"
+      return 0
+    fi
+    rm -f "$file"
+    sleep 4
+  done
+  warn "could not update Data Access audit log configuration on ${project} after retries; continuing"
 }
 
 # Locations where Gemini Enterprise apps and license configurations can live.

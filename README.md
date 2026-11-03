@@ -1,8 +1,10 @@
 # AI Control Plane
 
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/ldu1225/ai-control-plane.git&cloudshell_tutorial=TUTORIAL.md)
+
 Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registry, Agent Engine 배포, Model Armor), 모델별 토큰 사용량, NotebookLM, Antigravity, 클라우드 비용을 **하나의 관리 콘솔**에서 보고 통제하는 AI 거버넌스 대시보드입니다.
 
-이 저장소를 내려받아 설정 파일 하나(`deploy.env`)를 채우고 스크립트 하나(`scripts/deploy.sh`)를 실행하면, 여러분의 Google Cloud 프로젝트에 바로 배포됩니다. 코드를 고칠 필요가 없습니다. 제품명, 조직명, 로고, 색상, 언어, 사용할 모듈, 추적할 모델은 모두 설정으로 바꿀 수 있습니다.
+위 **Open in Cloud Shell** 버튼을 클릭하거나 Cloud Shell에서 명령 한 줄(`scripts/install.sh`)만 실행하면 필수 API 활성화, 서비스 에이전트 생성, 전용 서비스 계정, IAM 권한, 설정 버킷, 감사 로그 싱크, Data Access 감사 로그, Gemini Enterprise 프롬프트 로깅, Cloud Run 배포까지 한 번에 완료됩니다. 제품명, 조직명, 로고, 색상, 언어, 사용할 모듈, 추적할 모델은 모두 화면 설정으로 바꿀 수 있습니다.
 
 > [!IMPORTANT]
 > **샘플 데이터, 데모 모드, 가짜 데이터가 전혀 없습니다.** 화면의 모든 숫자는 연결한 Google Cloud 프로젝트에서 실제로 읽은 값입니다. 데이터 소스가 없거나 권한이 없으면 값을 추정하거나 채워 넣지 않고 `—`로 비워 두며, 화면 상단 알림과 데이터 소스 상태 패널에 원인과 해결 방법을 표시합니다.
@@ -151,17 +153,28 @@ flowchart LR
 
 macOS, Linux, Cloud Shell에서 그대로 실행됩니다. Cloud Shell에는 필요한 도구가 모두 설치되어 있습니다. 대시보드를 배포하기 전에 로그부터 쌓아 두려면 [3.5](#35-배포-전에-로그부터-쌓기)를 먼저 실행합니다.
 
-### 3.2 배포
+### 3.2 배포 (원클릭 / 명령 한 줄)
 
+**방법 A — 설정 파일 수정 없이 Cloud Shell에서 바로 실행 (대화형 프로젝트 선택)**
+```bash
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
+```
+
+**방법 B — 단일 또는 복수 프로젝트 무인(Non-interactive) 일괄 배포**
+```bash
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --projects my-project-1,my-project-2 \
+  --admins admin@example.org \
+  --viewers viewer@example.org
+```
+
+**방법 C — 저장소 클론 후 직접 실행 (`deploy.env` 또는 CLI 옵션)**
 ```bash
 git clone https://github.com/ldu1225/ai-control-plane.git
 cd ai-control-plane
 
-cp deploy.env.example deploy.env
-# deploy.env에서 최소 3개 값을 바꿉니다: PROJECT_ID, REGION, ADMIN_EMAILS
-
-scripts/deploy.sh --dry-run    # 실행될 명령만 미리 확인 (아무것도 바꾸지 않음)
-scripts/deploy.sh              # 실제 배포 (보통 3~8분)
+scripts/deploy.sh --project my-project-1 --admins admin@example.org
+# 또는 cp deploy.env.example deploy.env 편집 후 scripts/deploy.sh 실행
 ```
 
 스크립트가 하는 일:

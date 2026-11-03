@@ -14,28 +14,45 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=lib/common.sh
+source "$ROOT/scripts/lib/common.sh"
+
 CONFIG="$ROOT/deploy.env"
+CONFIG_EXPLICIT=0
+CLI_PROJECT=""
+CLI_REGION=""
 DELETE_DATA=0
 YES=0
 usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --config) CONFIG="$2"; shift 2 ;;
+    --config) CONFIG="$2"; CONFIG_EXPLICIT=1; shift 2 ;;
+    --project) CLI_PROJECT="$2"; shift 2 ;;
+    --region) CLI_REGION="$2"; shift 2 ;;
     --delete-data) DELETE_DATA=1; shift ;;
-    --yes) YES=1; shift ;;
+    -y|--yes) YES=1; shift ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
-# shellcheck source=lib/common.sh
-source "$ROOT/scripts/lib/common.sh"
 quiet() { "$@" >/dev/null 2>&1; }
 
-[[ -f "$CONFIG" ]] || die "configuration file not found: $CONFIG"
-# shellcheck disable=SC1090
-source "$CONFIG"
+if [[ "$CONFIG_EXPLICIT" == "1" ]]; then
+  [[ -f "$CONFIG" ]] || die "configuration file not found: $CONFIG"
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+elif [[ -n "$CLI_PROJECT" && -f "$ROOT/deploy.$(normalize_project_id "$CLI_PROJECT").env" ]]; then
+  # shellcheck disable=SC1090
+  source "$ROOT/deploy.$(normalize_project_id "$CLI_PROJECT").env"
+elif [[ -f "$CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+[[ -n "$CLI_PROJECT" ]] && PROJECT_ID="$CLI_PROJECT"
+[[ -n "$CLI_REGION" ]] && REGION="$CLI_REGION"
+
 PROJECT_ID="$(normalize_project_id "${PROJECT_ID:-}")"
-REGION="$(trim_ws "${REGION:-us-central1}")"
+REGION="$(trim_ws "${REGION:-asia-northeast3}")"
 SERVICE_NAME="$(trim_ws "${SERVICE_NAME:-ai-control-plane}")"
 AUDIT_DATASET="$(trim_ws "${AUDIT_DATASET:-ge_analytics}")"
 AR_REPOSITORY="$(trim_ws "${AR_REPOSITORY:-ai-control-plane}")"
@@ -44,7 +61,7 @@ SERVICE_ACCOUNT_ID="$(trim_ws "${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}")"
 SETTINGS_BUCKET="$(trim_ws "${SETTINGS_BUCKET:-}")"
 SESSION_SECRET_NAME="$(trim_ws "${SESSION_SECRET_NAME:-${SERVICE_NAME}-session-secret}")"
 OAUTH_SECRET_NAME="$(trim_ws "${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}")"
-validate_project_id "$PROJECT_ID" "$CONFIG"
+validate_project_id "$PROJECT_ID" "${CONFIG}"
 [[ -n "$SETTINGS_BUCKET" ]] || SETTINGS_BUCKET="$(default_settings_bucket "$PROJECT_ID" "$SERVICE_NAME")"
 
 SA_EMAIL="${SERVICE_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"

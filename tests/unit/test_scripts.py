@@ -436,7 +436,84 @@ esac
                     check=False,
                 )
                 self.assertEqual(res.returncode, 0, msg=(access_mode, res.stdout, res.stderr))
-                self.assertIn("Done", res.stdout)
+                self.assertIn("Deployment complete:", res.stdout)
+
+    def test_zero_config_cli_and_multi_project_install_dry_run(self):
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(bin_dir)
+            gcloud_stub = os.path.join(bin_dir, "gcloud")
+            with open(gcloud_stub, "w", encoding="utf-8") as fh:
+                fh.write("""#!/usr/bin/env bash
+case "$*" in
+  *"config get-value account"*) echo "owner@example.org" ;;
+  *"config get-value project"*) echo "demo-active-proj" ;;
+  *"projects describe"*) echo "123456789012" ;;
+  *"auth print-access-token"*) echo "" ;;
+  *"projects get-iam-policy"*) echo '{"bindings":[]}' ;;
+  *"run deploy --help"*) echo "--iap --no-iap --no-invoker-iam-check" ;;
+  *"describe"*) exit 1 ;;
+  *) exit 0 ;;
+esac
+""")
+            os.chmod(gcloud_stub, 0o755)
+            bq_stub = os.path.join(bin_dir, "bq")
+            with open(bq_stub, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env bash\nexit 1\n")
+            os.chmod(bq_stub, 0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+
+            # 1) Zero-config deploy.sh using active gcloud project & account (no deploy.env, no flags except --dry-run)
+            empty_cfg = os.path.join(tmp, "nonexistent.env")
+            res_zero = subprocess.run(
+                ["bash", os.path.join(ROOT, "scripts/deploy.sh"), "--project", "demo-zero-proj", "--dry-run"],
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res_zero.returncode, 0, msg=(res_zero.stdout, res_zero.stderr, empty_cfg))
+            self.assertIn("ADMIN_EMAILS defaulted to active gcloud account: owner@example.org", res_zero.stdout)
+            self.assertIn("modelarmor.googleapis.com", res_zero.stderr)
+            self.assertIn("dlp.googleapis.com", res_zero.stderr)
+            self.assertIn("roles/logging.privateLogViewer", res_zero.stderr)
+            self.assertIn("roles/logging.configWriter", res_zero.stderr)
+            self.assertIn("roles/resourcemanager.projectIamAdmin", res_zero.stderr)
+            self.assertIn("Data Access audit logs would be enabled across all AI services", res_zero.stdout)
+
+            # 2) Alias compatibility (INITIAL_ADMINS / INITIAL_VIEWERS)
+            alias_env_file = os.path.join(tmp, "alias.env")
+            with open(alias_env_file, "w", encoding="utf-8") as fh:
+                fh.write(
+                    'PROJECT_ID="demo-alias-proj"\n'
+                    'INITIAL_ADMINS="lead@example.org"\n'
+                    'INITIAL_VIEWERS="member@example.org"\n'
+                )
+            res_alias = subprocess.run(
+                ["bash", os.path.join(ROOT, "scripts/deploy.sh"), "--config", alias_env_file, "--dry-run"],
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res_alias.returncode, 0, msg=(res_alias.stdout, res_alias.stderr))
+            self.assertIn("lead@example.org", res_alias.stdout)
+            self.assertIn("member@example.org", res_alias.stdout)
+
+            # 3) Multi-project one-click install.sh (--projects proj-a,proj-b)
+            res_multi = subprocess.run(
+                [
+                    "bash", os.path.join(ROOT, "scripts/install.sh"),
+                    "--projects", "demo-proj-alpha,demo-proj-beta",
+                    "--admins", "lead@example.org",
+                    "--viewers", "member@example.org",
+                    "--dry-run",
+                ],
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res_multi.returncode, 0, msg=(res_multi.stdout, res_multi.stderr))
+            self.assertIn("Deployment complete: demo-proj-alpha", res_multi.stdout)
+            self.assertIn("Deployment complete: demo-proj-beta", res_multi.stdout)
+            self.assertIn("All 2 project deployment(s) completed", res_multi.stdout)
 
 
 if __name__ == "__main__":

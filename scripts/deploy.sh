@@ -1,64 +1,151 @@
 #!/usr/bin/env bash
-# AI Control Plane: one-command setup and deployment to Cloud Run.
+# AI Control Plane: zero-friction one-command setup and deployment to Google Cloud Run.
 #
-#   cp deploy.env.example deploy.env     # fill in your values (deploy.env is ignored by git)
-#   scripts/deploy.sh                    # or: scripts/deploy.sh --config other.env [--dry-run]
+# Quickest usage (no config file needed — auto-detects active gcloud account, billing, org & AI endpoints):
+#   scripts/deploy.sh --project PROJECT_ID [--admins a@example.org] [--viewers b@example.org]
+#   scripts/deploy.sh --projects proj-a,proj-b --admins a@example.org --viewers b@example.org
+#   scripts/deploy.sh                         # uses deploy.env if present, otherwise active gcloud project
 #
-# Safe to re-run: every step creates what is missing and updates what exists. deploy.env is the
-# source of truth for the service configuration (environment variables and secrets are replaced on
-# every run).
+# Config-file usage (100% compatible):
+#   cp deploy.env.example deploy.env
+#   scripts/deploy.sh [--config deploy.env] [--dry-run]
 #
-# Steps
-#   1. Enable the required Google Cloud APIs.
-#   2. Build the container image with Cloud Build (Artifact Registry), unless IMAGE is set.
-#   3. Create the runtime service account and grant read-only roles plus the audit log writer
-#      (and IAM write roles when ENABLE_GOVERNANCE_ACTIONS=true). ACCESS_MODE=google also gets a
-#      separate sign-in bridge service account that can read only the session signing key.
-#   4. Create a private, versioned Cloud Storage bucket for settings saved in the UI.
-#   5. Create the session signing key in Secret Manager.
-#   6. Data sources: BigQuery dataset + Log Router sink for AI logs, optional Data Access audit logs, and
-#      Gemini Enterprise usage logs (observability) for every app (same steps as scripts/prepare.sh).
-#   7. Deploy the dashboard and configure sign-in (ACCESS_MODE).
-#   8. Optional: Cloud Scheduler job for automatic Antigravity cap enforcement.
-#
-# To start collecting logs before the dashboard is deployed, run scripts/prepare.sh first.
-# Requirements: gcloud (recent), bq (part of the Google Cloud SDK), python3, and an account with
-# Owner (or equivalent) on PROJECT_ID. Nothing is read from or written to anywhere else.
+# Options
+#   --project ID            Google Cloud project ID to deploy into
+#   --projects ID1,ID2      Deploy sequentially into multiple Google Cloud projects in one run
+#   --region REGION         Cloud Run, Artifact Registry & bucket region (default: asia-northeast3)
+#   --admins EMAILS         Comma-separated admin emails or *@domain (default: active gcloud account)
+#   --viewers EMAILS        Comma-separated viewer emails or *@domain
+#   --org-name NAME         Organization display name (default: auto-detected from GCP Org / Project)
+#   --access-mode MODE      google | iap | password | google_oauth (default: google)
+#   --service-name NAME     Cloud Run service name (default: ai-control-plane)
+#   --read-only             Skip IAM governance write roles (ENABLE_GOVERNANCE_ACTIONS=false)
+#   --no-data-access-logs   Skip enabling Data Access audit logs
+#   --config FILE           Read settings from FILE (CLI flags override FILE values)
+#   --dry-run               Print commands that would run without changing anything
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG="$ROOT/deploy.env"
-DRY_RUN=0
+# shellcheck source=lib/common.sh
+source "$ROOT/scripts/lib/common.sh"
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+CONFIG="$ROOT/deploy.env"
+CONFIG_EXPLICIT=0
+DRY_RUN=0
+CLI_PROJECT=""
+CLI_PROJECTS=""
+CLI_REGION=""
+CLI_ADMINS=""
+CLI_VIEWERS=""
+CLI_ORG_NAME=""
+CLI_ACCESS_MODE=""
+CLI_SERVICE_NAME=""
+CLI_READ_ONLY=""
+CLI_DATA_ACCESS_LOGS=""
+
+usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
+
+ORIG_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --config) CONFIG="$2"; shift 2 ;;
+    --config) need_arg "$@"; CONFIG="$2"; CONFIG_EXPLICIT=1; shift 2 ;;
+    --project) need_arg "$@"; CLI_PROJECT="$2"; shift 2 ;;
+    --projects) need_arg "$@"; CLI_PROJECTS="$2"; shift 2 ;;
+    --region) need_arg "$@"; CLI_REGION="$2"; shift 2 ;;
+    --admins|--admin) need_arg "$@"; CLI_ADMINS="$2"; shift 2 ;;
+    --viewers|--viewer|--allowed-users) need_arg "$@"; CLI_VIEWERS="$2"; shift 2 ;;
+    --org-name) need_arg "$@"; CLI_ORG_NAME="$2"; shift 2 ;;
+    --access-mode) need_arg "$@"; CLI_ACCESS_MODE="$2"; shift 2 ;;
+    --service-name) need_arg "$@"; CLI_SERVICE_NAME="$2"; shift 2 ;;
+    --read-only) CLI_READ_ONLY="1"; shift ;;
+    --data-access-logs) CLI_DATA_ACCESS_LOGS="true"; shift ;;
+    --no-data-access-logs) CLI_DATA_ACCESS_LOGS="false"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    -y|--yes) shift ;;
     -h|--help) usage ;;
     *) echo "unknown argument: $1" >&2; usage ;;
   esac
 done
 
-# log, info, warn, die, run, retry, grant_dataset_role and the data source steps (shared with prepare.sh).
-# shellcheck source=lib/common.sh
-source "$ROOT/scripts/lib/common.sh"
+# Multi-project orchestration: invoke this script once per project and print a combined summary.
+if [[ -n "$CLI_PROJECTS" ]]; then
+  IFS=',' read -r -a MULTI_LIST <<<"$CLI_PROJECTS"
+  SUMMARY_LINES=()
+  FORWARD_ARGS=()
+  idx=0
+  while [[ $idx -lt ${#ORIG_ARGS[@]} ]]; do
+    arg="${ORIG_ARGS[$idx]}"
+    if [[ "$arg" == "--projects" || "$arg" == "--project" ]]; then
+      idx=$((idx + 2))
+      continue
+    fi
+    FORWARD_ARGS+=("$arg")
+    idx=$((idx + 1))
+  done
+  for raw_pid in "${MULTI_LIST[@]}"; do
+    pid="$(normalize_project_id "$raw_pid")"
+    [[ -n "$pid" ]] || continue
+    log "========================================================================"
+    log "Multi-project deployment target: ${pid}"
+    log "========================================================================"
+    "$0" --project "$pid" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+    SUMMARY_LINES+=("${pid}")
+  done
+  log "All ${#SUMMARY_LINES[@]} project deployment(s) completed: ${SUMMARY_LINES[*]}"
+  exit 0
+fi
 
-[[ -f "$CONFIG" ]] || die "configuration file not found: $CONFIG (copy deploy.env.example to deploy.env first)"
-# shellcheck disable=SC1090
-source "$CONFIG"
+if [[ "$CONFIG_EXPLICIT" == "1" ]]; then
+  [[ -f "$CONFIG" ]] || die "configuration file not found: $CONFIG"
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+elif [[ -n "$CLI_PROJECT" ]]; then
+  PER_PROJ_CFG="$ROOT/deploy.$(normalize_project_id "$CLI_PROJECT").env"
+  if [[ -f "$PER_PROJ_CFG" ]]; then
+    # shellcheck disable=SC1090
+    source "$PER_PROJ_CFG"
+  fi
+elif [[ -f "$CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+fi
+
+# Accept intuitive variable aliases so customers never hit naming mismatches.
+ADMIN_EMAILS="${ADMIN_EMAILS:-${INITIAL_ADMINS:-${ADMINS:-${ADMIN_EMAIL:-}}}}"
+ALLOWED_USERS="${ALLOWED_USERS:-${INITIAL_VIEWERS:-${VIEWERS:-${VIEWER_EMAILS:-}}}}"
+
+# Apply CLI overrides on top of config file / environment values.
+[[ -n "$CLI_PROJECT" ]] && PROJECT_ID="$CLI_PROJECT"
+[[ -n "$CLI_REGION" ]] && REGION="$CLI_REGION"
+[[ -n "$CLI_ADMINS" ]] && ADMIN_EMAILS="$CLI_ADMINS"
+[[ -n "$CLI_VIEWERS" ]] && ALLOWED_USERS="$CLI_VIEWERS"
+[[ -n "$CLI_ORG_NAME" ]] && ORGANIZATION_NAME="$CLI_ORG_NAME"
+[[ -n "$CLI_ACCESS_MODE" ]] && ACCESS_MODE="$CLI_ACCESS_MODE"
+[[ -n "$CLI_SERVICE_NAME" ]] && SERVICE_NAME="$CLI_SERVICE_NAME"
+[[ "$CLI_READ_ONLY" == "1" ]] && ENABLE_GOVERNANCE_ACTIONS="false"
+[[ -n "$CLI_DATA_ACCESS_LOGS" ]] && ENABLE_DATA_ACCESS_LOGS="$CLI_DATA_ACCESS_LOGS"
+
+for tool in gcloud bq python3; do command -v "$tool" >/dev/null || die "$tool is required"; done
+ACCOUNT="$(ensure_gcloud_auth)"
+CALLER_MEMBER="$(caller_iam_member "$ACCOUNT")"
 
 # ------------------------------------------------------------------------------------ settings
 PROJECT_ID="$(normalize_project_id "${PROJECT_ID:-}")"
-REGION="$(trim_ws "${REGION:-us-central1}")"
+if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == your-* || "$PROJECT_ID" == "PROJECT_ID" ]]; then
+  ACTIVE_GCP_PROJECT="$(normalize_project_id "$(gcloud config get-value project 2>/dev/null || true)")"
+  [[ "$ACTIVE_GCP_PROJECT" == "(unset)" ]] && ACTIVE_GCP_PROJECT=""
+  if [[ -n "$ACTIVE_GCP_PROJECT" && "$CONFIG_EXPLICIT" == "0" ]]; then
+    PROJECT_ID="$ACTIVE_GCP_PROJECT"
+    info "using active gcloud project: ${PROJECT_ID}"
+  fi
+fi
+
+REGION="$(trim_ws "${REGION:-asia-northeast3}")"
 SERVICE_NAME="$(trim_ws "${SERVICE_NAME:-ai-control-plane}")"
-ADMIN_EMAILS="${ADMIN_EMAILS:-}"
 ACCESS_MODE="$(trim_ws "${ACCESS_MODE:-google}")"
-ALLOWED_USERS="${ALLOWED_USERS:-}"
 IAP_MEMBERS="${IAP_MEMBERS:-}"
 BRIDGE_MEMBERS="${BRIDGE_MEMBERS:-allAuthenticatedUsers}"
-# Demo only: visitors without a session browse read-only with identifiers hidden (GUEST_REDACT_TERMS, comma
-# separated; defaults to the terms in .prepublish-terms when that file exists).
 GUEST_ACCESS="${GUEST_ACCESS:-false}"
 GUEST_REDACT_TERMS="${GUEST_REDACT_TERMS:-}"
 OAUTH_CLIENT_JSON="${OAUTH_CLIENT_JSON:-}"
@@ -68,24 +155,23 @@ GOOGLE_OAUTH_START_URL="${GOOGLE_OAUTH_START_URL:-}"
 PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-}"
 ORGANIZATION_NAME="${ORGANIZATION_NAME:-Your Organization}"
 PRODUCT_NAME="${PRODUCT_NAME:-}"
-DEFAULT_LOCALE="${DEFAULT_LOCALE:-en}"
-WORKSPACE_TIMEZONE="${WORKSPACE_TIMEZONE:-UTC}"
+DEFAULT_LOCALE="${DEFAULT_LOCALE:-ko}"
+WORKSPACE_TIMEZONE="${WORKSPACE_TIMEZONE:-Asia/Seoul}"
 AUDIT_DATASET="$(trim_ws "${AUDIT_DATASET:-ge_analytics}")"
 CREATE_LOG_SINK="${CREATE_LOG_SINK:-true}"
 DATASET_LOCATION="$(trim_ws "${DATASET_LOCATION:-$REGION}")"
-ENABLE_DATA_ACCESS_LOGS="${ENABLE_DATA_ACCESS_LOGS:-false}"
-# Usage logs (observability) and user/prompt logging (sensitiveLoggingEnabled) of every Gemini Enterprise
-# app in DISCOVERY_ENGINE_LOCATIONS. Without GE_PROMPT_LOGGING=true, userIamPrincipal is logged as <elided>.
+# Full coverage by default: enable Data Access audit logs, Gemini Enterprise observability + prompt logging,
+# and governance IAM controls out of the box so all 13 modules and health checks work immediately.
+ENABLE_DATA_ACCESS_LOGS="${ENABLE_DATA_ACCESS_LOGS:-true}"
 ENABLE_GE_OBSERVABILITY="${ENABLE_GE_OBSERVABILITY:-true}"
 GE_PROMPT_LOGGING="${GE_PROMPT_LOGGING:-true}"
 BILLING_PROJECT_ID="$(normalize_project_id "${BILLING_PROJECT_ID:-}")"
 BILLING_DATASET="$(trim_ws "${BILLING_DATASET:-}")"
 BILLING_TABLE="$(trim_ws "${BILLING_TABLE:-}")"
 BILLING_ACCOUNT_ID="$(trim_ws "${BILLING_ACCOUNT_ID:-}")"
-# Empty: step 6 detects the locations with a Gemini Enterprise app or license (global when there is none).
 DISCOVERY_ENGINE_LOCATIONS="${DISCOVERY_ENGINE_LOCATIONS:-}"
-AGENT_ENGINE_REGIONS="${AGENT_ENGINE_REGIONS:-$REGION}"
-ENABLE_GOVERNANCE_ACTIONS="${ENABLE_GOVERNANCE_ACTIONS:-false}"
+AGENT_ENGINE_REGIONS="${AGENT_ENGINE_REGIONS:-}"
+ENABLE_GOVERNANCE_ACTIONS="${ENABLE_GOVERNANCE_ACTIONS:-true}"
 ENFORCEMENT_SCHEDULE="${ENFORCEMENT_SCHEDULE:-}"
 AI_DEFAULT_MODEL="${AI_DEFAULT_MODEL:-}"
 AI_LOCATION="${AI_LOCATION:-}"
@@ -101,12 +187,22 @@ MIN_INSTANCES="${MIN_INSTANCES:-0}"
 MAX_INSTANCES="${MAX_INSTANCES:-3}"
 
 # ---------------------------------------------------------------------------------- validation
-for tool in gcloud bq python3; do command -v "$tool" >/dev/null || die "$tool is required"; done
-validate_project_id "$PROJECT_ID" "$CONFIG"
-[[ -z "$BILLING_PROJECT_ID" ]] || validate_project_id "$BILLING_PROJECT_ID" "$CONFIG (BILLING_PROJECT_ID)"
-[[ "$REGION" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || die "invalid REGION '${REGION}' in $CONFIG (for example 'asia-northeast3')"
+WHERE_LABEL="$( [[ -f "$CONFIG" ]] && basename "$CONFIG" || echo "--project" )"
+validate_project_id "$PROJECT_ID" "$WHERE_LABEL"
+[[ -z "$BILLING_PROJECT_ID" ]] || validate_project_id "$BILLING_PROJECT_ID" "${WHERE_LABEL} (BILLING_PROJECT_ID)"
+[[ "$REGION" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || die "invalid REGION '${REGION}' (for example 'asia-northeast3')"
+
+# Auto-default ADMIN_EMAILS to the active deploying gcloud account when omitted or left as template placeholder.
 [[ "$ADMIN_EMAILS" != *example.com* ]] || ADMIN_EMAILS=""
-[[ "$ACCESS_MODE" == "password" || -n "$ADMIN_EMAILS" ]] || die "set ADMIN_EMAILS in $CONFIG"
+if [[ -z "$ADMIN_EMAILS" && "$ACCESS_MODE" != "password" ]]; then
+  ADMIN_EMAILS="$ACCOUNT"
+  info "ADMIN_EMAILS defaulted to active gcloud account: ${ADMIN_EMAILS}"
+fi
+if [[ "$ACCESS_MODE" == "iap" && -z "$IAP_MEMBERS" ]]; then
+  IAP_MEMBERS="user:${ACCOUNT}"
+  info "IAP_MEMBERS defaulted to user:${ACCOUNT}"
+fi
+
 [[ "$SERVICE_NAME" =~ ^[a-z]([a-z0-9-]{0,40}[a-z0-9])?$ ]] || die "SERVICE_NAME must be lowercase letters, digits and hyphens"
 [[ -n "$SETTINGS_BUCKET" ]] || SETTINGS_BUCKET="$(default_settings_bucket "$PROJECT_ID" "$SERVICE_NAME")"
 [[ ${#SETTINGS_BUCKET} -le 63 ]] || die "SETTINGS_BUCKET '${SETTINGS_BUCKET}' is longer than 63 characters; set a shorter SETTINGS_BUCKET"
@@ -123,7 +219,7 @@ case "$GUEST_ACCESS" in
       GUEST_REDACT_TERMS="$(python3 - "$ROOT/.prepublish-terms" <<'PY'
 import sys
 terms = [line.split("#", 1)[0].strip() for line in open(sys.argv[1], encoding="utf-8")]
-print(",".join(t for t in terms if t and not t.startswith("!") and "," not in t))  # "!": public phrases
+print(",".join(t for t in terms if t and not t.startswith("!") and "," not in t))
 PY
 )"
     fi ;;
@@ -133,13 +229,6 @@ esac
 if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
   [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]] || die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
   [[ "$ACCESS_MODE" != "iap" ]] || die "ENFORCEMENT_SCHEDULE needs ACCESS_MODE google, google_oauth or password (IAP blocks the scheduler's OIDC token)"
-elif [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
-  # Suspended users are restored only inside an enforcement run.
-  if [[ "$ACCESS_MODE" == "iap" ]]; then
-    warn "governance actions without a schedule (IAP mode cannot use one): suspended users get access back only when an administrator runs enforcement after the settlement period resets"
-  else
-    warn "governance actions without ENFORCEMENT_SCHEDULE: suspended users get access back only when an enforcement run happens after the settlement period resets; set ENFORCEMENT_SCHEDULE (for example \"*/15 * * * *\") to restore them automatically"
-  fi
 fi
 for flag in CREATE_LOG_SINK ENABLE_DATA_ACCESS_LOGS ENABLE_GE_OBSERVABILITY GE_PROMPT_LOGGING ENABLE_GOVERNANCE_ACTIONS; do
   [[ "${!flag}" == "true" || "${!flag}" == "false" ]] || die "$flag must be true or false"
@@ -147,7 +236,7 @@ done
 DISCOVERY_ENGINE_LOCATIONS="$(printf '%s' "$DISCOVERY_ENGINE_LOCATIONS" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 [[ -z "$DISCOVERY_ENGINE_LOCATIONS" || "$DISCOVERY_ENGINE_LOCATIONS" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] \
   || die "DISCOVERY_ENGINE_LOCATIONS must be a comma-separated list such as global,us (or empty to detect)"
-# Modules hidden from every user at deploy time (Settings > Modules can switch them back on).
+
 # Keep this list in sync with MODULE_IDS in src/controlplane/config.py (checked by the unit tests).
 MODULE_IDS=(overview gemini_enterprise notebooklm model_usage agent_gateway agent_registry agent_deployments
   model_armor users antigravity finops telemetry analyst)
@@ -157,30 +246,28 @@ for module in ${disabled_list[@]+"${disabled_list[@]}"}; do
   [[ -z "$module" || " ${MODULE_IDS[*]} " == *" $module "* ]] \
     || die "unknown module '$module' in DISABLED_MODULES (modules: ${MODULE_IDS[*]})"
 done
-if [[ -z "$BILLING_TABLE" && ",$DISABLED_MODULES," != *",finops,"* ]]; then
-  info "no billing export configured (BILLING_TABLE): the cost pages stay empty until it is set in Settings;"
-  info "set DISABLED_MODULES=\"finops\" in $(basename "$CONFIG") to hide them"
-fi
-ACCOUNT="$(gcloud config get-value account 2>/dev/null || true)"
-[[ -n "$ACCOUNT" ]] || die "no active gcloud account (run: gcloud auth login)"
-CALLER_MEMBER="$(caller_iam_member "$ACCOUNT")"
+
 PROJECT_NUMBER=""
 GCLOUD_ERR="$(mktemp)"
 IAM_CACHE="$(mktemp)"
 trap 'rm -f "$GCLOUD_ERR" "$IAM_CACHE"' EXIT
+
+# Bootstrap foundational control-plane APIs first so brand-new empty projects can answer project/IAM APIs.
+bootstrap_foundation_apis "$PROJECT_ID"
+
 for attempt in 1 2 3; do
-  # stdout only: gcloud may print notices on stderr, which must never end up in URLs or identities.
   PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>"$GCLOUD_ERR" || true)"
   PROJECT_NUMBER="$(printf '%s' "$PROJECT_NUMBER" | tr -d '[:space:]')"
   [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]] && break
   [[ $attempt -lt 3 ]] || die "cannot read project ${PROJECT_ID} with ${ACCOUNT}: $(tail -n 3 "$GCLOUD_ERR")"
-  sleep 5
+  sleep 4
 done
 
 SA_EMAIL="${SERVICE_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 BUILD_SA_ID="${SERVICE_NAME:0:21}-build"
 BUILD_SA="${BUILD_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 CB_SERVICE_AGENT="service-${PROJECT_NUMBER}@gcp-sa-cloudbuild.iam.gserviceaccount.com"
+RUN_SERVICE_AGENT="service-${PROJECT_NUMBER}@serverless-robot-prod.iam.gserviceaccount.com"
 BRIDGE_NAME="${SERVICE_NAME}-signin"
 RUN_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
 BASE_URL="${PUBLIC_BASE_URL:-$RUN_URL}"
@@ -202,26 +289,37 @@ NEED_AUDIT=0; [[ "$ENABLE_DATA_ACCESS_LOGS" == "true" ]] && NEED_AUDIT=1
 log "Deploying ${SERVICE_NAME} to ${PROJECT_ID} (${REGION}) as ${ACCOUNT}"
 info "access mode: ${ACCESS_MODE}    dashboard URL: ${BASE_URL}"
 [[ "$DRY_RUN" == "1" ]] && info "dry run: commands that change anything are printed, not executed"
+
+# Verify caller IAM permissions upfront (and auto-grant missing deployment roles when caller has IAM Admin).
 preflight_caller_permissions deploy "$PROJECT_ID" "$ACCOUNT" "$NEED_BUILD" "$NEED_SINK" "$NEED_IAP" "$NEED_SCHED" "$NEED_AUDIT"
 
-# ------------------------------------------------------------------------------- 1. APIs
-log "1/8 Enabling APIs"
-APIS=(run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com bigquery.googleapis.com
-  logging.googleapis.com monitoring.googleapis.com discoveryengine.googleapis.com aiplatform.googleapis.com
-  cloudresourcemanager.googleapis.com iam.googleapis.com storage.googleapis.com secretmanager.googleapis.com
-  cloudbilling.googleapis.com serviceusage.googleapis.com)
-SID_APIS=(cloudbuild.googleapis.com artifactregistry.googleapis.com run.googleapis.com secretmanager.googleapis.com)
-if [[ "$NEED_IAP" == "1" ]]; then
-  APIS+=(iap.googleapis.com)
-  SID_APIS+=(iap.googleapis.com)
+# Verify Cloud Billing is linked (auto-links when one open billing account is accessible) and detect account ID.
+DETECTED_BA="$(ensure_project_billing "$PROJECT_ID")"
+if [[ -z "$BILLING_ACCOUNT_ID" && -n "$DETECTED_BA" ]]; then
+  BILLING_ACCOUNT_ID="$DETECTED_BA"
+  info "detected Cloud Billing account: ${BILLING_ACCOUNT_ID}"
 fi
-[[ -n "$ENFORCEMENT_SCHEDULE" ]] && APIS+=(cloudscheduler.googleapis.com)
-run gcloud services enable "${APIS[@]}" --project "$PROJECT_ID"
+
+# ------------------------------------------------------------------------------- 1. APIs & Service Agents
+log "1/8 Enabling all required AI, governance and platform APIs"
+enable_project_apis "$PROJECT_ID" "$NEED_IAP" "$NEED_SCHED" 0
+SID_APIS=(
+  cloudbuild.googleapis.com
+  artifactregistry.googleapis.com
+  run.googleapis.com
+  secretmanager.googleapis.com
+  iap.googleapis.com
+  aiplatform.googleapis.com
+  discoveryengine.googleapis.com
+  modelarmor.googleapis.com
+  cloudscheduler.googleapis.com
+  dlp.googleapis.com
+  logging.googleapis.com
+  bigquery.googleapis.com
+)
 ensure_service_identities "$PROJECT_ID" "$PROJECT_NUMBER" "${SID_APIS[@]}"
 
 # ------------------------------------------------------------------------------- 2. settings bucket
-# Created before building the image so regional Cloud Build staging can use gs://${SETTINGS_BUCKET}/_build/source
-# instead of Cloud Build's default US multi-region bucket (which fails under Korea resourceLocations org policies).
 log "2/8 Settings bucket gs://${SETTINGS_BUCKET}"
 if ! gcloud storage buckets describe "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" >/dev/null 2>&1; then
   run gcloud storage buckets create "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" --location "$REGION" \
@@ -229,7 +327,7 @@ if ! gcloud storage buckets describe "gs://${SETTINGS_BUCKET}" --project "$PROJE
   run gcloud storage buckets update "gs://${SETTINGS_BUCKET}" --versioning
 fi
 
-# ------------------------------------------------------------------------------- 3. identity
+# ------------------------------------------------------------------------------- 3. identity & IAM
 log "3/8 Service accounts and IAM (${SA_EMAIL})"
 ensure_sa() {  # ensure_sa ACCOUNT_ID EMAIL DISPLAY_NAME DESCRIPTION
   if ! gcloud iam service-accounts describe "$2" --project "$PROJECT_ID" >/dev/null 2>&1; then
@@ -240,13 +338,10 @@ ensure_sa() {  # ensure_sa ACCOUNT_ID EMAIL DISPLAY_NAME DESCRIPTION
 ensure_sa "$SERVICE_ACCOUNT_ID" "$SA_EMAIL" "AI Control Plane runtime" \
   "Least-privilege identity of the ${SERVICE_NAME} Cloud Run service"
 if [[ "$ACCESS_MODE" == "google" ]]; then
-  # No project roles: the sign-in bridge only reads the session signing key (granted in step 5).
   ensure_sa "$BRIDGE_SA_ID" "$BRIDGE_SA" "AI Control Plane sign-in bridge" \
     "Identity of the ${BRIDGE_NAME} sign-in bridge"
 fi
 if [[ -z "$IMAGE" ]]; then
-  # Dedicated build identity: avoids relying on the Compute Engine default service account (which does not exist
-  # when Compute Engine API was never enabled, or lacks roles in projects created after May 2024).
   ensure_sa "$BUILD_SA_ID" "$BUILD_SA" "AI Control Plane image builder" \
     "Least-privilege Cloud Build identity for ${SERVICE_NAME}"
 fi
@@ -273,21 +368,65 @@ grant_member() {  # grant_member PROJECT MEMBER ROLE
     --condition=None --quiet >/dev/null
   [[ "$DRY_RUN" == "1" ]] || info "granted $3 to $2 on $1"
 }
+grant_optional_role() {  # grant_optional_role PROJECT MEMBER ROLE
+  if [[ "$1" == "$PROJECT_ID" ]] && has_project_role "$2" "$3"; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] optional role $3 -> $2"
+    return 0
+  fi
+  gcloud projects add-iam-policy-binding "$1" --member "$2" --role "$3" \
+    --condition=None --quiet >/dev/null 2>&1 \
+    && info "granted $3 to $2 on $1" || true
+}
 
-# Read roles plus logging.logWriter, which is always granted so that every governance record (dry runs,
-# exception and review changes, enforcement runs) reaches the audit log, with or without IAM write roles.
-RUNTIME_ROLES=(roles/bigquery.dataViewer roles/bigquery.jobUser roles/aiplatform.user roles/discoveryengine.viewer
-  roles/monitoring.viewer roles/logging.viewer roles/iam.securityReviewer roles/serviceusage.serviceUsageConsumer
-  roles/logging.logWriter)
+# Complete runtime permissions for all 13 modules (including privateLogViewer for Data Access logs and
+# logging.configWriter + bigquery.user for one-click Telemetry sink creation in the UI).
+RUNTIME_ROLES=(
+  roles/bigquery.dataViewer
+  roles/bigquery.jobUser
+  roles/bigquery.user
+  roles/aiplatform.user
+  roles/discoveryengine.viewer
+  roles/monitoring.viewer
+  roles/logging.viewer
+  roles/logging.privateLogViewer
+  roles/logging.logWriter
+  roles/logging.configWriter
+  roles/iam.securityReviewer
+  roles/serviceusage.serviceUsageConsumer
+)
+OPTIONAL_RUNTIME_ROLES=(
+  roles/modelarmor.viewer
+  roles/cloudtrace.user
+)
 GOVERNANCE_ROLES=(roles/resourcemanager.projectIamAdmin roles/iam.roleAdmin)
 for role in "${RUNTIME_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
+for role in "${OPTIONAL_RUNTIME_ROLES[@]}"; do grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
 if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
   for role in "${GOVERNANCE_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
 else
   info "governance write roles skipped (ENABLE_GOVERNANCE_ACTIONS=false): dashboards and simulations only"
 fi
+# Ensure Cloud Run service agent binding exists on brand-new projects.
+grant_optional_role "$PROJECT_ID" "serviceAccount:${RUN_SERVICE_AGENT}" "roles/run.serviceAgent"
 run retry gcloud storage buckets add-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
   --member "serviceAccount:${SA_EMAIL}" --role roles/storage.objectAdmin >/dev/null
+
+# Auto-discover BigQuery Billing Export table when BILLING_TABLE is not configured.
+BILLING_SCAN_PROJECT="${BILLING_PROJECT_ID:-$PROJECT_ID}"
+if [[ -z "$BILLING_TABLE" ]]; then
+  DETECTED_BILL="$(auto_detect_billing_export "$BILLING_SCAN_PROJECT")"
+  if [[ -n "$DETECTED_BILL" ]]; then
+    BILLING_DATASET="${DETECTED_BILL%%|*}"
+    BILLING_TABLE="${DETECTED_BILL#*|}"
+    [[ -n "$BILLING_PROJECT_ID" ]] || BILLING_PROJECT_ID="$BILLING_SCAN_PROJECT"
+    info "auto-detected BigQuery billing export: ${BILLING_SCAN_PROJECT}.${BILLING_DATASET}.${BILLING_TABLE}"
+  elif [[ ",$DISABLED_MODULES," != *",finops,"* ]]; then
+    info "no BigQuery billing export table found yet in ${BILLING_SCAN_PROJECT} (connect later in Settings > Workspace if needed)"
+  fi
+fi
 
 # Billing export in another project: read access on that dataset only (no project-level role there).
 if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; then
@@ -297,10 +436,8 @@ if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; the
     info "[dry-run] grant BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} (this dataset only)"
   elif retry grant_dataset_role "$BILLING_PROJECT_ID" "$BILLING_DATASET" READER "$SA_EMAIL"; then
     info "granted BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} (this dataset only)"
-    # Earlier versions granted this role on the whole billing project; the dataset grant replaces it.
     gcloud projects remove-iam-policy-binding "$BILLING_PROJECT_ID" --member "serviceAccount:${SA_EMAIL}" \
-      --role roles/bigquery.dataViewer --condition=None --quiet >/dev/null 2>&1 \
-      && info "removed the earlier project-level BigQuery Data Viewer on ${BILLING_PROJECT_ID}" || true
+      --role roles/bigquery.dataViewer --condition=None --quiet >/dev/null 2>&1 || true
   else
     warn "could not grant read access on ${BILLING_PROJECT_ID}:${BILLING_DATASET}; grant BigQuery Data Viewer on that dataset to ${SA_EMAIL}"
   fi
@@ -313,16 +450,15 @@ if [[ -z "$IMAGE" ]]; then
     run gcloud artifacts repositories create "$AR_REPOSITORY" --repository-format=docker --location "$REGION" \
       --project "$PROJECT_ID" --description "AI Control Plane images"
   fi
+  # Guarantee Cloud Run service agent can pull images immediately on freshly created projects.
+  run gcloud artifacts repositories add-iam-policy-binding "$AR_REPOSITORY" \
+    --location "$REGION" --project "$PROJECT_ID" \
+    --member "serviceAccount:${RUN_SERVICE_AGENT}" --role roles/artifactregistry.reader --quiet >/dev/null 2>&1 || true
+
   IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${SERVICE_NAME}:$(date -u +%Y%m%d-%H%M%S)"
   info "building ${IMAGE}"
 
-  # Prepare dedicated Cloud Build identity, Cloud Build service agent, Artifact Registry write access, and
-  # temporary staging access on gs://${SETTINGS_BUCKET}/_build/source.
-  if ! has_project_role "serviceAccount:${CB_SERVICE_AGENT}" "roles/cloudbuild.serviceAgent"; then
-    run gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-      --member "serviceAccount:${CB_SERVICE_AGENT}" --role roles/cloudbuild.serviceAgent \
-      --condition=None --quiet >/dev/null 2>&1 || true
-  fi
+  grant_optional_role "$PROJECT_ID" "serviceAccount:${CB_SERVICE_AGENT}" "roles/cloudbuild.serviceAgent"
   grant_member "$PROJECT_ID" "serviceAccount:${BUILD_SA}" "roles/logging.logWriter"
   run retry gcloud artifacts repositories add-iam-policy-binding "$AR_REPOSITORY" \
     --location "$REGION" --project "$PROJECT_ID" \
@@ -370,17 +506,17 @@ EOF
         break
       fi
     done
-    # Remove staged source tarball and revoke temporary bucket access from the build identity.
     gcloud storage rm --recursive "gs://${SETTINGS_BUCKET}/_build/**" --project "$PROJECT_ID" >/dev/null 2>&1 || true
     gcloud storage buckets remove-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
       --member "serviceAccount:${BUILD_SA}" --role roles/storage.objectAdmin >/dev/null 2>&1 || true
 
-    # Automatic fallback: Cloud Shell and developer workstations have Docker installed. If Cloud Build is
-    # blocked by an organization policy, VPC-SC perimeter or caller restriction, build and push locally.
+    # Automatic fallback: Cloud Shell and workstations with Docker build & push directly to Artifact Registry.
     if [[ "$BUILD_OK" != "1" ]]; then
       if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        warn "Cloud Build failed; falling back to local Docker build and push to Artifact Registry..."
-        gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+        warn "Cloud Build blocked or unavailable; building locally with Docker and pushing to Artifact Registry..."
+        gcloud auth print-access-token 2>/dev/null \
+          | docker login -u oauth2accesstoken --password-stdin "https://${REGION}-docker.pkg.dev" >/dev/null 2>&1 \
+          || gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
         if docker build --platform linux/amd64 -t "$IMAGE" "$ROOT" && docker push "$IMAGE"; then
           BUILD_OK=1
         fi
@@ -451,21 +587,38 @@ elif [[ -n "$GOOGLE_OAUTH_CLIENT_ID" ]] && gcloud secrets describe "$OAUTH_SECRE
   SECRETS="${SECRETS},GOOGLE_OAUTH_CLIENT_SECRET=${OAUTH_SECRET_NAME}:latest"
 fi
 
-# ------------------------------------------------------------------------------- 6. data sources
-# Same steps as scripts/prepare.sh (scripts/lib/common.sh). Re-running updates an existing sink to the
-# current filter, which also repairs sinks created by earlier versions of this script.
-log "6/8 Data sources: audit log routing, Data Access logs, Gemini Enterprise usage logs"
+# ------------------------------------------------------------------------------- 6. data sources & auto-detection
+log "6/8 Data sources: audit log routing, Data Access logs, Gemini Enterprise & Agent Platform"
+if [[ -z "$ORGANIZATION_NAME" || "$ORGANIZATION_NAME" == "Your Organization" ]]; then
+  DETECTED_ORG="$(auto_detect_org_name "$PROJECT_ID")"
+  if [[ -n "$DETECTED_ORG" ]]; then
+    ORGANIZATION_NAME="$DETECTED_ORG"
+    info "auto-detected organization/workspace name: ${ORGANIZATION_NAME}"
+  fi
+fi
+
+if [[ -z "$AGENT_ENGINE_REGIONS" || -z "$AI_LOCATION" ]]; then
+  AI_LOC_PAIR="$(auto_detect_ai_locations "$PROJECT_ID" "$REGION")"
+  [[ -n "$AGENT_ENGINE_REGIONS" ]] || AGENT_ENGINE_REGIONS="${AI_LOC_PAIR%%|*}"
+  [[ -n "$AI_LOCATION" ]] || AI_LOCATION="${AI_LOC_PAIR#*|}"
+  info "Agent Platform endpoints: Agent Engine=${AGENT_ENGINE_REGIONS}, AI location=${AI_LOCATION}"
+fi
+
 if [[ -z "$DISCOVERY_ENGINE_LOCATIONS" ]]; then
   DISCOVERY_ENGINE_LOCATIONS="$(ge_locations "$PROJECT_ID")"
   if [[ -n "$DISCOVERY_ENGINE_LOCATIONS" ]]; then
-    info "Gemini Enterprise locations: ${DISCOVERY_ENGINE_LOCATIONS} (detected; set DISCOVERY_ENGINE_LOCATIONS to choose)"
+    info "Gemini Enterprise locations: ${DISCOVERY_ENGINE_LOCATIONS} (detected)"
   else
     DISCOVERY_ENGINE_LOCATIONS="global"
     info "no Gemini Enterprise app or license found yet: using DISCOVERY_ENGINE_LOCATIONS=global"
   fi
 fi
+
 if [[ "$CREATE_LOG_SINK" == "true" ]]; then
   ensure_ai_log_sink "$PROJECT_ID" "$AUDIT_DATASET" "$DATASET_LOCATION" "${SERVICE_NAME}-ai-logs"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    retry grant_dataset_role "$PROJECT_ID" "$AUDIT_DATASET" WRITER "$SA_EMAIL" >/dev/null 2>&1 || true
+  fi
 else
   info "sink skipped (CREATE_LOG_SINK=false): the dashboard reads the existing dataset ${AUDIT_DATASET}"
 fi
@@ -512,67 +665,10 @@ RUN_DEPLOY_HELP="$(gcloud run deploy --help 2>&1 || true)"
 NO_IAP_ARGS=()
 [[ "$RUN_DEPLOY_HELP" == *"--no-iap"* || "$RUN_DEPLOY_HELP" == *"--iap"* ]] && NO_IAP_ARGS=(--no-iap)
 
-# Deploys the public-entry dashboard service (the app enforces its own signed session cookies on every route).
-# Prefers --no-invoker-iam-check so organizations enforcing constraints/iam.allowedPolicyMemberDomains
-# (no allUsers IAM binding) succeed; falls back to --allow-unauthenticated on older gcloud versions or org policies.
-deploy_main_public() {
-  local env_str="$1"
-  if [[ "$DRY_RUN" == "1" ]]; then
-    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --no-invoker-iam-check \
-      --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-      --set-env-vars "$env_str" --set-secrets "$SECRETS"
-    return 0
-  fi
-  if [[ "$RUN_DEPLOY_HELP" == *"--no-invoker-iam-check"* ]]; then
-    if gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --no-invoker-iam-check \
-        --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-        --set-env-vars "$env_str" --set-secrets "$SECRETS"; then
-      return 0
-    fi
-    warn "--no-invoker-iam-check was rejected; retrying with --allow-unauthenticated..."
-  fi
-  gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --allow-unauthenticated \
-    --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-    --set-env-vars "$env_str" --set-secrets "$SECRETS" \
-    || die "Cloud Run deployment failed. If an organization policy enforces Cloud Run IAM invoker checks and blocks allUsers, set ACCESS_MODE=\"iap\" and IAP_MEMBERS=\"domain:your-domain.com\" in $(basename "$CONFIG") and re-run."
-}
-
-BRIDGE_READY=0
-case "$ACCESS_MODE" in
-  google)
-    info "sign-in bridge ${BRIDGE_NAME} (IAP signs users in with Google; the dashboard approves accounts)"
-    if [[ "$DRY_RUN" == "1" ]]; then
-      run gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
-        --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
-        --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
-        --set-secrets "$SECRETS"
-      BRIDGE_READY=1
-    elif retry gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
-        --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
-        --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
-        --set-secrets "$SECRETS"; then
-      BRIDGE_READY=1
-    else
-      warn "sign-in bridge (${BRIDGE_NAME}) with Cloud Run IAP could not be deployed; deploying the dashboard with built-in ID/Password sign-in enabled so you can log in immediately"
-    fi
-    if [[ "$BRIDGE_READY" == "1" ]]; then
-      run retry gcloud run services add-iam-policy-binding "$BRIDGE_NAME" --project "$PROJECT_ID" --region "$REGION" \
-        --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
-      IFS=',' read -r -a members <<<"$BRIDGE_MEMBERS"
-      for member in "${members[@]}"; do
-        member="$(normalize_iam_member "$member")"
-        [[ -n "$member" ]] || continue
-        run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
-          --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 || true
-      done
-      # Cloud Run Direct IAP evaluates explicit user:/domain: bindings even when allAuthenticatedUsers is present
-      # in the policy; always bind configured ADMIN_EMAILS and ALLOWED_USERS principals.
-      while IFS= read -r fallback_member; do
-        [[ -n "$fallback_member" ]] || continue
-        run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
-          --project="$PROJECT_ID" --member="$fallback_member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 \
-          && info "sign-in bridge IAP access: ${fallback_member}" || true
-      done < <(python3 - "$ADMIN_EMAILS" "$ALLOWED_USERS" <<'PY'
+# Collects explicit user: and domain: IAP principals from ADMIN_EMAILS, ALLOWED_USERS and active ACCOUNT.
+bind_iap_principals() {  # bind_iap_principals SERVICE_NAME
+  local svc="$1" principals fallback_member
+  principals="$(python3 - "$ADMIN_EMAILS" "$ALLOWED_USERS" "$ACCOUNT" <<'PYIAP'
 import sys
 public_domains = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com", "icloud.com", "naver.com", "daum.net", "hanmail.net", "kakao.com"}
 seen = set()
@@ -591,11 +687,86 @@ for raw in sys.argv[1:]:
             if cand and cand not in seen:
                 seen.add(cand)
                 print(cand)
-PY
-      )
-      grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/iap.admin" || true
-      # Ensure a custom IAP OAuth client is attached to the sign-in bridge so out-of-org Google accounts
-      # (when permitted by the project's OAuth brand) are not rejected by Cloud Run IAP's default in-org client.
+PYIAP
+  )"
+  while IFS= read -r fallback_member; do
+    [[ -n "$fallback_member" ]] || continue
+    run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$svc" --region="$REGION" \
+      --project="$PROJECT_ID" --member="$fallback_member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 \
+      && info "IAP access (${svc}): ${fallback_member}" || true
+  done <<<"$principals"
+}
+
+EFFECTIVE_ACCESS_MODE="$ACCESS_MODE"
+
+# Deploys the public-entry dashboard service (which enforces signed session cookies on every route).
+# 1) Tries --no-invoker-iam-check (succeeds under Domain Restricted Sharing without allUsers).
+# 2) Falls back to --allow-unauthenticated.
+# 3) If enterprise org policies block BOTH (--no-invoker-iam-check AND allUsers), automatically switches the
+#    main dashboard service to Direct Cloud Run IAP and binds ADMIN_EMAILS / ALLOWED_USERS / org domain!
+deploy_main_resilient() {
+  local public_env="$1"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --no-invoker-iam-check \
+      --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
+      --set-env-vars "$public_env" --set-secrets "$SECRETS"
+    return 0
+  fi
+  if [[ "$RUN_DEPLOY_HELP" == *"--no-invoker-iam-check"* ]]; then
+    if gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --no-invoker-iam-check \
+        --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
+        --set-env-vars "$public_env" --set-secrets "$SECRETS"; then
+      return 0
+    fi
+    warn "--no-invoker-iam-check was rejected; retrying with --allow-unauthenticated..."
+  fi
+  if gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --allow-unauthenticated \
+      --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
+      --set-env-vars "$public_env" --set-secrets "$SECRETS"; then
+    return 0
+  fi
+  warn "organization policy blocks unauthenticated Cloud Run entry; automatically switching ${SERVICE_NAME} to Direct Cloud Run IAP..."
+  local iap_env="${ENV_VARS}##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
+  retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
+    --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
+    --set-env-vars "$iap_env" --set-secrets "$SECRETS" \
+    || die "Cloud Run deployment failed under all access modes for ${PROJECT_ID}"
+  retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+    --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
+  bind_iap_principals "$SERVICE_NAME"
+  EFFECTIVE_ACCESS_MODE="iap"
+}
+
+BRIDGE_READY=0
+case "$ACCESS_MODE" in
+  google)
+    info "sign-in bridge ${BRIDGE_NAME} (IAP signs users in with Google; the dashboard approves accounts)"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      run gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
+        --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
+        --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
+        --set-secrets "$SECRETS"
+      BRIDGE_READY=1
+    elif retry gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
+        --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
+        --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
+        --set-secrets "$SECRETS"; then
+      BRIDGE_READY=1
+    else
+      warn "sign-in bridge (${BRIDGE_NAME}) with Cloud Run IAP could not be deployed; deploying the dashboard with built-in ID/Password sign-in enabled"
+    fi
+    if [[ "$BRIDGE_READY" == "1" ]]; then
+      run retry gcloud run services add-iam-policy-binding "$BRIDGE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+        --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
+      IFS=',' read -r -a members <<<"$BRIDGE_MEMBERS"
+      for member in "${members[@]}"; do
+        member="$(normalize_iam_member "$member")"
+        [[ -n "$member" ]] || continue
+        run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
+          --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 || true
+      done
+      bind_iap_principals "$BRIDGE_NAME"
+      grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/iap.admin"
       if [[ "$DRY_RUN" -eq 0 ]]; then
         IAP_BRAND="projects/${PROJECT_NUMBER}/brands/${PROJECT_NUMBER}"
         IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || echo "[]")"
@@ -623,25 +794,23 @@ PY
         fi
         rm -f "$IAP_SETTINGS_FILE"
       fi
-      ENV_VARS+="##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
+      MAIN_ENV="${ENV_VARS}##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
     else
-      ENV_VARS+="##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
+      MAIN_ENV="${ENV_VARS}##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
     fi
-    deploy_main_public "$ENV_VARS"
+    deploy_main_resilient "$MAIN_ENV"
     ;;
   password)
-    ENV_VARS+="##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
-    deploy_main_public "$ENV_VARS"
+    deploy_main_resilient "${ENV_VARS}##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
     ;;
   google_oauth)
-    ENV_VARS+="##AUTH_MODE=google##GOOGLE_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}##PUBLIC_BASE_URL=${BASE_URL}"
-    deploy_main_public "$ENV_VARS"
+    deploy_main_resilient "${ENV_VARS}##AUTH_MODE=google##GOOGLE_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}##PUBLIC_BASE_URL=${BASE_URL}"
     ;;
   iap)
-    ENV_VARS+="##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
+    IAP_ENV="${ENV_VARS}##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
     run retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-      --set-env-vars "$ENV_VARS" --set-secrets "$SECRETS"
+      --set-env-vars "$IAP_ENV" --set-secrets "$SECRETS"
     run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
       --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
     IFS=',' read -r -a members <<<"$IAP_MEMBERS"
@@ -649,17 +818,17 @@ PY
       member="$(normalize_iam_member "$member")"
       [[ -n "$member" ]] || continue
       run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$SERVICE_NAME" --region="$REGION" \
-        --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null
-      info "IAP access: ${member}"
+        --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 \
+        && info "IAP access: ${member}" || true
     done
+    bind_iap_principals "$SERVICE_NAME"
     ;;
 esac
 
-# ------------------------------------------------------------------------------- 8. scheduler
-log "8/8 Automatic enforcement schedule"
-if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
+# ------------------------------------------------------------------------------- 8. scheduler & live readiness probe
+log "8/8 Schedule & readiness check"
+if [[ -n "$ENFORCEMENT_SCHEDULE" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
   if ! gcloud iam service-accounts describe "$SCHEDULER_SA" --project "$PROJECT_ID" >/dev/null 2>&1; then
-    # No project roles: it can only call the enforce endpoint, which checks its OIDC token.
     run gcloud iam service-accounts create "$SCHEDULER_SA_ID" --project "$PROJECT_ID" \
       --display-name "AI Control Plane enforcement scheduler"
   fi
@@ -674,23 +843,43 @@ if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
     run retry gcloud scheduler jobs create http "$JOB" "${JOB_ARGS[@]}" --headers Content-Type=application/json >/dev/null
   fi
   info "job ${JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> ${ENFORCE_URL}"
-  info "runs follow the enforcement mode chosen on the Antigravity Controls page (manual review by default)"
 else
-  info "skipped (ENFORCEMENT_SCHEDULE is empty): enforcement runs only from the dashboard"
+  info "enforcement schedule: on-demand from the dashboard (ENFORCEMENT_SCHEDULE empty)"
 fi
 
-log "Done"
-case "$ACCESS_MODE" in
-  iap) info "Open ${BASE_URL} (IAP signs in: ${IAP_MEMBERS})" ;;
-  password) info "Open ${BASE_URL}/login and sign in with ID/Password (default initial account: admin / admin — change in Settings > Access control)" ;;
+if [[ "$DRY_RUN" != "1" ]]; then
+  HTTP_CODE="$(python3 - "${BASE_URL}/api/v1/auth/state" <<'PYPROBE' || echo "000"
+import sys, urllib.error, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+opener = urllib.request.build_opener(NoRedirect)
+try:
+    with opener.open(urllib.request.Request(sys.argv[1]), timeout=15) as r:
+        print(r.status)
+except urllib.error.HTTPError as e:
+    print(e.code)
+except Exception:
+    print("000")
+PYPROBE
+)"
+  if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" || "$HTTP_CODE" == "401" ]]; then
+    info "live readiness verified (${BASE_URL} responded HTTP ${HTTP_CODE})"
+  fi
+fi
+
+log "Deployment complete: ${PROJECT_ID}"
+case "$EFFECTIVE_ACCESS_MODE" in
+  iap) info "Dashboard URL : ${BASE_URL} (Google IAP sign-in)" ;;
+  password) info "Dashboard URL : ${BASE_URL}/login (ID/Password: initial account admin / admin)" ;;
   google)
     if [[ "$BRIDGE_READY" == "1" ]]; then
-      info "Open ${BASE_URL}/login and sign in with Google (${ADMIN_EMAILS}) or ID/Password"
+      info "Dashboard URL : ${BASE_URL}/login (Google sign-in: ${ADMIN_EMAILS}${ALLOWED_USERS:+, viewers: $ALLOWED_USERS})"
     else
-      info "Open ${BASE_URL}/login and sign in with ID/Password (default initial account: admin / admin — change in Settings > Access control)"
+      info "Dashboard URL : ${BASE_URL}/login (ID/Password: initial account admin / admin)"
     fi ;;
-  *) info "Open ${BASE_URL}/login and sign in with an administrator account (${ADMIN_EMAILS})" ;;
+  *) info "Dashboard URL : ${BASE_URL}/login (${ADMIN_EMAILS})" ;;
 esac
-info "Image: ${IMAGE}"
-info "Settings saved in the UI: gs://${SETTINGS_BUCKET}"
-info "Next: Settings > Workspace and data sources shows which data sources are connected."
+info "Audit dataset : ${PROJECT_ID}:${AUDIT_DATASET} (${DATASET_LOCATION}, Data Access=${ENABLE_DATA_ACCESS_LOGS}, GE Prompt Logging=${GE_PROMPT_LOGGING})"
+info "Settings store: gs://${SETTINGS_BUCKET}"
+info "Container     : ${IMAGE}"
