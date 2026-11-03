@@ -662,6 +662,93 @@ esac
             self.assertFalse(os.path.exists(os.path.join(install_dir, "deploy.env")))
             self.assertTrue(os.path.exists(os.path.join(install_dir, "deploy.env.bak")))
 
+    def test_zero_billing_permissions_and_msp_masked_account_succeed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_gcloud = os.path.join(tmp, "gcloud")
+            with open(fake_gcloud, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env python3\n"
+                    "import os, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "mode = os.environ.get('FAKE_BILLING_MODE', 'denied')\n"
+                    "if args[:3] == ['billing', 'projects', 'describe']:\n"
+                    "    if mode == 'denied':\n"
+                    "        sys.stderr.write('ERROR: PERMISSION_DENIED: Cloud Billing permission denied\\n')\n"
+                    "        sys.exit(1)\n"
+                    "    if mode == 'empty_json':\n"
+                    "        print('{}')\n"
+                    "        sys.exit(0)\n"
+                    "    if mode == 'msp_masked':\n"
+                    "        print('{\"billingAccountName\": \"billingAccounts/reseller-hidden\", \"billingEnabled\": true}')\n"
+                    "        sys.exit(0)\n"
+                    "    if mode == 'false_but_run_ok':\n"
+                    "        print('{\"billingEnabled\": false}')\n"
+                    "        sys.exit(0)\n"
+                    "    if mode == 'truly_unbilled':\n"
+                    "        print('{\"billingEnabled\": false}')\n"
+                    "        sys.exit(0)\n"
+                    "if args[:3] == ['billing', 'accounts', 'list']:\n"
+                    "    sys.stderr.write('ERROR: PERMISSION_DENIED\\n')\n"
+                    "    sys.exit(1)\n"
+                    "if args[:2] == ['services', 'enable']:\n"
+                    "    if 'cloudbilling.googleapis.com' in args:\n"
+                    "        sys.stderr.write('ERROR: PERMISSION_DENIED: cloudbilling blocked\\n')\n"
+                    "        sys.exit(1)\n"
+                    "    if mode == 'truly_unbilled' and 'run.googleapis.com' in args:\n"
+                    "        sys.stderr.write('ERROR: Billing must be enabled for activation of service run.googleapis.com\\n')\n"
+                    "        sys.exit(1)\n"
+                    "    sys.exit(0)\n"
+                    "sys.exit(0)\n"
+                )
+            os.chmod(fake_gcloud, 0o755)
+            common_sh = os.path.join(ROOT, "scripts/lib/common.sh")
+
+            for mode in ("denied", "empty_json", "msp_masked", "false_but_run_ok"):
+                env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}", FAKE_BILLING_MODE=mode)
+                res = subprocess.run(
+                    ["bash", "-c", f"source {common_sh}; DRY_RUN=0; ensure_project_billing demo-proj"],
+                    capture_output=True, text=True, env=env, check=False,
+                )
+                self.assertEqual(res.returncode, 0, msg=(mode, res.stdout, res.stderr))
+                # Reseller/masked billing account names must never leak invalid IDs to BILLING_ACCOUNT_ID.
+                self.assertEqual(res.stdout.strip(), "", msg=(mode, res.stdout))
+
+            # Restricted cloudbilling.googleapis.com must NOT fail enable_project_apis
+            env_api = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}", FAKE_BILLING_MODE="denied")
+            res_api = subprocess.run(
+                ["bash", "-c", f"source {common_sh}; DRY_RUN=0; enable_project_apis demo-proj 1 0 0"],
+                capture_output=True, text=True, env=env_api, check=False,
+            )
+            self.assertEqual(res_api.returncode, 0, msg=(res_api.stdout, res_api.stderr))
+
+            # Truly unbilled project with no billing linked at all gives clear Korean + English instructions
+            env_unbilled = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}", FAKE_BILLING_MODE="truly_unbilled")
+            res_unbilled = subprocess.run(
+                ["bash", "-c", f"source {common_sh}; DRY_RUN=0; ensure_project_billing demo-unbilled-proj"],
+                capture_output=True, text=True, env=env_unbilled, check=False,
+            )
+            self.assertNotEqual(res_unbilled.returncode, 0)
+            self.assertIn("Cloud Billing is not enabled on project demo-unbilled-proj", res_unbilled.stderr)
+            self.assertIn("결제 계정(Billing Account)", res_unbilled.stderr)
+
+    def test_preflight_denied_shows_clear_remediation_without_partial_resources(self):
+        common_sh = os.path.join(ROOT, "scripts/lib/common.sh")
+        cmd = (
+            f"source {common_sh}; "
+            "_check_project_permissions() { "
+            'echo \'{"status":"denied","missing_perms":["resourcemanager.projects.setIamPolicy","run.services.create"],'
+            '"missing_roles":["roles/resourcemanager.projectIamAdmin","roles/run.admin"]}\'; '
+            "}; "
+            "preflight_caller_permissions deploy demo-enterprise-proj viewer@example.org 1 1 1 0 1"
+        )
+        res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, check=False)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("roles/owner", res.stderr)
+        self.assertIn("roles/resourcemanager.projectIamAdmin", res.stderr)
+        self.assertIn("user:viewer@example.org", res.stderr)
+        self.assertIn("[한국어 안내]", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
+

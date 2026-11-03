@@ -267,7 +267,11 @@ for attempt in 1 2 3; do
   PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>"$GCLOUD_ERR" || true)"
   PROJECT_NUMBER="$(printf '%s' "$PROJECT_NUMBER" | tr -d '[:space:]')"
   [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]] && break
-  [[ $attempt -lt 3 ]] || die "cannot read project ${PROJECT_ID} with ${ACCOUNT}: $(tail -n 3 "$GCLOUD_ERR")"
+  [[ $attempt -lt 3 ]] || die "cannot read project ${PROJECT_ID} with ${ACCOUNT}: $(tail -n 3 "$GCLOUD_ERR")
+  [한국어 안내] 현재 로그인된 계정(${ACCOUNT})이 '${PROJECT_ID}' 프로젝트를 조회할 수 없습니다.
+   - 프로젝트 ID 오타 여부를 확인하거나, 올바른 계정으로 로그인하세요: gcloud auth login
+   - 또는 프로젝트 관리자에게 권한 부여를 요청하세요:
+     gcloud projects add-iam-policy-binding ${PROJECT_ID} --member=\"${CALLER_MEMBER}\" --role=\"roles/owner\""
   sleep 4
 done
 
@@ -439,15 +443,15 @@ fi
 # Billing export in another project: read access on that dataset only (no project-level role there).
 if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; then
   if [[ -z "$BILLING_DATASET" ]]; then
-    warn "BILLING_PROJECT_ID is set without BILLING_DATASET: billing read access was not granted"
+    warn "BILLING_PROJECT_ID is set without BILLING_DATASET: skipping cross-project billing ACL (deployment continues normally)"
   elif [[ "$DRY_RUN" == "1" ]]; then
     info "[dry-run] grant BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} (this dataset only)"
-  elif retry grant_dataset_role "$BILLING_PROJECT_ID" "$BILLING_DATASET" READER "$SA_EMAIL"; then
+  elif grant_dataset_role "$BILLING_PROJECT_ID" "$BILLING_DATASET" READER "$SA_EMAIL"; then
     info "granted BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} (this dataset only)"
     gcloud projects remove-iam-policy-binding "$BILLING_PROJECT_ID" --member "serviceAccount:${SA_EMAIL}" \
       --role roles/bigquery.dataViewer --condition=None --quiet >/dev/null 2>&1 || true
   else
-    warn "could not grant read access on ${BILLING_PROJECT_ID}:${BILLING_DATASET}; grant BigQuery Data Viewer on that dataset to ${SA_EMAIL}"
+    warn "no caller access on external billing dataset ${BILLING_PROJECT_ID}:${BILLING_DATASET} (continuing deployment normally; FinOps can be connected later by granting BigQuery Data Viewer on that dataset to ${SA_EMAIL})"
   fi
 fi
 

@@ -242,11 +242,12 @@ enable_project_apis() {
       aiplatform.googleapis.com
       storage.googleapis.com
       secretmanager.googleapis.com
-      cloudbilling.googleapis.com
     )
-    # Cloud Build, IAP and Cloud Scheduler have automatic runtime fallbacks (local Docker build, ID/Password
-    # login and manual enforcement), so enable them in core when requested and fall back gracefully if blocked.
+    # Cloud Build, IAP, Cloud Scheduler and Cloud Billing Catalog have automatic runtime fallbacks
+    # (local Docker build, ID/Password login, manual enforcement, and BigQuery/manual token pricing),
+    # so restricted billing/build/IAP APIs never abort deployment.
     optional_apis=(
+      cloudbilling.googleapis.com
       cloudbuild.googleapis.com
       iap.googleapis.com
       cloudscheduler.googleapis.com
@@ -272,7 +273,7 @@ enable_project_apis() {
     for api in "${core_apis[@]}"; do
       if ! gcloud services enable "$api" --project "$project" --quiet >/dev/null 2>&1; then
         case "$api" in
-          cloudbuild.googleapis.com|iap.googleapis.com|cloudscheduler.googleapis.com|cloudtrace.googleapis.com|clouderrorreporting.googleapis.com|sts.googleapis.com)
+          cloudbilling.googleapis.com|cloudbuild.googleapis.com|iap.googleapis.com|cloudscheduler.googleapis.com|cloudtrace.googleapis.com|clouderrorreporting.googleapis.com|sts.googleapis.com)
             warn "could not enable ${api} on ${project} (continuing with built-in fallback)" ;;
           *)
             gcloud services enable "$api" --project "$project" \
@@ -289,22 +290,51 @@ enable_project_apis() {
   fi
 }
 
-# Verifies that Cloud Billing is linked to PROJECT.
+# Emits a normalized XXXXXX-XXXXXX-XXXXXX Cloud Billing account ID, or nothing when masked/hidden by an MSP/reseller.
+_sanitize_billing_account_id() {
+  local raw
+  raw="$(trim_ws "${1:-}")"
+  raw="${raw#billingAccounts/}"
+  raw="$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')"
+  if [[ "$raw" =~ ^[0-9A-F]{6}-[0-9A-F]{6}-[0-9A-F]{6}$ ]]; then
+    printf '%s' "$raw"
+  fi
+}
+
+# Verifies that Cloud Billing is linked to PROJECT without requiring Billing Account permissions when billing
+# is already attached by a central Cloud/MSP team.
 # Usage: ensure_project_billing PROJECT [PREFERRED_BILLING_ACCOUNT_ID]
-# When unlinked, tries: (1) explicit PREFERRED_BILLING_ACCOUNT_ID, (2) billing account already linked on a
-# sibling project in the same folder, or (3) accessible open billing account(s). Prints the linked billing
-# account ID (XXXXXX-XXXXXX-XXXXXX) on stdout when readable.
+# Prints the linked billing account ID (XXXXXX-XXXXXX-XXXXXX) on stdout only when readable and valid.
 ensure_project_billing() {
-  local project="$1" preferred_ba="${2:-}" info_json enabled acct_name candidates=() cand parent_info parent_id sib_list sib sib_ba open_accts count link_err last_err=""
+  local project="$1" preferred_ba="${2:-}" info_json enabled acct_name candidates=() cand parent_info parent_id sib_list sib sib_ba open_accts count link_err probe_err last_err=""
   [[ "${DRY_RUN:-0}" == "1" ]] && return 0
-  preferred_ba="$(trim_ws "${preferred_ba#billingAccounts/}")"
+  preferred_ba="$(_sanitize_billing_account_id "$preferred_ba")"
   info_json="$(gcloud billing projects describe "$project" --format=json 2>/dev/null || true)"
   if [[ -z "$info_json" ]]; then
+    # Caller has no Cloud Billing read visibility (common in MSP / enterprise orgs) — continue without failing.
     [[ -n "$preferred_ba" ]] && printf '%s' "$preferred_ba"
     return 0
   fi
-  enabled="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("true" if d.get("billingEnabled") else "false")' "$info_json" 2>/dev/null || echo "unknown")"
-  acct_name="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print((d.get("billingAccountName") or "").rsplit("/",1)[-1])' "$info_json" 2>/dev/null || true)"
+  enabled="$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    val = d.get("billingEnabled", None) if isinstance(d, dict) else None
+    print("true" if val is True else ("false" if val is False else "unknown"))
+except Exception:
+    print("unknown")
+' "$info_json" 2>/dev/null || echo "unknown")"
+  acct_name="$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+    print((d.get("billingAccountName") or "").rsplit("/", 1)[-1] if isinstance(d, dict) else "")
+except Exception:
+    print("")
+' "$info_json" 2>/dev/null || true)"
+  acct_name="$(_sanitize_billing_account_id "$acct_name")"
+  [[ -z "$acct_name" && -n "$preferred_ba" ]] && acct_name="$preferred_ba"
+
   if [[ "$enabled" == "false" ]]; then
     [[ -n "$preferred_ba" ]] && candidates+=("$preferred_ba")
     parent_info="$(gcloud projects describe "$project" --format='value(parent.id,parent.type)' 2>/dev/null || true)"
@@ -313,7 +343,7 @@ ensure_project_billing() {
       sib_list="$(gcloud projects list --filter="parent.id=${parent_id} AND lifecycleState=ACTIVE" --format='value(projectId)' --limit=6 2>/dev/null || true)"
       while IFS= read -r sib; do
         [[ -n "$sib" && "$sib" != "$project" ]] || continue
-        sib_ba="$(gcloud billing projects describe "$sib" --format='value(billingAccountName)' 2>/dev/null | awk -F/ '{print $NF}' || true)"
+        sib_ba="$(_sanitize_billing_account_id "$(gcloud billing projects describe "$sib" --format='value(billingAccountName)' 2>/dev/null || true)")"
         if [[ -n "$sib_ba" && " ${candidates[*]-} " != *" ${sib_ba} "* ]]; then
           candidates+=("$sib_ba")
           break
@@ -323,7 +353,7 @@ ensure_project_billing() {
     open_accts="$(gcloud billing accounts list --filter="open=true" --format="value(name)" 2>/dev/null || true)"
     count="$(printf '%s\n' "$open_accts" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
     if [[ "$count" == "1" ]]; then
-      cand="$(printf '%s\n' "$open_accts" | head -n 1 | awk -F/ '{print $NF}')"
+      cand="$(_sanitize_billing_account_id "$(printf '%s\n' "$open_accts" | head -n 1)")"
       [[ -n "$cand" && " ${candidates[*]-} " != *" ${cand} "* ]] && candidates+=("$cand")
     fi
 
@@ -339,9 +369,23 @@ ensure_project_billing() {
     done
     rm -f "$link_err"
 
+    # Before failing, probe whether a billable service (run.googleapis.com) can actually be enabled:
+    # under MSP/reseller billing or restricted quota projects, `billing projects describe` may report false
+    # even when the project already has active billing attached.
+    if [[ "$enabled" == "false" ]]; then
+      probe_err="$(mktemp)"
+      if gcloud services enable run.googleapis.com --project "$project" --quiet >/dev/null 2>"$probe_err"; then
+        enabled="true"
+      else
+        [[ -n "$last_err" ]] || last_err="$(tr '\n' ' ' <"$probe_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
+      fi
+      rm -f "$probe_err"
+    fi
+
     if [[ "$enabled" == "false" ]]; then
       die "Cloud Billing is not enabled on project ${project}${last_err:+ (${last_err})}.
-  Link an active billing account in Google Cloud Console (Billing > Link a billing account) or pass --billing-account ACCOUNT_ID, then re-run."
+  Link an active billing account in Google Cloud Console (Billing > Link a billing account) or pass --billing-account ACCOUNT_ID, then re-run.
+  [안내] 배포 실행 계정에 빌링 열람/관리 권한은 없어도 되지만, 프로젝트 자체에는 결제 계정(Billing Account)이 연결되어 있어야 Cloud Run 활성화가 가능합니다. 클라우드/빌링 담당자에게 '${project}' 프로젝트 결제 계정 연결만 요청하신 뒤 동일 명령어를 다시 실행해 주세요."
     fi
   fi
   printf '%s' "$acct_name"
@@ -700,10 +744,17 @@ preflight_caller_permissions() {
   Fix option 1 — log in as a Project Owner and re-run:
     gcloud auth login
 
-  Fix option 2 — ask a Project Owner to grant Owner (or the least-privilege roles below) to ${account}:
+  Fix option 2 — ask a Project Owner to grant Owner (or Editor + Project IAM Admin) to ${account}:
     gcloud projects add-iam-policy-binding ${project} --member=\"${member}\" --role=\"roles/owner\"
 
-  (Least-privilege alternative instead of roles/owner: ${roles_csv})"
+  (Least-privilege alternative instead of roles/owner:
+    gcloud projects add-iam-policy-binding ${project} --member=\"${member}\" --role=\"roles/editor\"
+    gcloud projects add-iam-policy-binding ${project} --member=\"${member}\" --role=\"roles/resourcemanager.projectIamAdmin\"
+   or individual roles: ${roles_csv})
+
+  [한국어 안내] 현재 로그인된 계정(${account})에 '${project}' 프로젝트 배포 권한(IAM 정책 설정/API 활성화)이 없습니다.
+   1) 다른 Google 계정으로 잘못 로그인된 경우: gcloud auth login 실행 후 소유자 계정으로 다시 로그인하세요.
+   2) 프로젝트 관리자에게 위 명령어로 '${account}' 계정에 소유자(roles/owner) 또는 편집자+프로젝트 IAM 관리자(roles/editor + roles/resourcemanager.projectIamAdmin) 권한 부여를 요청하신 뒤 동일 명령어를 다시 실행해 주세요."
 }
 
 # ensure_service_identities PROJECT PROJECT_NUMBER SERVICE [SERVICE ...]
@@ -789,7 +840,7 @@ ensure_secret_created() {
 grant_dataset_role() {
   local file rc=0
   file="$(mktemp)"
-  if ! bq --project_id "$1" show --format=prettyjson "${1}:${2}" >"$file"; then
+  if ! bq --project_id "$1" show --format=prettyjson "${1}:${2}" >"$file" 2>/dev/null; then
     rm -f "$file"
     return 1
   fi
@@ -805,7 +856,7 @@ access.append({"role": role, "userByEmail": email})
 json.dump(dataset, open(path, "w"))
 PYCODE
   if [[ $rc -eq 0 ]]; then
-    bq --project_id "$1" update --source "$file" "${1}:${2}" >/dev/null || rc=1
+    bq --project_id "$1" update --source "$file" "${1}:${2}" >/dev/null 2>&1 || rc=1
   elif [[ $rc -eq 3 ]]; then
     rc=0
   fi
