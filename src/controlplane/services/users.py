@@ -50,29 +50,29 @@ def long_ctes(ctx, start_param="start_ts"):
         c, caps_m = msg_ctes(msrc, start_param)
         ctes += c
         labels.append(msrc.label)
-        parts.append("SELECT email, 'geActivity' AS metric, 1 AS value, ts FROM msg WHERE NOT is_auto")
+        parts.append("SELECT email AS email, 'geActivity' AS metric, 1 AS value, ts AS ts FROM msg WHERE NOT is_auto")
         available.add("geActivity")
     if asrc:
         c, caps_a = act_ctes(asrc, start_param)
         ctes += c
         labels.append(asrc.label)
         act_ok = caps_a["token"] and caps_a["user"]
-        parts.append("SELECT email, 'geActivity', 1, ts FROM act WHERE NOT is_auto")
+        parts.append("SELECT email AS email, 'geActivity' AS metric, 1 AS value, ts AS ts FROM act WHERE NOT is_auto")
         available.add("geActivity")
         if caps_a["agent"]:
             # Scheduled runs are the owner's agent calls but not activity of the person (AUTO_METRIC, see pivot_sql).
-            parts.append("SELECT email, IF(is_auto, '%s', 'agentCalls'), 1, ts FROM act WHERE agent_id IS NOT NULL"
-                         % AUTO_METRIC)
+            parts.append("SELECT email AS email, IF(is_auto, '%s', 'agentCalls') AS metric, 1 AS value, ts AS ts "
+                         "FROM act WHERE agent_id IS NOT NULL" % AUTO_METRIC)
             available.add("agentCalls")
     has_prompts, has_uploads = prompt_caps(caps_m, caps_a)
     if has_prompts or has_uploads:
         # Prompts and uploads: message log when populated in the window, otherwise activity log calls.
         ctes.append(ev_cte(bool(msrc), bool(asrc)))
         if has_prompts:
-            parts.append("SELECT email, 'gePrompts', 1, ts FROM ev WHERE prompt = 1")
+            parts.append("SELECT email AS email, 'gePrompts' AS metric, 1 AS value, ts AS ts FROM ev WHERE prompt = 1")
             available.add("gePrompts")
         if has_uploads:
-            parts.append("SELECT email, 'fileUploads', 1, ts FROM ev WHERE upload = 1")
+            parts.append("SELECT email AS email, 'fileUploads' AS metric, 1 AS value, ts AS ts FROM ev WHERE upload = 1")
             available.add("fileUploads")
     if dsrc:
         nb = nb_ctes(dsrc, start_param)
@@ -80,13 +80,13 @@ def long_ctes(ctx, start_param="start_ts"):
         if nb is not None:
             ctes += nb
             labels.append(dsrc.label)
-            parts.append("SELECT email, 'notebooklmActivity', 1, ts FROM nb")
-            parts.append("SELECT email, 'notebooklmPrompts', 1, MIN(ts) FROM nb WHERE prompt_key IS NOT NULL "
-                         "GROUP BY email, prompt_key")
+            parts.append("SELECT email AS email, 'notebooklmActivity' AS metric, 1 AS value, ts AS ts FROM nb")
+            parts.append("SELECT email AS email, 'notebooklmPrompts' AS metric, 1 AS value, MIN(ts) AS ts FROM nb "
+                         "WHERE prompt_key IS NOT NULL GROUP BY email, prompt_key")
             ctes.append("apc AS (SELECT %s AS ts, LOWER(%s) AS email FROM da_src t WHERE %s = 'aiplatform.googleapis.com' "
                         "AND REGEXP_CONTAINS(%s, r'%s'))" % (f["ts"], f["principal"], f["service"], f["method"],
                                                              MODEL_CALL_METHODS))
-            parts.append("SELECT email, 'agentPlatformCalls', 1, ts FROM apc")
+            parts.append("SELECT email AS email, 'agentPlatformCalls' AS metric, 1 AS value, ts AS ts FROM apc")
             available.update({"notebooklmActivity", "notebooklmPrompts", "agentPlatformCalls"})
     if osrc and act_ok:
         c, caps = armor_ctes(osrc, start_param)
@@ -95,8 +95,8 @@ def long_ctes(ctx, start_param="start_ts"):
             ctes.append("act_tok AS (SELECT token, ANY_VALUE(email) AS email FROM act WHERE token IS NOT NULL "
                         "AND email IS NOT NULL GROUP BY token)")
             labels.append(osrc.label)
-            parts.append("SELECT t.email, 'armorBlocks', 1, o.ts FROM ops o JOIN act_tok t ON t.token = o.token "
-                         "WHERE o.blocked")
+            parts.append("SELECT t.email AS email, 'armorBlocks' AS metric, 1 AS value, o.ts AS ts "
+                         "FROM ops o JOIN act_tok t ON t.token = o.token WHERE o.blocked")
             available.add("armorBlocks")
     agy_in_sql = False
     if agy_src is not None:
@@ -105,8 +105,8 @@ def long_ctes(ctx, start_param="start_ts"):
             ctes.append(agy_src.cte("agy_src", start=start_param))
             ctes.append("agy AS (SELECT %s AS ts, LOWER(%s) AS email, IFNULL(%s, 0) AS total FROM agy_src t)"
                         % (f["ts"], f["user"], f["total"] or "0"))
-            parts.append("SELECT email, 'antigravityRequests', 1, ts FROM agy")
-            parts.append("SELECT email, 'antigravityTokens', total, ts FROM agy")
+            parts.append("SELECT email AS email, 'antigravityRequests' AS metric, 1 AS value, ts AS ts FROM agy")
+            parts.append("SELECT email AS email, 'antigravityTokens' AS metric, total AS value, ts AS ts FROM agy")
             labels.append(agy_src.label)
             agy_in_sql = True
             available.update({"antigravityRequests", "antigravityTokens"})

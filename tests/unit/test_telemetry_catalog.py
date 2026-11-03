@@ -484,6 +484,62 @@ class IdleDatasetDiscoveryTest(unittest.TestCase):
         self.assertEqual(st["quickAdd"]["mapping"]["user"], "jsonPayload.actor_email")
         self.assertEqual(st["quickAdd"]["mapping"]["model"], "jsonPayload.model_id")
 
+    def test_sample_missing_custom_logs_populates_leaves_when_drowned_out(self):
+        Gcp = type("Gcp", (), {})
+
+        class Ctx:
+            gcp = Gcp()
+            project = "demo-project"
+
+            def rest(self, _method, _url, **_kw):
+                return {"entries": [{
+                    "timestamp": "2026-10-19T12:00:00Z",
+                    "jsonPayload": {"step_name": "retrieve", "token_usage": 530, "actor_email": "a@example.org"},
+                }]}
+
+            def run(self, tasks):
+                return {k: (True, fn()) for k, fn in tasks.items()}
+
+        leaves = {}
+        telemetry._sample_missing_custom_logs(
+            Ctx(),
+            [{"shortName": "custom_rag_worker", "logName": "projects/demo-project/logs/custom_rag_worker", "project": "demo-project"}],
+            leaves,
+        )
+        self.assertEqual(leaves["custom_rag_worker"]["jsonPayload.token_usage"], "NUMBER")
+
+    def test_users_long_ctes_aliases_metric_and_value_without_ge_tables(self):
+        from controlplane.services import users as users_svc
+        from controlplane.services.base import AUDIT_DATA_ACCESS
+        da_schema = schema_mod.TableSchema.from_dicts(COMMON + [rec(
+            "protopayload_auditlog", col("methodName"), col("serviceName"), col("resourceName"),
+            rec("authenticationInfo", col("principalEmail")),
+            rec("status", col("code", "INTEGER"), col("message")))])
+
+        class FakeSrc:
+            schema = da_schema
+            label = "bigquery:ge_analytics.cloudaudit_googleapis_com_data_access"
+
+            @staticmethod
+            def time_column():
+                return "timestamp"
+
+            @staticmethod
+            def cte(alias, start="start_ts"):
+                return "%s AS (SELECT * FROM t WHERE timestamp >= @%s)" % (alias, start)
+
+        class Ctx:
+            settings = {"governance": {"antigravity": {"usage_source": "auto"}}}
+
+            @staticmethod
+            def audit_source(name, optional=False):
+                return FakeSrc() if name == AUDIT_DATA_ACCESS else None
+
+        ctes, parts, _labels, _agy, available = users_svc.long_ctes(Ctx())
+        self.assertIn("agentPlatformCalls", available)
+        sql = users_svc.pivot_sql(ctes, parts)
+        self.assertIn("AS metric, 1 AS value, ts AS ts FROM nb", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -395,6 +395,7 @@ def _sample_logs_and_workloads(ctx):
         "resourceNames": ["projects/%s" % p for p in projs],
         "filter": (
             'timestamp>="%s" AND NOT logName:"cloudaudit.googleapis.com" '
+            'AND NOT logName:"run.googleapis.com%%2Frequests" '
             'AND NOT logName:"run.googleapis.com%%2Fvarlog%%2Fsystem"' % since
         ),
         "orderBy": "timestamp desc",
@@ -911,6 +912,45 @@ def _enrich_connector_meta(ctx, item):
         item["projectScope"] = item.get("projectScope") or "single"
 
 
+def _sample_missing_custom_logs(ctx, logs, log_leaves):
+    """Samples up to 3 recent entries for uncatalogued custom logs missed by the global sample window."""
+    gcp = getattr(ctx, "gcp", None)
+    if not (type(gcp).__name__ == "Gcp" and "request" not in getattr(gcp, "__dict__", {})):
+        return
+    tasks = {}
+    for lg in logs or []:
+        if len(tasks) >= 10:
+            break
+        short = lg.get("shortName") or ""
+        ln = lg.get("logName") or ""
+        proj = lg.get("project") or ctx.project
+        if not short or not ln or short in log_leaves or not config.valid_project(proj or ""):
+            continue
+        sid = catalog.sanitize_log_name(short)
+        if sid in CORE_TABLES or catalog.describe(sid, short=short).get("known"):
+            continue
+        safe_ln = ln.replace("\\", "\\\\").replace('"', '\\"')
+        tasks[short] = (
+            lambda p=proj, flt=('logName="%s"' % safe_ln): ctx.rest(
+                "POST", "%s/entries:list" % LOGGING_V2,
+                json_body={"resourceNames": ["projects/%s" % p], "filter": flt, "orderBy": "timestamp desc", "pageSize": 3},
+                timeout=4,
+            )
+        )
+    if not tasks:
+        return
+    for short, (ok, data) in ctx.run(tasks).items():
+        if not ok or not isinstance(data, dict):
+            continue
+        bucket = {}
+        for entry in data.get("entries") or []:
+            if isinstance(entry, dict):
+                for pth, ftype in _extract_entry_leaves(entry):
+                    bucket.setdefault(pth, ftype)
+        if bucket:
+            log_leaves[short] = bucket
+
+
 def _compute_discover(ctx):
     by_table, by_log, by_filter = {}, {}, {}
     for conn in all_connectors(ctx):
@@ -938,6 +978,8 @@ def _compute_discover(ctx):
     workload_streams, short_30d, log_leaves = (
         res["samples"][1] if res.get("samples") and res["samples"][0] else ([], {}, {})
     )
+    log_leaves = dict(log_leaves or {})
+    _sample_missing_custom_logs(ctx, logs, log_leaves)
     logical = {tb["id"] for tb in tables or []}
     builtin = _builtin_logs(ctx)
     by_id = {}
