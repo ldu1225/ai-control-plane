@@ -119,8 +119,8 @@ caller_iam_member() {
   fi
 }
 
-# Ensures gcloud has an authenticated active account; runs `gcloud auth login` interactively when needed.
-# Prints the active account email to stdout.
+# Ensures gcloud has an authenticated active account with a valid access token; runs `gcloud auth login`
+# interactively when needed. Prints the active account email to stdout.
 ensure_gcloud_auth() {
   local acct
   acct="$(trim_ws "$(gcloud config get-value account 2>/dev/null || true)")"
@@ -134,11 +134,19 @@ ensure_gcloud_auth() {
     fi
   fi
   [[ -n "$acct" ]] || die "no active gcloud account (run: gcloud auth login)"
+  if [[ "${DRY_RUN:-0}" != "1" ]] && ! gcloud auth print-access-token >/dev/null 2>&1; then
+    if [[ -t 0 ]]; then
+      info "gcloud session for ${acct} has expired; starting interactive re-authentication..." >&2
+      gcloud auth login "$acct" --quiet >&2 || die "gcloud authentication failed for ${acct}"
+    else
+      die "gcloud session for ${acct} has expired (run: gcloud auth login ${acct})"
+    fi
+  fi
   printf '%s' "$acct"
 }
 
-# Enables the 4 foundational control-plane APIs first so projects.testIamPermissions, IAM inspection and
-# batch API enabling never fail on a brand-new empty project.
+# Enables the foundational control-plane & billing APIs first so projects.testIamPermissions, IAM inspection,
+# Cloud Billing checks and batch API enabling never fail on a brand-new empty project.
 bootstrap_foundation_apis() {
   local project="$1"
   [[ "${DRY_RUN:-0}" == "1" ]] && return 0
@@ -147,6 +155,7 @@ bootstrap_foundation_apis() {
     cloudresourcemanager.googleapis.com \
     iam.googleapis.com \
     iamcredentials.googleapis.com \
+    cloudbilling.googleapis.com \
     --project "$project" --quiet >/dev/null 2>&1 || true
 }
 
@@ -241,44 +250,73 @@ enable_project_apis() {
   fi
 }
 
-# Verifies that Cloud Billing is linked to PROJECT. When unlinked and exactly one open billing account is
-# accessible to the caller, links it automatically. Prints the linked billing account ID (XXXXXX-XXXXXX-XXXXXX)
-# on stdout when readable, or empty string when billing metadata is not visible to the caller.
+# Verifies that Cloud Billing is linked to PROJECT.
+# Usage: ensure_project_billing PROJECT [PREFERRED_BILLING_ACCOUNT_ID]
+# When unlinked, tries: (1) explicit PREFERRED_BILLING_ACCOUNT_ID, (2) billing account already linked on a
+# sibling project in the same folder, or (3) accessible open billing account(s). Prints the linked billing
+# account ID (XXXXXX-XXXXXX-XXXXXX) on stdout when readable.
 ensure_project_billing() {
-  local project="$1" info_json enabled acct_name open_accts count first_ba
+  local project="$1" preferred_ba="${2:-}" info_json enabled acct_name candidates=() cand parent_info parent_id sib_list sib sib_ba open_accts count link_err last_err=""
   [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  preferred_ba="$(trim_ws "${preferred_ba#billingAccounts/}")"
   info_json="$(gcloud billing projects describe "$project" --format=json 2>/dev/null || true)"
   if [[ -z "$info_json" ]]; then
+    [[ -n "$preferred_ba" ]] && printf '%s' "$preferred_ba"
     return 0
   fi
   enabled="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("true" if d.get("billingEnabled") else "false")' "$info_json" 2>/dev/null || echo "unknown")"
   acct_name="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print((d.get("billingAccountName") or "").rsplit("/",1)[-1])' "$info_json" 2>/dev/null || true)"
   if [[ "$enabled" == "false" ]]; then
+    [[ -n "$preferred_ba" ]] && candidates+=("$preferred_ba")
+    parent_info="$(gcloud projects describe "$project" --format='value(parent.id,parent.type)' 2>/dev/null || true)"
+    parent_id="${parent_info%%$'\t'*}"
+    if [[ -n "$parent_id" && "$parent_info" == *$'\t'folder* ]]; then
+      sib_list="$(gcloud projects list --filter="parent.id=${parent_id} AND lifecycleState=ACTIVE" --format='value(projectId)' --limit=6 2>/dev/null || true)"
+      while IFS= read -r sib; do
+        [[ -n "$sib" && "$sib" != "$project" ]] || continue
+        sib_ba="$(gcloud billing projects describe "$sib" --format='value(billingAccountName)' 2>/dev/null | awk -F/ '{print $NF}' || true)"
+        if [[ -n "$sib_ba" && " ${candidates[*]-} " != *" ${sib_ba} "* ]]; then
+          candidates+=("$sib_ba")
+          break
+        fi
+      done <<<"$sib_list"
+    fi
     open_accts="$(gcloud billing accounts list --filter="open=true" --format="value(name)" 2>/dev/null || true)"
     count="$(printf '%s\n' "$open_accts" | sed '/^[[:space:]]*$/d' | wc -l | tr -d '[:space:]')"
     if [[ "$count" == "1" ]]; then
-      first_ba="$(printf '%s\n' "$open_accts" | head -n 1 | awk -F/ '{print $NF}')"
-      info "linking open billing account ${first_ba} to ${project}..." >&2
-      if gcloud billing projects link "$project" --billing-account="$first_ba" --quiet >/dev/null 2>&1; then
-        acct_name="$first_ba"
-        enabled="true"
-      fi
+      cand="$(printf '%s\n' "$open_accts" | head -n 1 | awk -F/ '{print $NF}')"
+      [[ -n "$cand" && " ${candidates[*]-} " != *" ${cand} "* ]] && candidates+=("$cand")
     fi
+
+    link_err="$(mktemp)"
+    for cand in ${candidates[@]+"${candidates[@]}"}; do
+      info "linking billing account ${cand} to ${project}..." >&2
+      if gcloud billing projects link "$project" --billing-account="$cand" --quiet >/dev/null 2>"$link_err"; then
+        acct_name="$cand"
+        enabled="true"
+        break
+      fi
+      last_err="$(tr '\n' ' ' <"$link_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
+    done
+    rm -f "$link_err"
+
     if [[ "$enabled" == "false" ]]; then
-      die "Cloud Billing is not enabled on project ${project}. Enable billing in Google Cloud Console (Billing > Link a billing account) and re-run."
+      die "Cloud Billing is not enabled on project ${project}${last_err:+ (${last_err})}.
+  Link an active billing account in Google Cloud Console (Billing > Link a billing account) or pass --billing-account ACCOUNT_ID, then re-run."
     fi
   fi
   printf '%s' "$acct_name"
 }
 
 # Scans BigQuery datasets in PROJECT for a Cloud Billing export table (detailed resource export preferred,
-# standard export fallback). Prints "DATASET|TABLE" when found, or nothing.
+# standard export fallback). Uses REST first and falls back to `bq ls` on mTLS-protected workstations.
+# Prints "DATASET|TABLE" when found, or nothing.
 auto_detect_billing_export() {
-  local project="$1" token
+  local project="$1" token out="" ds_list ds tbl_json found
   [[ "${DRY_RUN:-0}" == "1" ]] && return 0
   token="$(gcloud auth print-access-token 2>/dev/null || true)"
-  [[ -n "$token" ]] || return 0
-  ACP_ACCESS_TOKEN="$token" python3 - "$project" <<'PYBILL' || true
+  if [[ -n "$token" ]]; then
+    out="$(ACP_ACCESS_TOKEN="$token" python3 - "$project" <<'PYBILL' 2>/dev/null || true
 import json, os, sys, urllib.request
 
 project = sys.argv[1]
@@ -295,9 +333,8 @@ def get(url):
 try:
     datasets = (get(base + "?maxResults=200").get("datasets") or [])
 except Exception:  # pylint: disable=broad-except
-    sys.exit(0)
+    sys.exit(2)
 
-# Prioritize datasets commonly named *billing* first, then any other dataset.
 ordered = sorted(
     [d.get("datasetReference", {}).get("datasetId", "") for d in datasets],
     key=lambda name: (0 if "billing" in name.lower() else 1, name),
@@ -320,6 +357,44 @@ for ds in ordered:
 if fallback:
     print(fallback)
 PYBILL
+)"
+    if [[ -n "$out" ]]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+  ds_list="$(bq --project_id="$project" ls --format=json 2>/dev/null || true)"
+  [[ -n "$ds_list" && "$ds_list" == \[* ]] || return 0
+  for ds in $(python3 -c '
+import json, sys
+try:
+    items = json.loads(sys.argv[1]) or []
+    names = [d.get("datasetReference", {}).get("datasetId", "") for d in items]
+    for n in sorted([x for x in names if x], key=lambda s: (0 if "billing" in s.lower() else 1, s)):
+        print(n)
+except Exception:
+    pass
+' "$ds_list"); do
+    tbl_json="$(bq --project_id="$project" ls --max_results=200 --format=json "${project}:${ds}" 2>/dev/null || true)"
+    [[ -n "$tbl_json" && "$tbl_json" == \[* ]] || continue
+    found="$(python3 -c '
+import json, sys
+ds, raw = sys.argv[1], sys.argv[2]
+fallback = ""
+for t in (json.loads(raw) or []):
+    tid = t.get("tableReference", {}).get("tableId", "")
+    if tid.startswith("gcp_billing_export_resource_v1_"):
+        print("%s|%s" % (ds, tid)); sys.exit(0)
+    if tid.startswith("gcp_billing_export_v1_") and not fallback:
+        fallback = "%s|%s" % (ds, tid)
+if fallback:
+    print(fallback)
+' "$ds" "$tbl_json" 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  done
 }
 
 # Detects a human-friendly organization display name from PROJECT's ancestor GCP Organization or Project Name.
@@ -597,16 +672,17 @@ preflight_caller_permissions() {
 # Service Usage REST API so freshly enabled APIs never fail with "Service account service-... does not exist"
 # and never prompt interactively to install `gcloud beta`.
 ensure_service_identities() {
-  local project="$1" project_number="$2" token
+  local project="$1" project_number="$2" token gcloud_bin sdk_root svc
   shift 2
   [[ "${DRY_RUN:-0}" == "1" || $# -eq 0 ]] && return 0
   token="$(gcloud auth print-access-token 2>/dev/null || true)"
-  [[ -n "$token" ]] || return 0
-  ACP_ACCESS_TOKEN="$token" python3 - "$project" "$project_number" "$@" <<'PYSID' || true
-import os, sys, urllib.request
+  if [[ -n "$token" ]]; then
+    if ACP_ACCESS_TOKEN="$token" python3 - "$project" "$project_number" "$@" <<'PYSID' 2>/dev/null
+import os, sys, urllib.error, urllib.request
 
 project, project_number, services = sys.argv[1], sys.argv[2], sys.argv[3:]
 token = os.environ["ACP_ACCESS_TOKEN"]
+auth_failed = False
 for svc in services:
     url = "https://serviceusage.googleapis.com/v1beta1/projects/%s/services/%s:generateServiceIdentity" % (
         project_number, svc
@@ -624,9 +700,27 @@ for svc in services:
     try:
         with urllib.request.urlopen(req, timeout=20):
             pass
+    except urllib.error.HTTPError as err:
+        if err.code == 401:
+            auth_failed = True
+            break
     except Exception:  # pylint: disable=broad-except
         pass
+sys.exit(2 if auth_failed else 0)
 PYSID
+    then
+      return 0
+    fi
+  fi
+  # Fallback for mTLS / Context-Aware workstations when `gcloud beta` is already installed (never prompts).
+  gcloud_bin="$(command -v gcloud 2>/dev/null || true)"
+  sdk_root="${gcloud_bin%/bin/gcloud}"
+  if [[ -n "$sdk_root" && -d "${sdk_root}/lib/surface/beta" ]]; then
+    for svc in "$@"; do
+      CLOUDSDK_CORE_DISABLE_PROMPTS=1 gcloud beta services identity create \
+        --service="$svc" --project="$project" --quiet >/dev/null 2>&1 || true
+    done
+  fi
 }
 
 # ensure_secret_created SECRET_NAME PROJECT REGION

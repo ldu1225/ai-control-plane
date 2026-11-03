@@ -19,6 +19,7 @@
 #   --org-name NAME         Organization display name (default: auto-detected from GCP Org / Project)
 #   --access-mode MODE      google | iap | password | google_oauth (default: google)
 #   --service-name NAME     Cloud Run service name (default: ai-control-plane)
+#   --billing-account ID    Cloud Billing account ID to link if the project is unbilled
 #   --read-only             Skip IAM governance write roles (ENABLE_GOVERNANCE_ACTIONS=false)
 #   --no-data-access-logs   Skip enabling Data Access audit logs
 #   --config FILE           Read settings from FILE (CLI flags override FILE values)
@@ -40,10 +41,11 @@ CLI_VIEWERS=""
 CLI_ORG_NAME=""
 CLI_ACCESS_MODE=""
 CLI_SERVICE_NAME=""
+CLI_BILLING_ACCOUNT=""
 CLI_READ_ONLY=""
 CLI_DATA_ACCESS_LOGS=""
 
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
 ORIG_ARGS=("$@")
@@ -58,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --org-name) need_arg "$@"; CLI_ORG_NAME="$2"; shift 2 ;;
     --access-mode) need_arg "$@"; CLI_ACCESS_MODE="$2"; shift 2 ;;
     --service-name) need_arg "$@"; CLI_SERVICE_NAME="$2"; shift 2 ;;
+    --billing-account) need_arg "$@"; CLI_BILLING_ACCOUNT="$2"; shift 2 ;;
     --read-only) CLI_READ_ONLY="1"; shift ;;
     --data-access-logs) CLI_DATA_ACCESS_LOGS="true"; shift ;;
     --no-data-access-logs) CLI_DATA_ACCESS_LOGS="false"; shift ;;
@@ -123,6 +126,7 @@ ALLOWED_USERS="${ALLOWED_USERS:-${INITIAL_VIEWERS:-${VIEWERS:-${VIEWER_EMAILS:-}
 [[ -n "$CLI_ORG_NAME" ]] && ORGANIZATION_NAME="$CLI_ORG_NAME"
 [[ -n "$CLI_ACCESS_MODE" ]] && ACCESS_MODE="$CLI_ACCESS_MODE"
 [[ -n "$CLI_SERVICE_NAME" ]] && SERVICE_NAME="$CLI_SERVICE_NAME"
+[[ -n "$CLI_BILLING_ACCOUNT" ]] && BILLING_ACCOUNT_ID="$CLI_BILLING_ACCOUNT"
 [[ "$CLI_READ_ONLY" == "1" ]] && ENABLE_GOVERNANCE_ACTIONS="false"
 [[ -n "$CLI_DATA_ACCESS_LOGS" ]] && ENABLE_DATA_ACCESS_LOGS="$CLI_DATA_ACCESS_LOGS"
 
@@ -293,8 +297,8 @@ info "access mode: ${ACCESS_MODE}    dashboard URL: ${BASE_URL}"
 # Verify caller IAM permissions upfront (and auto-grant missing deployment roles when caller has IAM Admin).
 preflight_caller_permissions deploy "$PROJECT_ID" "$ACCOUNT" "$NEED_BUILD" "$NEED_SINK" "$NEED_IAP" "$NEED_SCHED" "$NEED_AUDIT"
 
-# Verify Cloud Billing is linked (auto-links when one open billing account is accessible) and detect account ID.
-DETECTED_BA="$(ensure_project_billing "$PROJECT_ID")"
+# Verify Cloud Billing is linked (auto-links when accessible) and detect account ID.
+DETECTED_BA="$(ensure_project_billing "$PROJECT_ID" "$BILLING_ACCOUNT_ID")"
 if [[ -z "$BILLING_ACCOUNT_ID" && -n "$DETECTED_BA" ]]; then
   BILLING_ACCOUNT_ID="$DETECTED_BA"
   info "detected Cloud Billing account: ${BILLING_ACCOUNT_ID}"
@@ -747,13 +751,28 @@ case "$ACCESS_MODE" in
         --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
         --set-secrets "$SECRETS"
       BRIDGE_READY=1
-    elif retry gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
-        --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
-        --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
-        --set-secrets "$SECRETS"; then
-      BRIDGE_READY=1
     else
-      warn "sign-in bridge (${BRIDGE_NAME}) with Cloud Run IAP could not be deployed; deploying the dashboard with built-in ID/Password sign-in enabled"
+      BRIDGE_LOG="$(mktemp)"
+      for bridge_attempt in 1 2 3; do
+        if gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
+            --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
+            --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
+            --set-secrets "$SECRETS" 2>&1 | tee "$BRIDGE_LOG"; then
+          BRIDGE_READY=1
+          break
+        fi
+        if [[ $bridge_attempt -lt 3 ]] && grep -Eiq 'does not exist|serviceAccount|propagation|not ready|DEADLINE_EXCEEDED|UNAVAILABLE' "$BRIDGE_LOG" \
+            && ! grep -Eiq 'organization|FAILED_PRECONDITION|not supported' "$BRIDGE_LOG"; then
+          warn "sign-in bridge attempt ${bridge_attempt}/3 waiting on IAM/agent propagation; retrying in 8s..."
+          sleep 8
+        else
+          break
+        fi
+      done
+      rm -f "$BRIDGE_LOG"
+      if [[ "$BRIDGE_READY" != "1" ]]; then
+        warn "sign-in bridge (${BRIDGE_NAME}) with Cloud Run IAP could not be deployed; deploying the dashboard with built-in ID/Password sign-in enabled"
+      fi
     fi
     if [[ "$BRIDGE_READY" == "1" ]]; then
       run retry gcloud run services add-iam-policy-binding "$BRIDGE_NAME" --project "$PROJECT_ID" --region "$REGION" \
