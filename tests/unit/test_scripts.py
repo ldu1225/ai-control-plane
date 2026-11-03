@@ -961,6 +961,15 @@ class MultiProjectHubAndTeardownTest(unittest.TestCase):
             self.assertIn("storage rm --recursive --all-versions gs://demo-hub-ai-control-plane-settings", calls)
             self.assertIn("logging sinks delete ai-control-plane-ai-logs", calls)
 
+    def test_process_substitution_help_works_over_non_seekable_pipe(self):
+        install_sh = os.path.join(ROOT, "scripts/install.sh")
+        res = subprocess.run(
+            ["bash", "-c", f'bash <(cat "{install_sh}") --help'],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn("Unified Multi-Project Hub", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

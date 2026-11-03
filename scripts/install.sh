@@ -26,7 +26,33 @@ set -euo pipefail
 REPO_URL="${ACP_REPO_URL:-https://github.com/ldu1225/ai-control-plane.git}"
 INSTALL_DIR="${ACP_INSTALL_DIR:-$HOME/ai-control-plane}"
 
-show_install_help() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+show_install_help() {
+  cat <<'HELP'
+AI Control Plane: One-Click / One-Command Installer.
+
+Run directly in Google Cloud Shell (or macOS/Linux) — no manual git clone or config editing needed:
+
+  1) Interactive 1-click wizard (press Enter to accept smart defaults):
+     bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
+
+  2) Single-project automated deployment (zero prompts):
+     bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+       --project PROJECT_ID
+
+  3) Unified Multi-Project Hub (1 dashboard monitoring multiple projects together):
+     bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+       --project HUB_PROJECT_ID --link-projects PROJECT_B,PROJECT_C
+
+  4) Separate per-project deployments (independent Cloud Run instance in each project):
+     bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+       --projects PROJECT_A,PROJECT_B --admins admin@example.org --viewers viewer@example.org
+
+  5) Pre-deployment log collection only:
+     bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+       --prepare-only --project PROJECT_ID
+HELP
+  exit "${1:-0}"
+}
 for _arg in "$@"; do
   [[ "$_arg" == "-h" || "$_arg" == "--help" ]] && show_install_help 0
 done
