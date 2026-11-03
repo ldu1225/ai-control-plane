@@ -11,7 +11,9 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import unittest
 import urllib.error
 from unittest import mock
@@ -514,6 +516,52 @@ esac
             self.assertIn("Deployment complete: demo-proj-alpha", res_multi.stdout)
             self.assertIn("Deployment complete: demo-proj-beta", res_multi.stdout)
             self.assertIn("All 2 project deployment(s) completed", res_multi.stdout)
+
+    def test_enable_data_access_logs_skips_unsupported_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy_path = os.path.join(tmp, "policy.json")
+            with open(policy_path, "w", encoding="utf-8") as fh:
+                fh.write('{"bindings": [], "etag": "Bw=="}\n')
+
+            fake_gcloud = os.path.join(tmp, "gcloud")
+            with open(fake_gcloud, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env python3\n"
+                    "import json, shutil, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "if args[:2] == ['projects', 'get-iam-policy']:\n"
+                    f"    print(open({policy_path!r}).read())\n"
+                    "    sys.exit(0)\n"
+                    "if args[:2] == ['projects', 'set-iam-policy']:\n"
+                    "    cand = json.load(open(args[3]))\n"
+                    "    svcs = {c.get('service') for c in cand.get('auditConfigs', [])}\n"
+                    "    for forbidden in ('notebooklm.googleapis.com', 'generativelanguage.googleapis.com', 'geminidataanalytics.googleapis.com'):\n"
+                    "        if forbidden in svcs:\n"
+                    "            sys.stderr.write(f'ERROR: INVALID_ARGUMENT: Service {forbidden} does not exist or does not support service level configuration\\n')\n"
+                    "            sys.exit(1)\n"
+                    f"    shutil.copyfile(args[3], {policy_path!r})\n"
+                    "    sys.exit(0)\n"
+                    "sys.exit(0)\n"
+                )
+            os.chmod(fake_gcloud, 0o755)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}")
+            res = subprocess.run(
+                [
+                    "bash", "-c",
+                    f"source {os.path.join(ROOT, 'scripts/lib/common.sh')}; DRY_RUN=0; enable_data_access_logs demo-audit-proj",
+                ],
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertEqual(res.stderr, "")
+            self.assertIn("Data Access audit logs enabled across all AI services", res.stdout)
+            saved = open(policy_path, encoding="utf-8").read()
+            self.assertIn("aiplatform.googleapis.com", saved)
+            self.assertIn("discoveryengine.googleapis.com", saved)
+            self.assertIn("modelarmor.googleapis.com", saved)
+            self.assertIn("businessaicode.googleapis.com", saved)
+            self.assertNotIn("notebooklm.googleapis.com", saved)
+            self.assertNotIn("generativelanguage.googleapis.com", saved)
 
 
 if __name__ == "__main__":

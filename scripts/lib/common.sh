@@ -825,21 +825,24 @@ ensure_ai_log_sink() {
 }
 
 # enable_data_access_logs PROJECT
-# Enables ADMIN_READ, DATA_READ and DATA_WRITE Cloud Audit Logs across all 7 AI services routed by
-# ai_log_filter (Agent Platform, Discovery Engine, Model Armor, Antigravity, NotebookLM, Gemini Data
-# Analytics and Gemini API). Retries on concurrent IAM etag conflicts so parallel bindings never fail.
+# Enables ADMIN_READ, DATA_READ and DATA_WRITE Cloud Audit Logs across all IAM-configurable AI services
+# (Agent Platform, Discovery Engine [Gemini Enterprise & NotebookLM], Model Armor, Antigravity, and Gemini
+# Data Analytics). Retries on concurrent IAM etag conflicts and automatically skips any service identifier
+# rejected with INVALID_ARGUMENT in restricted environments.
 enable_data_access_logs() {
-  local project="$1" file changed attempt
-  for attempt in 1 2 3 4; do
+  local project="$1" file err_file changed attempt skip_csv="" bad_svc
+  for attempt in 1 2 3 5; do
     file="$(mktemp)"
+    err_file="$(mktemp)"
     if ! gcloud projects get-iam-policy "$project" --format=json >"$file" 2>/dev/null; then
-      rm -f "$file"
+      rm -f "$file" "$err_file"
       warn "cannot read IAM policy of ${project} to update Data Access audit logs; continuing"
       return 0
     fi
-    changed="$(python3 - "$file" <<'PYAUDIT'
+    changed="$(python3 - "$file" "$skip_csv" <<'PYAUDIT'
 import json, sys
 path = sys.argv[1]
+skip = {s.strip() for s in sys.argv[2].split(",") if s.strip()}
 policy = json.load(open(path))
 configs = policy.setdefault("auditConfigs", [])
 changed = False
@@ -848,11 +851,11 @@ services = (
     "discoveryengine.googleapis.com",
     "modelarmor.googleapis.com",
     "businessaicode.googleapis.com",
-    "notebooklm.googleapis.com",
     "geminidataanalytics.googleapis.com",
-    "generativelanguage.googleapis.com",
 )
 for service in services:
+    if service in skip:
+        continue
     entry = next((c for c in configs if c.get("service") == service), None)
     if entry is None:
         entry = {"service": service, "auditLogConfigs": []}
@@ -867,22 +870,34 @@ print("yes" if changed else "no")
 PYAUDIT
 )"
     if [[ "$changed" != "yes" ]]; then
-      rm -f "$file"
+      rm -f "$file" "$err_file"
       info "Data Access audit logs already enabled across all AI services"
       return 0
     fi
     if [[ "${DRY_RUN:-0}" == "1" ]]; then
-      rm -f "$file"
+      rm -f "$file" "$err_file"
       info "[dry-run] Data Access audit logs would be enabled across all AI services"
       return 0
     fi
-    if gcloud projects set-iam-policy "$project" "$file" --quiet >/dev/null 2>&1; then
-      rm -f "$file"
-      info "Data Access audit logs enabled across all AI services (Agent Platform, Gemini Enterprise, Model Armor, NotebookLM, Antigravity)"
+    if gcloud projects set-iam-policy "$project" "$file" --quiet >/dev/null 2>"$err_file"; then
+      rm -f "$file" "$err_file"
+      info "Data Access audit logs enabled across all AI services (Agent Platform, Gemini Enterprise, NotebookLM, Model Armor, Antigravity)"
       return 0
     fi
-    rm -f "$file"
-    sleep 4
+    bad_svc="$(python3 - "$err_file" <<'PYERR' || true
+import re, sys
+txt = open(sys.argv[1], errors="replace").read()
+m = re.search(r"Service\s+([a-z0-9.-]+\.googleapis\.com)\s+does not", txt)
+if m:
+    print(m.group(1))
+PYERR
+)"
+    rm -f "$file" "$err_file"
+    if [[ -n "$bad_svc" && ",${skip_csv}," != *",${bad_svc},"* ]]; then
+      skip_csv="${skip_csv:+${skip_csv},}${bad_svc}"
+      continue
+    fi
+    sleep 3
   done
   warn "could not update Data Access audit log configuration on ${project} after retries; continuing"
 }

@@ -788,16 +788,19 @@ case "$ACCESS_MODE" in
       grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/iap.admin"
       if [[ "$DRY_RUN" -eq 0 ]]; then
         IAP_BRAND="projects/${PROJECT_NUMBER}/brands/${PROJECT_NUMBER}"
-        IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || echo "[]")"
-        if [[ "$IAP_CLIENT_JSON" == "[]" || -z "$IAP_CLIENT_JSON" ]]; then
+        IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || true)"
+        if [[ -z "$IAP_CLIENT_JSON" || "$IAP_CLIENT_JSON" == "[]" ]]; then
           gcloud iap oauth-clients create "$IAP_BRAND" --display_name="${SERVICE_NAME}-iap" --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
-          IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || echo "[]")"
+          IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || true)"
         fi
         IAP_SETTINGS_FILE="$(mktemp)"
-        if python3 - "$IAP_CLIENT_JSON" "$IAP_SETTINGS_FILE" <<'PY'
+        if python3 - "$IAP_CLIENT_JSON" "$IAP_SETTINGS_FILE" <<'PY' 2>/dev/null
 import json, sys
-clients = json.loads(sys.argv[1] or "[]")
-if not clients:
+try:
+    clients = json.loads((sys.argv[1] or "").strip() or "[]")
+except Exception:
+    sys.exit(1)
+if not isinstance(clients, list) or not clients:
     sys.exit(1)
 c = clients[0]
 cid = c.get("name", "").rpartition("/")[2]

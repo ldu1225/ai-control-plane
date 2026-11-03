@@ -106,17 +106,19 @@ flowchart LR
 
 ```text
 .
-|-- deploy.env.example          # 배포 설정 템플릿 (복사해서 deploy.env로 사용, Git 제외)
+|-- deploy.env.example          # 배포 설정 템플릿 (선택 — CLI 옵션만으로도 바로 배포 가능)
+|-- TUTORIAL.md                 # Open in Cloud Shell 대화형 설치 튜토리얼
 |-- config.yaml                 # 기본 설정 (자리표시자만 포함)
 |-- config.local.yaml.example   # 로컬 개발용 설정 템플릿 (복사해서 config.local.yaml로 사용, Git 제외)
 |-- requirements.txt            # 버전 고정 의존성
 |-- Dockerfile                  # 비루트 사용자로 실행되는 컨테이너 이미지
 |-- .dockerignore, .gcloudignore
 |-- scripts/
-|   |-- prepare.sh              # 배포 전 준비: 로그 수집 시작 (싱크, Gemini Enterprise 사용 로그)
-|   |-- deploy.sh               # 명령 한 번 배포 (다시 실행해도 안전)
+|   |-- install.sh              # 원클릭 / 명령 한 줄 자동 부트스트랩 설치기 (단일·복수 프로젝트)
+|   |-- prepare.sh              # 배포 전 준비: 로그 수집 시작 (싱크, Data Access, Gemini Enterprise 로그)
+|   |-- deploy.sh               # 명령 한 번 무중단 배포 (빈 프로젝트 기반 구성부터 헬스체크까지)
 |   |-- teardown.sh             # 배포한 리소스 삭제
-|   |-- lib/common.sh           # prepare.sh와 deploy.sh가 함께 쓰는 단계 (싱크 필터 포함)
+|   |-- lib/common.sh           # install / prepare / deploy 공통 자동화 모듈
 |   |-- prepublish_scan.py      # 배포 전 검사: 비밀 정보와 배포 식별자 (CI에서도 실행)
 |   `-- git-hooks/pre-push      # 푸시마다 검사를 실행하는 선택형 훅
 |-- terraform/                  # Terraform 배포 (IAP 방식, 선택)
@@ -134,7 +136,7 @@ flowchart LR
 |   |   `-- services/           # 모듈별 서비스 (governance, pricing, gemini_enterprise, ...)
 |   `-- web/                    # 프런트엔드 SPA (index.html, login.html, assets/)
 |-- eval/analyst/               # AI 애널리스트 골든 데이터셋과 평가 하네스 (16.1)
-|-- tests/unit/                 # 단위 테스트 (316개)
+|-- tests/unit/                 # 단위 테스트 (332개)
 `-- .github/workflows/tests.yml # 푸시마다 단위 테스트, 배포 전 검사, 데이터셋 검증 실행
 ```
 
@@ -146,27 +148,25 @@ flowchart LR
 
 | 항목 | 내용 |
 |---|---|
-| Google Cloud 프로젝트 | 관제할 프로젝트. 결제가 연결되어 있어야 합니다. |
-| 권한 | 배포하는 계정에 프로젝트 `Owner`(또는 서비스 사용 설정, IAM, Cloud Run, Cloud Build, Artifact Registry, Storage, Secret Manager, Logging, BigQuery 관리 권한) |
-| 도구 | [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) 최신 버전(`gcloud`, `bq` 포함), `python3`, `bash` |
-| 로그인 | `gcloud auth login` 후 `gcloud config set project PROJECT_ID` |
-
-macOS, Linux, Cloud Shell에서 그대로 실행됩니다. Cloud Shell에는 필요한 도구가 모두 설치되어 있습니다. 대시보드를 배포하기 전에 로그부터 쌓아 두려면 [3.5](#35-배포-전에-로그부터-쌓기)를 먼저 실행합니다.
+| Google Cloud 프로젝트 | 방금 생성한 빈(깡통) 프로젝트도 그대로 사용 가능합니다. 결제가 미연결 상태여도 열려 있는 결제 계정이 1개이거나 같은 폴더 내 다른 프로젝트에 결제가 연결되어 있으면 자동으로 연결합니다(`--billing-account ID` 직접 지정도 가능). |
+| 권한 | 배포하는 계정에 프로젝트 `Owner`(또는 IAM 관리자 권한이 있으면 누락된 세부 배포 역할을 스크립트가 스스로 부여) |
+| 실행 환경 | **Google Cloud Shell 권장** (`gcloud`, `bq`, `python3`, `git`, `docker` 모두 기본 내장). macOS / Linux 터미널에서도 동일하게 동작합니다. |
 
 ### 3.2 배포 (원클릭 / 명령 한 줄)
 
-**방법 A — 설정 파일 수정 없이 Cloud Shell에서 바로 실행 (대화형 프로젝트 선택)**
+**방법 A — 설정 파일 수정 없이 Cloud Shell에서 바로 실행 (대화형 프로젝트 번호 선택)**
 ```bash
 bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
 ```
 
-**방법 B — 단일 또는 복수 프로젝트 무인(Non-interactive) 일괄 배포**
+**방법 B — 단일 또는 복수 프로젝트 무인(Non-interactive) 명령 한 줄 일괄 배포**
 ```bash
 bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
   --projects my-project-1,my-project-2 \
   --admins admin@example.org \
   --viewers viewer@example.org
 ```
+*(프로젝트가 1개면 `--project my-project-1` 로 동일하게 실행하며, `--admins` 생략 시 현재 로그인된 `gcloud` 계정이 자동으로 관리자로 등록됩니다.)*
 
 **방법 C — 저장소 클론 후 직접 실행 (`deploy.env` 또는 CLI 옵션)**
 ```bash
@@ -177,28 +177,28 @@ scripts/deploy.sh --project my-project-1 --admins admin@example.org
 # 또는 cp deploy.env.example deploy.env 편집 후 scripts/deploy.sh 실행
 ```
 
-스크립트가 하는 일:
+스크립트가 빈 프로젝트에서 자동으로 처리하는 8단계:
 
 | 단계 | 내용 |
 |---|---|
-| 1. API 사용 설정 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing(가격표), Service Usage, 필요하면 IAP와 Cloud Scheduler |
-| 2. 컨테이너 이미지 | Artifact Registry 저장소(`ai-control-plane`)를 만들고 Cloud Build로 이미지를 빌드합니다. `IMAGE`를 지정하면 빌드를 건너뜁니다. |
-| 3. 런타임 서비스 계정 | 전용 서비스 계정을 만들고 읽기 역할과 감사 로그 쓰기 역할을 부여합니다. `ENABLE_GOVERNANCE_ACTIONS=true`이면 IAM 쓰기 역할을 추가합니다([6.6](#66-런타임-서비스-계정-권한)). `google` 방식에서는 로그인 브리지용 서비스 계정을 따로 만들고, 세션 서명 키만 읽을 수 있게 합니다. |
-| 4. 설정 버킷 | 비공개(공개 접근 차단), 버전 관리되는 Cloud Storage 버킷을 만듭니다. 화면에서 바꾼 설정, 예외 규칙, 정지 기록, 사람별 위젯 배치가 저장됩니다. |
-| 5. 세션 서명 키 | Secret Manager에 임의 키를 만들고 서비스 계정에 읽기 권한을 줍니다. |
-| 6. 데이터 소스 | BigQuery 데이터셋과 Log Router 싱크를 만들고, 이미 있으면 최신 필터로 갱신합니다(`CREATE_LOG_SINK=true`). 모든 Gemini Enterprise 앱에서 사용 로그(관측 가능성)를 켜고(`ENABLE_GE_OBSERVABILITY=true`), 선택하면 Data Access 감사 로그도 켭니다. `scripts/prepare.sh`와 같은 단계입니다. |
-| 7. Cloud Run 배포 | 대시보드를 배포하고 로그인 방식(`ACCESS_MODE`)을 구성합니다. |
-| 8. 자동 집행 일정 | `ENFORCEMENT_SCHEDULE`을 지정하면 Cloud Scheduler 작업을 만듭니다. |
+| 0. 사전 권한·결제 점검 | 기반 제어 API를 먼저 켜고, 호출자 IAM 권한 확인 및 자동 보강(Self-bootstrap), 결제 계정 연결 확인·자동 연결을 수행합니다. |
+| 1. 필수 API & 서비스 에이전트 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, IAP 등 모든 API와 Google 관리형 서비스 에이전트(`service-PROJECT_NUMBER@...`)를 즉시 생성합니다. |
+| 2. 설정 버킷 | 공개 접근이 차단되고 버전 관리가 켜진 Cloud Storage 버킷을 생성합니다. |
+| 3. 전용 서비스 계정 & IAM | 런타임 SA, 로그인 브리지 SA, **전용 Cloud Build 빌더 SA**(Compute Engine 기본 SA에 의존하지 않음)를 만들고 최소 권한을 부여합니다. BigQuery 결제 내보내기 테이블이 있으면 자동으로 탐지합니다. |
+| 4. 컨테이너 이미지 | Artifact Registry 저장소를 만들고 전용 빌더 SA로 Cloud Build 이미지를 빌드합니다(조직 정책으로 Cloud Build가 제한된 환경에서는 Cloud Shell/로컬 Docker로 자동 전환). |
+| 5. 세션 서명 키 | 리전 제한 조직 정책(`constraints/gcp.resourceLocations`)을 준수하여 Secret Manager 시크릿을 생성합니다. |
+| 6. 데이터 소스 일괄 활성화 | BigQuery 데이터셋(`ge_analytics`)과 파티션 Log Router 싱크 생성, **7개 AI 서비스 전체 Data Access 감사 로그 활성화**, 모든 Gemini Enterprise 앱의 **사용 로그 + 프롬프트·사용자 식별 로깅 활성화**, 조직명 및 Agent Platform 엔드포인트 자동 탐지를 수행합니다. |
+| 7. Cloud Run & 인증 자동 대응 | 로그인 브리지(IAP)와 대시보드를 배포합니다. 도메인 제한 공유(`iam.allowedPolicyMemberDomains`)나 비인증 호출 차단 조직 정책이 있어도 `--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** 또는 내장 ID/비밀번호 로그인으로 자동 전환하여 실패 없이 배포합니다. |
+| 8. 라이브 헬스체크 | 배포 직후 실제 엔드포인트 응답 상태(`HTTP 200/302/401`)를 검증하고 접속 주소와 요약 정보를 출력합니다. |
 
-- **다시 실행해도 안전합니다.** 없는 것은 만들고 있는 것은 갱신합니다. 설정을 바꾸고 다시 실행하면 그대로 반영됩니다.
-- `deploy.env`가 서비스 설정의 기준입니다. 실행할 때마다 Cloud Run 환경 변수와 시크릿을 `deploy.env` 기준으로 다시 씁니다.
-- 끝나면 접속 주소가 출력됩니다. 기본 주소는 `https://SERVICE_NAME-PROJECT_NUMBER.REGION.run.app` 형식입니다.
+- **다시 실행해도 안전합니다(멱등성 보장).** 없는 것은 만들고 있는 것은 최신 설정으로 갱신합니다.
+- `install.sh` 실행 시 프로젝트별 설정 스냅샷(`deploy.<PROJECT_ID>.env`, Git 제외)을 자동 저장하므로 추후 재배포도 명령 한 줄로 끝납니다.
 
 ### 3.3 첫 로그인
 
-1. 출력된 주소의 `/login`으로 접속해 **Google 계정으로 로그인**을 누릅니다.
-2. `ADMIN_EMAILS`에 있는 계정은 바로 관리자로 들어갑니다.
-3. 승인되지 않은 계정은 접근 요청으로 기록됩니다. 관리자가 **설정 > 액세스 제어**에서 viewer 또는 admin으로 승인합니다.
+1. 출력된 주소의 `/login`으로 접속해 **Google 계정으로 로그인**을 누릅니다(Direct IAP로 자동 전환된 조직 환경에서는 주소 접속 즉시 Google IAP 로그인이 실행됩니다).
+2. `--admins`(`ADMIN_EMAILS`)로 지정한 계정은 즉시 관리자로, `--viewers`(`ALLOWED_USERS`)로 지정한 계정은 즉시 뷰어로 접속됩니다.
+3. 추가 사용자는 **설정 > 액세스 제어** 화면에서 이메일 또는 도메인을 바로 등록·승인할 수 있습니다.
 
 ### 3.4 배포 후 확인
 
@@ -207,27 +207,25 @@ scripts/deploy.sh --project my-project-1 --admins admin@example.org
 3. 감사 로그 싱크를 새로 만들었다면 테이블은 해당 로그가 처음 발생할 때 생깁니다. 처음 몇 분에서 몇 시간 동안은 일부 지표가 비어 있을 수 있습니다.
 4. Antigravity 사용자별 한도를 쓰려면 [8장](#8-antigravity-사용자별-한도와-정지)을 따릅니다.
 
-### 3.5 배포 전에 로그부터 쌓기
+### 3.5 배포 전에 로그부터 쌓기 (선택)
 
-로그는 켠 시점부터 쌓입니다. 대시보드를 배포하기 전에 프로젝트 Owner가 Cloud Shell에서 아래 명령을 한 번 실행해 두면, 배포 첫날부터 그동안의 사용 현황을 볼 수 있습니다.
+로그는 켠 시점부터 쌓입니다. 대시보드를 아직 배포하지 않고 로그 수집만 먼저 켜 두려면 Cloud Shell에서 아래 명령 한 줄만 실행합니다.
 
 ```bash
-git clone https://github.com/ldu1225/ai-control-plane.git
-cd ai-control-plane
-scripts/prepare.sh --project PROJECT_ID --dataset-location asia-northeast3
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --prepare-only --project PROJECT_ID
 ```
 
 | 단계 | 내용 |
 |---|---|
-| 1. API 사용 설정 | Logging, BigQuery, Discovery Engine, Resource Manager |
+| 1. API 사용 설정 | Logging, BigQuery, Monitoring, Discovery Engine, Agent Platform, Model Armor 등 필수 API 및 서비스 에이전트 생성 |
 | 2. 로그 라우팅 | BigQuery 데이터셋(`ge_analytics`)과 Log Router 싱크(`ai-control-plane-ai-logs`)를 만듭니다([6.1](#61-감사-로그-싱크-bigquery)). Antigravity 로그도 포함되어 있어, Antigravity를 쓰기 시작하면 따로 할 일 없이 쌓입니다. |
-| 3. Gemini Enterprise 사용 로그 | `global`, `us`, `eu`의 모든 Gemini Enterprise 앱에서 관측 가능성(사용 로그와 사용자·프롬프트 로깅)을 켭니다([6.3](#63-gemini-enterprise-로그)). |
-| 4. Data Access 감사 로그 (선택) | `--data-access-logs`를 주면 Agent Platform, Discovery Engine, Model Armor의 Data Access 감사 로그를 켭니다(로그 양과 비용 증가). |
+| 3. Gemini Enterprise 사용·프롬프트 로그 | `global`, `us`, `eu`의 모든 Gemini Enterprise 앱에서 관측 가능성(사용 로그와 사용자·프롬프트 로깅)을 기본으로 켭니다([6.3](#63-gemini-enterprise-로그)). |
+| 4. Data Access 감사 로그 | 7개 AI 서비스(Agent Platform, Gemini Enterprise, Model Armor, Antigravity, NotebookLM, Gemini Data Analytics, Gemini API)의 Data Access 감사 로그를 기본으로 켭니다(제외하려면 `--no-data-access-logs`). |
 | 5. 확인 | 최근 30일 동안 Gemini Enterprise, Model Armor, Antigravity 로그가 들어왔는지 보여 줍니다. |
 
-- 다시 실행해도 안전하고, `--dry-run`으로 바뀔 내용만 먼저 볼 수 있습니다. 옵션 전체는 `scripts/prepare.sh --help`로 봅니다.
-- `scripts/deploy.sh`는 같은 이름의 데이터셋과 싱크를 찾아 그대로 씁니다. 다른 이름을 쓰면 `--dataset`, `--service-name`을 `deploy.env`의 `AUDIT_DATASET`, `SERVICE_NAME`과 맞춥니다.
-- Owner가 아니면 Service Usage 관리자, BigQuery 관리자, 로그 구성 작성자, 로그 뷰어, Discovery Engine 관리자 역할이 필요합니다. Gemini Enterprise 사용 로그를 켤 권한이 없으면 경고와 함께 콘솔 경로를 알려 주고 나머지 단계는 계속합니다.
+- 다시 실행해도 안전하고, `--dry-run`으로 바뀔 내용만 먼저 볼 수 있습니다. 여러 프로젝트를 한 번에 준비하려면 `--projects proj-a,proj-b`를 지정합니다.
+- 이후 대시보드를 배포할 때 `install.sh` 또는 `scripts/deploy.sh`는 같은 이름의 데이터셋과 싱크를 찾아 그대로 재사용합니다.
 
 ---
 

@@ -106,17 +106,19 @@ flowchart LR
 
 ```text
 .
-|-- deploy.env.example          # deployment settings template (copy to deploy.env, excluded from Git)
+|-- deploy.env.example          # deployment settings template (optional — CLI flags work directly)
+|-- TUTORIAL.md                 # Open in Cloud Shell interactive walkthrough
 |-- config.yaml                 # default settings (placeholders only)
 |-- config.local.yaml.example   # local development settings template (copy to config.local.yaml, excluded from Git)
 |-- requirements.txt            # pinned dependencies
 |-- Dockerfile                  # container image that runs as a non-root user
 |-- .dockerignore, .gcloudignore
 |-- scripts/
-|   |-- prepare.sh              # before deployment: start collecting logs (sink, Gemini Enterprise usage logs)
-|   |-- deploy.sh               # one-command deployment (safe to re-run)
+|   |-- install.sh              # one-click / one-command bootstrap installer (single or multi-project)
+|   |-- prepare.sh              # before deployment: start collecting logs (sink, Data Access, Gemini Enterprise logs)
+|   |-- deploy.sh               # one-command resilient deployment (from empty project to live readiness probe)
 |   |-- teardown.sh             # deletes the deployed resources
-|   |-- lib/common.sh           # steps shared by prepare.sh and deploy.sh (including the sink filter)
+|   |-- lib/common.sh           # shared automation helpers for install.sh, prepare.sh and deploy.sh
 |   |-- prepublish_scan.py      # release gate: secrets and deployment identifiers (also runs in CI)
 |   `-- git-hooks/pre-push      # opt-in hook that runs the scan before every push
 |-- terraform/                  # Terraform deployment (IAP mode, optional)
@@ -134,7 +136,7 @@ flowchart LR
 |   |   `-- services/           # per-module services (governance, pricing, gemini_enterprise, ...)
 |   `-- web/                    # frontend SPA (index.html, login.html, assets/)
 |-- eval/analyst/               # AI Analyst golden dataset and evaluation harness (16.1)
-|-- tests/unit/                 # unit tests (316)
+|-- tests/unit/                 # unit tests (332)
 `-- .github/workflows/tests.yml # unit tests, prepublish scan and dataset validation on every push
 ```
 
@@ -146,12 +148,9 @@ flowchart LR
 
 | Item | Details |
 |---|---|
-| Google Cloud project | The project to monitor. Billing must be linked to it. |
-| Permissions | Project `Owner` on the deploying account (or admin permissions for enabling services, IAM, Cloud Run, Cloud Build, Artifact Registry, Storage, Secret Manager, Logging and BigQuery) |
-| Tools | The latest [Google Cloud SDK](https://cloud.google.com/sdk/docs/install) (including `gcloud` and `bq`), `python3`, `bash` |
-| Sign-in | `gcloud auth login`, then `gcloud config set project PROJECT_ID` |
-
-It runs as is on macOS, Linux and Cloud Shell. Cloud Shell already has all the required tools. To start collecting logs before the dashboard is deployed, run [3.5](#35-start-collecting-logs-before-deployment) first.
+| Google Cloud project | Any Google Cloud project, including a brand-new empty project. If billing is not linked yet, the installer automatically links a single open billing account or sibling folder billing account (or pass `--billing-account ID`). |
+| Permissions | Project `Owner` on the deploying account (or IAM Admin — missing operational deployment roles are self-bootstrapped automatically) |
+| Environment | **Google Cloud Shell recommended** (`gcloud`, `bq`, `python3`, `git` and `docker` are pre-installed). Works identically on macOS and Linux. |
 
 ### 3.2 Deploy (One-click / One-liner)
 
@@ -167,6 +166,7 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
   --admins admin@example.org \
   --viewers viewer@example.org
 ```
+*(For a single project pass `--project my-project-1`; when `--admins` is omitted, the active `gcloud` account becomes the initial administrator.)*
 
 **Option C — Clone and run with CLI flags or `deploy.env`**
 ```bash
@@ -177,28 +177,28 @@ scripts/deploy.sh --project my-project-1 --admins admin@example.org
 # or copy deploy.env.example -> deploy.env and run scripts/deploy.sh
 ```
 
-What the script does:
+What the script automates end-to-end on a brand-new project:
 
 | Step | Details |
 |---|---|
-| 1. Enable APIs | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Resource Manager, IAM, Storage, Secret Manager, Cloud Billing (price list), Service Usage, and IAP and Cloud Scheduler when needed |
-| 2. Container image | Creates an Artifact Registry repository (`ai-control-plane`) and builds the image with Cloud Build. If `IMAGE` is set, the build is skipped. |
-| 3. Runtime service account | Creates a dedicated service account and grants it read roles plus the audit log writer. If `ENABLE_GOVERNANCE_ACTIONS=true`, IAM write roles are added ([6.6](#66-runtime-service-account-permissions)). In `google` mode, the sign-in bridge gets its own service account that can read only the session signing key. |
-| 4. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. It stores settings changed in the UI, exception rules, suspension records and personal widget layouts. |
-| 5. Session signing key | Creates a random key in Secret Manager and gives the service account read access to it. |
-| 6. Data sources | Creates the BigQuery dataset and the Log Router sink, or updates an existing sink to the current filter (`CREATE_LOG_SINK=true`). Turns on usage logs (observability) for every Gemini Enterprise app (`ENABLE_GE_OBSERVABILITY=true`) and, optionally, Data Access audit logs. These are the same steps as `scripts/prepare.sh`. |
-| 7. Cloud Run deployment | Deploys the dashboard and configures the sign-in method (`ACCESS_MODE`). |
-| 8. Automatic enforcement schedule | If `ENFORCEMENT_SCHEDULE` is set, creates a Cloud Scheduler job. |
+| 0. Preflight & Billing | Bootstraps foundational control-plane APIs, verifies/self-grants missing caller IAM roles, and verifies or auto-links Cloud Billing. |
+| 1. Enable APIs & Service Agents | Enables Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, IAP and provisions all Google-managed service agents (`service-PROJECT_NUMBER@...`) immediately. |
+| 2. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. |
+| 3. Dedicated SAs & IAM | Creates the runtime SA, sign-in bridge SA, and a **dedicated Cloud Build SA** (never relies on the legacy Compute Engine default SA), grants least-privilege roles, and auto-detects any BigQuery billing export table. |
+| 4. Container image | Creates the Artifact Registry repository and builds with Cloud Build using the dedicated builder SA (automatically falls back to local/Cloud Shell Docker if Cloud Build is restricted). |
+| 5. Session signing key | Creates a regional Secret Manager secret compliant with `constraints/gcp.resourceLocations` org policies. |
+| 6. Full data-source onboarding | Creates the BigQuery dataset (`ge_analytics`) and partitioned Log Router sink, **enables Data Access audit logs across all 7 AI services**, turns on **Gemini Enterprise usage + prompt/user logging**, and auto-detects org name and Agent Platform endpoints. |
+| 7. Resilient Cloud Run & Auth | Deploys the IAP sign-in bridge and dashboard, automatically adapting to enterprise org policies (`--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** or built-in ID/Password sign-in). |
+| 8. Live readiness probe | Verifies live HTTP response from the deployed Cloud Run URL and prints the exact login link. |
 
-- **It is safe to re-run.** It creates what is missing and updates what exists. If you change settings and run it again, the changes are applied.
-- `deploy.env` is the source of truth for the service configuration. Each run rewrites the Cloud Run environment variables and secrets from `deploy.env`.
-- When it finishes, it prints the URL. The default URL has the format `https://SERVICE_NAME-PROJECT_NUMBER.REGION.run.app`.
+- **Safe to re-run (idempotent).** Creates what is missing and updates what exists.
+- `install.sh` saves a git-ignored `deploy.<PROJECT_ID>.env` snapshot per project so future updates take a single command.
 
 ### 3.3 First sign-in
 
-1. Open `/login` at the printed URL and select **Sign in with Google**.
-2. Accounts in `ADMIN_EMAILS` sign in as administrators right away.
-3. Accounts that are not approved are recorded as access requests. An administrator approves them as viewer or admin in **Settings > Access control**.
+1. Open `/login` at the printed URL and select **Sign in with Google** (or sign in directly through Google IAP when Direct Cloud Run IAP was selected automatically).
+2. Accounts in `--admins` (`ADMIN_EMAILS`) sign in as administrators immediately; accounts in `--viewers` (`ALLOWED_USERS`) sign in as viewers immediately.
+3. Additional users or domains can be added anytime in **Settings > Access control**.
 
 ### 3.4 Post-deployment checks
 
@@ -207,27 +207,25 @@ What the script does:
 3. If you created a new audit log sink, each table is created when its log is first written. Some metrics can be empty for the first few minutes to a few hours.
 4. To use Antigravity per-user caps, follow [Section 8](#8-antigravity-per-user-caps-and-suspension).
 
-### 3.5 Start collecting logs before deployment
+### 3.5 Start collecting logs before deployment (optional)
 
-Logs are collected only from the moment they are turned on. If a project Owner runs the command below once in Cloud Shell before the dashboard is deployed, the dashboard shows that history from its first day.
+Logs are collected from the moment they are turned on. To turn on log routing before deploying the dashboard, run one command in Cloud Shell:
 
 ```bash
-git clone https://github.com/ldu1225/ai-control-plane.git
-cd ai-control-plane
-scripts/prepare.sh --project PROJECT_ID --dataset-location asia-northeast3
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --prepare-only --project PROJECT_ID
 ```
 
 | Step | Details |
 |---|---|
-| 1. Enable APIs | Logging, BigQuery, Discovery Engine, Resource Manager |
-| 2. Log routing | Creates the BigQuery dataset (`ge_analytics`) and the Log Router sink (`ai-control-plane-ai-logs`) ([6.1](#61-audit-log-sink-bigquery)). Antigravity logs are included, so they start flowing as soon as Antigravity is used. |
-| 3. Gemini Enterprise usage logs | Turns on observability (usage logs and user/prompt logging) for every Gemini Enterprise app in `global`, `us` and `eu` ([6.3](#63-gemini-enterprise-logs)). |
-| 4. Data Access audit logs (optional) | With `--data-access-logs`, turns on Data Access audit logs for Agent Platform, Discovery Engine and Model Armor (more log volume and cost). |
+| 1. Enable APIs | Logging, BigQuery, Monitoring, Discovery Engine, Agent Platform, Model Armor and service identities |
+| 2. Log routing | Creates the BigQuery dataset (`ge_analytics`) and the Log Router sink (`ai-control-plane-ai-logs`) ([6.1](#61-audit-log-sink-bigquery)). Antigravity logs are included automatically. |
+| 3. Gemini Enterprise usage & prompt logs | Turns on observability (usage logs and user/prompt logging) by default for every Gemini Enterprise app in `global`, `us` and `eu` ([6.3](#63-gemini-enterprise-logs)). |
+| 4. Data Access audit logs | Enables Data Access audit logs across all 7 AI services by default (pass `--no-data-access-logs` to skip). |
 | 5. Check | Shows whether Gemini Enterprise, Model Armor and Antigravity logs arrived in the last 30 days. |
 
-- It is safe to re-run, and `--dry-run` previews the changes first. `scripts/prepare.sh --help` lists every option.
-- `scripts/deploy.sh` finds the dataset and the sink by name and reuses them. If you use other names, match `--dataset` and `--service-name` to `AUDIT_DATASET` and `SERVICE_NAME` in `deploy.env`.
-- Without Owner, the account needs Service Usage Admin, BigQuery Admin, Logs Configuration Writer, Logs Viewer and Discovery Engine Admin. If it cannot turn on Gemini Enterprise usage logs, the script prints a warning with the console path and continues with the other steps.
+- Safe to re-run, and `--dry-run` previews changes first. Pass `--projects proj-a,proj-b` to prepare multiple projects at once.
+- When you later run `install.sh` or `scripts/deploy.sh`, it reuses the dataset and sink automatically.
 
 ---
 
