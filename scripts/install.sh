@@ -6,17 +6,30 @@
 #   1) Interactive 1-click wizard (press Enter to accept smart defaults):
 #      bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
 #
-#   2) Fully automated single or multi-project deployment (zero prompts):
+#   2) Single-project automated deployment (zero prompts):
+#      bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+#        --project PROJECT_ID
+#
+#   3) Unified Multi-Project Hub (1 dashboard monitoring multiple projects together):
+#      bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+#        --project HUB_PROJECT_ID --link-projects PROJECT_B,PROJECT_C
+#
+#   4) Separate per-project deployments (independent Cloud Run instance in each project):
 #      bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
 #        --projects PROJECT_A,PROJECT_B --admins admin@example.org --viewers viewer@example.org
 #
-#   3) Pre-deployment log collection only:
+#   5) Pre-deployment log collection only:
 #      bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
 #        --prepare-only --project PROJECT_ID
 set -euo pipefail
 
 REPO_URL="${ACP_REPO_URL:-https://github.com/ldu1225/ai-control-plane.git}"
 INSTALL_DIR="${ACP_INSTALL_DIR:-$HOME/ai-control-plane}"
+
+show_install_help() { sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+for _arg in "$@"; do
+  [[ "$_arg" == "-h" || "$_arg" == "--help" ]] && show_install_help 0
+done
 
 # Detect whether we are already running from a local checkout or streamed via curl/process substitution.
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
@@ -73,6 +86,7 @@ AUTO_YES=0
 DRY_RUN=0
 CLI_PROJECT=""
 CLI_PROJECTS=""
+CLI_LINK_PROJECTS=""
 CLI_REGION=""
 CLI_ADMINS=""
 CLI_VIEWERS=""
@@ -86,13 +100,16 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=1; EXTRA_ARGS+=(--dry-run); shift ;;
     --project) need_val "$@"; CLI_PROJECT="$2"; shift 2 ;;
     --projects) need_val "$@"; CLI_PROJECTS="$2"; shift 2 ;;
+    --link-projects|--scan-projects) need_val "$@"; CLI_LINK_PROJECTS="$2"; shift 2 ;;
     --region) need_val "$@"; CLI_REGION="$2"; shift 2 ;;
     --admins|--admin) need_val "$@"; CLI_ADMINS="$2"; shift 2 ;;
     --viewers|--viewer|--allowed-users) need_val "$@"; CLI_VIEWERS="$2"; shift 2 ;;
-    -h|--help)
-      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
-      exit 0 ;;
-    *) EXTRA_ARGS+=("$1"); shift ;;
+    --org-name|--access-mode|--service-name|--billing-account|--config|--dataset|--dataset-location|--ge-locations)
+      need_val "$@"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --read-only|--data-access-logs|--no-data-access-logs|--prepare-linked-projects|--no-prepare-linked-projects|--auto-discover-projects|--no-auto-discover-projects|--log-prompts|--no-log-prompts)
+      EXTRA_ARGS+=("$1"); shift ;;
+    -h|--help) show_install_help 0 ;;
+    *) echo "unknown argument: $1" >&2; show_install_help 2 ;;
   esac
 done
 
@@ -103,11 +120,29 @@ TARGET_PROJECTS="${CLI_PROJECTS:-$CLI_PROJECT}"
 ACTIVE_PROJECT="$(normalize_project_id "$(gcloud config get-value project 2>/dev/null || true)")"
 [[ "$ACTIVE_PROJECT" == "(unset)" ]] && ACTIVE_PROJECT=""
 
+PROJ_LINES=()
+resolve_project_csv() {  # resolve_project_csv RAW_CSV -> comma-separated project IDs
+  local raw="$1" tok entry out=()
+  IFS=',' read -r -a _toks <<<"$raw"
+  for tok in ${_toks[@]+"${_toks[@]}"}; do
+    tok="$(trim_ws "$tok")"
+    [[ -n "$tok" ]] || continue
+    if [[ "$tok" =~ ^[0-9]+$ ]] && [[ ${#PROJ_LINES[@]} -gt 0 && "$tok" -ge 1 && "$tok" -le ${#PROJ_LINES[@]} ]]; then
+      entry="${PROJ_LINES[$((tok - 1))]}"
+      out+=("${entry%%$'\t'*}")
+    else
+      out+=("$(normalize_project_id "$tok")")
+    fi
+  done
+  if [[ ${#out[@]} -gt 0 ]]; then
+    (IFS=','; echo "${out[*]}")
+  fi
+}
+
 # Interactive wizard when no --project / --projects flag was supplied and stdin is a terminal.
-if [[ -z "$TARGET_PROJECTS" && "$AUTO_YES" == "0" && -t 0 ]]; then
+if [[ -z "$TARGET_PROJECTS" && "$AUTO_YES" == "0" && ( -t 0 || "${ACP_FORCE_WIZARD:-0}" == "1" ) ]]; then
   log "AI Control Plane — One-Click Setup (${ACCOUNT})"
   PROJ_RAW="$(gcloud projects list --format='value(projectId,name)' --limit=30 2>/dev/null || true)"
-  PROJ_LINES=()
   while IFS= read -r line; do
     [[ -n "$line" ]] && PROJ_LINES+=("$line")
   done <<<"$PROJ_RAW"
@@ -128,39 +163,35 @@ if [[ -z "$TARGET_PROJECTS" && "$AUTO_YES" == "0" && -t 0 ]]; then
 
   PROMPT_DEFAULT="${ACTIVE_PROJECT}"
   if [[ -n "$PROMPT_DEFAULT" ]]; then
-    read -r -p "  1. Project ID or number(s) (comma-separated allowed) [${PROMPT_DEFAULT}]: " INPUT_PROJ
+    read -r -p "  1. Host project ID or number(s) [${PROMPT_DEFAULT}]: " INPUT_PROJ
     INPUT_PROJ="$(trim_ws "${INPUT_PROJ:-$PROMPT_DEFAULT}")"
   else
-    read -r -p "  1. Project ID or number(s) (comma-separated allowed): " INPUT_PROJ
+    read -r -p "  1. Host project ID or number(s): " INPUT_PROJ
     INPUT_PROJ="$(trim_ws "$INPUT_PROJ")"
   fi
   [[ -n "$INPUT_PROJ" ]] || die "no project selected"
-
-  # Resolve menu numbers (for example "1" or "1,2") as well as literal project IDs.
-  RESOLVED_LIST=()
-  IFS=',' read -r -a TOKENS <<<"$INPUT_PROJ"
-  for tok in "${TOKENS[@]}"; do
-    tok="$(trim_ws "$tok")"
-    [[ -n "$tok" ]] || continue
-    if [[ "$tok" =~ ^[0-9]+$ ]] && [[ "$tok" -ge 1 && "$tok" -le ${#PROJ_LINES[@]} ]]; then
-      entry="${PROJ_LINES[$((tok - 1))]}"
-      RESOLVED_LIST+=("${entry%%$'\t'*}")
-    else
-      RESOLVED_LIST+=("$(normalize_project_id "$tok")")
-    fi
-  done
-  TARGET_PROJECTS="$(IFS=','; echo "${RESOLVED_LIST[*]}")"
+  TARGET_PROJECTS="$(resolve_project_csv "$INPUT_PROJ")"
+  [[ -n "$TARGET_PROJECTS" ]] || die "no project selected"
 
   if [[ "$PREPARE_ONLY" == "0" ]]; then
+    if [[ "$TARGET_PROJECTS" != *,* && -z "$CLI_LINK_PROJECTS" ]]; then
+      read -r -p "  2. Additional projects to monitor together in this dashboard (optional, IDs/numbers) []: " INPUT_LINK
+      INPUT_LINK="$(trim_ws "${INPUT_LINK:-}")"
+      [[ -n "$INPUT_LINK" ]] && CLI_LINK_PROJECTS="$(resolve_project_csv "$INPUT_LINK")"
+      STEP_OFFSET=1
+    else
+      STEP_OFFSET=0
+    fi
+
     DEF_REGION="${CLI_REGION:-asia-northeast3}"
-    read -r -p "  2. Region [${DEF_REGION}]: " INPUT_REGION
+    read -r -p "  $((2 + STEP_OFFSET)). Region [${DEF_REGION}]: " INPUT_REGION
     CLI_REGION="$(trim_ws "${INPUT_REGION:-$DEF_REGION}")"
 
     DEF_ADMINS="${CLI_ADMINS:-$ACCOUNT}"
-    read -r -p "  3. Administrator email(s) [${DEF_ADMINS}]: " INPUT_ADMINS
+    read -r -p "  $((3 + STEP_OFFSET)). Administrator email(s) [${DEF_ADMINS}]: " INPUT_ADMINS
     CLI_ADMINS="$(trim_ws "${INPUT_ADMINS:-$DEF_ADMINS}")"
 
-    read -r -p "  4. Viewer email(s) (optional, comma-separated) [${CLI_VIEWERS}]: " INPUT_VIEWERS
+    read -r -p "  $((4 + STEP_OFFSET)). Viewer email(s) (optional, comma-separated) [${CLI_VIEWERS}]: " INPUT_VIEWERS
     CLI_VIEWERS="$(trim_ws "${INPUT_VIEWERS:-$CLI_VIEWERS}")"
   fi
 elif [[ -z "$TARGET_PROJECTS" ]]; then
@@ -171,23 +202,53 @@ fi
 CLI_REGION="${CLI_REGION:-asia-northeast3}"
 CLI_ADMINS="${CLI_ADMINS:-$ACCOUNT}"
 
+NORMALIZED_LINK_PROJECTS=""
+if [[ -n "$CLI_LINK_PROJECTS" ]]; then
+  LINK_OUT=()
+  IFS=',' read -r -a RAW_LINK_ARR <<<"$CLI_LINK_PROJECTS"
+  for rlp in "${RAW_LINK_ARR[@]}"; do
+    nlp="$(normalize_project_id "$rlp")"
+    [[ -n "$nlp" ]] || continue
+    [[ " ${LINK_OUT[*]-} " == *" ${nlp} "* ]] || LINK_OUT+=("$nlp")
+  done
+  [[ ${#LINK_OUT[@]} -gt 0 ]] && NORMALIZED_LINK_PROJECTS="$(IFS=','; echo "${LINK_OUT[*]}")"
+fi
+
 if [[ "$PREPARE_ONLY" == "1" ]]; then
-  if [[ "$TARGET_PROJECTS" == *,* ]]; then
-    exec "$ROOT/scripts/prepare.sh" --projects "$TARGET_PROJECTS" --dataset-location "$CLI_REGION" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+  PREP_LIST=()
+  IFS=',' read -r -a _raw_prep <<<"${TARGET_PROJECTS}${NORMALIZED_LINK_PROJECTS:+,${NORMALIZED_LINK_PROJECTS}}"
+  for _pp in "${_raw_prep[@]}"; do
+    _npp="$(normalize_project_id "$_pp")"
+    [[ -n "$_npp" ]] || continue
+    [[ " ${PREP_LIST[*]-} " == *" ${_npp} "* ]] || PREP_LIST+=("$_npp")
+  done
+  PREP_ALL="$(IFS=','; echo "${PREP_LIST[*]}")"
+  if [[ "$PREP_ALL" == *,* ]]; then
+    exec "$ROOT/scripts/prepare.sh" --projects "$PREP_ALL" --dataset-location "$CLI_REGION" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
   else
-    exec "$ROOT/scripts/prepare.sh" --project "$TARGET_PROJECTS" --dataset-location "$CLI_REGION" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+    exec "$ROOT/scripts/prepare.sh" --project "$PREP_ALL" --dataset-location "$CLI_REGION" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
   fi
 fi
 
 # Save per-project env snapshots (git-ignored via /*.env) so re-runs or customizations are effortless.
-if [[ "$DRY_RUN" != "1" ]]; then
+if [[ "$DRY_RUN" != "1" || "${ACP_SAVE_ENV_ON_DRY_RUN:-0}" == "1" ]]; then
   IFS=',' read -r -a SAVE_PROJECTS <<<"$TARGET_PROJECTS"
   for raw_pid in "${SAVE_PROJECTS[@]}"; do
     pid="$(normalize_project_id "$raw_pid")"
     [[ -n "$pid" ]] || continue
+    PER_PID_LINKS=""
+    if [[ -n "$NORMALIZED_LINK_PROJECTS" ]]; then
+      FILT_LINKS=()
+      IFS=',' read -r -a _larr <<<"$NORMALIZED_LINK_PROJECTS"
+      for _lp in "${_larr[@]}"; do
+        [[ -n "$_lp" && "$_lp" != "$pid" ]] && FILT_LINKS+=("$_lp")
+      done
+      [[ ${#FILT_LINKS[@]} -gt 0 ]] && PER_PID_LINKS="$(IFS=','; echo "${FILT_LINKS[*]}")"
+    fi
     ENV_OUT="$ROOT/deploy.${pid}.env"
     cat >"$ENV_OUT" <<EOF
 PROJECT_ID="${pid}"
+SCAN_PROJECTS="${PER_PID_LINKS}"
 REGION="${CLI_REGION}"
 DATASET_LOCATION="${CLI_REGION}"
 DEFAULT_LOCALE="ko"
@@ -205,6 +266,7 @@ fi
 
 DEPLOY_CMD=("$ROOT/scripts/deploy.sh" --region "$CLI_REGION" --admins "$CLI_ADMINS")
 [[ -n "$CLI_VIEWERS" ]] && DEPLOY_CMD+=(--viewers "$CLI_VIEWERS")
+[[ -n "$NORMALIZED_LINK_PROJECTS" ]] && DEPLOY_CMD+=(--link-projects "$NORMALIZED_LINK_PROJECTS")
 if [[ "$TARGET_PROJECTS" == *,* ]]; then
   DEPLOY_CMD+=(--projects "$TARGET_PROJECTS")
 else

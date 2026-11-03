@@ -7,7 +7,7 @@ Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registr
 위 **Open in Cloud Shell** 버튼을 클릭하거나 Cloud Shell에서 명령 한 줄(`scripts/install.sh`)만 실행하면 필수 API 활성화, 서비스 에이전트 생성, 전용 서비스 계정, IAM 권한, 설정 버킷, 감사 로그 싱크, Data Access 감사 로그, Gemini Enterprise 프롬프트 로깅, Cloud Run 배포까지 한 번에 완료됩니다. 제품명, 조직명, 로고, 색상, 언어, 사용할 모듈, 추적할 모델은 모두 화면 설정으로 바꿀 수 있습니다.
 
 > [!IMPORTANT]
-> **샘플 데이터, 데모 모드, 가짜 데이터가 전혀 없습니다.** 화면의 모든 숫자는 연결한 Google Cloud 프로젝트에서 실제로 읽은 값입니다. 데이터 소스가 없거나 권한이 없으면 값을 추정하거나 채워 넣지 않고 `—`로 비워 두며, 화면 상단 알림과 데이터 소스 상태 패널에 원인과 해결 방법을 표시합니다.
+> **샘플 데이터, 데모 모드, 가짜 데이터가 전혀 없습니다.** 화면의 모든 숫자는 연결한 Google Cloud 프로젝트에서 실제로 수집된 텔레메트리 값입니다. 데이터 소스가 없거나 권한이 없으면 임의 값으로 채우지 않고 `—`로 비워 두며, 결제 내보내기(Billing Export)가 아직 연결되지 않은 프로젝트에서는 관측된 토큰 사용량에 Google 공식 공개 단가와 실시간 환율을 곱한 역산 추정 비용임을 배지와 함께 투명하게 표시합니다.
 
 > [!NOTE]
 > 이 저장소는 Google Cloud 고객 환경에서 운영하도록 만든 관리 솔루션이며, Google이 공식 지원하는 제품이 아닙니다. English: [README.en.md](README.en.md)
@@ -42,7 +42,7 @@ Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registr
 
 | 원칙 | 의미 |
 |---|---|
-| 실측 데이터만 표시 | 추정치, 예시 값, 데모 데이터를 넣지 않습니다. 읽지 못한 값은 `—`와 원인으로 표시합니다. |
+| 실측 텔레메트리만 표시 | 예시 값이나 데모 데이터를 넣지 않습니다. 읽지 못한 값은 `—`와 원인으로 표시하며, 결제 내보내기가 없는 경우에만 실측 토큰 × 공식 공개 단가로 역산한 비용임을 명시해 보여 줍니다. |
 | 하드코딩 없음 | 모델 목록과 버전을 코드에 두지 않습니다. 결제 SKU, Cloud Monitoring, Antigravity 로그에서 자동으로 발견하므로 Gemini 4 Carbon, Gemini 4 Argon 등 새 모델이 나와도 배포 없이 추적됩니다. |
 | 스키마 적응형 | BigQuery 테이블과 컬럼은 `INFORMATION_SCHEMA`로 확인한 뒤 존재하는 것만 조회합니다. 날짜 분할(sharded) 테이블과 파티션 테이블을 모두 지원합니다. |
 | 모든 기능은 켜고 끔 | 모듈, 모델, 커넥터 단위로 켜고 끕니다. 꺼진 모듈은 데이터 소스를 조회하지 않습니다. |
@@ -60,14 +60,14 @@ Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registr
 | Agent Registry | `agent_registry` | Agent Engine과 Gemini Enterprise 에이전트 통합 카탈로그, 휴면과 폐기 권고, 생성 이력 | Agent Platform API, Discovery Engine API, 감사 로그 |
 | 에이전트 배포 | `agent_deployments` | Agent Engine 런타임, 실행 ID(서비스 계정), 호출량, ID별 모델 사용량, 런타임 비용 | Agent Platform API, 감사 로그, 결제 내보내기 |
 | Model Armor | `model_armor` | 판정 추이, 필터 일치, 애플리케이션과 사용자별 차단, 이벤트 상세 | BigQuery `modelarmor_googleapis_com_sanitize_operations` |
-| 모델 및 토큰 | `model_usage` | 모델 자동 탐지, 모델별 입력/출력/캐시 토큰, 호출 수, 오류율, 비용, 카탈로그 관리 | Cloud Monitoring, 결제 내보내기, Antigravity 로그 |
-| 비용 및 FinOps | `finops` | 총 비용, 크레딧, 순 비용, 서비스와 SKU별 비용, 급증 감지와 AI 원인 분석 | 결제 내보내기 |
+| 모델 및 토큰 | `model_usage` | 모델 자동 탐지, 모델별 입력/출력/캐시 토큰, 호출 수, 오류율, 비용, 카탈로그 관리 | Cloud Monitoring, 결제 내보내기, Antigravity 로그, 공개 가격표 |
+| 비용 및 FinOps | `finops` | 총 비용, 크레딧, 순 비용, 서비스와 SKU별 비용, 급증 감지와 AI 원인 분석, 일일 공개 단가·환율 동기화 | 결제 내보내기 (미연결 시 실측 토큰 × 공식 공개 단가·실시간 환율 역산) |
 | 사용자 및 액세스 | `users` | 사용자 360 뷰(서비스 전체 사용량), Antigravity IAM 상태, 개별 허용과 차단 | 전체 소스, Resource Manager IAM |
 | Antigravity 통제 | `antigravity` | 사용자별 비용/토큰/요청 한도, 자동 또는 수동 정지, 예외 규칙, 정산 기간, 안전 게이트, 클라우드에서 에이전트가 실행한 작업, 감사 로그 | Cloud Logging 또는 BigQuery, IAM, 결제 내보내기, Cloud Billing Catalog API |
 | 텔레메트리 확장 | `telemetry` | 로그·테이블 자동 발견과 쉬운 설명, 클릭 한 번으로 만드는 표준 대시보드, BigQuery 내보내기 명령 | BigQuery, Cloud Logging, Cloud Monitoring |
 | AI 애널리스트 | `analyst` | 자연어 질문, 검증된 읽기 전용 SQL, 결과 표와 차트, 요약 | BigQuery, Gemini on Agent Platform |
 
-공통 기능: 라이트/다크 테마, 한국어/영어 전환, 명령 팔레트(Ctrl/Cmd+K), 기간 선택(프리셋과 직접 지정), 표 검색/정렬/CSV 내보내기, 데이터 소스 상태 패널.
+공통 기능: 멀티 프로젝트 통합/개별 전환 선택기, 라이트/다크 테마, 한국어/영어 전환, 통화(KRW/USD) 전환, 명령 팔레트(Ctrl/Cmd+K), 기간 선택(프리셋과 직접 지정), 표 검색/정렬/CSV 내보내기, 데이터 소스 상태 패널.
 
 크레딧은 결제 내보내기에 실제 크레딧 행이 있을 때만 표시합니다. Gemini Code Assist와 Duet AI SKU는 모든 집계에서 제외됩니다.
 
@@ -114,7 +114,7 @@ flowchart LR
 |-- Dockerfile                  # 비루트 사용자로 실행되는 컨테이너 이미지
 |-- .dockerignore, .gcloudignore
 |-- scripts/
-|   |-- install.sh              # 원클릭 / 명령 한 줄 자동 부트스트랩 설치기 (단일·복수 프로젝트)
+|   |-- install.sh              # 원클릭 / 명령 한 줄 자동 부트스트랩 설치기 (단일·멀티 프로젝트 허브·개별 배포)
 |   |-- prepare.sh              # 배포 전 준비: 로그 수집 시작 (싱크, Data Access, Gemini Enterprise 로그)
 |   |-- deploy.sh               # 명령 한 번 무중단 배포 (빈 프로젝트 기반 구성부터 헬스체크까지)
 |   |-- teardown.sh             # 배포한 리소스 삭제
@@ -133,10 +133,10 @@ flowchart LR
 |   |   |-- schema.py           # 스키마 적응형 BigQuery 접근
 |   |   |-- settings_store.py   # 설정 저장소 (gcs, file, memory)
 |   |   |-- gcp.py, ai.py, cache.py, timeutil.py
-|   |   `-- services/           # 모듈별 서비스 (governance, pricing, gemini_enterprise, ...)
+|   |   `-- services/           # 모듈별 서비스 (governance, pricing, pricing_sync, gemini_enterprise, ...)
 |   `-- web/                    # 프런트엔드 SPA (index.html, login.html, assets/)
 |-- eval/analyst/               # AI 애널리스트 골든 데이터셋과 평가 하네스 (16.1)
-|-- tests/unit/                 # 단위 테스트 (332개)
+|-- tests/unit/                 # 단위 테스트 (350+개)
 `-- .github/workflows/tests.yml # 푸시마다 단위 테스트, 배포 전 검사, 데이터셋 검증 실행
 ```
 
@@ -154,23 +154,31 @@ flowchart LR
 
 ### 3.2 배포 (원클릭 / 명령 한 줄)
 
-**방법 A — 설정 파일 수정 없이 Cloud Shell에서 바로 실행 (대화형 프로젝트 번호 선택)**
+**방법 A — 설정 파일 없이 Cloud Shell에서 대화형 원클릭 설치 (Enter만 눌러 진행)**
 ```bash
 bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
 ```
 
-**방법 B — 단일 또는 복수 프로젝트 무인(Non-interactive) 명령 한 줄 일괄 배포**
+**방법 B — 단일 프로젝트 무인(Non-interactive) 명령 한 줄 배포**
 ```bash
-bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --projects my-project-1,my-project-2 --admins admin@example.org --viewers viewer@example.org
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --project my-project-id
 ```
-*(프로젝트가 1개면 `--project my-project-1` 로 동일하게 실행하며, `--admins` 생략 시 현재 로그인된 `gcloud` 계정이 자동으로 관리자로 등록됩니다. 기존에 예전 `~/ai-control-plane` 폴더나 잘못된 `deploy.env`가 남아 있어도 위 명령 한 줄이 자동으로 최신 코드로 덮어쓰고 기존 `deploy.env`는 `deploy.env.bak`으로 분리하므로 별도로 삭제하거나 다시 클론할 필요가 없습니다.)*
 
-**방법 C — 저장소 클론 후 직접 실행 (`deploy.env` 또는 CLI 옵션)**
+**방법 C — 여러 프로젝트를 하나의 대시보드에서 통합 관제 (멀티 프로젝트 허브, 권장)**
+```bash
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --project hub-project-id --link-projects project-b,project-c
+```
+*(대표 프로젝트 `hub-project-id`에 대시보드 1개를 배포하고, 연동 프로젝트(`project-b,project-c`)에 읽기 전용 IAM 및 감사 로그 싱크를 자동 연결합니다. 화면 상단 프로젝트 선택기에서 **전체 프로젝트 합산** 또는 **개별 프로젝트**를 클릭 한 번으로 전환해 볼 수 있습니다. 만약 프로젝트마다 별도의 독립된 Cloud Run 대시보드를 각각 배포하려면 `--projects project-a,project-b` 옵션을 사용하세요.)*
+
+*(공통 참고: `--admins admin@example.org --viewers viewer@example.org`를 추가해 계정을 지정할 수 있으며, `--admins` 생략 시 현재 로그인된 `gcloud` 계정이 자동으로 관리자로 등록됩니다. 기존에 예전 `~/ai-control-plane` 폴더나 잘못된 `deploy.env`가 남아 있어도 위 명령 한 줄이 자동으로 최신 코드로 갱신하고 기존 `deploy.env`는 `deploy.env.bak`으로 분리합니다.)*
+
+**방법 D — 저장소 클론 후 직접 실행 (`deploy.env` 또는 CLI 옵션)**
 ```bash
 git clone https://github.com/ldu1225/ai-control-plane.git
 cd ai-control-plane
 
-scripts/deploy.sh --project my-project-1 --admins admin@example.org
+scripts/deploy.sh --project my-project-id --link-projects project-b,project-c
 # 또는 cp deploy.env.example deploy.env 편집 후 scripts/deploy.sh 실행
 ```
 
@@ -181,15 +189,15 @@ scripts/deploy.sh --project my-project-1 --admins admin@example.org
 | 0. 사전 권한·결제 점검 | 기반 제어 API를 먼저 켜고, 호출자 IAM 권한 확인 및 자동 보강(Self-bootstrap), 결제 계정 연결 확인·자동 연결을 수행합니다. |
 | 1. 필수 API & 서비스 에이전트 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, IAP 등 모든 API와 Google 관리형 서비스 에이전트(`service-PROJECT_NUMBER@...`)를 즉시 생성합니다. |
 | 2. 설정 버킷 | 공개 접근이 차단되고 버전 관리가 켜진 Cloud Storage 버킷을 생성합니다. |
-| 3. 전용 서비스 계정 & IAM | 런타임 SA, 로그인 브리지 SA, **전용 Cloud Build 빌더 SA**(Compute Engine 기본 SA에 의존하지 않음)를 만들고 최소 권한을 부여합니다. BigQuery 결제 내보내기 테이블이 있으면 자동으로 탐지합니다. |
-| 4. 컨테이너 이미지 | Artifact Registry 저장소를 만들고 전용 빌더 SA로 Cloud Build 이미지를 빌드합니다(조직 정책으로 Cloud Build가 제한된 환경에서는 Cloud Shell/로컬 Docker로 자동 전환). |
+| 3. 전용 서비스 계정 & IAM | 런타임 SA, 로그인 브리지 SA, **전용 Cloud Build 빌더 SA**(Compute Engine 기본 SA에 의존하지 않음)를 만들고 최소 권한을 부여합니다. `--link-projects`로 지정한 연동 프로젝트에도 읽기 전용 스캔 권한을 자동 부여하며, BigQuery 결제 내보내기 테이블이 있으면 자동으로 탐지합니다. |
+| 4. 컨테이너 이미지 | Artifact Registry 저장소를 만들고 전용 빌더 SA로 Cloud Build 이미지를 빌드합니다(리전 워커 제한 시 글로벌 Cloud Build -> Cloud Shell/로컬 Docker로 3단계 자동 전환). |
 | 5. 세션 서명 키 | 리전 제한 조직 정책(`constraints/gcp.resourceLocations`)을 준수하여 Secret Manager 시크릿을 생성합니다. |
-| 6. 데이터 소스 일괄 활성화 | BigQuery 데이터셋(`ge_analytics`)과 파티션 Log Router 싱크 생성, **7개 AI 서비스 전체 Data Access 감사 로그 활성화**, 모든 Gemini Enterprise 앱의 **사용 로그 + 프롬프트·사용자 식별 로깅 활성화**, 조직명 및 Agent Platform 엔드포인트 자동 탐지를 수행합니다. |
+| 6. 데이터 소스 일괄 활성화 | BigQuery 데이터셋(`ge_analytics`)과 파티션 Log Router 싱크 생성, **AI 서비스 전체 Data Access 감사 로그 활성화**, 모든 Gemini Enterprise 앱의 **사용 로그 + 프롬프트·사용자 식별 로깅 활성화**, 연동 프로젝트 로그 싱크 온보딩(권한 보유 시), 조직명 및 Agent Platform 엔드포인트 자동 탐지를 수행합니다. |
 | 7. Cloud Run & 인증 자동 대응 | 로그인 브리지(IAP)와 대시보드를 배포합니다. 도메인 제한 공유(`iam.allowedPolicyMemberDomains`)나 비인증 호출 차단 조직 정책이 있어도 `--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** 또는 내장 ID/비밀번호 로그인으로 자동 전환하여 실패 없이 배포합니다. |
-| 8. 라이브 헬스체크 | 배포 직후 실제 엔드포인트 응답 상태(`HTTP 200/302/401`)를 검증하고 접속 주소와 요약 정보를 출력합니다. |
+| 8. 단가 동기화 스케줄 & 헬스체크 | 매일 새벽 `04:00 KST` 공식 공개 단가·환율 자동 동기화 작업(`ai-control-plane-pricing-sync`)을 등록하고, 배포 직후 실제 엔드포인트 응답 상태(`HTTP 200/302/401`)를 검증해 접속 주소를 출력합니다. |
 
 - **다시 실행해도 안전합니다(멱등성 보장).** 없는 것은 만들고 있는 것은 최신 설정으로 갱신합니다.
-- `install.sh` 실행 시 프로젝트별 설정 스냅샷(`deploy.<PROJECT_ID>.env`, Git 제외)을 자동 저장하므로 추후 재배포도 명령 한 줄로 끝납니다.
+- `install.sh` 실행 시 프로젝트별 설정 스냅샷(`deploy.<PROJECT_ID>.env`, Git 제외, `SCAN_PROJECTS` 포함)을 자동 저장하므로 추후 재배포도 명령 한 줄로 끝납니다.
 
 ### 3.3 첫 로그인
 
@@ -199,10 +207,11 @@ scripts/deploy.sh --project my-project-1 --admins admin@example.org
 
 ### 3.4 배포 후 확인
 
-1. 상단 바의 **데이터 소스**를 눌러 연결 상태를 확인합니다. 빨간색 항목에 원인(권한, 테이블 없음 등)이 표시됩니다.
-2. **설정 > 워크스페이스 및 데이터 소스**에서 결제 내보내기, 감사 로그 데이터셋, Gemini Enterprise 위치를 확인하거나 바꿉니다.
-3. 감사 로그 싱크를 새로 만들었다면 테이블은 해당 로그가 처음 발생할 때 생깁니다. 처음 몇 분에서 몇 시간 동안은 일부 지표가 비어 있을 수 있습니다.
-4. Antigravity 사용자별 한도를 쓰려면 [8장](#8-antigravity-사용자별-한도와-정지)을 따릅니다.
+1. 상단 바의 **프로젝트 선택기**에서 대표 프로젝트, 연동 프로젝트, 자동 탐지 프로젝트를 전환하거나 **전체 프로젝트**로 통합 조회합니다.
+2. 상단 바의 **데이터 소스**를 눌러 연결 상태를 확인합니다. 빨간색 항목에 원인(권한, 테이블 없음 등)이 표시됩니다.
+3. 결제 내보내기(Billing Export)가 아직 연결되지 않아도 토큰 기반 역산 비용이 즉시 표시되며, 추후 **설정 > 워크스페이스 및 데이터 소스**에서 결제 내보내기를 연결하면 자동으로 실제 청구액 모드로 전환됩니다.
+4. 감사 로그 싱크를 새로 만들었다면 테이블은 해당 로그가 처음 발생할 때 생깁니다. 처음 몇 분에서 몇 시간 동안은 일부 지표가 비어 있을 수 있습니다.
+5. Antigravity 사용자별 한도를 쓰려면 [8장](#8-antigravity-사용자별-한도와-정지)을 따릅니다.
 
 ### 3.5 배포 전에 로그부터 쌓기 (선택)
 
@@ -230,30 +239,33 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 
 `deploy.env`는 bash가 읽는 `KEY="value"` 형식입니다. 공백이 있는 값은 따옴표로 감쌉니다. 이 파일은 `.gitignore`에 포함되어 Git에 올라가지 않습니다.
 
-### 4.1 필수
+### 4.1 필수 및 멀티 프로젝트
 
-| 변수 | 예시 | 설명 |
+| 변수 | 기본값 / 예시 | 설명 |
 |---|---|---|
-| `PROJECT_ID` | `my-project` | 관제하고 배포할 프로젝트 |
+| `PROJECT_ID` | `my-project` (미지정 시 활성 `gcloud` 프로젝트) | 대시보드를 배포할 대표 Google Cloud 프로젝트 ID |
+| `SCAN_PROJECTS` | 비어 있음 (예: `proj-b,proj-c`) | 하나의 대시보드에 함께 묶어 통합 관제할 추가 프로젝트 ID 목록(`--link-projects`) |
+| `SCAN_ALL_PROJECTS` | `true` | 런타임 서비스 계정이 접근 가능한 조직 내 다른 프로젝트를 자동 탐지해 프로젝트 선택기에 표시 |
+| `PREPARE_LINKED_PROJECTS` | `true` | 배포 시 `SCAN_PROJECTS` 대상 프로젝트에도 감사 로그 싱크와 Data Access 로그를 가능한 범위 내에서 자동 구성 |
 | `REGION` | `asia-northeast3` | Cloud Run, Artifact Registry, 설정 버킷, Scheduler 리전 |
-| `ADMIN_EMAILS` | `admin@example.com,*@security.example.com` | 관리자. 쉼표로 구분하고 `*@도메인` 형식을 쓸 수 있습니다. |
+| `ADMIN_EMAILS` | 활성 `gcloud` 계정 | 관리자 이메일(쉼표 구분, `*@도메인` 형식 허용) |
 
 ### 4.2 서비스와 표시
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `SERVICE_NAME` | `ai-control-plane` | Cloud Run 서비스 이름. 서비스 계정, 버킷, 시크릿, 싱크, 스케줄러 작업 이름에도 쓰입니다. |
-| `ORGANIZATION_NAME` | `Your Organization` | 헤더와 로그인 화면에 표시할 조직명 |
-| `DEFAULT_LOCALE` | `en` (템플릿은 `ko`) | 기본 언어 `ko` 또는 `en`. 사용자는 화면에서 바꿀 수 있습니다. |
-| `WORKSPACE_TIMEZONE` | `UTC` (템플릿은 `Asia/Seoul`) | 날짜 표시, 일별 집계, 스케줄러 시간대 |
+| `ORGANIZATION_NAME` | GCP 조직/프로젝트명 자동 탐지 | 헤더와 로그인 화면에 표시할 조직명 |
+| `DEFAULT_LOCALE` | `ko` | 기본 언어 `ko` 또는 `en`. 사용자는 화면에서 바꿀 수 있습니다. |
+| `WORKSPACE_TIMEZONE` | `Asia/Seoul` | 날짜 표시, 일별 집계, 스케줄러 시간대 |
 | `PRODUCT_NAME` | 비어 있음 | 제품명 변경(화이트라벨). 비우면 `AI Control Plane` |
-| `DISABLED_MODULES` | 비어 있음 | 배포할 때 숨길 모듈(쉼표 구분). 예: 결제 내보내기가 없으면 `finops`. 설정 > 모듈에서 다시 켤 수 있습니다. 모듈 ID: `overview`, `gemini_enterprise`, `notebooklm`, `model_usage`, `agent_gateway`, `agent_registry`, `agent_deployments`, `model_armor`, `users`, `antigravity`, `finops`, `telemetry`, `analyst` |
+| `DISABLED_MODULES` | 비어 있음 | 배포할 때 숨길 모듈(쉼표 구분). 설정 > 모듈에서 다시 켤 수 있습니다. 모듈 ID: `overview`, `gemini_enterprise`, `notebooklm`, `model_usage`, `agent_gateway`, `agent_registry`, `agent_deployments`, `model_armor`, `users`, `antigravity`, `finops`, `telemetry`, `analyst` |
 
 ### 4.3 로그인 방식
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `ACCESS_MODE` | `google` | `google`, `google_oauth`, `iap` 중 하나([5장](#5-로그인과-권한)) |
+| `ACCESS_MODE` | `google` | `google`, `google_oauth`, `iap`, `password` 중 하나([5장](#5-로그인과-권한)) |
 | `ALLOWED_USERS` | 비어 있음 | Google 로그인 방식에서 미리 승인할 viewer. 예: `*@example.com,partner@example.org` |
 | `IAP_MEMBERS` | 비어 있음 | `iap` 방식에서 접속을 허용할 주체. 예: `group:ai-governance@example.com,user:a@example.com` |
 | `OAUTH_CLIENT_JSON` | 비어 있음 | `google_oauth` 방식에서 내려받은 OAuth 클라이언트 JSON 경로(커밋 금지) |
@@ -268,32 +280,33 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 |---|---|---|
 | `AUDIT_DATASET` | `ge_analytics` | 감사 로그가 들어오는 BigQuery 데이터셋 |
 | `CREATE_LOG_SINK` | `true` | 데이터셋과 Log Router 싱크를 만들고, 이미 있으면 최신 필터로 갱신. 직접 관리하는 다른 싱크를 쓰면 `false` |
-| `DATASET_LOCATION` | `US` | 새로 만드는 데이터셋 위치(예: `asia-northeast3`) |
-| `ENABLE_DATA_ACCESS_LOGS` | `false` | Agent Platform, Discovery Engine, Model Armor의 Data Access 감사 로그 켜기(로그 양과 비용 증가) |
+| `DATASET_LOCATION` | `REGION` (`asia-northeast3`) | 새로 만드는 데이터셋 위치 |
+| `ENABLE_DATA_ACCESS_LOGS` | `true` | Agent Platform, Discovery Engine, Model Armor 등 AI 서비스의 Data Access 감사 로그 켜기(`--no-data-access-logs`로 생략 가능) |
 | `ENABLE_GE_OBSERVABILITY` | `true` | `DISCOVERY_ENGINE_LOCATIONS`의 모든 Gemini Enterprise 앱에서 사용 로그(관측 가능성) 켜기. Owner 또는 Gemini Enterprise 관리자 권한이 필요하며, 권한이 없으면 경고만 남깁니다. |
 | `GE_PROMPT_LOGGING` | `true` | 사용자 이메일(`userIamPrincipal`), 프롬프트·응답 원문, 업로드 파일 이름이 `<elided>`로 가려지지 않도록 함께 기록합니다. |
-| `BILLING_PROJECT_ID` | 비어 있음 | 결제 내보내기가 있는 프로젝트(비우면 `PROJECT_ID`) |
-| `BILLING_DATASET` | 비어 있음 | 결제 내보내기 데이터셋. 예: `billing_detailed_usage` |
-| `BILLING_TABLE` | 비어 있음 | `gcp_billing_export_resource_v1_XXXXXX_XXXXXX_XXXXXX` |
-| `BILLING_ACCOUNT_ID` | 비어 있음 | `XXXXXX-XXXXXX-XXXXXX` |
+| `BILLING_PROJECT_ID` | 자동 탐지 | 결제 내보내기가 있는 프로젝트(비우면 `PROJECT_ID`에서 자동 탐지) |
+| `BILLING_DATASET` | 자동 탐지 | 결제 내보내기 데이터셋. 예: `billing_detailed_usage` |
+| `BILLING_TABLE` | 자동 탐지 | `gcp_billing_export_resource_v1_XXXXXX_XXXXXX_XXXXXX` (없으면 토큰 기반 역산 비용 자동 적용) |
+| `BILLING_ACCOUNT_ID` | 자동 탐지 | `XXXXXX-XXXXXX-XXXXXX` |
 | `DISCOVERY_ENGINE_LOCATIONS` | 자동 감지 | Gemini Enterprise 위치(쉼표 구분, 예: `global,us`). 비워 두면 배포할 때 `global`, `us`, `eu` 중 Gemini Enterprise 앱이나 라이선스가 있는 위치를 찾아 쓰고, 하나도 없으면 `global`을 씁니다. |
-| `AGENT_ENGINE_REGIONS` | `REGION` | Agent Engine 리전(쉼표 구분) |
+| `AGENT_ENGINE_REGIONS` | 자동 감지 | Agent Engine 리전(쉼표 구분) |
 
 결제 값은 배포 후 **설정 > 워크스페이스 및 데이터 소스**에서 입력해도 됩니다.
 
-### 4.5 거버넌스
+### 4.5 거버넌스 및 스케줄
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `ENABLE_GOVERNANCE_ACTIONS` | `false` | IAM 쓰기 역할 부여. 한도 초과 사용자 정지, 복원, 개별 허용/차단, 마커 역할 생성에 필요 |
-| `ENFORCEMENT_SCHEDULE` | 비어 있음 | 자동 집행 일정(cron). 예: `*/15 * * * *`. `ENABLE_GOVERNANCE_ACTIONS=true`와 `google` 또는 `google_oauth` 방식이 필요합니다. 정지된 사용자는 집행 실행에서 복원되므로, 일정이 없으면 기간이 초기화된 뒤 관리자가 집행을 실행해야 접근이 돌아옵니다. 스크립트와 Antigravity 화면이 이를 경고합니다. |
+| `ENABLE_GOVERNANCE_ACTIONS` | `true` | IAM 쓰기 역할 부여(`--read-only` 지정 시 `false`). 한도 초과 사용자 정지, 복원, 개별 허용/차단, 마커 역할 생성에 필요 |
+| `ENFORCEMENT_SCHEDULE` | 비어 있음 | 자동 집행 일정(cron). 예: `*/15 * * * *`. `ENABLE_GOVERNANCE_ACTIONS=true`와 `google` 또는 `google_oauth` 방식이 필요합니다. 정지된 사용자는 집행 실행에서 복원되므로, 일정이 없으면 기간이 초기화된 뒤 관리자가 집행을 실행해야 접근이 돌아옵니다. |
+| `PRICING_SYNC_SCHEDULE` | `0 4 * * *` | 매일 새벽 `04:00 KST`에 Google 공식 모델 단가와 실시간 USD/KRW 환율을 동기화하는 Cloud Scheduler 일정(`off` 지정 시 스케줄러 생략, 앱 내장 모니터만 동작) |
 
 ### 4.6 기타
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `AI_DEFAULT_MODEL` | 비어 있음 | AI 애널리스트 기본 모델(비우면 `config.yaml` 값) |
-| `IMAGE` | 비어 있음 | 미리 빌드한 이미지. 비우면 Cloud Build로 빌드 |
+| `IMAGE` | 비어 있음 | 미리 빌드한 이미지. 비우면 Cloud Build로 빌드(제한 시 로컬 Docker 자동 전환) |
 | `MEMORY`, `CPU` | `1Gi`, `1` | Cloud Run 리소스 |
 | `MIN_INSTANCES`, `MAX_INSTANCES` | `0`, `3` | 인스턴스 수. 0이면 요청이 없을 때 비용이 들지 않습니다. |
 | `AR_REPOSITORY` | `ai-control-plane` | Artifact Registry 저장소 이름 |
@@ -530,7 +543,7 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.8 비용 및 FinOps
 
-결제 내보내기로 총 비용, 크레딧, 순 비용, 서비스와 SKU별 비용, AI 비중을 계산합니다. 전일 대비 `finops.spike_threshold_pct`(기본 50%) 이상, `spike_min_delta` 이상 늘어난 날을 급증으로 표시하고, 원인 분석을 누르면 Gemini가 SKU 변화를 근거로 원인을 요약합니다.
+결제 내보내기(Billing Export)가 연결된 프로젝트에서는 총 비용, 크레딧, 순 비용, 서비스와 SKU별 실제 청구 비용, AI 비중을 계산합니다. 결제 내보내기가 아직 연결되지 않은 프로젝트에서는 관측된 토큰 사용량(Cloud Monitoring 및 추론 로그)에 Google 공식 공개 단가와 실시간 USD/KRW 환율을 곱해 모델·서비스별 비용을 자동 역산하며, 매일 새벽 `04:00 KST`에 공개 단가와 환율을 동기화하고 가격 변동이 감지되면 알림 배너로 고지합니다(관리자는 즉시 동기화 및 알림 확인 가능). 전일 대비 `finops.spike_threshold_pct`(기본 50%) 이상, `spike_min_delta` 이상 늘어난 날을 급증으로 표시하고, 원인 분석을 누르면 Gemini가 변화를 근거로 원인을 요약합니다.
 
 ### 7.9 사용자 및 액세스
 
@@ -671,7 +684,7 @@ flowchart TD
 |---|---|---|
 | `product` | `name`, `tagline` | 제품명과 태그라인(화이트라벨) |
 | `branding` | `organization_name`, `logo_url`, `accent_color`, `default_locale`, `default_theme` | 조직 아이덴티티. 로고는 HTTPS URL 또는 `/assets/` 경로 |
-| `workspace` | `project_id`, `quota_project_id`, `timezone`, `default_range_days`, `audit_dataset` | 관제 대상과 기본 조회 조건 |
+| `workspace` | `project_id`, `projects`, `scan_all_projects`, `quota_project_id`, `timezone`, `default_range_days`, `audit_dataset` | 대표·연동 관제 프로젝트, 자동 탐지 여부, 기본 조회 조건 |
 | `workspace.billing` | `project_id`, `dataset`, `table`, `account_id` | 결제 내보내기 위치 |
 | `workspace` | `discovery_engine_locations`, `agent_engine_regions`, `telemetry_datasets` | API 조회 위치와 추가 텔레메트리 데이터셋 |
 | `security` | `auth_mode`, `admins`, `allowed_users`, `google_client_id`, `public_base_url`, `session_hours`, `sign_in_bridge_url`, `iap_audience`, `mask_pii_for_viewers` | 인증과 권한 |
@@ -691,6 +704,7 @@ flowchart TD
 | 변수 | 대응 설정 |
 |---|---|
 | `PROJECT_ID`, `QUOTA_PROJECT_ID` | `workspace.project_id`, `workspace.quota_project_id` |
+| `SCAN_PROJECTS`, `SCAN_ALL_PROJECTS` | `workspace.projects`(쉼표 구분), `workspace.scan_all_projects`(`true`/`false`) |
 | `AUDIT_DATASET_ID` | `workspace.audit_dataset` |
 | `BILLING_PROJECT_ID`, `BILLING_DATASET_ID`, `BILLING_TABLE_ID`, `BILLING_ACCOUNT_ID` | `workspace.billing.*` |
 | `WORKSPACE_TIMEZONE` | `workspace.timezone` |
@@ -835,10 +849,10 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 
 | 증상 | 확인할 점 |
 |---|---|
-| `deploy.sh`가 Cloud Build 단계에서 실패 | 새 프로젝트는 Compute Engine 기본 서비스 계정으로 빌드합니다. 스크립트가 출력하는 명령으로 `roles/cloudbuild.builds.builder`를 부여하고 다시 실행합니다. |
-| 로그인 브리지 IAP 권한 부여 실패 | 조직 정책(도메인 제한 공유)이 `allAuthenticatedUsers`를 막습니다. `BRIDGE_MEMBERS="domain:example.com"`으로 바꿉니다. |
-| `--no-invoker-iam-check` 배포 실패 | 조직 정책 `run.managed.requireInvokerIam`이 켜져 있습니다. 예외를 받거나 `ACCESS_MODE=iap`를 씁니다. |
-| IAP 배포 실패(조직 없는 프로젝트) | Cloud Run 콘솔의 보안 탭에서 IAP를 한 번 켠 뒤 다시 실행합니다. |
+| `deploy.sh`가 Cloud Build 단계에서 제한됨 | 스크립트는 전용 빌더 SA(`SERVICE_NAME-build`)로 리전 Cloud Build -> 글로벌 Cloud Build -> Cloud Shell/로컬 Docker 순서로 자동 전환합니다. 세 경로가 모두 막힌 환경이면 미리 빌드한 이미지를 `IMAGE`에 지정합니다. |
+| 로그인 브리지 IAP 권한 부여 실패 | 조직 정책(도메인 제한 공유)이 `allAuthenticatedUsers`를 막으면 관리자·뷰어 도메인을 자동으로 바인딩하며, 필요하면 `BRIDGE_MEMBERS="domain:example.com"`으로 지정합니다. |
+| `--no-invoker-iam-check` 배포 실패 | 조직 정책이 비인증 진입을 막으면 스크립트가 자동으로 Direct Cloud Run IAP 모드로 전환해 배포합니다. |
+| IAP 배포 실패(조직 없는 프로젝트) | Cloud Run 콘솔의 보안 탭에서 IAP를 한 번 켠 뒤 다시 실행하거나 `ACCESS_MODE=password`를 씁니다. |
 | 로그인 후 "승인되지 않은 계정" | 관리자가 설정 > 액세스 제어에서 요청을 승인하거나 `ALLOWED_USERS`에 추가합니다. |
 | 모든 요청이 401 (`iap` 방식) | 사용자에게 `roles/iap.httpsResourceAccessor`가 있는지(`IAP_MEMBERS`) 확인합니다. |
 | 화면에 설정 안내만 표시 | `PROJECT_ID`가 비었거나 예시 값입니다. |
@@ -850,20 +864,20 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 | Antigravity 사용자가 0명 | `inference_response` 로그가 프로젝트에 있는지(Antigravity for organizations). 개인 환경의 에이전트는 이 로그를 남기지 않습니다. |
 | Antigravity 상태가 모두 `UNKNOWN` | `resourcemanager.projects.getIamPolicy` 권한(`roles/iam.securityReviewer`) |
 | 정지/복원 버튼이 거부됨 | `ENABLE_GOVERNANCE_ACTIONS=true`로 다시 배포했는지, 마커 역할이 있는지, 게이트 결과 |
-| 비용 한도가 적용되지 않음 | 한도 정책 카드의 토큰 단가에 "단가를 찾지 못함" 또는 모델별 "단가 없음"이 있는지. `cloudbilling.googleapis.com` 사용 설정과 결제 내보내기 연결을 확인합니다. |
+| 비용 한도가 적용되지 않음 | 한도 정책 카드의 토큰 단가에 "단가를 찾지 못함" 또는 모델별 "단가 없음"이 있는지. `cloudbilling.googleapis.com` 사용 설정과 단가 동기화 상태를 확인합니다. |
 | "예외 규칙이 영구 저장되지 않습니다" 경고 | `SETTINGS_BUCKET`이 없습니다. `deploy.sh`로 배포하면 자동으로 만듭니다. |
 
 ### 14.3 업그레이드
 
-새 버전을 받은 뒤 같은 `deploy.env`로 `scripts/deploy.sh`를 다시 실행합니다. 화면 설정, 예외 규칙, 정지 기록, 위젯 배치는 설정 버킷에 있으므로 그대로 유지됩니다. v2.1.0부터는 `CREATE_LOG_SINK=true`로 다시 실행할 때 기존 싱크의 필터도 최신으로 갱신되어, 이전 버전 싱크에서 빠지던 Gemini Enterprise·Model Armor·Antigravity 로그가 그때부터 들어옵니다.
+Cloud Shell에서 설치 명령 한 줄(`bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --project PROJECT_ID`)을 다시 실행하거나, 저장소를 최신으로 받은 뒤 `scripts/deploy.sh --project PROJECT_ID`를 실행합니다. 화면 설정, 예외 규칙, 정지 기록, 위젯 배치는 설정 버킷에 있고 프로젝트별 `deploy.<PROJECT_ID>.env`(`SCAN_PROJECTS` 포함)도 그대로 유지됩니다.
 
 ---
 
 ## 15. 삭제
 
 ```bash
-scripts/teardown.sh                 # 서비스, 스케줄러, 서비스 계정, IAM 바인딩, 시크릿 삭제
-scripts/teardown.sh --delete-data   # 설정 버킷(화면 설정, 예외 규칙, 정지 기록, 위젯 배치)과 로그 싱크까지 삭제
+scripts/teardown.sh --project PROJECT_ID                # 서비스, 스케줄러 작업(집행·단가 동기화), 서비스 계정, 대표·연동 프로젝트 IAM 바인딩, 시크릿 삭제
+scripts/teardown.sh --project PROJECT_ID --delete-data  # 설정 버킷(화면 설정, 예외 규칙, 정지 기록, 위젯 배치)과 로그 싱크까지 삭제
 ```
 
 BigQuery 감사 로그 데이터셋, Artifact Registry 저장소, Data Access 감사 로그 설정은 자동으로 지우지 않고 삭제 명령만 안내합니다. Gemini Enterprise 앱의 관측 가능성(사용 로그) 설정도 그대로 두며, 필요하면 콘솔의 앱 > 구성 > 관측 가능성에서 끕니다. 마커 역할도 정지된 사용자가 아직 쓰고 있을 수 있어 남겨 두고 삭제 명령만 안내합니다. 대시보드가 정지한 사용자가 있다면 삭제 전에 Antigravity 통제 화면에서 복원합니다.
@@ -900,7 +914,7 @@ Git이 공개할 파일을 검사해 비밀 정보(개인 키, API 키, OAuth �
 
 | 경로 | 설명 |
 |---|---|
-| `GET /api/v1/bootstrap`, `GET /api/v1/session` | 화면 초기화 정보, 세션과 CSRF 토큰 |
+| `GET /api/v1/bootstrap`, `GET /api/v1/session` | 화면 초기화 정보(프로젝트 목록·통화 포함), 세션과 CSRF 토큰 |
 | `GET /api/v1/health` | 데이터 소스 상태 |
 | `GET/POST /api/v1/settings`, `POST /api/v1/settings/reset` | 설정 조회, 저장, 재설정 |
 | `GET /api/v1/access`, `POST /api/v1/access/users`, `.../users/delete`, `.../requests/dismiss` | 계정 승인과 역할 |
@@ -914,7 +928,7 @@ Git이 공개할 파일을 검사해 비밀 정보(개인 키, API 키, OAuth �
 | `GET /api/v1/governance/antigravity/status` | Antigravity 한도 상태, 단가, 검토 대기열, 정지, 예외 규칙 |
 | `POST /api/v1/governance/antigravity/cap`, `/enforce`, `/review`, `/exceptions`, `/exceptions/delete`, `/user-action`, `/setup` | Antigravity 통제(관리자) |
 | `GET /api/v1/governance/audit-log`, `/governance/antigravity/agent-activity` | 감사 로그, 에이전트 작업 |
-| `GET /api/v1/finops/summary`, `POST /api/v1/finops/spikes/analyze` | FinOps |
+| `GET /api/v1/finops/summary`, `GET /api/v1/finops/pricing`, `POST /api/v1/finops/pricing/sync`, `POST /api/v1/finops/pricing/ack`, `POST /api/v1/finops/spikes/analyze` | FinOps, 공개 단가·환율 모니터 및 급증 분석 |
 | `GET /api/v1/telemetry/discover`, `/connectors`, `/connectors/data`, `POST /connectors`, `/connectors/delete` | 텔레메트리 확장 |
 | `GET /api/v1/layouts`, `POST /api/v1/layouts` | 사람별 위젯 배치(개요와 각 화면) |
 | `POST /api/v1/analyst/chat` | AI 애널리스트 |

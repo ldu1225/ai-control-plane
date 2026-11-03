@@ -13,7 +13,9 @@
 # Options
 #   --project ID            Google Cloud project ID to deploy into
 #   --projects ID1,ID2      Deploy sequentially into multiple Google Cloud projects in one run
-#   --link-projects ID1,ID2 Link secondary GCP projects for unified multi-project scanning & grant read IAM
+#   --link-projects ID1,ID2 Link secondary GCP projects for unified multi-project scanning, log routing & read IAM
+#   --no-prepare-linked-projects  Skip onboarding log sinks/APIs on --link-projects secondary projects
+#   --no-auto-discover-projects   Disable automatic discovery of readable projects in the same GCP Organization
 #   --region REGION         Cloud Run, Artifact Registry & bucket region (default: asia-northeast3)
 #   --admins EMAILS         Comma-separated admin emails or *@domain (default: active gcloud account)
 #   --viewers EMAILS        Comma-separated viewer emails or *@domain
@@ -47,8 +49,10 @@ CLI_SERVICE_NAME=""
 CLI_BILLING_ACCOUNT=""
 CLI_READ_ONLY=""
 CLI_DATA_ACCESS_LOGS=""
+CLI_PREPARE_LINKED=""
+CLI_SCAN_ALL=""
 
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
 normalize_cli_args "$@"
@@ -70,10 +74,14 @@ while [[ $# -gt 0 ]]; do
     --read-only) CLI_READ_ONLY="1"; shift ;;
     --data-access-logs) CLI_DATA_ACCESS_LOGS="true"; shift ;;
     --no-data-access-logs) CLI_DATA_ACCESS_LOGS="false"; shift ;;
+    --prepare-linked-projects) CLI_PREPARE_LINKED="true"; shift ;;
+    --no-prepare-linked-projects) CLI_PREPARE_LINKED="false"; shift ;;
+    --auto-discover-projects) CLI_SCAN_ALL="true"; shift ;;
+    --no-auto-discover-projects) CLI_SCAN_ALL="false"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -y|--yes) shift ;;
-    -h|--help) usage ;;
-    *) echo "unknown argument: $1" >&2; usage ;;
+    -h|--help) usage 0 ;;
+    *) echo "unknown argument: $1" >&2; usage 2 ;;
   esac
 done
 
@@ -124,6 +132,7 @@ fi
 ADMIN_EMAILS="${ADMIN_EMAILS:-${INITIAL_ADMINS:-${ADMINS:-${ADMIN_EMAIL:-}}}}"
 ALLOWED_USERS="${ALLOWED_USERS:-${INITIAL_VIEWERS:-${VIEWERS:-${VIEWER_EMAILS:-}}}}"
 SCAN_PROJECTS="${SCAN_PROJECTS:-${LINKED_PROJECTS:-${WORKSPACE_PROJECTS:-}}}"
+SCAN_ALL_PROJECTS="${SCAN_ALL_PROJECTS:-${AUTO_DISCOVER_PROJECTS:-}}"
 
 # Apply CLI overrides on top of config file / environment values.
 [[ -n "$CLI_PROJECT" ]] && PROJECT_ID="$CLI_PROJECT"
@@ -137,6 +146,8 @@ SCAN_PROJECTS="${SCAN_PROJECTS:-${LINKED_PROJECTS:-${WORKSPACE_PROJECTS:-}}}"
 [[ -n "$CLI_BILLING_ACCOUNT" ]] && BILLING_ACCOUNT_ID="$CLI_BILLING_ACCOUNT"
 [[ "$CLI_READ_ONLY" == "1" ]] && ENABLE_GOVERNANCE_ACTIONS="false"
 [[ -n "$CLI_DATA_ACCESS_LOGS" ]] && ENABLE_DATA_ACCESS_LOGS="$CLI_DATA_ACCESS_LOGS"
+[[ -n "$CLI_PREPARE_LINKED" ]] && PREPARE_LINKED_PROJECTS="$CLI_PREPARE_LINKED"
+[[ -n "$CLI_SCAN_ALL" ]] && SCAN_ALL_PROJECTS="$CLI_SCAN_ALL"
 
 for tool in gcloud bq python3; do command -v "$tool" >/dev/null || die "$tool is required"; done
 ACCOUNT="$(ensure_gcloud_auth)"
@@ -172,6 +183,7 @@ WORKSPACE_TIMEZONE="${WORKSPACE_TIMEZONE:-Asia/Seoul}"
 AUDIT_DATASET="$(trim_ws "${AUDIT_DATASET:-ge_analytics}")"
 CREATE_LOG_SINK="${CREATE_LOG_SINK:-true}"
 DATASET_LOCATION="$(trim_ws "${DATASET_LOCATION:-$REGION}")"
+PREPARE_LINKED_PROJECTS="${PREPARE_LINKED_PROJECTS:-true}"
 # Full coverage by default: enable Data Access audit logs, Gemini Enterprise observability + prompt logging,
 # and governance IAM controls out of the box so all 13 modules and health checks work immediately.
 ENABLE_DATA_ACCESS_LOGS="${ENABLE_DATA_ACCESS_LOGS:-true}"
@@ -243,9 +255,13 @@ if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
   [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]] || die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
   [[ "$ACCESS_MODE" != "iap" ]] || die "ENFORCEMENT_SCHEDULE needs ACCESS_MODE google, google_oauth or password (IAP blocks the scheduler's OIDC token)"
 fi
-for flag in CREATE_LOG_SINK ENABLE_DATA_ACCESS_LOGS ENABLE_GE_OBSERVABILITY GE_PROMPT_LOGGING ENABLE_GOVERNANCE_ACTIONS; do
+for flag in CREATE_LOG_SINK ENABLE_DATA_ACCESS_LOGS ENABLE_GE_OBSERVABILITY GE_PROMPT_LOGGING ENABLE_GOVERNANCE_ACTIONS PREPARE_LINKED_PROJECTS; do
   [[ "${!flag}" == "true" || "${!flag}" == "false" ]] || die "$flag must be true or false"
 done
+if [[ -n "$SCAN_ALL_PROJECTS" ]]; then
+  SCAN_ALL_PROJECTS="$(printf '%s' "$SCAN_ALL_PROJECTS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  [[ "$SCAN_ALL_PROJECTS" == "true" || "$SCAN_ALL_PROJECTS" == "false" ]] || die "SCAN_ALL_PROJECTS must be true or false"
+fi
 DISCOVERY_ENGINE_LOCATIONS="$(printf '%s' "$DISCOVERY_ENGINE_LOCATIONS" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 [[ -z "$DISCOVERY_ENGINE_LOCATIONS" || "$DISCOVERY_ENGINE_LOCATIONS" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] \
   || die "DISCOVERY_ENGINE_LOCATIONS must be a comma-separated list such as global,us (or empty to detect)"
@@ -483,6 +499,7 @@ fi
 
 # Linked secondary projects (--link-projects / SCAN_PROJECTS): grant read-only multi-project scanning IAM.
 NORMALIZED_SCAN_PROJECTS=""
+CLEAN_LINKED=()
 if [[ -n "$SCAN_PROJECTS" ]]; then
   LINKED_READ_ROLES=(
     roles/bigquery.dataViewer
@@ -495,10 +512,10 @@ if [[ -n "$SCAN_PROJECTS" ]]; then
     roles/modelarmor.viewer
   )
   IFS=',' read -r -a raw_linked <<<"$SCAN_PROJECTS"
-  CLEAN_LINKED=()
   for raw_lp in "${raw_linked[@]}"; do
     lp="$(normalize_project_id "$raw_lp")"
     [[ -z "$lp" || "$lp" == "$PROJECT_ID" ]] && continue
+    [[ " ${CLEAN_LINKED[*]-} " == *" ${lp} "* ]] && continue
     validate_project_id "$lp" "--link-projects"
     CLEAN_LINKED+=("$lp")
     if [[ "$DRY_RUN" == "1" ]]; then
@@ -726,6 +743,12 @@ if [[ "$ENABLE_GE_OBSERVABILITY" == "true" ]]; then
 else
   info "Gemini Enterprise observability unchanged (ENABLE_GE_OBSERVABILITY=false)"
 fi
+if [[ ${#CLEAN_LINKED[@]} -gt 0 && "$PREPARE_LINKED_PROJECTS" == "true" ]]; then
+  for lp in "${CLEAN_LINKED[@]}"; do
+    prepare_linked_project_telemetry "$lp" "$AUDIT_DATASET" "$DATASET_LOCATION" "${SERVICE_NAME}-ai-logs" \
+      "$CREATE_LOG_SINK" "$ENABLE_DATA_ACCESS_LOGS" "$ENABLE_GE_OBSERVABILITY" "$GE_PROMPT_LOGGING"
+  done
+fi
 
 # ------------------------------------------------------------------------------- 7. deploy
 log "7/8 Deploying Cloud Run"
@@ -737,6 +760,7 @@ add_env() { [[ -n "$2" ]] && ENV_VARS+="##$1=$2"; return 0; }
 add_env PRODUCT_NAME "$PRODUCT_NAME"
 add_env DISABLED_MODULES "$DISABLED_MODULES"
 add_env SCAN_PROJECTS "$NORMALIZED_SCAN_PROJECTS"
+add_env SCAN_ALL_PROJECTS "$SCAN_ALL_PROJECTS"
 add_env BILLING_PROJECT_ID "$BILLING_PROJECT_ID"
 add_env BILLING_DATASET_ID "$BILLING_DATASET"
 add_env BILLING_TABLE_ID "$BILLING_TABLE"
@@ -1018,5 +1042,6 @@ case "$EFFECTIVE_ACCESS_MODE" in
   *) info "Dashboard URL : ${BASE_URL}/login (${ADMIN_EMAILS})" ;;
 esac
 info "Audit dataset : ${PROJECT_ID}:${AUDIT_DATASET} (${DATASET_LOCATION}, Data Access=${ENABLE_DATA_ACCESS_LOGS}, GE Prompt Logging=${GE_PROMPT_LOGGING})"
+[[ -n "$NORMALIZED_SCAN_PROJECTS" ]] && info "Linked scan   : ${NORMALIZED_SCAN_PROJECTS}"
 info "Settings store: gs://${SETTINGS_BUCKET}"
 info "Container     : ${IMAGE}"

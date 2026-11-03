@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # AI Control Plane: removes what scripts/deploy.sh created, using the same deploy.env.
 #
-#   scripts/teardown.sh                  # services, scheduler job, service accounts, IAM bindings, secrets
-#   scripts/teardown.sh --delete-data    # also the settings bucket (UI settings, exception rules,
-#                                        # suspension records, widget layouts) and the Log Router sink
+#   scripts/teardown.sh --project PROJECT_ID     # services, scheduler jobs, service accounts, IAM bindings, secrets
+#   scripts/teardown.sh --delete-data            # also the settings bucket (UI settings, exception rules,
+#                                                # suspension records, widget layouts) and the Log Router sink
 #   scripts/teardown.sh --config other.env --yes
+#   scripts/teardown.sh --project PROJECT_ID --dry-run
 #
 # Never deleted automatically: the BigQuery audit dataset (it holds your logs), the Artifact Registry
 # repository and the Data Access audit log configuration. The script prints the commands for them.
@@ -20,19 +21,27 @@ source "$ROOT/scripts/lib/common.sh"
 CONFIG="$ROOT/deploy.env"
 CONFIG_EXPLICIT=0
 CLI_PROJECT=""
+CLI_LINK_PROJECTS=""
 CLI_REGION=""
 DELETE_DATA=0
+DRY_RUN=0
 YES=0
-usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
+
+normalize_cli_args "$@"
+set -- ${NORMALIZED_ARGS[@]+"${NORMALIZED_ARGS[@]}"}
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --config) CONFIG="$2"; CONFIG_EXPLICIT=1; shift 2 ;;
-    --project) CLI_PROJECT="$2"; shift 2 ;;
-    --region) CLI_REGION="$2"; shift 2 ;;
+    --config) need_arg "$@"; CONFIG="$2"; CONFIG_EXPLICIT=1; shift 2 ;;
+    --project) need_arg "$@"; CLI_PROJECT="$2"; shift 2 ;;
+    --link-projects|--scan-projects) need_arg "$@"; CLI_LINK_PROJECTS="$2"; shift 2 ;;
+    --region) need_arg "$@"; CLI_REGION="$2"; shift 2 ;;
     --delete-data) DELETE_DATA=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
     -y|--yes) YES=1; shift ;;
-    -h|--help) usage ;;
-    *) echo "unknown argument: $1" >&2; usage ;;
+    -h|--help) usage 0 ;;
+    *) echo "unknown argument: $1" >&2; usage 2 ;;
   esac
 done
 quiet() { "$@" >/dev/null 2>&1; }
@@ -41,17 +50,36 @@ if [[ "$CONFIG_EXPLICIT" == "1" ]]; then
   [[ -f "$CONFIG" ]] || die "configuration file not found: $CONFIG"
   # shellcheck disable=SC1090
   source "$CONFIG"
-elif [[ -n "$CLI_PROJECT" && -f "$ROOT/deploy.$(normalize_project_id "$CLI_PROJECT").env" ]]; then
-  # shellcheck disable=SC1090
-  source "$ROOT/deploy.$(normalize_project_id "$CLI_PROJECT").env"
+elif [[ -n "$CLI_PROJECT" ]]; then
+  NORM_CLI_PROJECT="$(normalize_project_id "$CLI_PROJECT")"
+  if [[ -f "$ROOT/deploy.${NORM_CLI_PROJECT}.env" ]]; then
+    # shellcheck disable=SC1090
+    source "$ROOT/deploy.${NORM_CLI_PROJECT}.env"
+  elif [[ -f "$CONFIG" ]]; then
+    CFG_PID="$(bash -c 'source "$1" >/dev/null 2>&1 || true; printf "%s" "${PROJECT_ID:-}"' _ "$CONFIG")"
+    CFG_PID="$(normalize_project_id "$CFG_PID")"
+    if [[ -z "$CFG_PID" || "$CFG_PID" == "$NORM_CLI_PROJECT" ]]; then
+      # shellcheck disable=SC1090
+      source "$CONFIG"
+    fi
+  fi
 elif [[ -f "$CONFIG" ]]; then
   # shellcheck disable=SC1090
   source "$CONFIG"
 fi
+SCAN_PROJECTS="${SCAN_PROJECTS:-${LINKED_PROJECTS:-${WORKSPACE_PROJECTS:-}}}"
 [[ -n "$CLI_PROJECT" ]] && PROJECT_ID="$CLI_PROJECT"
+[[ -n "$CLI_LINK_PROJECTS" ]] && SCAN_PROJECTS="$CLI_LINK_PROJECTS"
 [[ -n "$CLI_REGION" ]] && REGION="$CLI_REGION"
 
 PROJECT_ID="$(normalize_project_id "${PROJECT_ID:-}")"
+if [[ -z "$PROJECT_ID" || "$PROJECT_ID" == your-* || "$PROJECT_ID" == "PROJECT_ID" ]]; then
+  if [[ "$CONFIG_EXPLICIT" == "0" ]]; then
+    ACTIVE_GCP_PROJECT="$(normalize_project_id "$(gcloud config get-value project 2>/dev/null || true)")"
+    [[ "$ACTIVE_GCP_PROJECT" == "(unset)" ]] && ACTIVE_GCP_PROJECT=""
+    [[ -n "$ACTIVE_GCP_PROJECT" ]] && PROJECT_ID="$ACTIVE_GCP_PROJECT"
+  fi
+fi
 REGION="$(trim_ws "${REGION:-asia-northeast3}")"
 SERVICE_NAME="$(trim_ws "${SERVICE_NAME:-ai-control-plane}")"
 AUDIT_DATASET="$(trim_ws "${AUDIT_DATASET:-ge_analytics}")"
@@ -61,7 +89,8 @@ SERVICE_ACCOUNT_ID="$(trim_ws "${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}")"
 SETTINGS_BUCKET="$(trim_ws "${SETTINGS_BUCKET:-}")"
 SESSION_SECRET_NAME="$(trim_ws "${SESSION_SECRET_NAME:-${SERVICE_NAME}-session-secret}")"
 OAUTH_SECRET_NAME="$(trim_ws "${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}")"
-validate_project_id "$PROJECT_ID" "${CONFIG}"
+WHERE_LABEL="$( [[ -f "$CONFIG" ]] && basename "$CONFIG" || echo "--project" )"
+validate_project_id "$PROJECT_ID" "$WHERE_LABEL"
 [[ -n "$SETTINGS_BUCKET" ]] || SETTINGS_BUCKET="$(default_settings_bucket "$PROJECT_ID" "$SERVICE_NAME")"
 
 SA_EMAIL="${SERVICE_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -74,14 +103,25 @@ SINK="${SERVICE_NAME}-ai-logs"
 
 echo "This removes ${SERVICE_NAME} from project ${PROJECT_ID} (${REGION})."
 [[ "$DELETE_DATA" == "1" ]] && echo "It also deletes gs://${SETTINGS_BUCKET} and the log sink ${SINK}."
+if [[ "$DRY_RUN" == "1" ]]; then
+  info "[dry-run] scheduler jobs: ${SERVICE_NAME}-enforce, ${SERVICE_NAME}-pricing-sync"
+  info "[dry-run] Cloud Run services: ${SERVICE_NAME}, ${BRIDGE_NAME}"
+  info "[dry-run] IAM bindings on ${PROJECT_ID}${SCAN_PROJECTS:+ and linked projects (${SCAN_PROJECTS})} for ${SA_EMAIL}"
+  info "[dry-run] service accounts: ${SA_EMAIL}, ${BUILD_SA}, ${SCHEDULER_SA}, ${BRIDGE_SA}"
+  info "[dry-run] secrets: ${SESSION_SECRET_NAME}, ${OAUTH_SECRET_NAME}"
+  [[ "$DELETE_DATA" == "1" ]] && info "[dry-run] delete gs://${SETTINGS_BUCKET} and log sink ${SINK}"
+  exit 0
+fi
 if [[ "$YES" != "1" ]]; then
   read -r -p "Type the project id to continue: " answer
   [[ "$answer" == "$PROJECT_ID" ]] || die "cancelled"
 fi
 
-log "Cloud Scheduler job"
-quiet gcloud scheduler jobs delete "${SERVICE_NAME}-enforce" --project "$PROJECT_ID" --location "$REGION" --quiet \
-  && info "deleted ${SERVICE_NAME}-enforce" || info "not found"
+log "Cloud Scheduler jobs"
+for job in "${SERVICE_NAME}-enforce" "${SERVICE_NAME}-pricing-sync"; do
+  quiet gcloud scheduler jobs delete "$job" --project "$PROJECT_ID" --location "$REGION" --quiet \
+    && info "deleted ${job}" || info "${job} not found"
+done
 
 log "Cloud Run services"
 for svc in "$SERVICE_NAME" "$BRIDGE_NAME"; do
@@ -108,6 +148,16 @@ remove_bindings "$PROJECT_ID" "serviceAccount:${BUILD_SA}"
 quiet gcloud artifacts repositories remove-iam-policy-binding "$AR_REPOSITORY" \
   --location "$REGION" --project "$PROJECT_ID" \
   --member "serviceAccount:${BUILD_SA}" --role roles/artifactregistry.writer --quiet || true
+
+if [[ -n "$SCAN_PROJECTS" ]]; then
+  IFS=',' read -r -a raw_linked <<<"$SCAN_PROJECTS"
+  for raw_lp in "${raw_linked[@]}"; do
+    lp="$(normalize_project_id "$raw_lp")"
+    [[ -z "$lp" || "$lp" == "$PROJECT_ID" ]] && continue
+    remove_bindings "$lp" "serviceAccount:${SA_EMAIL}"
+  done
+fi
+
 if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; then
   remove_bindings "$BILLING_PROJECT_ID" "serviceAccount:${SA_EMAIL}"   # deployments made before dataset-level grants
   if [[ -n "$BILLING_DATASET" ]]; then

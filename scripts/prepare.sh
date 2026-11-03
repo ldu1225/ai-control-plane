@@ -42,7 +42,7 @@ DATA_ACCESS_LOGS=true
 LOG_PROMPTS=true
 DRY_RUN=0
 
-usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 need() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 normalize_cli_args "$@"
 set -- ${NORMALIZED_ARGS[@]+"${NORMALIZED_ARGS[@]}"}
@@ -60,8 +60,8 @@ while [[ $# -gt 0 ]]; do
     --log-prompts) LOG_PROMPTS=true; shift ;;
     --no-log-prompts) LOG_PROMPTS=false; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
-    -h|--help) usage ;;
-    *) echo "unknown argument: $1" >&2; usage ;;
+    -h|--help) usage 0 ;;
+    *) echo "unknown argument: $1" >&2; usage 2 ;;
   esac
 done
 

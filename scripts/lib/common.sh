@@ -916,6 +916,56 @@ ensure_ai_log_sink() {
   info "sink ${sink} -> ${project}:${dataset} (writer ${writer}: BigQuery Data Editor on this dataset only)"
 }
 
+# prepare_linked_project_telemetry PROJECT DATASET LOCATION SINK CREATE_SINK ENABLE_AUDIT ENABLE_GE LOG_PROMPTS
+# Best-effort, non-fatal telemetry setup for secondary projects passed via --link-projects / SCAN_PROJECTS.
+# Never aborts the hub deployment when the caller only has read/IAM privileges on the linked project.
+prepare_linked_project_telemetry() {
+  local project="$1" dataset="$2" location="$3" sink="$4"
+  local create_sink="${5:-true}" enable_audit="${6:-true}" enable_ge="${7:-true}" log_prompts="${8:-true}"
+  local dest filter writer ge_locs sink_ok=0
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    info "[dry-run] linked project ${project}: best-effort APIs, ${project}:${dataset} (${location}) sink, Data Access logs & GE observability"
+    return 0
+  fi
+  gcloud services enable logging.googleapis.com bigquery.googleapis.com monitoring.googleapis.com \
+    aiplatform.googleapis.com discoveryengine.googleapis.com modelarmor.googleapis.com \
+    --project "$project" --quiet >/dev/null 2>&1 || true
+  if [[ "$create_sink" == "true" ]]; then
+    if ! bq --project_id "$project" show --dataset "${project}:${dataset}" >/dev/null 2>&1; then
+      bq --project_id "$project" --location "$location" mk --dataset \
+        --description "AI audit logs routed for AI Control Plane" "${project}:${dataset}" >/dev/null 2>&1 \
+        || bq --project_id "$project" --location "US" mk --dataset \
+          --description "AI audit logs routed for AI Control Plane" "${project}:${dataset}" >/dev/null 2>&1 || true
+    fi
+    if bq --project_id "$project" show --dataset "${project}:${dataset}" >/dev/null 2>&1; then
+      dest="bigquery.googleapis.com/projects/${project}/datasets/${dataset}"
+      filter="$(ai_log_filter)"
+      if gcloud logging sinks describe "$sink" --project "$project" >/dev/null 2>&1; then
+        gcloud logging sinks update "$sink" "$dest" --log-filter "$filter" --project "$project" --quiet >/dev/null 2>&1 && sink_ok=1 || true
+      else
+        gcloud logging sinks create "$sink" "$dest" --use-partitioned-tables --log-filter "$filter" \
+          --project "$project" --quiet >/dev/null 2>&1 && sink_ok=1 || true
+      fi
+      if [[ "$sink_ok" == "1" ]]; then
+        writer="$(gcloud logging sinks describe "$sink" --project "$project" --format='value(writerIdentity)' 2>/dev/null || true)"
+        if [[ -n "$writer" ]] && grant_dataset_role "$project" "$dataset" WRITER "${writer#serviceAccount:}" >/dev/null 2>&1; then
+          info "linked project ${project}: log sink ${sink} -> ${project}:${dataset} ready"
+        fi
+      fi
+    fi
+  fi
+  if [[ "$enable_audit" == "true" ]]; then
+    enable_data_access_logs "$project" || true
+  fi
+  if [[ "$enable_ge" == "true" ]]; then
+    ge_locs="$(ge_locations "$project")"
+    if [[ -n "$ge_locs" ]]; then
+      ensure_ge_observability "$project" "$ge_locs" "$log_prompts" || true
+    fi
+  fi
+  return 0
+}
+
 # enable_data_access_logs PROJECT
 # Enables ADMIN_READ, DATA_READ and DATA_WRITE Cloud Audit Logs across all IAM-configurable AI services
 # (Agent Platform, Discovery Engine [Gemini Enterprise & NotebookLM], Model Armor, Antigravity, and Gemini

@@ -242,7 +242,7 @@ class TokenMergeTest(unittest.TestCase):
         keys = [m["key"] for m in out["models"]]
         self.assertEqual(keys, ["gemini-3.7-flash"])
         flash = out["models"][0]
-        # Monitoring (Vertex AI) 1,200 + Gemini API 500; the Vertex billing line and the CodeMender line are not added.
+        # Monitoring (Agent Platform) 1,200 + Gemini API 500; the Agent Platform billing line and the CodeMender line are not added.
         self.assertEqual(flash["tokens"]["total"], 1700)
         self.assertEqual(flash["tokens"]["input"], 1500)
         self.assertAlmostEqual(flash["cost"], 0.15, places=6)

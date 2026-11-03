@@ -115,7 +115,15 @@ class DeployModulesTest(unittest.TestCase):
 
     def test_deploy_env_example_documents_the_new_settings(self):
         example = read("deploy.env.example")
-        for key in ("DISABLED_MODULES", "ENABLE_GE_OBSERVABILITY", "GE_PROMPT_LOGGING"):
+        for key in (
+            "DISABLED_MODULES",
+            "ENABLE_GE_OBSERVABILITY",
+            "GE_PROMPT_LOGGING",
+            "SCAN_PROJECTS",
+            "SCAN_ALL_PROJECTS",
+            "PREPARE_LINKED_PROJECTS",
+            "PRICING_SYNC_SCHEDULE",
+        ):
             self.assertRegex(example, r"(?m)^%s=" % key)
 
 
@@ -747,6 +755,211 @@ esac
         self.assertIn("roles/resourcemanager.projectIamAdmin", res.stderr)
         self.assertIn("user:viewer@example.org", res.stderr)
         self.assertIn("[한국어 안내]", res.stderr)
+
+
+class MultiProjectHubAndTeardownTest(unittest.TestCase):
+    """End-to-end tests for --link-projects hub mode, interactive wizard, prepare-only, and teardown.sh."""
+
+    def _make_stub_bin(self, tmp, log_file=None, projects_csv=None):
+        bin_dir = os.path.join(tmp, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        gcloud_stub = os.path.join(bin_dir, "gcloud")
+        projects_out = projects_csv or "alpha-hub\tAlpha Hub\nbeta-spoke\tBeta Spoke\ngamma-spoke\tGamma Spoke"
+        log_stmt = f'echo "$*" >> "{log_file}"\n' if log_file else ""
+        with open(gcloud_stub, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#!/usr/bin/env bash\n"
+                f"{log_stmt}"
+                'case "$*" in\n'
+                '  *"config get-value account"*) echo "owner@example.org" ;;\n'
+                '  *"config get-value project"*) echo "alpha-hub" ;;\n'
+                f'  *"projects list"*) printf "%b\\n" "{projects_out}" ;;\n'
+                '  *"projects describe"*) echo "123456789012" ;;\n'
+                '  *"auth print-access-token"*) echo "" ;;\n'
+                '  *"projects get-iam-policy"*"value(bindings.role)"*) echo "roles/bigquery.jobUser" ;;\n'
+                '  *"projects get-iam-policy"*) echo \'{"bindings":[]}\' ;;\n'
+                '  *"logging sinks describe"*) exit 0 ;;\n'
+                '  *"run deploy --help"*) echo "--iap --no-iap --no-invoker-iam-check" ;;\n'
+                '  *"describe"*) exit 1 ;;\n'
+                '  *) exit 0 ;;\n'
+                'esac\n'
+            )
+        os.chmod(gcloud_stub, 0o755)
+        bq_stub = os.path.join(bin_dir, "bq")
+        with open(bq_stub, "w", encoding="utf-8") as fh:
+            fh.write("#!/usr/bin/env bash\nexit 1\n")
+        os.chmod(bq_stub, 0o755)
+        return bin_dir
+
+    def _copy_scripts_workspace(self, tmp):
+        ws = os.path.join(tmp, "ws")
+        os.makedirs(os.path.join(ws, "scripts", "lib"), exist_ok=True)
+        for rel in (
+            "scripts/install.sh",
+            "scripts/deploy.sh",
+            "scripts/prepare.sh",
+            "scripts/teardown.sh",
+            "scripts/lib/common.sh",
+        ):
+            src = os.path.join(ROOT, rel)
+            dst = os.path.join(ws, rel)
+            with open(src, "rb") as sf, open(dst, "wb") as df:
+                df.write(sf.read())
+            os.chmod(dst, 0o755)
+        return ws
+
+    def test_unified_hub_link_projects_persists_env_and_reloads_on_redeploy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._make_stub_bin(tmp)
+            ws = self._copy_scripts_workspace(tmp)
+            env = dict(
+                os.environ,
+                PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
+                ACP_SAVE_ENV_ON_DRY_RUN="1",
+            )
+            # Pass host project duplicated inside --link-projects + messy projects/ prefix to verify deduplication & normalization
+            res = subprocess.run(
+                [
+                    "bash", os.path.join(ws, "scripts/install.sh"),
+                    "--project", "demo-hub",
+                    "--link-projects", "projects/demo-spoke-a, demo-spoke-b, demo-hub, demo-spoke-a",
+                    "--admins", "admin@example.org",
+                    "--dry-run",
+                ],
+                cwd=ws,
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("Linked scan   : demo-spoke-a,demo-spoke-b", res.stdout)
+            self.assertIn("[dry-run] grant multi-project read roles on demo-spoke-a", res.stdout)
+            self.assertIn("[dry-run] grant multi-project read roles on demo-spoke-b", res.stdout)
+            self.assertIn("[dry-run] linked project demo-spoke-a: best-effort APIs, demo-spoke-a:ge_analytics", res.stdout)
+            self.assertIn("[dry-run] linked project demo-spoke-b: best-effort APIs, demo-spoke-b:ge_analytics", res.stdout)
+            self.assertIn("SCAN_PROJECTS=demo-spoke-a,demo-spoke-b", res.stderr)
+
+            saved_env_path = os.path.join(ws, "deploy.demo-hub.env")
+            self.assertTrue(os.path.exists(saved_env_path))
+            with open(saved_env_path, encoding="utf-8") as fh:
+                saved_env = fh.read()
+            self.assertIn('SCAN_PROJECTS="demo-spoke-a,demo-spoke-b"', saved_env)
+
+            # Re-running deploy.sh --project demo-hub WITHOUT --link-projects must preserve SCAN_PROJECTS from deploy.demo-hub.env!
+            res_redeploy = subprocess.run(
+                [
+                    "bash", os.path.join(ws, "scripts/deploy.sh"),
+                    "--project", "demo-hub",
+                    "--no-auto-discover-projects",
+                    "--dry-run",
+                ],
+                cwd=ws,
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res_redeploy.returncode, 0, msg=(res_redeploy.stdout, res_redeploy.stderr))
+            self.assertIn("Linked scan   : demo-spoke-a,demo-spoke-b", res_redeploy.stdout)
+            self.assertIn("SCAN_ALL_PROJECTS=false", res_redeploy.stderr)
+
+    def test_interactive_wizard_resolves_menu_numbers_for_host_and_linked_projects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._make_stub_bin(tmp)
+            ws = self._copy_scripts_workspace(tmp)
+            env = dict(
+                os.environ,
+                PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
+                ACP_FORCE_WIZARD="1",
+            )
+            wizard_input = "1\n2,3\nasia-northeast3\nadmin@example.org\nviewer@example.org\n"
+            res = subprocess.run(
+                ["bash", os.path.join(ws, "scripts/install.sh"), "--dry-run"],
+                cwd=ws,
+                input=wizard_input,
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("Deployment complete: alpha-hub", res.stdout)
+            self.assertIn("Linked scan   : beta-spoke,gamma-spoke", res.stdout)
+
+    def test_prepare_only_with_link_projects_prepares_hub_and_spokes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._make_stub_bin(tmp)
+            ws = self._copy_scripts_workspace(tmp)
+            env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
+            res = subprocess.run(
+                [
+                    "bash", os.path.join(ws, "scripts/install.sh"),
+                    "--prepare-only",
+                    "--project", "demo-hub",
+                    "--link-projects", "demo-spoke-a,demo-spoke-b",
+                    "--dry-run",
+                ],
+                cwd=ws,
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("Preparing demo-hub for AI Control Plane", res.stdout)
+            self.assertIn("Preparing demo-spoke-a for AI Control Plane", res.stdout)
+            self.assertIn("Preparing demo-spoke-b for AI Control Plane", res.stdout)
+            self.assertIn("grant the sink writer BigQuery Data Editor on demo-spoke-b:ge_analytics", res.stdout)
+
+    def test_teardown_dry_run_and_live_stub_clean_pricing_scheduler_and_linked_iam(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud_log = os.path.join(tmp, "gcloud_calls.log")
+            bin_dir = self._make_stub_bin(tmp, log_file=gcloud_log)
+            ws = self._copy_scripts_workspace(tmp)
+            env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+            # 1) Dry-run with Unicode dashes/quotes, --link-projects, AND an unrelated deploy.env present in $ROOT:
+            #    must NOT leak another project's SETTINGS_BUCKET or REGION, and must NOT mutate anything.
+            with open(os.path.join(ws, "deploy.env"), "w", encoding="utf-8") as fh:
+                fh.write(
+                    'PROJECT_ID="unrelated-other-proj"\n'
+                    'REGION="europe-west1"\n'
+                    'SETTINGS_BUCKET="unrelated-other-proj-bucket"\n'
+                )
+            res_dry = subprocess.run(
+                [
+                    "bash", os.path.join(ws, "scripts/teardown.sh"),
+                    "\u2014project=\u201cdemo-hub\u201d",
+                    "\u2013link-projects=demo-spoke-a,demo-spoke-b",
+                    "--delete-data",
+                    "--dry-run",
+                ],
+                cwd=ws,
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res_dry.returncode, 0, msg=(res_dry.stdout, res_dry.stderr))
+            self.assertIn("project demo-hub (asia-northeast3)", res_dry.stdout)
+            self.assertNotIn("unrelated-other-proj-bucket", res_dry.stdout)
+            self.assertIn("gs://demo-hub-ai-control-plane-settings", res_dry.stdout)
+            self.assertIn("[dry-run] scheduler jobs: ai-control-plane-enforce, ai-control-plane-pricing-sync", res_dry.stdout)
+            self.assertIn("[dry-run] IAM bindings on demo-hub and linked projects (demo-spoke-a,demo-spoke-b)", res_dry.stdout)
+            self.assertFalse(os.path.exists(gcloud_log) and "delete" in open(gcloud_log, encoding="utf-8").read())
+
+            # 2) Non-dry-run loading SCAN_PROJECTS automatically from deploy.demo-hub.env
+            with open(os.path.join(ws, "deploy.demo-hub.env"), "w", encoding="utf-8") as fh:
+                fh.write(
+                    'PROJECT_ID="demo-hub"\n'
+                    'REGION="asia-northeast3"\n'
+                    'SCAN_PROJECTS="demo-spoke-a,demo-spoke-b"\n'
+                )
+            res_live = subprocess.run(
+                [
+                    "bash", os.path.join(ws, "scripts/teardown.sh"),
+                    "--project", "demo-hub",
+                    "--delete-data",
+                    "--yes",
+                ],
+                cwd=ws,
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res_live.returncode, 0, msg=(res_live.stdout, res_live.stderr))
+            with open(gcloud_log, encoding="utf-8") as fh:
+                calls = fh.read()
+            self.assertIn("scheduler jobs delete ai-control-plane-pricing-sync", calls)
+            self.assertIn("scheduler jobs delete ai-control-plane-enforce", calls)
+            self.assertIn("projects remove-iam-policy-binding demo-spoke-a", calls)
+            self.assertIn("projects remove-iam-policy-binding demo-spoke-b", calls)
+            self.assertIn("storage rm --recursive --all-versions gs://demo-hub-ai-control-plane-settings", calls)
+            self.assertIn("logging sinks delete ai-control-plane-ai-logs", calls)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ This is an AI governance dashboard for viewing and controlling Gemini Enterprise
 Click **Open in Cloud Shell** above or run `scripts/install.sh` in Cloud Shell to enable all required APIs, provision service agents and least-privilege identities, configure audit log routing, Data Access audit logs and Gemini Enterprise prompt logging, and deploy the dashboard to Cloud Run in one step. The product name, organization name, logo, colors, language, modules to use and models to track can all be changed in settings.
 
 > [!IMPORTANT]
-> **There is no sample data, no demo mode and no fake data.** Every number in the UI is a value actually read from the connected Google Cloud project. If a data source is missing or access is denied, the value is not estimated or filled in. It is left empty as `—`, and the notice at the top of the page and the data source health panel show the cause and how to fix it.
+> **There is no sample data, no demo mode and no fake data.** Every number in the UI is a value actually read from the connected Google Cloud project(s). When a BigQuery Billing Export table is not connected yet, cost metrics automatically fall back to **Token-Based Reverse Cost Estimation** (measured token usage × official Google Cloud public pricing × live USD/KRW exchange rate, clearly badged as estimated cost in the UI). Metrics whose underlying telemetry cannot be read are never fabricated — they are shown as `—` with the exact cause and remediation steps.
 
 > [!NOTE]
 > This repository is a management solution built to run in Google Cloud customer environments. It is not an officially supported Google product. Korean: [README.md](README.md)
@@ -42,7 +42,7 @@ Click **Open in Cloud Shell** above or run `scripts/install.sh` in Cloud Shell t
 
 | Principle | Meaning |
 |---|---|
-| Measured data only | No estimates, example values or demo data are added. Values that cannot be read are shown as `—` with the cause. |
+| Measured data only | No sample values or demo data are ever injected. Without a billing export, measured token usage is valued with official Google Cloud public pricing (explicitly badged as estimated cost); unreadable metrics are shown as `—` with the cause. |
 | No hardcoding | Model lists and versions are not kept in code. Models are discovered automatically from billing SKUs, Cloud Monitoring and Antigravity logs, so new models such as Gemini 4 Carbon and Gemini 4 Argon are tracked without a new deployment. |
 | Schema-adaptive | BigQuery tables and columns are checked with `INFORMATION_SCHEMA`, and only the ones that exist are queried. Both date-sharded tables and partitioned tables are supported. |
 | Everything can be turned on or off | Modules, models and connectors are turned on or off individually. Disabled modules do not query their data sources. |
@@ -61,13 +61,13 @@ Click **Open in Cloud Shell** above or run `scripts/install.sh` in Cloud Shell t
 | Deployments | `agent_deployments` | Agent Engine runtimes, runtime identities (service accounts), invocation volume, model usage by identity, runtime cost | Agent Platform API, audit logs, billing export |
 | Model Armor | `model_armor` | Verdicts over time, matched filters, blocks by application and user, event details | BigQuery `modelarmor_googleapis_com_sanitize_operations` |
 | Models & Tokens | `model_usage` | Automatic model discovery, input/output/cached tokens per model, invocations, error rate, cost, catalog management | Cloud Monitoring, billing export, Antigravity logs |
-| Cost & FinOps | `finops` | Gross cost, credits, net cost, cost by service and SKU, spike detection and AI root-cause analysis | Billing export |
+| Cost & FinOps | `finops` | Gross cost, credits, net cost, cost by service/SKU or per-model token cost estimate, daily `04:00 KST` pricing/FX sync & change alerts, spike detection and AI root-cause analysis | Billing export or Token-Based Reverse Cost Estimation (Cloud Billing Catalog API + live FX) |
 | Users & Access | `users` | 360-degree user view (usage across all services), Antigravity IAM state, individual allow and disallow | All sources, Resource Manager IAM |
 | Antigravity Controls | `antigravity` | Per-user cost/token/request caps, automatic or manual suspension, exception rules, settlement periods, safety gates, Agent activity in your cloud, audit log | Cloud Logging or BigQuery, IAM, billing export, Cloud Billing Catalog API |
 | Telemetry Extensions | `telemetry` | Automatic discovery of logs and tables with plain-language descriptions, one-click standard dashboards, BigQuery export commands | BigQuery, Cloud Logging, Cloud Monitoring |
 | AI Analyst | `analyst` | Natural language questions, validated read-only SQL, result tables and charts, summaries | BigQuery, Gemini on Agent Platform |
 
-Common features: light/dark theme, Korean/English switching, command palette (Ctrl/Cmd+K), date range selection (presets and custom range), table search/sort/CSV export, data source health panel.
+Common features: light/dark theme, Korean/English switching, unified multi-project selector (`All Projects` or per-project filter), currency selector (`KRW`/`USD`), command palette (Ctrl/Cmd+K), date range selection (presets and custom range), table search/sort/CSV export, data source health panel.
 
 Credits are shown only when the billing export contains actual credit rows. Gemini Code Assist and Duet AI SKUs are excluded from all totals.
 
@@ -114,7 +114,7 @@ flowchart LR
 |-- Dockerfile                  # container image that runs as a non-root user
 |-- .dockerignore, .gcloudignore
 |-- scripts/
-|   |-- install.sh              # one-click / one-command bootstrap installer (single or multi-project)
+|   |-- install.sh              # one-click / one-command bootstrap installer (single or multi-project hub)
 |   |-- prepare.sh              # before deployment: start collecting logs (sink, Data Access, Gemini Enterprise logs)
 |   |-- deploy.sh               # one-command resilient deployment (from empty project to live readiness probe)
 |   |-- teardown.sh             # deletes the deployed resources
@@ -133,10 +133,10 @@ flowchart LR
 |   |   |-- schema.py           # schema-adaptive BigQuery access
 |   |   |-- settings_store.py   # settings store (gcs, file, memory)
 |   |   |-- gcp.py, ai.py, cache.py, timeutil.py
-|   |   `-- services/           # per-module services (governance, pricing, gemini_enterprise, ...)
+|   |   `-- services/           # per-module services (governance, pricing, pricing_sync, gemini_enterprise, ...)
 |   `-- web/                    # frontend SPA (index.html, login.html, assets/)
 |-- eval/analyst/               # AI Analyst golden dataset and evaluation harness (16.1)
-|-- tests/unit/                 # unit tests (332)
+|-- tests/unit/                 # unit tests
 `-- .github/workflows/tests.yml # unit tests, prepublish scan and dataset validation on every push
 ```
 
@@ -148,29 +148,42 @@ flowchart LR
 
 | Item | Details |
 |---|---|
-| Google Cloud project | Any Google Cloud project, including a brand-new empty project. If billing is not linked yet, the installer automatically links a single open billing account or sibling folder billing account (or pass `--billing-account ID`). |
-| Permissions | Project `Owner` on the deploying account (or IAM Admin — missing operational deployment roles are self-bootstrapped automatically) |
+| Google Cloud project | Any Google Cloud project **ID** (lowercase letters, digits and hyphens — not the display Name), including a brand-new empty project. If billing is not linked yet, the installer automatically links a single open billing account or sibling folder billing account (or pass `--billing-account ID`). |
+| Permissions | Project `Owner` on the deploying account (or `Project IAM Admin` — missing operational deployment roles are self-bootstrapped automatically). When linking secondary projects (`--link-projects`), having IAM/admin access on those projects lets the installer grant cross-project read roles and enable log routing automatically. |
 | Environment | **Google Cloud Shell recommended** (`gcloud`, `bq`, `python3`, `git` and `docker` are pre-installed). Works identically on macOS and Linux. |
 
 ### 3.2 Deploy (One-click / One-liner)
 
-**Option A — Run directly in Cloud Shell with zero config editing (interactive project selector)**
+**Option A — Interactive wizard in Cloud Shell (zero config editing; picks host project & optional linked projects by menu number)**
 ```bash
 bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
 ```
 
-**Option B — Unattended single or multi-project deployment**
+**Option B — Single-project unattended deployment**
 ```bash
-bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --projects my-project-1,my-project-2 --admins admin@example.org --viewers viewer@example.org
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --project my-project-1 --admins admin@example.org --viewers viewer@example.org
 ```
-*(For a single project pass `--project my-project-1`; when `--admins` is omitted, the active `gcloud` account becomes the initial administrator. If an older `~/ai-control-plane` directory or stale `deploy.env` already exists in Cloud Shell, this command automatically updates or re-clones it cleanly and backs up any old `deploy.env` to `deploy.env.bak`.)*
+*(When `--admins` is omitted, the active `gcloud` account becomes the initial administrator.)*
 
-**Option C — Clone and run with CLI flags or `deploy.env`**
+**Option C (Recommended for multi-project orgs) — Unified Multi-Project Hub (1 Cloud Run dashboard monitoring multiple projects together)**
+```bash
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --project my-hub-project \
+  --link-projects my-project-2,my-project-3 \
+  --admins admin@example.org --viewers viewer@example.org
+```
+- Deploys **one** Cloud Run dashboard in `my-hub-project`, grants its runtime service account least-privilege read roles on `my-project-2` and `my-project-3`, configures same-region BigQuery audit log sinks on the linked projects so `UNION ALL` queries work seamlessly, and aggregates all projects in the header project selector (`All Projects` or individual project filter).
+- Even without `--link-projects`, any other project in the **same Google Cloud Organization** that the runtime service account can read is discovered automatically (`SCAN_ALL_PROJECTS=true` by default; pass `--no-auto-discover-projects` to restrict strictly to `--link-projects`).
+- Need **completely isolated Cloud Run dashboards** per project instead of one shared hub? Use `--projects proj-a,proj-b`.
+- If an older `~/ai-control-plane` clone or broken `deploy.env` exists in Cloud Shell, `install.sh` automatically updates or re-clones it cleanly and backs up `deploy.env` to `deploy.env.bak`.
+
+**Option D — Clone and run directly with CLI flags or `deploy.env`**
 ```bash
 git clone https://github.com/ldu1225/ai-control-plane.git
 cd ai-control-plane
 
-scripts/deploy.sh --project my-project-1 --admins admin@example.org
+scripts/deploy.sh --project my-hub-project --link-projects my-project-2,my-project-3 --admins admin@example.org
 # or copy deploy.env.example -> deploy.env and run scripts/deploy.sh
 ```
 
@@ -179,17 +192,17 @@ What the script automates end-to-end on a brand-new project:
 | Step | Details |
 |---|---|
 | 0. Preflight & Billing | Bootstraps foundational control-plane APIs, verifies/self-grants missing caller IAM roles, and verifies or auto-links Cloud Billing. |
-| 1. Enable APIs & Service Agents | Enables Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, IAP and provisions all Google-managed service agents (`service-PROJECT_NUMBER@...`) immediately. |
+| 1. Enable APIs & Service Agents | Enables Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, Cloud Scheduler, IAP and provisions all Google-managed service agents (`service-PROJECT_NUMBER@...`) immediately. |
 | 2. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. |
-| 3. Dedicated SAs & IAM | Creates the runtime SA, sign-in bridge SA, and a **dedicated Cloud Build SA** (never relies on the legacy Compute Engine default SA), grants least-privilege roles, and auto-detects any BigQuery billing export table. |
+| 3. Dedicated SAs & IAM | Creates the runtime SA, sign-in bridge SA, and a **dedicated Cloud Build SA** (never relies on the legacy Compute Engine default SA), grants least-privilege roles on the host project and any `--link-projects` projects, and auto-detects any BigQuery billing export table. |
 | 4. Container image | Creates the Artifact Registry repository and builds with Cloud Build using the dedicated builder SA (automatically falls back to local/Cloud Shell Docker if Cloud Build is restricted). |
 | 5. Session signing key | Creates a regional Secret Manager secret compliant with `constraints/gcp.resourceLocations` org policies. |
-| 6. Full data-source onboarding | Creates the BigQuery dataset (`ge_analytics`) and partitioned Log Router sink, **enables Data Access audit logs across all 7 AI services**, turns on **Gemini Enterprise usage + prompt/user logging**, and auto-detects org name and Agent Platform endpoints. |
-| 7. Resilient Cloud Run & Auth | Deploys the IAP sign-in bridge and dashboard, automatically adapting to enterprise org policies (`--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** or built-in ID/Password sign-in). |
+| 6. Full data-source onboarding | Creates the BigQuery dataset (`ge_analytics`) and partitioned Log Router sink, **enables Data Access audit logs across AI services**, turns on **Gemini Enterprise usage + prompt/user logging**, onboards `--link-projects` secondary projects in the same BigQuery region, and auto-detects org name and Agent Platform endpoints. |
+| 7. Resilient Cloud Run, Auth & Pricing Sync | Deploys the IAP sign-in bridge and dashboard (adapting automatically to enterprise org policies: `--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** or built-in ID/Password sign-in) and provisions the daily `04:00 KST` public pricing & USD/KRW FX sync scheduler (`ai-control-plane-pricing-sync`). |
 | 8. Live readiness probe | Verifies live HTTP response from the deployed Cloud Run URL and prints the exact login link. |
 
 - **Safe to re-run (idempotent).** Creates what is missing and updates what exists.
-- `install.sh` saves a git-ignored `deploy.<PROJECT_ID>.env` snapshot per project so future updates take a single command.
+- `install.sh` saves a git-ignored `deploy.<PROJECT_ID>.env` snapshot (including `SCAN_PROJECTS`) so future upgrades preserve your linked projects automatically.
 
 ### 3.3 First sign-in
 
@@ -199,9 +212,9 @@ What the script automates end-to-end on a brand-new project:
 
 ### 3.4 Post-deployment checks
 
-1. Select **Data sources** in the top bar to check the connection status. Red items show the cause (permissions, missing table and so on).
-2. In **Settings > Workspace and data sources**, check or change the billing export, the audit log dataset and the Gemini Enterprise locations.
-3. If you created a new audit log sink, each table is created when its log is first written. Some metrics can be empty for the first few minutes to a few hours.
+1. Use the **Project selector** (`All Projects` or individual project) and **Currency selector** (`KRW` / `USD`) in the top header bar to verify unified visibility.
+2. Select **Data sources** in the top bar to check connection status. Even before a BigQuery Billing Export table is connected, **Overview**, **Models & Tokens** and **Cost & FinOps** automatically calculate estimated costs from measured token usage, Google Cloud public pricing and live USD/KRW FX rates. When you later export Cloud Billing to BigQuery, connect the table in **Settings > Workspace and data sources** to switch automatically to exact invoiced SKU costs and credits.
+3. If you created a new audit log sink, each BigQuery table is created automatically when its first log entry arrives.
 4. To use Antigravity per-user caps, follow [Section 8](#8-antigravity-per-user-caps-and-suspension).
 
 ### 3.5 Start collecting logs before deployment (optional)
@@ -218,10 +231,10 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 | 1. Enable APIs | Logging, BigQuery, Monitoring, Discovery Engine, Agent Platform, Model Armor and service identities |
 | 2. Log routing | Creates the BigQuery dataset (`ge_analytics`) and the Log Router sink (`ai-control-plane-ai-logs`) ([6.1](#61-audit-log-sink-bigquery)). Antigravity logs are included automatically. |
 | 3. Gemini Enterprise usage & prompt logs | Turns on observability (usage logs and user/prompt logging) by default for every Gemini Enterprise app in `global`, `us` and `eu` ([6.3](#63-gemini-enterprise-logs)). |
-| 4. Data Access audit logs | Enables Data Access audit logs across all 7 AI services by default (pass `--no-data-access-logs` to skip). |
+| 4. Data Access audit logs | Enables Data Access audit logs across AI services by default (pass `--no-data-access-logs` to skip). |
 | 5. Check | Shows whether Gemini Enterprise, Model Armor and Antigravity logs arrived in the last 30 days. |
 
-- Safe to re-run, and `--dry-run` previews changes first. Pass `--projects proj-a,proj-b` to prepare multiple projects at once.
+- Safe to re-run, and `--dry-run` previews changes first. Pass `--projects proj-a,proj-b` (or `--project hub --link-projects spoke-a,spoke-b`) to prepare multiple projects at once.
 - When you later run `install.sh` or `scripts/deploy.sh`, it reuses the dataset and sink automatically.
 
 ---
@@ -234,59 +247,63 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 
 | Variable | Example | Description |
 |---|---|---|
-| `PROJECT_ID` | `my-project` | Project to monitor and deploy to |
+| `PROJECT_ID` | `my-project` | Host project to deploy Cloud Run to and primary project to monitor |
 | `REGION` | `asia-northeast3` | Region for Cloud Run, Artifact Registry, the settings bucket and Scheduler |
-| `ADMIN_EMAILS` | `admin@example.com,*@security.example.com` | Administrators. Separate entries with commas. You can use the `*@domain` format. |
+| `ADMIN_EMAILS` | `admin@example.com,*@security.example.com` | Administrators (defaults to active `gcloud` account when omitted). Separate entries with commas; `*@domain` is supported. |
 
 ### 4.2 Service and display
 
 | Variable | Default | Description |
 |---|---|---|
-| `SERVICE_NAME` | `ai-control-plane` | Cloud Run service name. Also used in the names of the service account, bucket, secrets, sink and scheduler job. |
-| `ORGANIZATION_NAME` | `Your Organization` | Organization name shown in the header and on the sign-in page |
-| `DEFAULT_LOCALE` | `en` (`ko` in the template) | Default language, `ko` or `en`. Users can change it in the UI. |
-| `WORKSPACE_TIMEZONE` | `UTC` (`Asia/Seoul` in the template) | Time zone for date display, daily totals and the scheduler |
+| `SERVICE_NAME` | `ai-control-plane` | Cloud Run service name. Also used in the names of the service account, bucket, secrets, sink and scheduler jobs. |
+| `ORGANIZATION_NAME` | Auto-detected (`Your Organization` fallback) | Organization name shown in the header and on the sign-in page |
+| `DEFAULT_LOCALE` | `en` (`ko` in `deploy.env.example`) | Default language, `ko` or `en`. Users can change it in the UI. |
+| `WORKSPACE_TIMEZONE` | `Asia/Seoul` | Time zone for date display, daily totals and Cloud Scheduler jobs |
 | `PRODUCT_NAME` | Empty | Changes the product name (white label). If empty, `AI Control Plane` |
-| `DISABLED_MODULES` | Empty | Modules hidden at deploy time (comma separated), for example `finops` without a billing export. Settings > Modules can switch them back on. Module IDs: `overview`, `gemini_enterprise`, `notebooklm`, `model_usage`, `agent_gateway`, `agent_registry`, `agent_deployments`, `model_armor`, `users`, `antigravity`, `finops`, `telemetry`, `analyst` |
+| `DISABLED_MODULES` | Empty | Modules hidden at deploy time (comma separated). Settings > Modules can switch them back on. Module IDs: `overview`, `gemini_enterprise`, `notebooklm`, `model_usage`, `agent_gateway`, `agent_registry`, `agent_deployments`, `model_armor`, `users`, `antigravity`, `finops`, `telemetry`, `analyst` |
 
 ### 4.3 Sign-in method
 
 | Variable | Default | Description |
 |---|---|---|
-| `ACCESS_MODE` | `google` | One of `google`, `google_oauth` or `iap` ([Section 5](#5-sign-in-and-permissions)) |
+| `ACCESS_MODE` | `google` | One of `google`, `google_oauth`, `iap` or `password` ([Section 5](#5-sign-in-and-permissions)) |
 | `ALLOWED_USERS` | Empty | Viewers to approve in advance for Google sign-in. Example: `*@example.com,partner@example.org` |
 | `IAP_MEMBERS` | Empty | Principals allowed to access the dashboard in `iap` mode. Example: `group:ai-governance@example.com,user:a@example.com` |
 | `OAUTH_CLIENT_JSON` | Empty | Path to the OAuth client JSON downloaded for `google_oauth` mode (do not commit it) |
-| `BRIDGE_MEMBERS` | `allAuthenticatedUsers` | Principals that can pass the sign-in bridge in `google` mode. If an organization policy blocks this, use `domain:example.com` |
+| `BRIDGE_MEMBERS` | `allAuthenticatedUsers` | Principals that can pass the sign-in bridge in `google` mode. If an organization policy blocks this, `deploy.sh` falls back automatically or you can set `domain:example.com` |
 | `PUBLIC_BASE_URL` | Empty | Custom domain. Example: `https://ai-governance.example.com` |
 | `GUEST_ACCESS` | `false` | Demo only. `true` lets anyone with the link browse read-only as a guest without signing in ([5.3](#53-guest-access-demo-only)). `google` and `google_oauth` only |
 | `GUEST_REDACT_TERMS` | Terms in `.prepublish-terms` | Demo only. Comma-separated terms hidden from guests (project, organization or customer names) |
 
-### 4.4 Data sources
+### 4.4 Data sources and multi-project scanning
 
 | Variable | Default | Description |
 |---|---|---|
+| `SCAN_PROJECTS` | Empty | Additional project IDs (comma separated, `--link-projects`) to aggregate into this single hub dashboard alongside `PROJECT_ID` |
+| `SCAN_ALL_PROJECTS` | `true` | Automatically discovers and includes readable projects within the same Google Cloud Organization (`--no-auto-discover-projects` sets `false`) |
+| `PREPARE_LINKED_PROJECTS` | `true` | Automatically enables core observability APIs, same-region `ge_analytics` dataset, Log Router sink and Data Access logs on `SCAN_PROJECTS` during `deploy.sh` (`--no-prepare-linked-projects` skips) |
 | `AUDIT_DATASET` | `ge_analytics` | BigQuery dataset that receives the audit logs |
 | `CREATE_LOG_SINK` | `true` | Creates the dataset and the Log Router sink, and updates an existing sink to the current filter. Use `false` if you manage a different sink yourself |
-| `DATASET_LOCATION` | `US` | Location of the new dataset (for example `asia-northeast3`) |
-| `ENABLE_DATA_ACCESS_LOGS` | `false` | Turns on Data Access audit logs for Agent Platform, Discovery Engine and Model Armor (more log volume and cost) |
+| `DATASET_LOCATION` | `REGION` | Location of newly created BigQuery audit datasets (aligned across hub and linked projects so `UNION ALL` queries succeed) |
+| `ENABLE_DATA_ACCESS_LOGS` | `true` | Turns on Data Access audit logs across AI services (`--no-data-access-logs` sets `false`) |
 | `ENABLE_GE_OBSERVABILITY` | `true` | Turns on usage logs (observability) for every Gemini Enterprise app in `DISCOVERY_ENGINE_LOCATIONS`. Needs Owner or Gemini Enterprise Admin; without it, only a warning is printed. |
 | `GE_PROMPT_LOGGING` | `true` | Turns on `sensitiveLoggingEnabled` so user identities (`userIamPrincipal`), prompt/response text and uploaded file names are recorded instead of `<elided>`. |
-| `BILLING_PROJECT_ID` | Empty | Project that holds the billing export (if empty, `PROJECT_ID`) |
+| `BILLING_PROJECT_ID` | Empty | Project that holds the billing export (if empty, auto-detected or `PROJECT_ID`) |
 | `BILLING_DATASET` | Empty | Billing export dataset. Example: `billing_detailed_usage` |
 | `BILLING_TABLE` | Empty | `gcp_billing_export_resource_v1_XXXXXX_XXXXXX_XXXXXX` |
 | `BILLING_ACCOUNT_ID` | Empty | `XXXXXX-XXXXXX-XXXXXX` |
 | `DISCOVERY_ENGINE_LOCATIONS` | detected | Gemini Enterprise locations (comma separated, for example `global,us`). When empty, deployment uses the locations among `global`, `us` and `eu` that have a Gemini Enterprise app or license, or `global` when there is none. |
-| `AGENT_ENGINE_REGIONS` | `REGION` | Agent Engine regions (comma separated) |
+| `AGENT_ENGINE_REGIONS` | Auto-detected + `REGION` | Agent Engine regions (comma separated) |
 
-You can also enter the billing values after deployment in **Settings > Workspace and data sources**.
+You can also enter or update the billing values after deployment in **Settings > Workspace and data sources**.
 
-### 4.5 Governance
+### 4.5 Governance and automated pricing sync
 
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_GOVERNANCE_ACTIONS` | `false` | Grants IAM write roles. Required to suspend users over their cap, restore them, allow or disallow individual users and create marker roles |
-| `ENFORCEMENT_SCHEDULE` | Empty | Automatic enforcement schedule (cron). Example: `*/15 * * * *`. Requires `ENABLE_GOVERNANCE_ACTIONS=true` and the `google` or `google_oauth` mode. Suspended users are restored by enforcement runs, so without a schedule they get access back only when an administrator runs enforcement after the period resets. The script and the Antigravity page warn about this. |
+| `ENFORCEMENT_SCHEDULE` | Empty | Automatic enforcement schedule (cron). Example: `*/15 * * * *`. Requires `ENABLE_GOVERNANCE_ACTIONS=true`. Suspended users are restored by enforcement runs, so without a schedule they get access back only when an administrator runs enforcement after the period resets. |
+| `PRICING_SYNC_SCHEDULE` | `0 4 * * *` | Daily Cloud Scheduler cron (`WORKSPACE_TIMEZONE`, default `04:00 KST`) that syncs official Google Cloud model pricing and live USD/KRW exchange rates (`off` or `none` disables the job) |
 
 ### 4.6 Other
 
@@ -531,7 +548,10 @@ Shows verdicts over time, matched filters (prompt injection, sensitive data and 
 
 ### 7.8 Cost & FinOps
 
-Calculates gross cost, credits, net cost, cost by service and SKU, and the AI share of spend from the billing export. A day is marked as a spike when cost rose by at least `finops.spike_threshold_pct` (default 50%) and by at least `spike_min_delta` compared with the previous day. When you select Explain with AI, Gemini summarizes the cause based on the SKU changes.
+- **When a BigQuery Billing Export table is connected** (`costSource: "billing_export"`): Calculates exact gross cost, credits, net cost, cost by service and SKU, and the AI share of spend directly from invoiced SKUs.
+- **When a Billing Export table is not connected yet** (`costSource: "token_estimate"`): Automatically computes **Token-Based Reverse Cost Estimation** from measured input/output token usage across Cloud Monitoring and audit logs × official Google Cloud public pricing × live USD/KRW exchange rate, broken down per model and per day, with a transparent UI status badge indicating estimated cost.
+- **Daily `04:00 KST` public pricing & FX sync**: Cloud Scheduler (`ai-control-plane-pricing-sync`) syncs Google Cloud Billing Catalog SKUs, official generative AI pricing docs, and live USD/KRW FX rates daily at `04:00 KST` (administrators can also trigger an immediate sync from the Cost & FinOps page). Any model rate change or newly added SKU raises a persistent review banner until acknowledged.
+- **Spike detection**: A day is marked as a spike when cost rose by at least `finops.spike_threshold_pct` (default 50%) and by at least `spike_min_delta` compared with the previous day. When you select Explain with AI, Gemini summarizes the cause based on the SKU or model changes.
 
 ### 7.9 Users & Access
 
@@ -672,7 +692,7 @@ Items changed in the UI are marked "Customized", and you can use **Reset to defa
 |---|---|---|
 | `product` | `name`, `tagline` | Product name and tagline (white label) |
 | `branding` | `organization_name`, `logo_url`, `accent_color`, `default_locale`, `default_theme` | Organization identity. The logo is an HTTPS URL or an `/assets/` path |
-| `workspace` | `project_id`, `quota_project_id`, `timezone`, `default_range_days`, `audit_dataset` | Monitored project and default query settings |
+| `workspace` | `project_id`, `projects`, `scan_all_projects`, `quota_project_id`, `timezone`, `default_range_days`, `audit_dataset` | Host project, linked multi-project list, same-org auto-discovery and default query settings |
 | `workspace.billing` | `project_id`, `dataset`, `table`, `account_id` | Billing export location |
 | `workspace` | `discovery_engine_locations`, `agent_engine_regions`, `telemetry_datasets` | API locations and additional telemetry datasets |
 | `security` | `auth_mode`, `admins`, `allowed_users`, `google_client_id`, `public_base_url`, `session_hours`, `sign_in_bridge_url`, `iap_audience`, `mask_pii_for_viewers` | Authentication and permissions |
@@ -692,6 +712,7 @@ Items changed in the UI are marked "Customized", and you can use **Reset to defa
 | Variable | Maps to |
 |---|---|
 | `PROJECT_ID`, `QUOTA_PROJECT_ID` | `workspace.project_id`, `workspace.quota_project_id` |
+| `SCAN_PROJECTS`, `SCAN_ALL_PROJECTS` | `workspace.projects` (comma-separated linked project IDs), `workspace.scan_all_projects` (`true`/`false`) |
 | `AUDIT_DATASET_ID` | `workspace.audit_dataset` |
 | `BILLING_PROJECT_ID`, `BILLING_DATASET_ID`, `BILLING_TABLE_ID`, `BILLING_ACCOUNT_ID` | `workspace.billing.*` |
 | `WORKSPACE_TIMEZONE` | `workspace.timezone` |
@@ -703,7 +724,7 @@ Items changed in the UI are marked "Customized", and you can use **Reset to defa
 | `SIGN_IN_BRIDGE_URL`, `BRIDGE_RETURN_URL` | Sign-in bridge URL (dashboard side), dashboard URL to return to (bridge side) |
 | `IAP_AUDIENCE` | Audience of the IAP signed header |
 | `SETTINGS_BUCKET` | `storage.gcs_bucket` |
-| `SCHEDULER_INVOKERS` | Service accounts that can call the enforcement endpoint (comma separated) |
+| `SCHEDULER_INVOKERS` | Service accounts that can call the enforcement and pricing sync endpoints (comma separated) |
 | `AI_DEFAULT_MODEL`, `AI_LOCATION` | `ai_engine.default_model`, `ai_engine.location` |
 | `HOST`, `PORT` | `server.host`, `server.port` |
 
@@ -836,9 +857,9 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 
 | Symptom | What to check |
 |---|---|
-| `deploy.sh` fails at the Cloud Build step | New projects build with the Compute Engine default service account. Grant `roles/cloudbuild.builds.builder` with the command that the script prints, then run it again. |
-| Granting IAP access on the sign-in bridge fails | An organization policy (domain restricted sharing) blocks `allAuthenticatedUsers`. Change it to `BRIDGE_MEMBERS="domain:example.com"`. |
-| Deployment with `--no-invoker-iam-check` fails | The organization policy `run.managed.requireInvokerIam` is turned on. Get an exception or use `ACCESS_MODE=iap`. |
+| `deploy.sh` fails at the Cloud Build step | `deploy.sh` creates a dedicated Cloud Build service account (it never depends on the legacy Compute Engine default SA) and falls back automatically to local/Cloud Shell Docker if Cloud Build is restricted by org policy. If both fail, verify billing and `cloudbuild.googleapis.com` / `artifactregistry.googleapis.com` permissions. |
+| Granting IAP access on the sign-in bridge fails | An organization policy (domain restricted sharing) blocks `allAuthenticatedUsers`. `deploy.sh` automatically falls back, or you can set `BRIDGE_MEMBERS="domain:example.com"`. |
+| Deployment with `--no-invoker-iam-check` fails | The organization policy `run.managed.requireInvokerIam` is turned on. `deploy.sh` automatically tries `--allow-unauthenticated` and Direct Cloud Run IAP (`ACCESS_MODE=iap`). |
 | IAP deployment fails (project without an organization) | Turn on IAP once in the Security tab of the Cloud Run console, then run again. |
 | "Access is not approved yet" after sign-in | An administrator approves the request in Settings > Access control, or adds the account to `ALLOWED_USERS`. |
 | Every request returns 401 (`iap` mode) | Check that the user has `roles/iap.httpsResourceAccessor` (`IAP_MEMBERS`). |
@@ -856,18 +877,18 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 
 ### 14.3 Upgrading
 
-Get the new version, then run `scripts/deploy.sh` again with the same `deploy.env`. UI settings, exception rules, suspension records and widget layouts are in the settings bucket, so they are kept. From v2.1.0, a re-run with `CREATE_LOG_SINK=true` also updates the filter of an existing sink, so the Gemini Enterprise, Model Armor and Antigravity logs that sinks from earlier versions missed start arriving.
+Run the one-liner again (`bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --project PROJECT_ID`) or `git pull && scripts/deploy.sh --project PROJECT_ID`. Saved `deploy.<PROJECT_ID>.env` files (including `SCAN_PROJECTS`) and all UI settings, exception rules, suspension records and widget layouts in the settings bucket are preserved automatically.
 
 ---
 
 ## 15. Removal
 
 ```bash
-scripts/teardown.sh                 # deletes the service, scheduler, service accounts, IAM bindings and secrets
-scripts/teardown.sh --delete-data   # also deletes the settings bucket (UI settings, exception rules, suspension records, widget layouts) and the log sink
+scripts/teardown.sh --project PROJECT_ID                 # deletes Cloud Run services, enforcement & pricing-sync schedulers, SAs, host & linked-project IAM bindings, and secrets
+scripts/teardown.sh --project PROJECT_ID --delete-data   # also deletes the settings bucket and the Log Router sink (add --dry-run to preview first)
 ```
 
-The BigQuery audit log dataset, the Artifact Registry repository and the Data Access audit log settings are not deleted automatically. The script only shows the commands to delete them. The observability (usage log) setting of Gemini Enterprise apps is also left on; turn it off in the console under the app > Configurations > Observability if needed. The marker roles are also kept, because suspended users still hold them; the script prints the commands to delete them. If the dashboard has suspended any users, restore them on the Antigravity Controls page before removal.
+If `deploy.<PROJECT_ID>.env` contains `SCAN_PROJECTS` (or you pass `--link-projects PROJ_B,PROJ_C`), `teardown.sh` also removes the runtime service account's cross-project IAM bindings from those linked projects. The BigQuery audit log dataset, the Artifact Registry repository and the Data Access audit log settings are not deleted automatically; the script prints the exact commands to delete them if desired. The observability setting of Gemini Enterprise apps and any Antigravity marker roles are also kept so suspended users are not orphaned; restore any suspended users on the Antigravity Controls page before removal.
 
 ---
 
@@ -915,7 +936,7 @@ It scans the files Git would publish and fails on secrets (private keys, API key
 | `GET /api/v1/governance/antigravity/status` | Antigravity cap status, unit prices, review queue, suspensions, exception rules |
 | `POST /api/v1/governance/antigravity/cap`, `/enforce`, `/review`, `/exceptions`, `/exceptions/delete`, `/user-action`, `/setup` | Antigravity Controls (administrator) |
 | `GET /api/v1/governance/audit-log`, `/governance/antigravity/agent-activity` | Audit log, agent activity |
-| `GET /api/v1/finops/summary`, `POST /api/v1/finops/spikes/analyze` | FinOps |
+| `GET /api/v1/finops/summary`, `GET /api/v1/finops/pricing`, `POST /api/v1/finops/pricing/sync`, `POST /api/v1/finops/pricing/alerts/ack`, `POST /api/v1/finops/spikes/analyze` | Cost & FinOps, automated daily pricing/FX sync and spike analysis |
 | `GET /api/v1/telemetry/discover`, `/connectors`, `/connectors/data`, `POST /connectors`, `/connectors/delete` | Telemetry Extensions |
 | `GET /api/v1/layouts`, `POST /api/v1/layouts` | Personal widget layouts (Overview and other pages) |
 | `POST /api/v1/analyst/chat` | AI Analyst |
