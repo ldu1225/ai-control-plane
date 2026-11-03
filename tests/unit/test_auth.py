@@ -476,6 +476,56 @@ class GoogleModeConfigTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 app_module.App(environ={"CONFIG_PATH": cfg, "GOOGLE_OAUTH_CLIENT_SECRET": "x", "K_SERVICE": "svc"})
 
+    def test_password_only_fallback_without_oauth_or_bridge(self):
+        """When neither google_client_id nor sign_in_bridge_url is set (e.g. ACCESS_MODE=password or
+        Cloud Run IAP bridge unavailable), the service starts cleanly with built-in ID/Password sign-in."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = os.path.join(tmp, "config.yaml")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write(BRIDGE_A_CONFIG)
+            environ = {
+                "CONFIG_PATH": cfg,
+                "SESSION_SECRET": "s" * 48,
+                "K_SERVICE": "ai-control-plane",
+                "PUBLIC_BASE_URL": "https://dash.example.com",
+            }
+            with mock.patch.dict(os.environ, {"CONFIG_PATH": cfg}):
+                pw_app = app_module.App(environ=environ)
+            self.assertFalse(pw_app.auth.google_enabled)
+            srv = app_module.make_server(pw_app, "127.0.0.1", 0)
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                conn.request("GET", "/api/v1/auth/state", headers={"Host": "dash.example.com"})
+                resp = conn.getresponse()
+                state = json.loads(resp.read().decode("utf-8"))["data"]
+                self.assertEqual(state["authMode"], "google")
+                self.assertFalse(state["googleEnabled"])
+                self.assertTrue(state["passwordEnabled"])
+                csrf = state["csrfToken"]
+
+                conn.request("GET", "/auth/google/start", headers={"Host": "dash.example.com"})
+                start_resp = conn.getresponse()
+                start_resp.read()
+                self.assertEqual(start_resp.status, 302)
+                self.assertEqual(start_resp.getheader("Location"), "/login?error=unavailable")
+
+                conn.request(
+                    "POST", "/api/v1/auth/login",
+                    body=json.dumps({"username": "admin", "password": "admin"}).encode("utf-8"),
+                    headers={"Host": "dash.example.com", "Content-Type": "application/json",
+                             "Cookie": "cp_csrf=%s" % csrf, "X-CSRF-Token": csrf},
+                )
+                login_resp = conn.getresponse()
+                login_body = json.loads(login_resp.read().decode("utf-8"))
+                self.assertEqual(login_resp.status, 200)
+                self.assertEqual(login_body["data"]["user"]["role"], "admin")
+                conn.close()
+            finally:
+                srv.shutdown()
+                srv.server_close()
+
 
 
 BRIDGE_A_CONFIG = """workspace:

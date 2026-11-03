@@ -85,7 +85,7 @@ def auth_state(ctx, handler):
                      "accentColor": s["branding"]["accent_color"], "defaultLocale": s["branding"]["default_locale"],
                      "defaultTheme": s["branding"]["default_theme"]},
         "authMode": mode,
-        "googleEnabled": bool(mode == "google" and sign_in is not None),
+        "googleEnabled": bool(mode == "google" and sign_in is not None and sign_in.google_enabled),
         "passwordEnabled": bool(mode == "google" and sign_in is not None),
         "defaultAdminPassword": bool(mode == "google" and sign_in is not None and
                                      sign_in.default_admin_password_active()),

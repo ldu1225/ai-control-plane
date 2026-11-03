@@ -27,6 +27,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" 2>/dev/null || cd /tmp
 # shellcheck source=lib/common.sh
 source "$ROOT/scripts/lib/common.sh"
 
@@ -48,6 +49,8 @@ CLI_DATA_ACCESS_LOGS=""
 usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
+normalize_cli_args "$@"
+set -- ${NORMALIZED_ARGS[@]+"${NORMALIZED_ARGS[@]}"}
 ORIG_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -258,6 +261,7 @@ trap 'rm -f "$GCLOUD_ERR" "$IAM_CACHE"' EXIT
 
 # Bootstrap foundational control-plane APIs first so brand-new empty projects can answer project/IAM APIs.
 bootstrap_foundation_apis "$PROJECT_ID"
+export CLOUDSDK_CORE_PROJECT="$PROJECT_ID"
 
 for attempt in 1 2 3; do
   PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>"$GCLOUD_ERR" || true)"
@@ -510,18 +514,32 @@ EOF
         break
       fi
     done
+
+    # Tier 2 fallback: if regional worker pool quota is 0 or unavailable (and not restricted by resourceLocations), try global Cloud Build.
+    if [[ "$BUILD_OK" != "1" ]] && ! grep -Eiq 'resourceLocations' "$BUILD_LOG"; then
+      warn "regional Cloud Build (${REGION}) did not succeed; retrying with global Cloud Build..."
+      if gcloud builds submit "$ROOT" \
+          --project "$PROJECT_ID" \
+          --config "$CB_CONFIG" \
+          --gcs-source-staging-dir "gs://${SETTINGS_BUCKET}/_build/source" \
+          2>&1 | tee -a "$BUILD_LOG"; then
+        BUILD_OK=1
+      fi
+    fi
+
     gcloud storage rm --recursive "gs://${SETTINGS_BUCKET}/_build/**" --project "$PROJECT_ID" >/dev/null 2>&1 || true
     gcloud storage buckets remove-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
       --member "serviceAccount:${BUILD_SA}" --role roles/storage.objectAdmin >/dev/null 2>&1 || true
 
-    # Automatic fallback: Cloud Shell and workstations with Docker build & push directly to Artifact Registry.
+    # Tier 3 fallback: Cloud Shell and workstations with Docker build & push directly to Artifact Registry.
     if [[ "$BUILD_OK" != "1" ]]; then
       if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         warn "Cloud Build blocked or unavailable; building locally with Docker and pushing to Artifact Registry..."
         gcloud auth print-access-token 2>/dev/null \
           | docker login -u oauth2accesstoken --password-stdin "https://${REGION}-docker.pkg.dev" >/dev/null 2>&1 \
           || gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
-        if docker build --platform linux/amd64 -t "$IMAGE" "$ROOT" && docker push "$IMAGE"; then
+        if (docker build --platform linux/amd64 -t "$IMAGE" "$ROOT" || docker build -t "$IMAGE" "$ROOT") \
+            && docker push "$IMAGE"; then
           BUILD_OK=1
         fi
       fi

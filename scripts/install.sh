@@ -29,22 +29,44 @@ if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
 fi
 
 if [[ -z "$LOCAL_ROOT" ]]; then
+  # Move out of any deleted or target directory first so git/python/gcloud never fail on an orphaned $PWD.
+  cd "$HOME" 2>/dev/null || cd /tmp
   command -v git >/dev/null || { echo "error: git is required" >&2; exit 1; }
+  if [[ -f "$INSTALL_DIR/deploy.env" ]]; then
+    cp -f "$INSTALL_DIR/deploy.env" "$INSTALL_DIR/deploy.env.bak" 2>/dev/null || true
+    rm -f "$INSTALL_DIR/deploy.env" 2>/dev/null || true
+  fi
+  UPDATED=0
   if [[ -d "$INSTALL_DIR/.git" ]]; then
     printf '\n==> Updating AI Control Plane in %s\n' "$INSTALL_DIR"
-    git -C "$INSTALL_DIR" fetch --quiet origin main
-    git -C "$INSTALL_DIR" reset --hard --quiet origin/main
-  else
+    rm -f "$INSTALL_DIR/.git/index.lock" 2>/dev/null || true
+    if git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL" >/dev/null 2>&1 \
+        && (git -C "$INSTALL_DIR" fetch --depth 1 --quiet origin main >/dev/null 2>&1 \
+            || git -C "$INSTALL_DIR" fetch --depth 1 --quiet origin HEAD >/dev/null 2>&1) \
+        && git -C "$INSTALL_DIR" checkout -f -B main FETCH_HEAD >/dev/null 2>&1 \
+        && git -C "$INSTALL_DIR" reset --hard --quiet FETCH_HEAD >/dev/null 2>&1; then
+      UPDATED=1
+    else
+      printf '    existing checkout could not be fast-updated; performing clean re-clone...\n'
+    fi
+  fi
+  if [[ "$UPDATED" != "1" ]]; then
     rm -rf "$INSTALL_DIR"
     printf '\n==> Downloading AI Control Plane into %s\n' "$INSTALL_DIR"
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
   fi
+  chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
+  cd "$INSTALL_DIR"
   exec "$INSTALL_DIR/scripts/install.sh" "$@"
 fi
 
 ROOT="$LOCAL_ROOT"
+cd "$ROOT" 2>/dev/null || cd /tmp
 # shellcheck source=lib/common.sh
 source "$ROOT/scripts/lib/common.sh"
+
+normalize_cli_args "$@"
+set -- ${NORMALIZED_ARGS[@]+"${NORMALIZED_ARGS[@]}"}
 
 PREPARE_ONLY=0
 AUTO_YES=0

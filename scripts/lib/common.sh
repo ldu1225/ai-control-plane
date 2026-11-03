@@ -26,21 +26,60 @@ retry() {
   done
 }
 
-# Trims leading and trailing whitespace from $1.
+# Trims leading and trailing whitespace (including UTF-8 non-breaking spaces) from $1.
 trim_ws() {
-  local s="${1:-}"
+  local s="${1:-}" nbsp=$'\xc2\xa0'
+  s="${s//"$nbsp"/ }"
   s="${s#"${s%%[![:space:]]*}"}"
   s="${s%"${s##*[![:space:]]}"}"
   printf '%s' "$s"
+}
+
+# Normalizes CLI tokens pasted from email/messenger clients:
+# - Converts leading Unicode em-dash (—), en-dash (–), horizontal bar (―), or minus (−) into --
+# - Replaces non-breaking spaces with regular spaces and strips surrounding smart quotes (“ ” ‘ ’)
+# - Splits --flag=value into (--flag value) so both "--project foo" and "--project=foo" work
+NORMALIZED_ARGS=()
+normalize_cli_args() {
+  NORMALIZED_ARGS=()
+  local tok k v d
+  local em=$'\xe2\x80\x94' en=$'\xe2\x80\x93' hbar=$'\xe2\x80\x95' uminus=$'\xe2\x88\x92'
+  local nbsp=$'\xc2\xa0' ldq=$'\xe2\x80\x9c' rdq=$'\xe2\x80\x9d' lsq=$'\xe2\x80\x98' rsq=$'\xe2\x80\x99'
+  for tok in "$@"; do
+    tok="${tok//"$nbsp"/ }"
+    tok="${tok#"$ldq"}"; tok="${tok%"$rdq"}"
+    tok="${tok#"$lsq"}"; tok="${tok%"$rsq"}"
+    for d in "$em" "$en" "$hbar" "$uminus"; do
+      if [[ "$tok" == "${d}${d}"* ]]; then
+        tok="--${tok#"${d}${d}"}"
+      elif [[ "$tok" == "${d}"* ]]; then
+        tok="--${tok#"$d"}"
+      fi
+    done
+    if [[ "$tok" == --*=* ]]; then
+      k="${tok%%=*}"
+      v="${tok#*=}"
+      v="${v#"$ldq"}"; v="${v%"$rdq"}"
+      v="${v#"$lsq"}"; v="${v%"$rsq"}"
+      v="${v#\"}"; v="${v%\"}"
+      v="${v#\'}"; v="${v%\'}"
+      NORMALIZED_ARGS+=("$k" "$v")
+    else
+      NORMALIZED_ARGS+=("$tok")
+    fi
+  done
 }
 
 # Strips common copy-paste prefixes (such as "gcloud config set project ", "--project ", "project ",
 # "projects/") and surrounding quotes/whitespace from a project ID, warning when a prefix was removed.
 normalize_project_id() {
   local raw="${1:-}" cleaned prev
+  local ldq=$'\xe2\x80\x9c' rdq=$'\xe2\x80\x9d' lsq=$'\xe2\x80\x98' rsq=$'\xe2\x80\x99'
   cleaned="$(trim_ws "$raw")"
   while :; do
     prev="$cleaned"
+    cleaned="${cleaned#"$ldq"}"; cleaned="${cleaned%"$rdq"}"
+    cleaned="${cleaned#"$lsq"}"; cleaned="${cleaned%"$rsq"}"
     cleaned="${cleaned#\"}"; cleaned="${cleaned%\"}"
     cleaned="${cleaned#\'}"; cleaned="${cleaned%\'}"
     cleaned="$(trim_ws "$cleaned")"

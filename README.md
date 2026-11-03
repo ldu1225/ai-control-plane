@@ -161,12 +161,9 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 
 **방법 B — 단일 또는 복수 프로젝트 무인(Non-interactive) 명령 한 줄 일괄 배포**
 ```bash
-bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
-  --projects my-project-1,my-project-2 \
-  --admins admin@example.org \
-  --viewers viewer@example.org
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --projects my-project-1,my-project-2 --admins admin@example.org --viewers viewer@example.org
 ```
-*(프로젝트가 1개면 `--project my-project-1` 로 동일하게 실행하며, `--admins` 생략 시 현재 로그인된 `gcloud` 계정이 자동으로 관리자로 등록됩니다.)*
+*(프로젝트가 1개면 `--project my-project-1` 로 동일하게 실행하며, `--admins` 생략 시 현재 로그인된 `gcloud` 계정이 자동으로 관리자로 등록됩니다. 기존에 예전 `~/ai-control-plane` 폴더나 잘못된 `deploy.env`가 남아 있어도 위 명령 한 줄이 자동으로 최신 코드로 덮어쓰고 기존 `deploy.env`는 `deploy.env.bak`으로 분리하므로 별도로 삭제하거나 다시 클론할 필요가 없습니다.)*
 
 **방법 C — 저장소 클론 후 직접 실행 (`deploy.env` 또는 CLI 옵션)**
 ```bash

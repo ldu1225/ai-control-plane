@@ -304,7 +304,9 @@ function passwordFormView() {
 
 function signInView() {
   const guest = Boolean(state && state.guestAccess);
+  const google = Boolean(state && state.googleEnabled !== false);
   const defaultAdmin = Boolean(state && state.defaultAdminPassword);
+  const hasAltActions = google || guest;
   return [
     heading(t('Sign in'), t('Sign in with your account ID and password to continue to {product}.', { product: productName() })),
     noticeAlert(),
@@ -314,18 +316,21 @@ function signInView() {
       text: t('Default login: ID "admin" / Password "admin". You can change this password and create customer accounts in Settings > Access control.'),
     }) : null,
     passwordFormView(),
-    h('div', { class: 'login-divider' }, h('span', null, t('or'))),
-    h('div', { class: 'login-actions' },
-      googleButton(),
+    hasAltActions ? h('div', { class: 'login-divider' }, h('span', null, t('or'))) : null,
+    hasAltActions ? h('div', { class: 'login-actions' },
+      google ? googleButton() : null,
       guest ? linkButton(t('Continue as guest'), nextTarget(), 'ghost', 'arrow-right') : null,
-      notice.error === 'not_approved' && state && state.switchAccountUrl ? switchAccountButton(t('Use another account')) : null),
+      google && notice.error === 'not_approved' && state && state.switchAccountUrl ? switchAccountButton(t('Use another account')) : null) : null,
     note(guest
       ? t('Guests can look around with identifiers hidden. Administration needs an account approved by your administrators.')
-      : t('Sign in with your assigned ID and password, or use an approved Google account.')),
+      : (google
+        ? t('Sign in with your assigned ID and password, or use an approved Google account.')
+        : t('Sign in with your assigned account ID and password.'))),
   ];
 }
 
 function signedInView(user) {
+  const google = Boolean(state && state.googleEnabled !== false);
   const signOutBtn = h('button', { type: 'button', class: ['btn', 'btn-ghost', 'btn-block', 'login-btn'] }, icon('logout', { size: 15 }), t('Sign out'));
   signOutBtn.addEventListener('click', () => signOut(signOutBtn));
   if (isLogoutPath) {
@@ -342,12 +347,14 @@ function signedInView(user) {
     ];
   }
   return [
-    heading(t('You are signed in'), t('Continue to {product} or switch to another Google account.', { product: productName() })),
+    heading(t('You are signed in'), google
+      ? t('Continue to {product} or switch to another Google account.', { product: productName() })
+      : t('Continue to {product}.', { product: productName() })),
     noticeAlert(),
     accountBox(user),
     h('div', { class: 'login-actions' },
       linkButton(t('Continue to {product}', { product: productName() }), nextTarget(), 'primary', 'arrow-right'),
-      switchAccountButton(t('Use another account')),
+      google ? switchAccountButton(t('Use another account')) : null,
       signOutBtn),
   ];
 }

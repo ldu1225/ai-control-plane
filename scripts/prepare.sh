@@ -28,6 +28,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" 2>/dev/null || cd /tmp
 # shellcheck source=lib/common.sh
 source "$ROOT/scripts/lib/common.sh"
 
@@ -43,6 +44,8 @@ DRY_RUN=0
 
 usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 need() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
+normalize_cli_args "$@"
+set -- ${NORMALIZED_ARGS[@]+"${NORMALIZED_ARGS[@]}"}
 ORIG_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -95,6 +98,7 @@ validate_project_id "$PROJECT_ID" "--project"
 [[ "$GE_LOCATIONS" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] || die "--ge-locations must be a comma-separated list such as global,us,eu"
 
 bootstrap_foundation_apis "$PROJECT_ID"
+export CLOUDSDK_CORE_PROJECT="$PROJECT_ID"
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null | tr -d '[:space:]' || true)"
 [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]] || die "cannot read project ${PROJECT_ID} with ${ACCOUNT}"
 

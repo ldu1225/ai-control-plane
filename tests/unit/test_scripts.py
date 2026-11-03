@@ -555,13 +555,112 @@ esac
             self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
             self.assertEqual(res.stderr, "")
             self.assertIn("Data Access audit logs enabled across all AI services", res.stdout)
-            saved = open(policy_path, encoding="utf-8").read()
+            with open(policy_path, encoding="utf-8") as fh:
+                saved = fh.read()
             self.assertIn("aiplatform.googleapis.com", saved)
             self.assertIn("discoveryengine.googleapis.com", saved)
             self.assertIn("modelarmor.googleapis.com", saved)
             self.assertIn("businessaicode.googleapis.com", saved)
             self.assertNotIn("notebooklm.googleapis.com", saved)
             self.assertNotIn("generativelanguage.googleapis.com", saved)
+
+    def _make_fake_gcloud_env(self, tmp):
+        bin_dir = os.path.join(tmp, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        gcloud_stub = os.path.join(bin_dir, "gcloud")
+        with open(gcloud_stub, "w", encoding="utf-8") as fh:
+            fh.write("""#!/usr/bin/env bash
+case "$*" in
+  *"config get-value account"*) echo "owner@example.org" ;;
+  *"config get-value project"*) echo "demo-active-proj" ;;
+  *"projects describe"*) echo "123456789012" ;;
+  *"auth print-access-token"*) echo "" ;;
+  *"projects get-iam-policy"*) echo '{"bindings":[]}' ;;
+  *"run deploy --help"*) echo "--iap --no-iap --no-invoker-iam-check" ;;
+  *"describe"*) exit 1 ;;
+  *) exit 0 ;;
+esac
+""")
+        os.chmod(gcloud_stub, 0o755)
+        bq_stub = os.path.join(bin_dir, "bq")
+        with open(bq_stub, "w", encoding="utf-8") as fh:
+            fh.write("#!/usr/bin/env bash\nexit 1\n")
+        os.chmod(bq_stub, 0o755)
+        return bin_dir
+
+    def test_unicode_cli_normalization_and_equals_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._make_fake_gcloud_env(tmp)
+            env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}")
+            res = subprocess.run(
+                [
+                    "bash", os.path.join(ROOT, "scripts/install.sh"),
+                    "\u2014projects=\u201cdemo-proj-alpha,demo-proj-beta\u201d",
+                    "\u2013admins", "admin@example.org",
+                    "\u2212\u2212viewers=viewer@example.org",
+                    "--dry-run",
+                ],
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("Deployment complete: demo-proj-alpha", res.stdout)
+            self.assertIn("Deployment complete: demo-proj-beta", res.stdout)
+
+    def test_install_sh_heals_stale_dirty_clone_and_broken_deploy_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = self._make_fake_gcloud_env(tmp)
+            # Create a local "upstream" git repo containing the current scripts so install.sh can clone/fetch offline.
+            upstream = os.path.join(tmp, "upstream")
+            os.makedirs(os.path.join(upstream, "scripts", "lib"), exist_ok=True)
+            for rel in ("scripts/install.sh", "scripts/deploy.sh", "scripts/prepare.sh", "scripts/lib/common.sh"):
+                src = os.path.join(ROOT, rel)
+                dst = os.path.join(upstream, rel)
+                with open(src, "rb") as sf, open(dst, "wb") as df:
+                    df.write(sf.read())
+                os.chmod(dst, 0o755)
+            git_env = dict(
+                os.environ,
+                GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.org",
+                GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.org",
+            )
+            subprocess.run(["git", "init", "-b", "main", upstream], check=True, capture_output=True, env=git_env)
+            subprocess.run(["git", "-C", upstream, "add", "."], check=True, capture_output=True, env=git_env)
+            subprocess.run(["git", "-C", upstream, "commit", "-m", "v2"], check=True, capture_output=True, env=git_env)
+
+            # Simulate customer's existing stale & dirty ~/ai-control-plane with a syntax-broken deploy.env + index.lock
+            install_dir = os.path.join(tmp, "home", "ai-control-plane")
+            os.makedirs(os.path.dirname(install_dir), exist_ok=True)
+            subprocess.run(["git", "clone", "--depth", "1", upstream, install_dir], check=True, capture_output=True, env=git_env)
+            with open(os.path.join(install_dir, "scripts", "deploy.sh"), "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env bash\necho 'OLD BROKEN DEPLOY'; exit 99\n")
+            with open(os.path.join(install_dir, "deploy.env"), "w", encoding="utf-8") as fh:
+                fh.write("PROJECT_ID=((BROKEN SYNTAX\n")
+            with open(os.path.join(install_dir, ".git", "index.lock"), "w", encoding="utf-8") as fh:
+                fh.write("stale lock")
+
+            # Also copy install.sh outside the repo to mimic `bash <(curl ...)` where LOCAL_ROOT is empty
+            standalone_installer = os.path.join(tmp, "streamed_install.sh")
+            with open(os.path.join(ROOT, "scripts/install.sh"), "rb") as sf, open(standalone_installer, "wb") as df:
+                df.write(sf.read())
+            os.chmod(standalone_installer, 0o755)
+
+            env = dict(
+                os.environ,
+                HOME=os.path.join(tmp, "home"),
+                ACP_REPO_URL=upstream,
+                ACP_INSTALL_DIR=install_dir,
+                PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
+            )
+            res = subprocess.run(
+                ["bash", standalone_installer, "--project", "demo-healed-proj", "--admins", "admin@example.org", "--dry-run"],
+                cwd=install_dir,
+                capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("Updating AI Control Plane", res.stdout)
+            self.assertIn("Deployment complete: demo-healed-proj", res.stdout)
+            self.assertFalse(os.path.exists(os.path.join(install_dir, "deploy.env")))
+            self.assertTrue(os.path.exists(os.path.join(install_dir, "deploy.env.bak")))
 
 
 if __name__ == "__main__":

@@ -186,12 +186,10 @@ class GoogleSignIn:
         self.client_secret = (environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip()
         self.oauth_redirect_uri = (environ.get("GOOGLE_OAUTH_REDIRECT_URI") or "").strip()
         self.oauth_start_url = (environ.get("GOOGLE_OAUTH_START_URL") or "").strip()
-        if not self.bridge_url:
-            if not self.client_id:
-                raise ValueError("auth_mode=google requires security.google_client_id (GOOGLE_OAUTH_CLIENT_ID) "
-                                 "or security.sign_in_bridge_url (SIGN_IN_BRIDGE_URL)")
-            if not self.client_secret:
-                raise ValueError("auth_mode=google requires the GOOGLE_OAUTH_CLIENT_SECRET environment variable")
+        if self.client_id and not self.client_secret and not self.bridge_url:
+            raise ValueError("auth_mode=google requires the GOOGLE_OAUTH_CLIENT_SECRET environment variable")
+        if not self.google_enabled:
+            LOG.info("Google OAuth / sign-in bridge not configured: running with built-in ID/Password sign-in only")
         self.public_base_url = (sec.get("public_base_url") or "").rstrip("/")
         if environ.get("K_SERVICE") and not self.public_base_url:
             LOG.warning("PUBLIC_BASE_URL is not set: the OAuth redirect URI is derived from the request host")
@@ -202,6 +200,10 @@ class GoogleSignIn:
         self.bridge = Signer(secret, "sign-in-bridge")
         self.settings = settings_manager
         self._verify_request = None
+
+    @property
+    def google_enabled(self):
+        return bool(self.bridge_url or (self.client_id and self.client_secret))
 
     # -- helpers ------------------------------------------------------------------
     def canonical_host(self):
@@ -337,6 +339,8 @@ class GoogleSignIn:
     # -- flow ---------------------------------------------------------------------
     def start(self, headers, query):
         """Returns (location, cookies) for the redirect to Google."""
+        if not self.google_enabled:
+            return "/login?error=unavailable", []
         params = urllib.parse.parse_qs(query or "", max_num_fields=8)
         next_path = safe_next((params.get("next") or ["/"])[0])
         https = request_is_https(headers)
@@ -364,6 +368,8 @@ class GoogleSignIn:
         """Completes the sign-in. Returns (location, cookies). Never raises for user-caused errors."""
         https = request_is_https(headers)
         cookies = [self._clear(TRANSACTION_COOKIE, https)]
+        if not self.google_enabled:
+            return "/login?error=unavailable", cookies
         params = urllib.parse.parse_qs(query or "", max_num_fields=16)
         get = lambda key: (params.get(key) or [""])[0]  # noqa: E731
         txn = self.transactions.verify(self._read(headers, TRANSACTION_COOKIE))

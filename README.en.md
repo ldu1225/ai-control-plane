@@ -161,12 +161,9 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 
 **Option B — Unattended single or multi-project deployment**
 ```bash
-bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
-  --projects my-project-1,my-project-2 \
-  --admins admin@example.org \
-  --viewers viewer@example.org
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --projects my-project-1,my-project-2 --admins admin@example.org --viewers viewer@example.org
 ```
-*(For a single project pass `--project my-project-1`; when `--admins` is omitted, the active `gcloud` account becomes the initial administrator.)*
+*(For a single project pass `--project my-project-1`; when `--admins` is omitted, the active `gcloud` account becomes the initial administrator. If an older `~/ai-control-plane` directory or stale `deploy.env` already exists in Cloud Shell, this command automatically updates or re-clones it cleanly and backs up any old `deploy.env` to `deploy.env.bak`.)*
 
 **Option C — Clone and run with CLI flags or `deploy.env`**
 ```bash
