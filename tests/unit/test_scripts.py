@@ -302,6 +302,142 @@ class InputValidationHelpersTest(unittest.TestCase):
             self.assertEqual(res.returncode, 0)
             self.assertEqual(res.stdout, expected)
 
+    def test_caller_iam_member_formats_users_and_service_accounts(self):
+        self.assertEqual(self._bash('caller_iam_member "alice@example.org"').stdout, "user:alice@example.org")
+        self.assertEqual(
+            self._bash('caller_iam_member "ci-bot@my-demo-project.iam.gserviceaccount.com"').stdout,
+            "serviceAccount:ci-bot@my-demo-project.iam.gserviceaccount.com",
+        )
+
+
+def preflight_script():
+    match = re.search(r"<<'PYPREFLIGHT'\n(.*?)\nPYPREFLIGHT\n", read("scripts/lib/common.sh"), re.S)
+    return match.group(1)
+
+
+class EnterpriseDeployHardeningTest(unittest.TestCase):
+    """Caller IAM preflight, self-bootstrap, dedicated Cloud Build SA, and end-to-end deploy.sh dry-run."""
+
+    def _run_preflight_py(self, handler, mode="deploy", need_build="1", need_sink="1",
+                          need_iap="1", need_sched="0", need_audit="0"):
+        out = io.StringIO()
+        argv = ["-", mode, "demo-proj", need_build, need_sink, need_iap, need_sched, need_audit]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.dict(os.environ, {"ACP_ACCESS_TOKEN": "tok"}), \
+                mock.patch("urllib.request.urlopen", handler), \
+                contextlib.redirect_stdout(out):
+            try:
+                exec(compile(preflight_script(), "preflight", "exec"), {"__name__": "__main__"})  # pylint: disable=exec-used
+            except SystemExit:
+                pass
+        return json.loads(out.getvalue().strip())
+
+    def test_preflight_ok_when_all_permissions_granted(self):
+        def handler(req, timeout=None):  # pylint: disable=unused-argument
+            body = json.loads(req.data)
+            return io.BytesIO(json.dumps({"permissions": body["permissions"]}).encode())
+
+        verdict = self._run_preflight_py(handler)
+        self.assertEqual(verdict["status"], "ok")
+        self.assertEqual(verdict["missing_perms"], [])
+
+    def test_preflight_bootstraps_when_caller_has_iam_admin_without_cloudbuild(self):
+        def handler(req, timeout=None):  # pylint: disable=unused-argument
+            body = json.loads(req.data)
+            granted = [p for p in body["permissions"] if p not in ("cloudbuild.builds.create", "iap.web.setIamPolicy")]
+            return io.BytesIO(json.dumps({"permissions": granted}).encode())
+
+        verdict = self._run_preflight_py(handler)
+        self.assertEqual(verdict["status"], "bootstrap")
+        self.assertIn("cloudbuild.builds.create", verdict["missing_perms"])
+        self.assertIn("roles/cloudbuild.builds.editor", verdict["missing_roles"])
+        self.assertIn("roles/iap.admin", verdict["missing_roles"])
+        self.assertNotIn("roles/resourcemanager.projectIamAdmin", verdict["missing_roles"])
+
+    def test_preflight_denies_editor_without_iam_admin(self):
+        def handler(req, timeout=None):  # pylint: disable=unused-argument
+            body = json.loads(req.data)
+            blocked = {"resourcemanager.projects.setIamPolicy", "cloudbuild.builds.create",
+                       "secretmanager.secrets.setIamPolicy", "run.services.setIamPolicy"}
+            granted = [p for p in body["permissions"] if p not in blocked]
+            return io.BytesIO(json.dumps({"permissions": granted}).encode())
+
+        verdict = self._run_preflight_py(handler)
+        self.assertEqual(verdict["status"], "denied")
+        self.assertIn("resourcemanager.projects.setIamPolicy", verdict["missing_perms"])
+        self.assertIn("cloudbuild.builds.create", verdict["missing_perms"])
+
+    def test_preflight_falls_back_to_individual_probes_on_http_400(self):
+        def handler(req, timeout=None):  # pylint: disable=unused-argument
+            perms = json.loads(req.data)["permissions"]
+            if len(perms) > 1 or perms[0] == "iap.web.setIamPolicy":
+                raise http_error(req.full_url, 400, "INVALID_ARGUMENT")
+            return io.BytesIO(json.dumps({"permissions": perms}).encode())
+
+        verdict = self._run_preflight_py(handler)
+        self.assertEqual(verdict["status"], "ok")
+
+    def test_deploy_never_relies_on_default_compute_sa_or_us_staging(self):
+        deploy = read("scripts/deploy.sh")
+        common = read("scripts/lib/common.sh")
+        teardown = read("scripts/teardown.sh")
+        self.assertNotIn("-compute@developer.gserviceaccount.com", deploy)
+        self.assertIn("CLOUD_LOGGING_ONLY", deploy)
+        self.assertIn("--gcs-source-staging-dir", deploy)
+        self.assertIn("docker build --platform linux/amd64", deploy)
+        self.assertIn("ensure_service_identities", deploy)
+        self.assertIn("--replication-policy=user-managed", common)
+        self.assertIn("BUILD_SA=", teardown)
+
+    def test_deploy_dry_run_executes_cleanly_end_to_end(self):
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(bin_dir)
+            gcloud_stub = os.path.join(bin_dir, "gcloud")
+            with open(gcloud_stub, "w", encoding="utf-8") as fh:
+                fh.write("""#!/usr/bin/env bash
+case "$*" in
+  *"config get-value account"*) echo "admin@example.org" ;;
+  *"projects describe"*) echo "123456789012" ;;
+  *"auth print-access-token"*) echo "" ;;
+  *"projects get-iam-policy"*) echo '{"bindings":[]}' ;;
+  *"run deploy --help"*) echo "--iap --no-iap --no-invoker-iam-check" ;;
+  *"describe"*) exit 1 ;;
+  *) exit 0 ;;
+esac
+""")
+            os.chmod(gcloud_stub, 0o755)
+            bq_stub = os.path.join(bin_dir, "bq")
+            with open(bq_stub, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env bash\nexit 1\n")
+            os.chmod(bq_stub, 0o755)
+
+            for access_mode in ("google", "password", "iap"):
+                env_file = os.path.join(tmp, f"deploy-{access_mode}.env")
+                with open(env_file, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        'PROJECT_ID="project demo-project-260520"\n'
+                        'REGION="asia-northeast3"\n'
+                        'ADMIN_EMAILS="admin@example.org"\n'
+                        'ALLOWED_USERS="viewer@example.org"\n'
+                        'IAP_MEMBERS="example.org"\n'
+                        f'ACCESS_MODE="{access_mode}"\n'
+                    )
+                env = os.environ.copy()
+                env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+                res = subprocess.run(
+                    ["bash", os.path.join(ROOT, "scripts/deploy.sh"), "--config", env_file, "--dry-run"],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                self.assertEqual(res.returncode, 0, msg=(access_mode, res.stdout, res.stderr))
+                self.assertIn("Done", res.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -48,6 +48,7 @@ validate_project_id "$PROJECT_ID" "$CONFIG"
 [[ -n "$SETTINGS_BUCKET" ]] || SETTINGS_BUCKET="$(default_settings_bucket "$PROJECT_ID" "$SERVICE_NAME")"
 
 SA_EMAIL="${SERVICE_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+BUILD_SA="${SERVICE_NAME:0:21}-build@${PROJECT_ID}.iam.gserviceaccount.com"
 SCHEDULER_SA="${SERVICE_NAME:0:20}-scheduler@${PROJECT_ID}.iam.gserviceaccount.com"
 BRIDGE_SA="${SERVICE_NAME:0:23}-signin@${PROJECT_ID}.iam.gserviceaccount.com"
 BILLING_DATASET="${BILLING_DATASET:-}"
@@ -86,6 +87,10 @@ remove_bindings() {  # remove_bindings PROJECT MEMBER
   return 0
 }
 remove_bindings "$PROJECT_ID" "serviceAccount:${SA_EMAIL}"
+remove_bindings "$PROJECT_ID" "serviceAccount:${BUILD_SA}"
+quiet gcloud artifacts repositories remove-iam-policy-binding "$AR_REPOSITORY" \
+  --location "$REGION" --project "$PROJECT_ID" \
+  --member "serviceAccount:${BUILD_SA}" --role roles/artifactregistry.writer --quiet || true
 if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; then
   remove_bindings "$BILLING_PROJECT_ID" "serviceAccount:${SA_EMAIL}"   # deployments made before dataset-level grants
   if [[ -n "$BILLING_DATASET" ]]; then
@@ -113,7 +118,7 @@ PYCODE
 fi
 
 log "Service accounts"
-for sa in "$SA_EMAIL" "$SCHEDULER_SA" "$BRIDGE_SA"; do
+for sa in "$SA_EMAIL" "$BUILD_SA" "$SCHEDULER_SA" "$BRIDGE_SA"; do
   quiet gcloud iam service-accounts delete "$sa" --project "$PROJECT_ID" --quiet && info "deleted ${sa}" || info "${sa} not found"
 done
 

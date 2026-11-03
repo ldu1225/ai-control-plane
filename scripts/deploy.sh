@@ -72,7 +72,7 @@ DEFAULT_LOCALE="${DEFAULT_LOCALE:-en}"
 WORKSPACE_TIMEZONE="${WORKSPACE_TIMEZONE:-UTC}"
 AUDIT_DATASET="$(trim_ws "${AUDIT_DATASET:-ge_analytics}")"
 CREATE_LOG_SINK="${CREATE_LOG_SINK:-true}"
-DATASET_LOCATION="$(trim_ws "${DATASET_LOCATION:-US}")"
+DATASET_LOCATION="$(trim_ws "${DATASET_LOCATION:-$REGION}")"
 ENABLE_DATA_ACCESS_LOGS="${ENABLE_DATA_ACCESS_LOGS:-false}"
 # Usage logs (observability) and user/prompt logging (sensitiveLoggingEnabled) of every Gemini Enterprise
 # app in DISCOVERY_ENGINE_LOCATIONS. Without GE_PROMPT_LOGGING=true, userIamPrincipal is logged as <elided>.
@@ -89,7 +89,7 @@ ENABLE_GOVERNANCE_ACTIONS="${ENABLE_GOVERNANCE_ACTIONS:-false}"
 ENFORCEMENT_SCHEDULE="${ENFORCEMENT_SCHEDULE:-}"
 AI_DEFAULT_MODEL="${AI_DEFAULT_MODEL:-}"
 AI_LOCATION="${AI_LOCATION:-}"
-IMAGE="${IMAGE:-}"
+IMAGE="$(trim_ws "${IMAGE:-}")"
 AR_REPOSITORY="$(trim_ws "${AR_REPOSITORY:-ai-control-plane}")"
 SERVICE_ACCOUNT_ID="$(trim_ws "${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}")"
 SETTINGS_BUCKET="$(trim_ws "${SETTINGS_BUCKET:-}")"
@@ -105,19 +105,20 @@ for tool in gcloud bq python3; do command -v "$tool" >/dev/null || die "$tool is
 validate_project_id "$PROJECT_ID" "$CONFIG"
 [[ -z "$BILLING_PROJECT_ID" ]] || validate_project_id "$BILLING_PROJECT_ID" "$CONFIG (BILLING_PROJECT_ID)"
 [[ "$REGION" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || die "invalid REGION '${REGION}' in $CONFIG (for example 'asia-northeast3')"
-[[ -n "$ADMIN_EMAILS" && "$ADMIN_EMAILS" != *example.com* ]] || die "set ADMIN_EMAILS in $CONFIG"
+[[ "$ADMIN_EMAILS" != *example.com* ]] || ADMIN_EMAILS=""
+[[ "$ACCESS_MODE" == "password" || -n "$ADMIN_EMAILS" ]] || die "set ADMIN_EMAILS in $CONFIG"
 [[ "$SERVICE_NAME" =~ ^[a-z]([a-z0-9-]{0,40}[a-z0-9])?$ ]] || die "SERVICE_NAME must be lowercase letters, digits and hyphens"
 [[ -n "$SETTINGS_BUCKET" ]] || SETTINGS_BUCKET="$(default_settings_bucket "$PROJECT_ID" "$SERVICE_NAME")"
 [[ ${#SETTINGS_BUCKET} -le 63 ]] || die "SETTINGS_BUCKET '${SETTINGS_BUCKET}' is longer than 63 characters; set a shorter SETTINGS_BUCKET"
 case "$ACCESS_MODE" in
-  google) ;;
+  google|password) ;;
   google_oauth) [[ -f "$OAUTH_CLIENT_JSON" ]] || die "ACCESS_MODE=google_oauth needs OAUTH_CLIENT_JSON (downloaded OAuth client JSON)" ;;
   iap) [[ -n "$IAP_MEMBERS" ]] || die "ACCESS_MODE=iap needs IAP_MEMBERS (for example group:ai-governance@example.com)" ;;
-  *) die "ACCESS_MODE must be google, google_oauth or iap" ;;
+  *) die "ACCESS_MODE must be google, google_oauth, iap or password" ;;
 esac
 case "$GUEST_ACCESS" in
   true)
-    [[ "$ACCESS_MODE" != "iap" ]] || die "GUEST_ACCESS=true needs ACCESS_MODE google or google_oauth"
+    [[ "$ACCESS_MODE" != "iap" ]] || die "GUEST_ACCESS=true needs ACCESS_MODE google, google_oauth or password"
     if [[ -z "$GUEST_REDACT_TERMS" && -f "$ROOT/.prepublish-terms" ]]; then
       GUEST_REDACT_TERMS="$(python3 - "$ROOT/.prepublish-terms" <<'PY'
 import sys
@@ -131,7 +132,7 @@ PY
 esac
 if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
   [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]] || die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
-  [[ "$ACCESS_MODE" != "iap" ]] || die "ENFORCEMENT_SCHEDULE needs ACCESS_MODE google or google_oauth (IAP blocks the scheduler's OIDC token)"
+  [[ "$ACCESS_MODE" != "iap" ]] || die "ENFORCEMENT_SCHEDULE needs ACCESS_MODE google, google_oauth or password (IAP blocks the scheduler's OIDC token)"
 elif [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
   # Suspended users are restored only inside an enforcement run.
   if [[ "$ACCESS_MODE" == "iap" ]]; then
@@ -162,9 +163,11 @@ if [[ -z "$BILLING_TABLE" && ",$DISABLED_MODULES," != *",finops,"* ]]; then
 fi
 ACCOUNT="$(gcloud config get-value account 2>/dev/null || true)"
 [[ -n "$ACCOUNT" ]] || die "no active gcloud account (run: gcloud auth login)"
+CALLER_MEMBER="$(caller_iam_member "$ACCOUNT")"
 PROJECT_NUMBER=""
 GCLOUD_ERR="$(mktemp)"
-trap 'rm -f "$GCLOUD_ERR"' EXIT
+IAM_CACHE="$(mktemp)"
+trap 'rm -f "$GCLOUD_ERR" "$IAM_CACHE"' EXIT
 for attempt in 1 2 3; do
   # stdout only: gcloud may print notices on stderr, which must never end up in URLs or identities.
   PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>"$GCLOUD_ERR" || true)"
@@ -175,6 +178,9 @@ for attempt in 1 2 3; do
 done
 
 SA_EMAIL="${SERVICE_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+BUILD_SA_ID="${SERVICE_NAME:0:21}-build"
+BUILD_SA="${BUILD_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+CB_SERVICE_AGENT="service-${PROJECT_NUMBER}@gcp-sa-cloudbuild.iam.gserviceaccount.com"
 BRIDGE_NAME="${SERVICE_NAME}-signin"
 RUN_URL="https://${SERVICE_NAME}-${PROJECT_NUMBER}.${REGION}.run.app"
 BASE_URL="${PUBLIC_BASE_URL:-$RUN_URL}"
@@ -187,9 +193,16 @@ BRIDGE_SA_ID="${SERVICE_NAME:0:23}-signin"
 BRIDGE_SA="${BRIDGE_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 ENFORCE_URL="${BASE_URL}/api/v1/governance/antigravity/enforce"
 
+NEED_BUILD=0; [[ -z "$IMAGE" ]] && NEED_BUILD=1
+NEED_SINK=0; [[ "$CREATE_LOG_SINK" == "true" ]] && NEED_SINK=1
+NEED_IAP=0; [[ "$ACCESS_MODE" == "google" || "$ACCESS_MODE" == "iap" ]] && NEED_IAP=1
+NEED_SCHED=0; [[ -n "$ENFORCEMENT_SCHEDULE" ]] && NEED_SCHED=1
+NEED_AUDIT=0; [[ "$ENABLE_DATA_ACCESS_LOGS" == "true" ]] && NEED_AUDIT=1
+
 log "Deploying ${SERVICE_NAME} to ${PROJECT_ID} (${REGION}) as ${ACCOUNT}"
 info "access mode: ${ACCESS_MODE}    dashboard URL: ${BASE_URL}"
 [[ "$DRY_RUN" == "1" ]] && info "dry run: commands that change anything are printed, not executed"
+preflight_caller_permissions deploy "$PROJECT_ID" "$ACCOUNT" "$NEED_BUILD" "$NEED_SINK" "$NEED_IAP" "$NEED_SCHED" "$NEED_AUDIT"
 
 # ------------------------------------------------------------------------------- 1. APIs
 log "1/8 Enabling APIs"
@@ -197,51 +210,85 @@ APIS=(run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.c
   logging.googleapis.com monitoring.googleapis.com discoveryengine.googleapis.com aiplatform.googleapis.com
   cloudresourcemanager.googleapis.com iam.googleapis.com storage.googleapis.com secretmanager.googleapis.com
   cloudbilling.googleapis.com serviceusage.googleapis.com)
-[[ "$ACCESS_MODE" != "google_oauth" ]] && APIS+=(iap.googleapis.com)
+SID_APIS=(cloudbuild.googleapis.com artifactregistry.googleapis.com run.googleapis.com secretmanager.googleapis.com)
+if [[ "$NEED_IAP" == "1" ]]; then
+  APIS+=(iap.googleapis.com)
+  SID_APIS+=(iap.googleapis.com)
+fi
 [[ -n "$ENFORCEMENT_SCHEDULE" ]] && APIS+=(cloudscheduler.googleapis.com)
 run gcloud services enable "${APIS[@]}" --project "$PROJECT_ID"
+ensure_service_identities "$PROJECT_ID" "$PROJECT_NUMBER" "${SID_APIS[@]}"
 
-# ------------------------------------------------------------------------------- 2. image
-log "2/8 Container image"
-if [[ -z "$IMAGE" ]]; then
-  if ! gcloud artifacts repositories describe "$AR_REPOSITORY" --location "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1; then
-    run gcloud artifacts repositories create "$AR_REPOSITORY" --repository-format=docker --location "$REGION" \
-      --project "$PROJECT_ID" --description "AI Control Plane images"
-  fi
-  IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${SERVICE_NAME}:$(date -u +%Y%m%d-%H%M%S)"
-  info "building ${IMAGE}"
-  run gcloud builds submit "$ROOT" --project "$PROJECT_ID" --region "$REGION" --tag "$IMAGE" || die "Cloud Build failed.
-  New projects build as the Compute Engine default service account, which may need the builder role:
-    gcloud projects add-iam-policy-binding ${PROJECT_ID} --role roles/cloudbuild.builds.builder \\
-      --member serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com
-  Then run this script again."
-else
-  info "using prebuilt image ${IMAGE}"
+# ------------------------------------------------------------------------------- 2. settings bucket
+# Created before building the image so regional Cloud Build staging can use gs://${SETTINGS_BUCKET}/_build/source
+# instead of Cloud Build's default US multi-region bucket (which fails under Korea resourceLocations org policies).
+log "2/8 Settings bucket gs://${SETTINGS_BUCKET}"
+if ! gcloud storage buckets describe "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" >/dev/null 2>&1; then
+  run gcloud storage buckets create "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" --location "$REGION" \
+    --uniform-bucket-level-access --public-access-prevention
+  run gcloud storage buckets update "gs://${SETTINGS_BUCKET}" --versioning
 fi
 
 # ------------------------------------------------------------------------------- 3. identity
-log "3/8 Runtime service account ${SA_EMAIL}"
-if ! gcloud iam service-accounts describe "$SA_EMAIL" --project "$PROJECT_ID" >/dev/null 2>&1; then
-  run gcloud iam service-accounts create "$SERVICE_ACCOUNT_ID" --project "$PROJECT_ID" \
-    --display-name "AI Control Plane runtime" --description "Least-privilege identity of the ${SERVICE_NAME} Cloud Run service"
+log "3/8 Service accounts and IAM (${SA_EMAIL})"
+ensure_sa() {  # ensure_sa ACCOUNT_ID EMAIL DISPLAY_NAME DESCRIPTION
+  if ! gcloud iam service-accounts describe "$2" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    run gcloud iam service-accounts create "$1" --project "$PROJECT_ID" \
+      --display-name "$3" --description "$4"
+  fi
+}
+ensure_sa "$SERVICE_ACCOUNT_ID" "$SA_EMAIL" "AI Control Plane runtime" \
+  "Least-privilege identity of the ${SERVICE_NAME} Cloud Run service"
+if [[ "$ACCESS_MODE" == "google" ]]; then
+  # No project roles: the sign-in bridge only reads the session signing key (granted in step 5).
+  ensure_sa "$BRIDGE_SA_ID" "$BRIDGE_SA" "AI Control Plane sign-in bridge" \
+    "Identity of the ${BRIDGE_NAME} sign-in bridge"
 fi
+if [[ -z "$IMAGE" ]]; then
+  # Dedicated build identity: avoids relying on the Compute Engine default service account (which does not exist
+  # when Compute Engine API was never enabled, or lacks roles in projects created after May 2024).
+  ensure_sa "$BUILD_SA_ID" "$BUILD_SA" "AI Control Plane image builder" \
+    "Least-privilege Cloud Build identity for ${SERVICE_NAME}"
+fi
+
+gcloud projects get-iam-policy "$PROJECT_ID" --format=json >"$IAM_CACHE" 2>/dev/null || echo "{}" >"$IAM_CACHE"
+has_project_role() {  # has_project_role MEMBER ROLE
+  python3 - "$IAM_CACHE" "$1" "$2" <<'PYIAM'
+import json, sys
+policy = json.load(open(sys.argv[1]))
+want_member, want_role = sys.argv[2].lower(), sys.argv[3]
+for b in policy.get("bindings") or []:
+    if b.get("role") == want_role and not b.get("condition"):
+        if any(m.lower() == want_member for m in (b.get("members") or [])):
+            sys.exit(0)
+sys.exit(1)
+PYIAM
+}
+grant_member() {  # grant_member PROJECT MEMBER ROLE
+  if [[ "$1" == "$PROJECT_ID" ]] && has_project_role "$2" "$3"; then
+    info "already granted $3 to $2"
+    return 0
+  fi
+  run retry gcloud projects add-iam-policy-binding "$1" --member "$2" --role "$3" \
+    --condition=None --quiet >/dev/null
+  [[ "$DRY_RUN" == "1" ]] || info "granted $3 to $2 on $1"
+}
+
 # Read roles plus logging.logWriter, which is always granted so that every governance record (dry runs,
 # exception and review changes, enforcement runs) reaches the audit log, with or without IAM write roles.
 RUNTIME_ROLES=(roles/bigquery.dataViewer roles/bigquery.jobUser roles/aiplatform.user roles/discoveryengine.viewer
   roles/monitoring.viewer roles/logging.viewer roles/iam.securityReviewer roles/serviceusage.serviceUsageConsumer
   roles/logging.logWriter)
 GOVERNANCE_ROLES=(roles/resourcemanager.projectIamAdmin roles/iam.roleAdmin)
-grant() {  # grant PROJECT ROLE
-  run retry gcloud projects add-iam-policy-binding "$1" --member "serviceAccount:${SA_EMAIL}" --role "$2" \
-    --condition=None --quiet >/dev/null
-  [[ "$DRY_RUN" == "1" ]] || info "granted $2 on $1"
-}
-for role in "${RUNTIME_ROLES[@]}"; do grant "$PROJECT_ID" "$role"; done
+for role in "${RUNTIME_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
 if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
-  for role in "${GOVERNANCE_ROLES[@]}"; do grant "$PROJECT_ID" "$role"; done
+  for role in "${GOVERNANCE_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
 else
   info "governance write roles skipped (ENABLE_GOVERNANCE_ACTIONS=false): dashboards and simulations only"
 fi
+run retry gcloud storage buckets add-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
+  --member "serviceAccount:${SA_EMAIL}" --role roles/storage.objectAdmin >/dev/null
+
 # Billing export in another project: read access on that dataset only (no project-level role there).
 if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; then
   if [[ -z "$BILLING_DATASET" ]]; then
@@ -258,33 +305,109 @@ if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; the
     warn "could not grant read access on ${BILLING_PROJECT_ID}:${BILLING_DATASET}; grant BigQuery Data Viewer on that dataset to ${SA_EMAIL}"
   fi
 fi
-if [[ "$ACCESS_MODE" == "google" ]] && \
-    ! gcloud iam service-accounts describe "$BRIDGE_SA" --project "$PROJECT_ID" >/dev/null 2>&1; then
-  # No project roles: the sign-in bridge only reads the session signing key (granted in step 5).
-  run gcloud iam service-accounts create "$BRIDGE_SA_ID" --project "$PROJECT_ID" \
-    --display-name "AI Control Plane sign-in bridge" --description "Identity of the ${BRIDGE_NAME} sign-in bridge"
-fi
 
-# ------------------------------------------------------------------------------- 4. settings bucket
-log "4/8 Settings bucket gs://${SETTINGS_BUCKET}"
-if ! gcloud storage buckets describe "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" >/dev/null 2>&1; then
-  run gcloud storage buckets create "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" --location "$REGION" \
-    --uniform-bucket-level-access --public-access-prevention
-  run gcloud storage buckets update "gs://${SETTINGS_BUCKET}" --versioning
+# ------------------------------------------------------------------------------- 4. image
+log "4/8 Container image"
+if [[ -z "$IMAGE" ]]; then
+  if ! gcloud artifacts repositories describe "$AR_REPOSITORY" --location "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    run gcloud artifacts repositories create "$AR_REPOSITORY" --repository-format=docker --location "$REGION" \
+      --project "$PROJECT_ID" --description "AI Control Plane images"
+  fi
+  IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/${AR_REPOSITORY}/${SERVICE_NAME}:$(date -u +%Y%m%d-%H%M%S)"
+  info "building ${IMAGE}"
+
+  # Prepare dedicated Cloud Build identity, Cloud Build service agent, Artifact Registry write access, and
+  # temporary staging access on gs://${SETTINGS_BUCKET}/_build/source.
+  if ! has_project_role "serviceAccount:${CB_SERVICE_AGENT}" "roles/cloudbuild.serviceAgent"; then
+    run gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+      --member "serviceAccount:${CB_SERVICE_AGENT}" --role roles/cloudbuild.serviceAgent \
+      --condition=None --quiet >/dev/null 2>&1 || true
+  fi
+  grant_member "$PROJECT_ID" "serviceAccount:${BUILD_SA}" "roles/logging.logWriter"
+  run retry gcloud artifacts repositories add-iam-policy-binding "$AR_REPOSITORY" \
+    --location "$REGION" --project "$PROJECT_ID" \
+    --member "serviceAccount:${BUILD_SA}" --role roles/artifactregistry.writer --quiet >/dev/null 2>&1 \
+    || grant_member "$PROJECT_ID" "serviceAccount:${BUILD_SA}" "roles/artifactregistry.writer"
+  run retry gcloud iam service-accounts add-iam-policy-binding "$BUILD_SA" --project "$PROJECT_ID" \
+    --member "$CALLER_MEMBER" --role roles/iam.serviceAccountUser --condition=None --quiet >/dev/null
+  run gcloud iam service-accounts add-iam-policy-binding "$BUILD_SA" --project "$PROJECT_ID" \
+    --member "serviceAccount:${CB_SERVICE_AGENT}" --role roles/iam.serviceAccountTokenCreator \
+    --condition=None --quiet >/dev/null 2>&1 || true
+  run retry gcloud storage buckets add-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
+    --member "serviceAccount:${BUILD_SA}" --role roles/storage.objectAdmin >/dev/null
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] gcloud builds submit ${ROOT} --region ${REGION} --service-account ${BUILD_SA} -> ${IMAGE}"
+  else
+    CB_DIR="$(mktemp -d)"
+    CB_CONFIG="${CB_DIR}/cloudbuild.yaml"
+    BUILD_LOG="${CB_DIR}/build.log"
+    cat >"$CB_CONFIG" <<EOF
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', '${IMAGE}', '.']
+images:
+- '${IMAGE}'
+serviceAccount: 'projects/${PROJECT_ID}/serviceAccounts/${BUILD_SA}'
+options:
+  logging: CLOUD_LOGGING_ONLY
+EOF
+    BUILD_OK=0
+    for build_attempt in 1 2 3; do
+      if gcloud builds submit "$ROOT" \
+          --project "$PROJECT_ID" \
+          --region "$REGION" \
+          --config "$CB_CONFIG" \
+          --gcs-source-staging-dir "gs://${SETTINGS_BUCKET}/_build/source" \
+          2>&1 | tee "$BUILD_LOG"; then
+        BUILD_OK=1
+        break
+      fi
+      if [[ $build_attempt -lt 3 ]] && grep -Eiq 'PERMISSION_DENIED|NOT_FOUND|does not exist|serviceAccount|actAs|propagation' "$BUILD_LOG"; then
+        warn "Cloud Build attempt ${build_attempt}/3 hit IAM/API propagation; retrying in 12s..."
+        sleep 12
+      else
+        break
+      fi
+    done
+    # Remove staged source tarball and revoke temporary bucket access from the build identity.
+    gcloud storage rm --recursive "gs://${SETTINGS_BUCKET}/_build/**" --project "$PROJECT_ID" >/dev/null 2>&1 || true
+    gcloud storage buckets remove-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
+      --member "serviceAccount:${BUILD_SA}" --role roles/storage.objectAdmin >/dev/null 2>&1 || true
+
+    # Automatic fallback: Cloud Shell and developer workstations have Docker installed. If Cloud Build is
+    # blocked by an organization policy, VPC-SC perimeter or caller restriction, build and push locally.
+    if [[ "$BUILD_OK" != "1" ]]; then
+      if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        warn "Cloud Build failed; falling back to local Docker build and push to Artifact Registry..."
+        gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
+        if docker build --platform linux/amd64 -t "$IMAGE" "$ROOT" && docker push "$IMAGE"; then
+          BUILD_OK=1
+        fi
+      fi
+    fi
+    if [[ "$BUILD_OK" != "1" ]]; then
+      BUILD_TAIL="$(tail -n 20 "$BUILD_LOG" 2>/dev/null || true)"
+      rm -rf "$CB_DIR"
+      die "container image build failed for ${PROJECT_ID} (as ${ACCOUNT}):
+${BUILD_TAIL}"
+    fi
+    rm -rf "$CB_DIR"
+  fi
+else
+  info "using prebuilt image ${IMAGE}"
 fi
-run retry gcloud storage buckets add-iam-policy-binding "gs://${SETTINGS_BUCKET}" --member "serviceAccount:${SA_EMAIL}" \
-  --role roles/storage.objectAdmin >/dev/null
 
 # ------------------------------------------------------------------------------- 5. secrets
 log "5/8 Session signing key (Secret Manager: ${SESSION_SECRET_NAME})"
-if ! gcloud secrets describe "$SESSION_SECRET_NAME" --project "$PROJECT_ID" >/dev/null 2>&1; then
-  if [[ "$DRY_RUN" == "1" ]]; then
-    info "[dry-run] create secret ${SESSION_SECRET_NAME} with a random 48-byte value"
-  else
+ensure_secret_created "$SESSION_SECRET_NAME" "$PROJECT_ID" "$REGION"
+if [[ "$DRY_RUN" == "1" ]]; then
+  info "[dry-run] ensure ${SESSION_SECRET_NAME} has an active secret version"
+else
+  if [[ -z "$(gcloud secrets versions list "$SESSION_SECRET_NAME" --project "$PROJECT_ID" --filter='state=ENABLED' --limit 1 --format='value(name)' 2>/dev/null || true)" ]]; then
     python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(48))' \
-      | gcloud secrets create "$SESSION_SECRET_NAME" --project "$PROJECT_ID" --replication-policy=automatic \
-          --labels=app=ai-control-plane --data-file=- >/dev/null
-    info "created"
+      | gcloud secrets versions add "$SESSION_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+    info "created secret version"
   fi
 fi
 run retry gcloud secrets add-iam-policy-binding "$SESSION_SECRET_NAME" --project "$PROJECT_ID" \
@@ -311,10 +434,7 @@ print(body["client_id"])
 PY
 )"
   info "OAuth client ${OAUTH_CLIENT_ID}"
-  if ! gcloud secrets describe "$OAUTH_SECRET_NAME" --project "$PROJECT_ID" >/dev/null 2>&1; then
-    run gcloud secrets create "$OAUTH_SECRET_NAME" --project "$PROJECT_ID" --replication-policy=automatic \
-      --labels=app=ai-control-plane >/dev/null
-  fi
+  ensure_secret_created "$OAUTH_SECRET_NAME" "$PROJECT_ID" "$REGION"
   if [[ "$DRY_RUN" == "1" ]]; then
     info "[dry-run] add the client secret from ${OAUTH_CLIENT_JSON} as a new version of ${OAUTH_SECRET_NAME}"
   else
@@ -388,30 +508,71 @@ fi
 COMMON=(--image "$IMAGE" --project "$PROJECT_ID" --region "$REGION" --cpu-boost --quiet)
 MAIN=("${COMMON[@]}" --service-account "$SA_EMAIL")
 
+RUN_DEPLOY_HELP="$(gcloud run deploy --help 2>&1 || true)"
+NO_IAP_ARGS=()
+[[ "$RUN_DEPLOY_HELP" == *"--no-iap"* || "$RUN_DEPLOY_HELP" == *"--iap"* ]] && NO_IAP_ARGS=(--no-iap)
+
+# Deploys the public-entry dashboard service (the app enforces its own signed session cookies on every route).
+# Prefers --no-invoker-iam-check so organizations enforcing constraints/iam.allowedPolicyMemberDomains
+# (no allUsers IAM binding) succeed; falls back to --allow-unauthenticated on older gcloud versions or org policies.
+deploy_main_public() {
+  local env_str="$1"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --no-invoker-iam-check \
+      --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
+      --set-env-vars "$env_str" --set-secrets "$SECRETS"
+    return 0
+  fi
+  if [[ "$RUN_DEPLOY_HELP" == *"--no-invoker-iam-check"* ]]; then
+    if gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --no-invoker-iam-check \
+        --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
+        --set-env-vars "$env_str" --set-secrets "$SECRETS"; then
+      return 0
+    fi
+    warn "--no-invoker-iam-check was rejected; retrying with --allow-unauthenticated..."
+  fi
+  gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --allow-unauthenticated \
+    --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
+    --set-env-vars "$env_str" --set-secrets "$SECRETS" \
+    || die "Cloud Run deployment failed. If an organization policy enforces Cloud Run IAM invoker checks and blocks allUsers, set ACCESS_MODE=\"iap\" and IAP_MEMBERS=\"domain:your-domain.com\" in $(basename "$CONFIG") and re-run."
+}
+
+BRIDGE_READY=0
 case "$ACCESS_MODE" in
   google)
     info "sign-in bridge ${BRIDGE_NAME} (IAP signs users in with Google; the dashboard approves accounts)"
-    run gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
-      --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
-      --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
-      --set-secrets "$SECRETS"
-    run retry gcloud run services add-iam-policy-binding "$BRIDGE_NAME" --project "$PROJECT_ID" --region "$REGION" \
-      --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
-    IFS=',' read -r -a members <<<"$BRIDGE_MEMBERS"
-    for member in "${members[@]}"; do
-      member="$(normalize_iam_member "$member")"
-      [[ -n "$member" ]] || continue
-      run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
-        --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 || true
-    done
-    # Cloud Run Direct IAP evaluates explicit user:/domain: bindings even when allAuthenticatedUsers is present
-    # in the policy; always bind configured ADMIN_EMAILS and ALLOWED_USERS principals.
-    while IFS= read -r fallback_member; do
-      [[ -n "$fallback_member" ]] || continue
-      run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
-        --project="$PROJECT_ID" --member="$fallback_member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 \
-        && info "sign-in bridge IAP access: ${fallback_member}" || true
-    done < <(python3 - "$ADMIN_EMAILS" "$ALLOWED_USERS" <<'PY'
+    if [[ "$DRY_RUN" == "1" ]]; then
+      run gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
+        --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
+        --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
+        --set-secrets "$SECRETS"
+      BRIDGE_READY=1
+    elif retry gcloud run deploy "$BRIDGE_NAME" "${COMMON[@]}" --service-account "$BRIDGE_SA" --no-allow-unauthenticated --iap \
+        --memory 512Mi --cpu 1 --max-instances 3 --timeout 60 \
+        --set-env-vars "^##^AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${BRIDGE_NAME}##BRIDGE_RETURN_URL=${BASE_URL}##ORGANIZATION_NAME=${ORGANIZATION_NAME}" \
+        --set-secrets "$SECRETS"; then
+      BRIDGE_READY=1
+    else
+      warn "sign-in bridge (${BRIDGE_NAME}) with Cloud Run IAP could not be deployed; deploying the dashboard with built-in ID/Password sign-in enabled so you can log in immediately"
+    fi
+    if [[ "$BRIDGE_READY" == "1" ]]; then
+      run retry gcloud run services add-iam-policy-binding "$BRIDGE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+        --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
+      IFS=',' read -r -a members <<<"$BRIDGE_MEMBERS"
+      for member in "${members[@]}"; do
+        member="$(normalize_iam_member "$member")"
+        [[ -n "$member" ]] || continue
+        run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
+          --project="$PROJECT_ID" --member="$member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 || true
+      done
+      # Cloud Run Direct IAP evaluates explicit user:/domain: bindings even when allAuthenticatedUsers is present
+      # in the policy; always bind configured ADMIN_EMAILS and ALLOWED_USERS principals.
+      while IFS= read -r fallback_member; do
+        [[ -n "$fallback_member" ]] || continue
+        run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
+          --project="$PROJECT_ID" --member="$fallback_member" --role=roles/iap.httpsResourceAccessor --condition=None >/dev/null 2>&1 \
+          && info "sign-in bridge IAP access: ${fallback_member}" || true
+      done < <(python3 - "$ADMIN_EMAILS" "$ALLOWED_USERS" <<'PY'
 import sys
 public_domains = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com", "icloud.com", "naver.com", "daum.net", "hanmail.net", "kakao.com"}
 seen = set()
@@ -431,20 +592,19 @@ for raw in sys.argv[1:]:
                 seen.add(cand)
                 print(cand)
 PY
-    )
-    run gcloud projects add-iam-policy-binding "$PROJECT_ID" --member "serviceAccount:${SA_EMAIL}" \
-      --role roles/iap.admin --condition=None --quiet >/dev/null 2>&1 || true
-    # Ensure a custom IAP OAuth client is attached to the sign-in bridge so out-of-org Google accounts
-    # (when permitted by the project's OAuth brand) are not rejected by Cloud Run IAP's default in-org client.
-    if [[ "$DRY_RUN" -eq 0 ]]; then
-      IAP_BRAND="projects/${PROJECT_NUMBER}/brands/${PROJECT_NUMBER}"
-      IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || echo "[]")"
-      if [[ "$IAP_CLIENT_JSON" == "[]" || -z "$IAP_CLIENT_JSON" ]]; then
-        gcloud iap oauth-clients create "$IAP_BRAND" --display_name="${SERVICE_NAME}-iap" --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+      )
+      grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/iap.admin" || true
+      # Ensure a custom IAP OAuth client is attached to the sign-in bridge so out-of-org Google accounts
+      # (when permitted by the project's OAuth brand) are not rejected by Cloud Run IAP's default in-org client.
+      if [[ "$DRY_RUN" -eq 0 ]]; then
+        IAP_BRAND="projects/${PROJECT_NUMBER}/brands/${PROJECT_NUMBER}"
         IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || echo "[]")"
-      fi
-      IAP_SETTINGS_FILE="$(mktemp)"
-      if python3 - "$IAP_CLIENT_JSON" "$IAP_SETTINGS_FILE" <<'PY'
+        if [[ "$IAP_CLIENT_JSON" == "[]" || -z "$IAP_CLIENT_JSON" ]]; then
+          gcloud iap oauth-clients create "$IAP_BRAND" --display_name="${SERVICE_NAME}-iap" --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+          IAP_CLIENT_JSON="$(gcloud iap oauth-clients list "$IAP_BRAND" --project="$PROJECT_ID" --format=json 2>/dev/null || echo "[]")"
+        fi
+        IAP_SETTINGS_FILE="$(mktemp)"
+        if python3 - "$IAP_CLIENT_JSON" "$IAP_SETTINGS_FILE" <<'PY'
 import json, sys
 clients = json.loads(sys.argv[1] or "[]")
 if not clients:
@@ -457,26 +617,29 @@ if not cid or not secret:
 with open(sys.argv[2], "w", encoding="utf-8") as fh:
     fh.write(f"access_settings:\n  oauth_settings:\n    client_id: {cid}\n    client_secret: {secret}\n")
 PY
-      then
-        gcloud iap settings set "$IAP_SETTINGS_FILE" --project="$PROJECT_ID" --resource-type=cloud-run --region="$REGION" --service="$BRIDGE_NAME" --quiet >/dev/null 2>&1 \
-          && info "sign-in bridge custom IAP OAuth client configured" || true
+        then
+          gcloud iap settings set "$IAP_SETTINGS_FILE" --project="$PROJECT_ID" --resource-type=cloud-run --region="$REGION" --service="$BRIDGE_NAME" --quiet >/dev/null 2>&1 \
+            && info "sign-in bridge custom IAP OAuth client configured" || true
+        fi
+        rm -f "$IAP_SETTINGS_FILE"
       fi
-      rm -f "$IAP_SETTINGS_FILE"
+      ENV_VARS+="##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
+    else
+      ENV_VARS+="##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
     fi
-    ENV_VARS+="##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
-    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --no-iap --no-invoker-iam-check \
-      --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-      --set-env-vars "$ENV_VARS" --set-secrets "$SECRETS"
+    deploy_main_public "$ENV_VARS"
+    ;;
+  password)
+    ENV_VARS+="##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
+    deploy_main_public "$ENV_VARS"
     ;;
   google_oauth)
     ENV_VARS+="##AUTH_MODE=google##GOOGLE_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}##PUBLIC_BASE_URL=${BASE_URL}"
-    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --no-iap --no-invoker-iam-check \
-      --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-      --set-env-vars "$ENV_VARS" --set-secrets "$SECRETS"
+    deploy_main_public "$ENV_VARS"
     ;;
   iap)
     ENV_VARS+="##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
-    run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
+    run retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
       --set-env-vars "$ENV_VARS" --set-secrets "$SECRETS"
     run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
@@ -519,6 +682,13 @@ fi
 log "Done"
 case "$ACCESS_MODE" in
   iap) info "Open ${BASE_URL} (IAP signs in: ${IAP_MEMBERS})" ;;
+  password) info "Open ${BASE_URL}/login and sign in with ID/Password (default initial account: admin / admin — change in Settings > Access control)" ;;
+  google)
+    if [[ "$BRIDGE_READY" == "1" ]]; then
+      info "Open ${BASE_URL}/login and sign in with Google (${ADMIN_EMAILS}) or ID/Password"
+    else
+      info "Open ${BASE_URL}/login and sign in with ID/Password (default initial account: admin / admin — change in Settings > Access control)"
+    fi ;;
   *) info "Open ${BASE_URL}/login and sign in with an administrator account (${ADMIN_EMAILS})" ;;
 esac
 info "Image: ${IMAGE}"

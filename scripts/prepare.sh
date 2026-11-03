@@ -72,6 +72,8 @@ gcloud projects describe "$PROJECT_ID" --format='value(projectId)' >/dev/null 2>
 
 log "Preparing ${PROJECT_ID} for AI Control Plane as ${ACCOUNT}"
 [[ "$DRY_RUN" == "1" ]] && info "dry run: commands that change anything are printed, not executed"
+NEED_AUDIT_PREP=0; [[ "$DATA_ACCESS_LOGS" == "true" ]] && NEED_AUDIT_PREP=1
+preflight_caller_permissions prepare "$PROJECT_ID" "$ACCOUNT" 0 1 0 0 "$NEED_AUDIT_PREP"
 
 log "1/5 Enabling APIs"
 run gcloud services enable logging.googleapis.com bigquery.googleapis.com discoveryengine.googleapis.com \

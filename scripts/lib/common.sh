@@ -107,6 +107,254 @@ normalize_iam_member() {
   esac
 }
 
+# Formats an active gcloud account email as a user: or serviceAccount: IAM member.
+caller_iam_member() {
+  local acct
+  acct="$(trim_ws "${1:-}")"
+  if [[ "$acct" == *.gserviceaccount.com ]]; then
+    printf 'serviceAccount:%s' "$acct"
+  else
+    printf 'user:%s' "$acct"
+  fi
+}
+
+# _check_project_permissions MODE PROJECT NEED_BUILD NEED_SINK NEED_IAP NEED_SCHEDULER NEED_AUDIT_ADMIN
+# Calls Cloud Resource Manager projects.testIamPermissions and prints a single-line JSON verdict:
+#   status="ok"         every required permission is already present
+#   status="bootstrap"  some operational permissions are missing, but caller has setIamPolicy so script can self-grant
+#   status="denied"     caller lacks required permissions and lacks setIamPolicy to grant them
+#   status="skip"       token unavailable or transient network failure (caller continues normally)
+_check_project_permissions() {
+  local token
+  token="$(gcloud auth print-access-token 2>/dev/null || true)"
+  if [[ -z "$token" ]]; then
+    printf '{"status":"skip","reason":"no_token"}\n'
+    return 0
+  fi
+  ACP_ACCESS_TOKEN="$token" python3 - "$@" <<'PYPREFLIGHT'
+import json, os, sys, urllib.error, urllib.request
+
+mode, project = sys.argv[1], sys.argv[2]
+need_build = sys.argv[3] == "1"
+need_sink = sys.argv[4] == "1"
+need_iap = sys.argv[5] == "1"
+need_scheduler = sys.argv[6] == "1"
+need_audit_admin = sys.argv[7] == "1"
+token = os.environ["ACP_ACCESS_TOKEN"]
+
+# Ordered pairs of (permission, minimal predefined role that grants it).
+checks = [("serviceusage.services.enable", "roles/serviceusage.serviceUsageAdmin")]
+if mode == "prepare":
+    if need_sink:
+        checks += [
+            ("bigquery.datasets.create", "roles/bigquery.admin"),
+            ("logging.sinks.create", "roles/logging.configWriter"),
+        ]
+    if need_audit_admin:
+        checks += [
+            ("resourcemanager.projects.getIamPolicy", "roles/resourcemanager.projectIamAdmin"),
+            ("resourcemanager.projects.setIamPolicy", "roles/resourcemanager.projectIamAdmin"),
+        ]
+else:
+    checks += [
+        ("resourcemanager.projects.getIamPolicy", "roles/resourcemanager.projectIamAdmin"),
+        ("resourcemanager.projects.setIamPolicy", "roles/resourcemanager.projectIamAdmin"),
+        ("serviceusage.services.use", "roles/serviceusage.serviceUsageConsumer"),
+        ("iam.serviceAccounts.create", "roles/iam.serviceAccountAdmin"),
+        ("iam.serviceAccounts.setIamPolicy", "roles/iam.serviceAccountAdmin"),
+        ("iam.serviceAccounts.actAs", "roles/iam.serviceAccountUser"),
+        ("storage.buckets.create", "roles/storage.admin"),
+        ("storage.buckets.setIamPolicy", "roles/storage.admin"),
+        ("secretmanager.secrets.create", "roles/secretmanager.admin"),
+        ("secretmanager.secrets.setIamPolicy", "roles/secretmanager.admin"),
+        ("run.services.create", "roles/run.admin"),
+        ("run.services.setIamPolicy", "roles/run.admin"),
+    ]
+    if need_build:
+        checks += [
+            ("cloudbuild.builds.create", "roles/cloudbuild.builds.editor"),
+            ("artifactregistry.repositories.create", "roles/artifactregistry.admin"),
+            ("artifactregistry.repositories.uploadArtifacts", "roles/artifactregistry.admin"),
+        ]
+    if need_sink:
+        checks += [
+            ("bigquery.datasets.create", "roles/bigquery.admin"),
+            ("logging.sinks.create", "roles/logging.configWriter"),
+        ]
+    if need_iap:
+        checks += [("iap.web.setIamPolicy", "roles/iap.admin")]
+    if need_scheduler:
+        checks += [("cloudscheduler.jobs.create", "roles/cloudscheduler.admin")]
+
+all_perms = []
+for perm, _ in checks:
+    if perm not in all_perms:
+        all_perms.append(perm)
+if "resourcemanager.projects.setIamPolicy" not in all_perms:
+    probe_perms = all_perms + ["resourcemanager.projects.setIamPolicy"]
+else:
+    probe_perms = list(all_perms)
+
+url = "https://cloudresourcemanager.googleapis.com/v1/projects/%s:testIamPermissions" % project
+
+
+def test_batch(perms):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps({"permissions": perms}).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return set(json.load(resp).get("permissions") or [])
+
+
+granted = set()
+valid_perms = set(probe_perms)
+try:
+    granted = test_batch(probe_perms)
+except urllib.error.HTTPError as err:
+    if err.code == 400:
+        # One or more permission strings are not registered on Project in this environment; test individually.
+        valid_perms = set()
+        for p in probe_perms:
+            try:
+                got = test_batch([p])
+                valid_perms.add(p)
+                granted |= got
+            except urllib.error.HTTPError as sub:
+                if sub.code != 400:
+                    print(json.dumps({"status": "skip", "reason": "http_%s" % sub.code}))
+                    sys.exit(0)
+    else:
+        print(json.dumps({"status": "skip", "reason": "http_%s" % err.code}))
+        sys.exit(0)
+except Exception as exc:  # pylint: disable=broad-except
+    print(json.dumps({"status": "skip", "reason": str(exc)[:80]}))
+    sys.exit(0)
+
+missing_perms = []
+missing_roles = []
+for perm, role in checks:
+    if perm in valid_perms and perm not in granted:
+        missing_perms.append(perm)
+        if role not in missing_roles:
+            missing_roles.append(role)
+
+if not missing_perms:
+    print(json.dumps({"status": "ok", "missing_perms": [], "missing_roles": []}))
+elif "resourcemanager.projects.setIamPolicy" in granted:
+    bootstrap_roles = [r for r in missing_roles if r != "roles/resourcemanager.projectIamAdmin"]
+    print(json.dumps({"status": "bootstrap", "missing_perms": missing_perms, "missing_roles": bootstrap_roles}))
+else:
+    print(json.dumps({"status": "denied", "missing_perms": missing_perms, "missing_roles": missing_roles}))
+PYPREFLIGHT
+}
+
+# preflight_caller_permissions MODE PROJECT ACCOUNT [NEED_BUILD] [NEED_SINK] [NEED_IAP] [NEED_SCHEDULER] [NEED_AUDIT_ADMIN]
+# Verifies caller IAM permissions upfront. When the caller has Project IAM Admin (setIamPolicy) but lacks
+# operational roles (such as Cloud Build Editor, Cloud Run Admin, Secret Manager Admin or IAP Admin),
+# automatically grants the missing roles to the caller and waits for IAM propagation. When the caller lacks
+# setIamPolicy as well (for example Editor/Viewer only), fails fast with exact copy-paste remediation commands.
+preflight_caller_permissions() {
+  local mode="$1" project="$2" account="$3"
+  local need_build="${4:-1}" need_sink="${5:-1}" need_iap="${6:-0}" need_sched="${7:-0}" need_audit="${8:-0}"
+  local verdict status member roles_csv perms_csv role attempt
+  member="$(caller_iam_member "$account")"
+  verdict="$(_check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit")"
+  status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status","skip"))' "$verdict" 2>/dev/null || echo "skip")"
+  if [[ "$status" == "ok" || "$status" == "skip" ]]; then
+    return 0
+  fi
+  perms_csv="$(python3 -c 'import json,sys; print(", ".join(json.loads(sys.argv[1]).get("missing_perms",[])))' "$verdict")"
+  roles_csv="$(python3 -c 'import json,sys; print(" ".join(json.loads(sys.argv[1]).get("missing_roles",[])))' "$verdict")"
+  if [[ "$status" == "bootstrap" ]]; then
+    info "account ${account} has IAM admin access; granting missing deployment roles: ${roles_csv}"
+    for role in $roles_csv; do
+      run retry gcloud projects add-iam-policy-binding "$project" --member "$member" --role "$role" \
+        --condition=None --quiet >/dev/null \
+        || warn "could not grant ${role} to ${member}; continuing"
+    done
+    if [[ "${DRY_RUN:-0}" != "1" ]]; then
+      for attempt in 1 2 3 4 5 6; do
+        sleep 5
+        verdict="$(_check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit")"
+        status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status","skip"))' "$verdict" 2>/dev/null || echo "skip")"
+        [[ "$status" == "ok" ]] && break
+      done
+    fi
+    return 0
+  fi
+  die "account ${account} lacks required permissions on project ${project}:
+    missing permissions: ${perms_csv}
+
+  Fix option 1 — log in as a Project Owner and re-run:
+    gcloud auth login
+
+  Fix option 2 — ask a Project Owner to grant Owner (or the least-privilege roles below) to ${account}:
+    gcloud projects add-iam-policy-binding ${project} --member=\"${member}\" --role=\"roles/owner\"
+
+  (Least-privilege alternative instead of roles/owner: ${roles_csv})"
+}
+
+# ensure_service_identities PROJECT PROJECT_NUMBER SERVICE [SERVICE ...]
+# Triggers creation of Google-managed service agents (such as gcp-sa-cloudbuild and gcp-sa-iap) via the
+# Service Usage REST API so freshly enabled APIs never fail with "Service account service-... does not exist"
+# and never prompt interactively to install `gcloud beta`.
+ensure_service_identities() {
+  local project="$1" project_number="$2" token
+  shift 2
+  [[ "${DRY_RUN:-0}" == "1" || $# -eq 0 ]] && return 0
+  token="$(gcloud auth print-access-token 2>/dev/null || true)"
+  [[ -n "$token" ]] || return 0
+  ACP_ACCESS_TOKEN="$token" python3 - "$project" "$project_number" "$@" <<'PYSID' || true
+import json, os, sys, urllib.error, urllib.request
+
+project, project_number, services = sys.argv[1], sys.argv[2], sys.argv[3:]
+token = os.environ["ACP_ACCESS_TOKEN"]
+for svc in services:
+    url = "https://serviceusage.googleapis.com/v1beta1/projects/%s/services/%s:generateServiceIdentity" % (
+        project_number, svc
+    )
+    req = urllib.request.Request(
+        url,
+        data=b"{}",
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + token,
+            "X-Goog-User-Project": project,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20):
+            pass
+    except Exception:  # pylint: disable=broad-except
+        pass
+PYSID
+}
+
+# ensure_secret_created SECRET_NAME PROJECT REGION
+# Creates an empty Secret Manager secret if missing. Prefers regional user-managed replication in REGION so
+# organizations enforcing constraints/gcp.resourceLocations (for example asia-northeast3 only) succeed, and
+# falls back to automatic replication if needed.
+ensure_secret_created() {
+  local secret="$1" project="$2" region="$3"
+  if gcloud secrets describe "$secret" --project "$project" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    info "[dry-run] create secret ${secret} in ${region}"
+    return 0
+  fi
+  gcloud secrets create "$secret" --project "$project" \
+    --replication-policy=user-managed --locations="$region" \
+    --labels=app=ai-control-plane >/dev/null 2>&1 \
+    || gcloud secrets create "$secret" --project "$project" \
+      --replication-policy=automatic \
+      --labels=app=ai-control-plane >/dev/null
+}
+
 # Dataset-level BigQuery access (a dataset ACL entry) for one service account; project IAM is not touched.
 # grant_dataset_role PROJECT DATASET ROLE EMAIL, where ROLE is READER (Data Viewer) or WRITER (Data Editor).
 # Returns non-zero when the dataset cannot be read or updated.
