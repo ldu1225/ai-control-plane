@@ -464,7 +464,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 | `roles/bigquery.dataViewer` | 감사 로그와 결제 내보내기 조회. 결제 데이터셋이 다른 프로젝트에 있으면 그 데이터셋에만 읽기 권한을 줍니다. |
 | `roles/logging.viewer` | Antigravity 추론 로그, 거버넌스 감사 로그, 로그 소스 발견 |
 | `roles/monitoring.viewer` | 모델별 토큰과 호출 지표, 텔레메트리 확장의 로그별 최근 기록 건수 |
-| `roles/discoveryengine.viewer` | 라이선스, 엔진, 어시스턴트, 에이전트 |
+| `roles/discoveryengine.viewer` + `CustomAiControlPlaneLicenseReader` | 엔진, 어시스턴트, 에이전트 및 라이선스 배정 현황(`listUserLicenses` 읽기 전용 커스텀 역할 자동 생성) |
 | `roles/aiplatform.user` | Agent Engine 조회, AI 애널리스트(Gemini) 호출 |
 | `roles/iam.securityReviewer` | 프로젝트 IAM 정책 조회(Antigravity 상태 분류) |
 | `roles/serviceusage.serviceUsageConsumer` | 모든 호출에 quota project 헤더 사용 |

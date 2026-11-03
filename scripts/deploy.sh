@@ -416,6 +416,26 @@ OPTIONAL_RUNTIME_ROLES=(
 GOVERNANCE_ROLES=(roles/resourcemanager.projectIamAdmin roles/iam.roleAdmin)
 for role in "${RUNTIME_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
 for role in "${OPTIONAL_RUNTIME_ROLES[@]}"; do grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
+# Google Cloud's predefined roles/discoveryengine.viewer omits userStores.listUserLicenses; grant a read-only custom role (or fallback).
+LICENSE_READER_ROLE_ID="CustomAiControlPlaneLicenseReader"
+LICENSE_READER_ROLE="projects/${PROJECT_ID}/roles/${LICENSE_READER_ROLE_ID}"
+LICENSE_READER_PERMS="discoveryengine.licenseConfigs.get,discoveryengine.licenseConfigs.list,discoveryengine.userStores.get,discoveryengine.userStores.listUserLicenses"
+if [[ "$DRY_RUN" == "1" ]]; then
+  info "[dry-run] custom role ${LICENSE_READER_ROLE} (${LICENSE_READER_PERMS}) -> ${SA_EMAIL}"
+else
+  gcloud iam roles undelete "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+  if gcloud iam roles describe "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    gcloud iam roles update "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" --permissions "$LICENSE_READER_PERMS" --quiet >/dev/null 2>&1 || true
+    grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$LICENSE_READER_ROLE"
+  elif gcloud iam roles create "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" \
+      --title "AI Control Plane License Reader" \
+      --description "Read-only Gemini Enterprise license config and user seat reader" \
+      --permissions "$LICENSE_READER_PERMS" --stage GA --quiet >/dev/null 2>&1; then
+    grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$LICENSE_READER_ROLE"
+  else
+    grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/discoveryengine.editor"
+  fi
+fi
 if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
   for role in "${GOVERNANCE_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
 else
