@@ -444,6 +444,43 @@ class Ctx:
             self._emit_dataset_failure(first_err[0], dataset, first_err[1])
         return False
 
+    def _audit_target_location(self):
+        """Selects one consistent BigQuery location when scanned projects span multiple regions.
+
+        BigQuery cannot UNION or JOIN tables across different dataset locations (for example `ASIA-NORTHEAST3`
+        and `US`) in a single SQL job. When multiple locations exist among `self.projects`, we pick the
+        location with the richest audit table coverage (breaking ties in favor of the primary project)."""
+        if getattr(self, "_cached_audit_loc_ready", False):
+            return self._cached_audit_loc
+        dataset = self.audit_dataset
+        projects = self.projects
+        if len(projects) <= 1 or not hasattr(self.registry, "dataset_location"):
+            self._cached_audit_loc = None
+            self._cached_audit_loc_ready = True
+            return None
+        loc_scores = {}
+        primary_loc = None
+        for idx, proj in enumerate(projects):
+            if (proj, dataset) in self._dataset_failed:
+                continue
+            try:
+                loc = self.registry.dataset_location(proj, dataset, self.quota_project)
+                groups = self.registry.tables(proj, dataset, self.quota_project, self.max_bytes)
+            except (GcpError, ValueError):
+                continue
+            if not loc:
+                continue
+            if idx == 0:
+                primary_loc = loc
+            loc_scores[loc] = loc_scores.get(loc, 0) + max(len(groups), 1)
+        if len(loc_scores) <= 1:
+            chosen = next(iter(loc_scores), None)
+        else:
+            chosen = max(loc_scores.keys(), key=lambda l: (loc_scores[l], 1 if l == primary_loc else 0))
+        self._cached_audit_loc = chosen
+        self._cached_audit_loc_ready = True
+        return chosen
+
     def audit_source(self, logical, optional=False):
         """Resolves `logical` across all scanned projects (single `Source` or multi-project `UnionSource`).
 
@@ -453,6 +490,7 @@ class Ctx:
         dataset = self.audit_dataset
         label = "bigquery:%s.%s" % (dataset, logical)
         projects = self.projects
+        target_loc = self._audit_target_location()
         matched = []
         any_dataset_ok = False
         first_err = None
@@ -461,11 +499,15 @@ class Ctx:
             if (proj, dataset) in self._dataset_failed:
                 continue
             try:
+                proj_loc = (self.registry.dataset_location(proj, dataset, self.quota_project)
+                            if hasattr(self.registry, "dataset_location") else None)
                 groups = self.registry.tables(proj, dataset, self.quota_project, self.max_bytes)
                 any_dataset_ok = True
             except (GcpError, ValueError) as err:
                 if idx == 0:
                     first_err = (proj, err)
+                continue
+            if target_loc and proj_loc and proj_loc != target_loc:
                 continue
             if logical not in groups:
                 continue

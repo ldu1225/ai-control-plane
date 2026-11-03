@@ -303,6 +303,81 @@ class MultiProjectUnionAndAuditZeroStateTest(unittest.TestCase):
         self.assertIsNone(src)
         self.assertEqual(req_ctx.warnings, [])
 
+    def test_media_clip_sku_rejected_from_token_pricing(self):
+        from controlplane.services import pricing
+        skus = [
+            {
+                "description": "Lyria 3 Output",
+                "pricingInfo": [{
+                    "currencyConversionRate": 1344.0,
+                    "effectiveTime": "2026-11-01T00:00:00Z",
+                    "pricingExpression": {
+                        "usageUnit": "count",
+                        "usageUnitDescription": "count",
+                        "baseUnitConversionFactor": 1,
+                        "tieredRates": [{"unitPrice": {"units": "107", "nanos": 520000000}}],
+                    },
+                }],
+            },
+            {
+                "description": "Gemini 2.5 Flash Text Input",
+                "pricingInfo": [{
+                    "currencyConversionRate": 1344.0,
+                    "effectiveTime": "2026-11-01T00:00:00Z",
+                    "pricingExpression": {
+                        "usageUnit": "count",
+                        "usageUnitDescription": "count",
+                        "baseUnitConversionFactor": 1,
+                        "tieredRates": [{"unitPrice": {"units": "0", "nanos": 403}}],
+                    },
+                }],
+            },
+        ]
+        parsed = [(k, d) for k, d, *_ in pricing.catalog_entries(skus) if k]
+        self.assertEqual(parsed, [("gemini-2.5-flash", "input")])
+        self.assertFalse(pricing_sync._valid_token_entry("lyria-3", {"output": 80000.0}))
+        _, rate = pricing_sync.lookup_model_rate({"gemini-2.5-flash": {"input": 0.3, "output": 2.5}}, "lyria-3")
+        self.assertIsNone(rate)
+
+    def test_audit_source_avoids_cross_region_bigquery_union(self):
+        s_ts = schema.TableSchema([schema._DictField({"name": "timestamp", "type": "TIMESTAMP"})])
+
+        class MultiRegionRegistry:
+            def dataset_location(self, project, _dataset, _quota):
+                return "ASIA-NORTHEAST3" if project == "proj-kr" else "US"
+
+            def tables(self, project, _dataset, _quota, _max_bytes):
+                if project == "proj-kr":
+                    return {"cloudaudit_googleapis_com_data_access": {"kind": "table"}}
+                return {
+                    "cloudaudit_googleapis_com_data_access": {"kind": "table"},
+                    "discoveryengine_googleapis_com_gen_ai_user_message": {"kind": "table"},
+                }
+
+            def source(self, project, dataset, logical, _quota, _max_bytes):
+                loc = self.dataset_location(project, dataset, _quota)
+                return schema.Source(project, dataset, logical, "table", logical, s_ts, location=loc)
+
+        app = support.FakeApp()
+        app.registry = MultiRegionRegistry()
+        eff = support.make_settings(workspace={
+            "project_id": "proj-kr",
+            "projects": ["proj-us"],
+            "scan_all_projects": False,
+            "audit_dataset": "ge_analytics",
+        })
+        req_ctx = base.Ctx(
+            app=app,
+            settings=eff,
+            version=1,
+            identity=Identity("admin@example.com", "admin", "google", "u:admin"),
+        )
+        src = req_ctx.audit_source("cloudaudit_googleapis_com_data_access")
+        self.assertIsNotNone(src)
+        self.assertEqual(src.project, "proj-us")
+        self.assertEqual(src.location, "US")
+
 
 if __name__ == "__main__":
     unittest.main()
+

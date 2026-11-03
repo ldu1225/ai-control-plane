@@ -93,7 +93,30 @@ HEADING_RE = re.compile(r'^##\s+(.+?)(?:\s+\{%\s*id=(?:"|&quot;)([^"&]+)(?:"|&qu
 TAB_RE = re.compile(r'\{%\s*tab\s+title=(?:"|&quot;)([^"&]+)(?:"|&quot;)\s*%\}(.*?)\{%\s*/tab\s*%\}', re.DOTALL)
 TABLE_BLOCK_RE = re.compile(r"\{%\s*table\s*%\}(.*?)\{%\s*/table\s*%\}", re.DOTALL)
 NOSCRIPT_PRE_RE = re.compile(r"<noscript>\s*<pre>(.*?)</pre>\s*</noscript>", re.DOTALL | re.IGNORECASE)
-NON_TEXT_MODEL_WORDS = ("image", "banana", "tts", "transcribe", "live", "native-audio", "robotics", "veo", "imagen")
+NON_TEXT_MODEL_WORDS = (
+    "image", "banana", "tts", "transcribe", "live", "native-audio", "robotics",
+    "veo", "imagen", "lyria", "music", "song", "clip", "track", "chirp",
+)
+MEDIA_FAMILY_PREFIXES = ("lyria", "imagen", "veo", "chirp")
+MAX_TOKEN_USD_PER_MILLION = 500.0
+
+
+def _valid_token_entry(key, item):
+    """True when `key`/`item` represents a realistic per-1M-token LLM rate rather than a media clip SKU."""
+    low = (key or "").lower()
+    if any(low == p or low.startswith(p + "-") for p in MEDIA_FAMILY_PREFIXES):
+        return False
+    if not isinstance(item, dict):
+        return False
+    inp = to_float(item.get("input"))
+    outp = to_float(item.get("output"))
+    if inp is None and outp is None:
+        return False
+    if (inp is not None and (inp < 0 or inp > MAX_TOKEN_USD_PER_MILLION)) or (
+        outp is not None and (outp < 0 or outp > MAX_TOKEN_USD_PER_MILLION)
+    ):
+        return False
+    return True
 
 
 class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -475,7 +498,7 @@ def sync_pricing(app, actor="system", trigger="manual", fetcher=_fetch_public_ur
                 for key, entry in cat_krw.items():
                     inp_usd = round(entry["input"] / cat_rate, 6) if entry.get("input") else None
                     out_usd = round(entry["output"] / cat_rate, 6) if entry.get("output") else None
-                    if inp_usd is None and out_usd is None:
+                    if not _valid_token_entry(key, {"input": inp_usd, "output": out_usd}):
                         continue
                     cur = dict(merged.get(key) or {"cached": None, "label": models.display_from_key(key)})
                     if inp_usd is not None:
@@ -574,6 +597,8 @@ def effective_token_rates(ctx, currency=None):
     for key, base in BASELINE_USD_PER_MILLION.items():
         combined[key] = dict(base, source="baseline")
     for key, item in synced.items():
+        if not _valid_token_entry(key, item):
+            continue
         cur = dict(combined.get(key) or {"label": models.display_from_key(key)})
         cur.update({k: v for k, v in item.items() if v is not None})
         combined[key] = cur
@@ -601,6 +626,8 @@ def effective_token_rates(ctx, currency=None):
 def lookup_model_rate(rates, raw_model_id):
     """Finds rate dict for a model ID or normalized family key, with family prefix fallback."""
     key = models.normalize_model_id(str(raw_model_id or ""))
+    if any(key == p or key.startswith(p + "-") for p in MEDIA_FAMILY_PREFIXES):
+        return key, None
     if key in rates:
         return key, rates[key]
     for cand_key, rate in rates.items():
@@ -640,7 +667,9 @@ def format_pricing_response(state, effective_settings, new_alerts_count=0):
     merged = {}
     for k, b in BASELINE_USD_PER_MILLION.items():
         merged[k] = dict(b, source="baseline")
-    merged.update(raw_models)
+    for k, v in raw_models.items():
+        if _valid_token_entry(k, v):
+            merged[k] = v
 
     model_rows = []
     for key, item in sorted(merged.items()):

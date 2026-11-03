@@ -40,7 +40,9 @@ MAX_CATALOG_PAGES = 8
 # SKU variants that do not carry the standard online text price.
 VARIANT_WORDS = {"batch", "flex", "priority", "offpeak", "peak", "caching", "cached", "cache", "live", "provisioned",
                  "tuning", "tuned", "audio", "image", "images", "video", "cyber", "bidi", "embedding", "embeddings",
-                 "grounding", "search", "contributor", "deferred", "offline"}
+                 "grounding", "search", "contributor", "deferred", "offline",
+                 "lyria", "music", "song", "clip", "clips", "track", "tracks", "veo", "imagen", "chirp"}
+MAX_USD_PER_SINGLE_TOKEN = 0.0005  # $500 / 1M tokens ceiling rejects per-clip / per-image / per-call SKUs
 LONG_CONTEXT_RE = re.compile(r"(?i)(?:>|\u2265|over|above)\s*\d|long context|long input|long output")
 WORD_RE = re.compile(r"[a-z0-9.]+")
 
@@ -137,6 +139,10 @@ def catalog_entries(skus):
             yield None, None, None, None, rate, info.get("effectiveTime")
             continue
         price = _money(tiers[-1].get("unitPrice")) / float(pexpr.get("baseUnitConversionFactor") or 1)
+        usd_per_token = price / float(rate if rate and rate > 0 else 1.0)
+        if usd_per_token <= 0 or usd_per_token > MAX_USD_PER_SINGLE_TOKEN:
+            yield None, None, None, None, rate, info.get("effectiveTime")
+            continue
         key, direction, prod = hit
         desc = (sku.get("description") or "").lower()
         yield key, direction, (1 if prod else 0, 0 if "global" in desc else 1), price, rate, info.get("effectiveTime")

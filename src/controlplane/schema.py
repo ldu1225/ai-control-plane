@@ -289,7 +289,7 @@ def expr(alias, schema, *candidates, cast=None):
 class Source:
     """A resolved table (plain or date-sharded) with its schema."""
 
-    def __init__(self, project, dataset, logical, kind, table, schema, latest=None):
+    def __init__(self, project, dataset, logical, kind, table, schema, latest=None, location=None):
         self.project = project
         self.dataset = dataset
         self.logical = logical
@@ -297,6 +297,7 @@ class Source:
         self.table = table
         self.schema = schema
         self.latest = latest
+        self.location = location
 
     @property
     def label(self):
@@ -373,6 +374,7 @@ class UnionSource:
         self.kind = "union"
         self.table = first.table
         self.latest = first.latest
+        self.location = getattr(first, "location", None)
         self._col_specs, self.schema = self._unify_schemas()
 
     def _unify_schemas(self):
@@ -489,17 +491,34 @@ class SchemaRegistry:
         self._schemas = TTLCache(1024)
 
     def tables(self, project, dataset, quota_project, max_bytes):
-        """Returns {logical: info}. Raises GcpError (not_found when the dataset is missing)."""
+        """Returns {logical: info}. Raises GcpError (not_found when the dataset is missing, cached negatively)."""
         if not valid_project(project) or not valid_dataset(dataset):
             raise ValueError("invalid dataset reference")
 
         def load():
+            from .gcp import GcpError
             sql = "SELECT table_name, table_type FROM `%s.%s.INFORMATION_SCHEMA.TABLES`" % (project, dataset)
-            res = self.gcp.query(sql, {}, quota_project=quota_project, module="schema", max_bytes=max_bytes)
+            try:
+                res = self.gcp.query(sql, {}, quota_project=quota_project, module="schema", max_bytes=max_bytes)
+            except GcpError as err:
+                if err.kind == "not_found":
+                    return {"__missing__": err}
+                raise
             return group_tables([(r.get("table_name"), r.get("table_type")) for r in res.rows])
 
         value, _ = self._tables.get_or_compute(("tables", project, dataset), TABLES_TTL, load)
+        if isinstance(value, dict) and "__missing__" in value:
+            raise value["__missing__"]
         return value
+
+    def dataset_location(self, project, dataset, quota_project, max_bytes=10**9):
+        """Infers dataset location from the first available table's cached metadata, or None when empty."""
+        groups = self.tables(project, dataset, quota_project, max_bytes)
+        if not groups:
+            return None
+        first_info = next(iter(groups.values()))
+        meta = self.schema(project, dataset, first_info["latest"], quota_project)
+        return meta.get("location") if isinstance(meta, dict) else None
 
     def resolve(self, project, dataset, logical, quota_project, max_bytes):
         groups = self.tables(project, dataset, quota_project, max_bytes)
@@ -526,10 +545,11 @@ class SchemaRegistry:
                 raise GcpError("http", message=type(err).__name__)
             partitioning = getattr(tbl, "time_partitioning", None)
             ingestion = bool(partitioning is not None and not getattr(partitioning, "field", None))
+            loc = (getattr(tbl, "location", None) or "").strip().upper() or None
             return {"schema": TableSchema(tbl.schema, partition_field=getattr(partitioning, "field", None),
                                           ingestion_partitioned=ingestion),
                     "rows": getattr(tbl, "num_rows", None), "bytes": getattr(tbl, "num_bytes", None),
-                    "modified": getattr(tbl, "modified", None)}
+                    "modified": getattr(tbl, "modified", None), "location": loc}
 
         value, _ = self._schemas.get_or_compute(("schema", project, dataset, table), SCHEMA_TTL, load)
         return value
@@ -540,12 +560,15 @@ class SchemaRegistry:
         if res["kind"] == "missing":
             return None
         meta = self.schema(project, dataset, res["latest"], quota_project)
-        return Source(project, dataset, logical, res["kind"], res["table"], meta["schema"], latest=res["latest"])
+        loc = meta.get("location") if isinstance(meta, dict) else None
+        return Source(project, dataset, logical, res["kind"], res["table"], meta["schema"],
+                      latest=res["latest"], location=loc)
 
     def table_source(self, project, dataset, table, quota_project):
         """Source for an exact (non-discovered) table such as the billing export table."""
         meta = self.schema(project, dataset, table, quota_project)
-        return Source(project, dataset, table, "table", table, meta["schema"], latest=table)
+        loc = meta.get("location") if isinstance(meta, dict) else None
+        return Source(project, dataset, table, "table", table, meta["schema"], latest=table, location=loc)
 
     def invalidate(self):
         self._tables.clear()
