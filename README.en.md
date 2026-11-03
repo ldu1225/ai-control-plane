@@ -447,11 +447,11 @@ In **Billing > Billing export**, turn on the **Detailed usage cost** export to B
 
 Features that use the billing export: Cost & FinOps, cost per model, agent runtime cost (requires the resource-level export), and the actual unit prices for Antigravity per-person cost caps.
 
-Organizations without a billing export hide the cost pages with `DISABLED_MODULES="finops"`. Antigravity per-person cost caps still work; they use the Google public price list (contract discounts are not reflected).
+When a billing export is configured, Cost & FinOps, cost per model, agent runtime cost, and Antigravity per-person cost caps reflect actual billed unit prices and negotiated credits. When no billing export is configured, the control plane automatically estimates spend from observed token usage (Cloud Monitoring and inference logs) multiplied by official Google Cloud public token prices and live USD/KRW exchange rates, with a daily early-morning pricing & FX monitor, manual sync, and change alerts.
 
 ### 6.5 Antigravity inference logs
 
-Antigravity token usage per user is read from the `businessaicode.googleapis.com/inference_response` log that Antigravity for organizations writes to the project. If a BigQuery sink table exists, BigQuery is used. Otherwise, the Cloud Logging API is used (`usage_source: auto`). Coding agents used from a personal setup (for example, Jetski) do not write this log. Google Cloud API calls that such agents make with user credentials are shown under **Agent activity in your cloud** on the Antigravity Controls page, based on audit logs.
+Antigravity token usage per user is read from the `businessaicode.googleapis.com/inference_response` log that Antigravity for organizations writes to the project. If a BigQuery sink table exists, BigQuery is used. Otherwise, the Cloud Logging API is used (`usage_source: auto`). Google Cloud API calls that coding agents make with user credentials are shown under **Agent activity in your cloud** on the Antigravity Controls page, based on audit logs.
 
 ### 6.6 Runtime service account permissions
 

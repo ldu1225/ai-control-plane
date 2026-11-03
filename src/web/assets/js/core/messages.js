@@ -25,6 +25,7 @@ const TEMPLATES = [
   [/^Dataset (\S+) is not a valid identifier\.$/, 'Dataset {a} is not a valid identifier.'],
   [/^Dataset (\S+) was not found in project (\S+)\.$/, 'Dataset {a} was not found in project {b}.'],
   // Data source health
+  [/^Dataset (\S+) reachable \(0 tables yet; log sinks create tables on first event\)$/, 'Dataset {a} reachable (0 tables yet; log sinks create tables on first event)'],
   [/^(\d+) tables found \((\d+) core log tables\)$/, '{a} tables found ({b} core log tables)'],
   [/^(\d+) license configuration\(s\) found$/, '{a} license configuration(s) found'],
   [/^Reachable in (\S+)$/, 'Reachable in {a}'],

@@ -191,6 +191,9 @@ def user_table(ctx, rng):
                 last = u.get("last")
                 if last is not None and (m.get("lastActive") is None or last > m["lastActive"]):
                     m["lastActive"] = last
+    if not sourced and not parts and ctx.audit_dataset_ready() and not ctx.has_transient_warning():
+        sourced = True
+        ctx.add_source("bigquery:%s" % ctx.audit_dataset)
     return {"users": users, "available": sorted(available), "sourced": sourced}
 
 

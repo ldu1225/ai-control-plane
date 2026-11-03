@@ -72,9 +72,12 @@ function renderOverview(ctx, body, d) {
       value: fmt.currency(spend.hasCredits ? spend.net : spend.gross, ccy, { compact: true }),
       delta: isNum(spend.previousNet) && isNum(spend.net) && spend.previousNet !== 0 ? (spend.net - spend.previousNet) / Math.abs(spend.previousNet) : null,
       goodWhen: 'down', disabled: spend.disabled,
-      meta: spend.hasCredits ? h('span', null, t('{c} credits applied', { c: fmt.currency(spend.credits, ccy) })) : null,
+      meta: spend.hasCredits ? h('span', null, t('{c} credits applied', { c: fmt.currency(spend.credits, ccy) })) : (spend.estimated ? h('span', null, t('Token-estimated')) : null),
       spark: seriesValues(d.spendTrend, spend.hasCredits ? 'net' : 'gross'), sparkColor: TONES.teal,
-      tip: t('Billing export cost for the period. Net cost subtracts credits only when credit rows exist.'), onClick: nav('#/finops'),
+      tip: spend.estimated
+        ? t('Estimated from observed token usage multiplied by official public token pricing and live USD/KRW FX.')
+        : t('Billing export cost for the period. Net cost subtracts credits only when credit rows exist.'),
+      onClick: nav('#/finops'),
     }),
     kpi({
       label: t('Model Armor blocks'), value: fmt.int(k.armorBlocks && k.armorBlocks.value), delta: deltaOf(k.armorBlocks), goodWhen: 'down',
@@ -105,7 +108,8 @@ function renderOverview(ctx, body, d) {
 
   const row1 = h('div', { class: 'grid' });
   const spendCard = chartCard({
-    title: t('Spend trend'), subtitle: rangeText(), source: t('Cloud Billing export'),
+    title: t('Spend trend'), subtitle: rangeText(),
+    source: spend.estimated ? t('Token usage \u00d7 public pricing') : t('Cloud Billing export'),
     build: (host) => lineChart(host, {
       ...fromTimeline(d.spendTrend, { names: { gross: t('Gross cost'), net: t('Net cost') }, colors: { gross: TONES.info, net: TONES.teal } }),
       yFormat: (v) => fmt.currency(v, ccy, { compact: true }), valueFormat: (v) => fmt.currency(v, ccy), height: 250,

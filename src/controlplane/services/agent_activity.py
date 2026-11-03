@@ -1,10 +1,10 @@
-"""Coding agents in the cloud (Antigravity, Jetski and similar agents): Google Cloud API calls that
-coding agents made with users' credentials, from Cloud Audit Logs.
+"""Coding agents in the cloud: Google Cloud API calls that coding agents made with users'
+credentials, from Cloud Audit Logs.
 
 Agents identify themselves in the caller-supplied user agent ("... agent-name/<agent>"), for example
-the Google Cloud CLI run by an Antigravity or Jetski agent. Data access logs show reads (queries, gets,
-lists); admin activity logs show changes. Model token usage of these agents is not part of the
-project's logs; it is reported by the Antigravity inference log when that log exists.
+the Google Cloud CLI run by a coding agent. Data access logs show reads (queries, gets, lists);
+admin activity logs show changes. Model token usage is reported separately by the Antigravity
+inference log when configured.
 """
 
 from __future__ import annotations
@@ -53,6 +53,13 @@ def summary(ctx):
     prev_ctes, labels = activity_ctes(sources, "prev_start_ts")
     cur_ctes, _ = activity_ctes(sources, "start_ts")
     if not prev_ctes:
+        if not any(s for _, _, s in sources) and ctx.audit_dataset_ready() and not ctx.has_transient_warning():
+            ctx.add_source("bigquery:%s" % ctx.audit_dataset)
+            return {
+                "kpis": {"calls": {"value": 0, "previous": 0}, "users": 0, "changes": 0, "errors": 0},
+                "trend": timeutil.timeline(rng, [timeutil.series("calls", "API calls", [0] * len(rng.buckets()))]),
+                "byAgent": [], "byApi": [], "byUser": [], "recent": [],
+            }
         return out
     label = labels[0]
     cur = ",\n".join(cur_ctes)

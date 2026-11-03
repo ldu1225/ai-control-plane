@@ -73,12 +73,35 @@ class FakeCtx:
         return self.ws["project_id"]
 
     @property
-    def projects(self):
+    def selected_project(self):
+        raw = (self.params.get("project") or "all").strip().lower()
+        return raw if (raw and raw != "all" and config.valid_project(raw)) else "all"
+
+    @property
+    def all_projects(self):
         out = [self.project]
         for p in self.ws.get("projects") or []:
             if p and p not in out:
                 out.append(p)
         return out
+
+    @property
+    def projects(self):
+        all_p = self.all_projects
+        sel = self.selected_project
+        if sel != "all" and sel in all_p:
+            return [sel]
+        return all_p
+
+    @property
+    def active_project(self):
+        sel = self.selected_project
+        return sel if (sel != "all" and sel in self.all_projects) else self.project
+
+    @property
+    def project_details(self):
+        return [{"id": p, "name": p, "parent": None, "sameOrg": None,
+                 "source": "primary" if p == self.project else "configured"} for p in self.all_projects]
 
     @property
     def quota_project(self):
@@ -95,6 +118,19 @@ class FakeCtx:
     @property
     def excluded_patterns(self):
         return list(self.settings["model_catalog"]["excluded_sku_patterns"])
+
+    def child(self, rng=None):
+        c = FakeCtx(settings=self.settings, body=dict(self.body), params=dict(self.params), role=self.identity.role)
+        c.app = self.app
+        c.version = self.version
+        c.identity = self.identity
+        c.range = rng if rng is not None else self.range
+        return c
+
+    def absorb(self, other):
+        for w in other.warnings:
+            self.warn(w["source"], w["code"], w["message"])
+        self.sources |= other.sources
 
     def warn(self, source, code, message):
         self.warnings.append({"source": source, "code": code, "message": message})
@@ -119,10 +155,13 @@ class FakeCtx:
     def memo(self, name, key, fn, ttl=None):  # pylint: disable=unused-argument
         return fn(self)
 
+    def audit_dataset_ready(self):
+        return False
+
     def audit_source(self, logical, optional=False):  # pylint: disable=unused-argument
         return None
 
-    def billing_source(self):
+    def billing_source(self, warn_unconfigured=False):  # pylint: disable=unused-argument
         return None
 
     def rest(self, method, url, **kwargs):  # pragma: no cover - tests patch the callers

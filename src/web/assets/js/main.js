@@ -248,6 +248,13 @@ function openProjectMenu(anchor, ws, projects) {
         timeout: 2400,
       });
     };
+    const detailMap = new Map(((ws && ws.projectDetails) || []).map((d) => [d.id, d]));
+    const sourceBadge = (p, detail) => {
+      const src = detail ? detail.source : (p === ws.projectId ? 'primary' : 'configured');
+      if (src === 'primary') return badge(t('Primary'), 'info', { size: 'sm' });
+      if (src === 'configured') return badge(t('Explicitly linked'), 'accent', { size: 'sm' });
+      return badge(t('Auto-discovered'), 'success', { size: 'sm' });
+    };
     return h('div', { class: 'ws-popover' },
       h('div', { class: 'ws-pop-header' },
         h('div', null,
@@ -270,6 +277,11 @@ function openProjectMenu(anchor, ws, projects) {
         projects.map((p) => {
           const isPrimary = p === ws.projectId;
           const isSelected = sel === p;
+          const detail = detailMap.get(p);
+          const subParts = [];
+          if (detail && detail.name && detail.name !== p) subParts.push(detail.name);
+          if (detail && detail.sameOrg) subParts.push(t('Same organization'));
+          else if (detail && detail.parent) subParts.push(detail.parent);
           return h('button', {
             type: 'button',
             class: ['ws-proj-item', isSelected ? 'active' : ''],
@@ -279,7 +291,8 @@ function openProjectMenu(anchor, ws, projects) {
             h('div', { class: 'ws-proj-body' },
               h('div', { class: 'ws-proj-row' },
                 h('span', { class: 'mono fw-600 ws-proj-id' }, p),
-                badge(isPrimary ? t('Primary') : t('Connected'), isPrimary ? 'info' : 'neutral', { size: 'sm' }))),
+                sourceBadge(p, detail)),
+              subParts.length ? h('div', { class: 'ws-proj-desc' }, subParts.join(' \u00b7 ')) : null),
             isSelected ? h('span', { class: 'ws-proj-check' }, icon('check', { size: 15 })) : null);
         })),
       h('div', { class: 'ws-pop-footer' },
@@ -327,6 +340,19 @@ function renderNav() {
     }, h('span', { class: 'nav-icon' }, icon('sidebar', { size: 17 })), h('span', { class: 'nav-label' }, t('Collapse sidebar'))));
 }
 
+function formatPricingAlertLine(a) {
+  if (!a) return '';
+  if (a.kind === 'fx') {
+    const sign = isNum(a.pctChange) && a.pctChange > 0 ? '+' : '';
+    return `USD/KRW: ${fmt.num(a.before, 2)} \u2192 ${fmt.num(a.after, 2)} KRW (${sign}${fmt.num(a.pctChange, 2)}%)`;
+  }
+  if (a.kind === 'new_model') {
+    return `${a.label || a.target}: ${t('New public model rate')} ($${fmt.num(a.after, 3)} / 1M)`;
+  }
+  const sign = isNum(a.pctChange) && a.pctChange > 0 ? '+' : '';
+  return `${a.label || a.target} (${a.field}): $${fmt.num(a.before, 3)} \u2192 $${fmt.num(a.after, 3)} / 1M (${sign}${fmt.num(a.pctChange, 1)}%)`;
+}
+
 function renderBanners() {
   const list = [];
   const ws = store.boot.workspace || {};
@@ -336,6 +362,32 @@ function renderBanners() {
       title: t('Workspace not configured'),
       text: t('Connect a Google Cloud project, the audit log dataset and the billing export table to start collecting governance data.'),
       actions: button({ label: t('Configure'), size: 'sm', variant: 'primary', onClick: () => { if (!requireAdmin(t('Configure workspace'))) return; window.location.hash = '#/settings/workspace'; } }),
+    }));
+  }
+  const pa = store.boot.pricingAlerts;
+  if (pa && pa.unacknowledgedCount > 0) {
+    const items = (pa.alerts || []).slice(0, 3).map(formatPricingAlertLine).filter(Boolean);
+    const ackBtn = isAdmin() ? button({
+      label: t('Acknowledge'),
+      size: 'sm',
+      onClick: async () => {
+        try {
+          const res = await api.post('/api/v1/finops/pricing/ack', { all: true });
+          store.boot.pricingAlerts = { ...pa, unacknowledgedCount: res.data.unacknowledgedCount || 0, alerts: res.data.alerts || [] };
+          renderBanners();
+          toast({ title: t('Pricing alerts acknowledged'), tone: 'success', timeout: 2200 });
+        } catch (err) {
+          toast({ title: t('Update failed'), text: errorText(err), tone: 'danger' });
+        }
+      },
+    }) : null;
+    list.push(banner({
+      tone: 'warning',
+      title: t('Public token pricing or USD/KRW rate changed ({n})', { n: pa.unacknowledgedCount }),
+      text: items.join(' \u00b7 '),
+      actions: h('div', { class: 'row' },
+        button({ label: t('Cost & FinOps'), size: 'sm', variant: 'primary', onClick: () => { window.location.hash = '#/finops'; } }),
+        ackBtn),
     }));
   }
   const s = session();

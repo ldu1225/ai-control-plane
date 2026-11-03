@@ -48,13 +48,14 @@ def table_ref(project, dataset, table):
 
 
 class Node:
-    __slots__ = ("name", "type", "mode", "children")
+    __slots__ = ("name", "type", "mode", "children", "strict_children")
 
-    def __init__(self, name, ftype, mode, children=None):
+    def __init__(self, name, ftype, mode, children=None, strict_children=False):
         self.name = name
         self.type = norm_type(ftype)
         self.mode = (mode or "NULLABLE").upper()
         self.children = children or {}
+        self.strict_children = bool(strict_children)
 
 
 class TableSchema:
@@ -186,6 +187,31 @@ def build_expr(alias, schema, candidate):
         is_last = i == len(segs) - 1
         if node.type == "JSON" or (node.type == "STRING" and not is_last):
             rest = segs[i + 1:]
+            if rest and node.children:
+                mapped_rest = []
+                cur_children = node.children
+                cur_strict = node.strict_children
+                for rname, ridx in rest:
+                    if cur_children:
+                        cnode = cur_children.get(rname.lower())
+                        if cnode is None:
+                            if cur_strict:
+                                return None
+                            mapped_rest.append((rname, ridx))
+                            cur_children = {}
+                            cur_strict = False
+                        else:
+                            eff_idx = 0 if (ridx is None and cnode.mode == "REPEATED") else ridx
+                            mapped_rest.append((cnode.name, eff_idx))
+                            cur_children = cnode.children
+                            cur_strict = cnode.strict_children
+                    else:
+                        if cur_strict:
+                            return None
+                        mapped_rest.append((rname, ridx))
+                rest = mapped_rest
+            elif rest and node.strict_children:
+                return None
             if any(n.mode == "REPEATED" or ix is not None for _, ix, n in resolved):
                 root_name = resolved[0][0]
                 inner = [(n, 0 if (ix is None and nd.mode == "REPEATED") else ix)
@@ -306,6 +332,128 @@ class Source:
         where.append("%s >= @%s" % (quote_ident(col), start))
         where.append("%s < @%s" % (quote_ident(col), end))
         return "%s AS (SELECT * FROM %s WHERE %s)" % (name, self.fq(), " AND ".join(where))
+
+
+_SCALAR_UNION_TYPES = frozenset({"TIMESTAMP", "STRING", "INT64", "FLOAT64", "BOOL", "DATE", "NUMERIC", "BIGNUMERIC"})
+
+
+def _merge_node_children(nodes):
+    merged = {}
+    order = []
+    by_key = {}
+    for parent in nodes:
+        for k, child in (parent.children or {}).items():
+            if k not in by_key:
+                order.append(k)
+                by_key[k] = []
+            by_key[k].append(child)
+    for k in order:
+        group = by_key[k]
+        first = group[0]
+        sub_children = _merge_node_children(group)
+        schemaless = any(n.type in ("JSON", "STRING") and not n.children for n in group)
+        mode = "REPEATED" if any(n.mode == "REPEATED" for n in group) else first.mode
+        ftype = "STRUCT" if sub_children else first.type
+        merged[k] = Node(first.name, ftype, mode, children=sub_children, strict_children=bool(sub_children and not schemaless))
+    return merged
+
+
+class UnionSource:
+    """Multi-project BigQuery source combining identical logical tables across sibling projects via UNION ALL."""
+
+    def __init__(self, sources):
+        if not sources:
+            raise ValueError("UnionSource requires at least one Source")
+        self.sources = list(sources)
+        first = self.sources[0]
+        self.project = first.project
+        self.projects = [s.project for s in self.sources]
+        self.dataset = first.dataset
+        self.logical = first.logical
+        self.kind = "union"
+        self.table = first.table
+        self.latest = first.latest
+        self._col_specs, self.schema = self._unify_schemas()
+
+    def _unify_schemas(self):
+        order = []
+        by_key = {}
+        for src in self.sources:
+            if src.schema is None:
+                continue
+            for k, node in src.schema.tree.items():
+                if k not in by_key:
+                    order.append(k)
+                    by_key[k] = []
+                by_key[k].append(node)
+        specs = []
+        unified_tree = {}
+        for k in order:
+            nodes = by_key[k]
+            canonical = nodes[0].name
+            types = {n.type for n in nodes}
+            all_scalar = all(n.mode != "REPEATED" and n.type in _SCALAR_UNION_TYPES for n in nodes) and len(types) == 1
+            if all_scalar:
+                stype = nodes[0].type
+                specs.append((k, canonical, "scalar", stype))
+                unified_tree[k] = Node(canonical, stype, "NULLABLE")
+            else:
+                children = _merge_node_children(nodes)
+                schemaless = any(n.type in ("JSON", "STRING") and not n.children for n in nodes)
+                specs.append((k, canonical, "json", "JSON"))
+                unified_tree[k] = Node(canonical, "JSON", "NULLABLE", children=children,
+                                       strict_children=not schemaless)
+        schema = TableSchema([])
+        schema.tree = unified_tree
+        schema.ingestion_partitioned = any(bool(s.schema and s.schema.ingestion_partitioned) for s in self.sources)
+        return specs, schema
+
+    @property
+    def label(self):
+        return "bigquery:%s.%s" % (self.dataset, self.logical)
+
+    @property
+    def sharded(self):
+        return any(s.sharded for s in self.sources)
+
+    def time_column(self, preferred=("timestamp", "receiveTimestamp")):
+        for name in preferred:
+            node = self.schema.node(name) if self.schema else None
+            if node is not None and node.type == "TIMESTAMP" and node.mode != "REPEATED" and "." not in name:
+                return node.name
+        return self.schema.first_timestamp() if self.schema else None
+
+    def cte(self, name, start="start_ts", end="end_ts", time_col=None, sfx=("sfx_start", "sfx_end")):
+        if not COLUMN_SEGMENT_RE.match(name):
+            raise ValueError("invalid CTE name")
+        branches = []
+        for src in self.sources:
+            col = time_col if (time_col and src.schema and src.schema.node(time_col)) else src.time_column()
+            if col is None:
+                continue
+            selects = []
+            for k, canonical, mode, stype in self._col_specs:
+                snode = src.schema.tree.get(k) if src.schema else None
+                q_out = quote_ident(canonical)
+                if snode is None:
+                    selects.append("CAST(NULL AS %s) AS %s" % (stype, q_out))
+                elif mode == "scalar":
+                    selects.append("%s AS %s" % (quote_ident(snode.name), q_out))
+                elif snode.type == "JSON" and snode.mode != "REPEATED":
+                    selects.append("%s AS %s" % (quote_ident(snode.name), q_out))
+                else:
+                    selects.append("TO_JSON(%s) AS %s" % (quote_ident(snode.name), q_out))
+            where = []
+            if src.sharded:
+                where.append("_TABLE_SUFFIX BETWEEN @%s AND @%s" % sfx)
+            if src.schema is not None and src.schema.ingestion_partitioned:
+                where.append("_PARTITIONTIME >= TIMESTAMP_SUB(@%s, INTERVAL 3 DAY)" % start)
+            where.append("%s >= @%s" % (quote_ident(col), start))
+            where.append("%s < @%s" % (quote_ident(col), end))
+            branches.append("SELECT %s FROM %s WHERE %s" % (", ".join(selects), src.fq(), " AND ".join(where)))
+        if not branches:
+            raise ValueError("no time column")
+        return "%s AS (%s)" % (name, " UNION ALL ".join(branches))
 
 
 def group_tables(rows):

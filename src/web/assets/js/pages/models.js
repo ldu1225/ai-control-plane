@@ -63,7 +63,16 @@ function renderPage(ctx, body, d) {
     kpi({ label: t('Total tokens'), value: fmt.compact(tk.total), meta: h('span', null, t('Source: {s}', { s: tokenSourceLabel(d.tokenSource) })), tip: t('Input, output and cached tokens across enabled models.') }),
     kpi({ label: t('Input tokens'), value: fmt.compact(tk.input), meta: isNum(tk.total) && tk.total > 0 ? h('span', null, t('{p} of total', { p: fmt.pct((tk.input || 0) / tk.total) })) : null }),
     kpi({ label: t('Output tokens'), value: fmt.compact(tk.output), meta: isNum(tk.total) && tk.total > 0 ? h('span', null, t('{p} of total', { p: fmt.pct((tk.output || 0) / tk.total) })) : null }),
-    kpi({ label: t('Model spend'), value: fmt.currency(totals.cost, ccy, { compact: true }), meta: isNum(totals.productCost) && totals.productCost > 0 ? h('span', null, t('Plus {v} in product charges', { v: fmt.currency(totals.productCost, ccy, { compact: true }) })) : null, tip: t('Billing export cost attributed to model SKUs. SKUs matching the excluded patterns are not counted.') }),
+    kpi({
+      label: t('Model spend'),
+      value: fmt.currency(totals.cost, ccy, { compact: true }),
+      meta: isNum(totals.productCost) && totals.productCost > 0
+        ? h('span', null, t('Plus {v} in product charges', { v: fmt.currency(totals.productCost, ccy, { compact: true }) }))
+        : (d.costSource === 'token_estimate' ? h('span', null, t('Token-estimated ({ccy})', { ccy })) : null),
+      tip: d.costSource === 'token_estimate'
+        ? t('Estimated from observed token usage multiplied by official public token pricing and live USD/KRW FX.')
+        : t('Billing export cost attributed to model SKUs. SKUs matching the excluded patterns are not counted.'),
+    }),
     kpi({ label: t('Models tracked'), value: fmt.int(totals.modelsTracked), meta: h('span', null, t('{n} discovered', { n: fmt.int(totals.modelsDiscovered) })) }),
     kpi({ label: t('Invocations'), value: fmt.compact(invocations), meta: isNum(invocations) && invocations > 0 ? h('span', null, t('{p} error rate', { p: fmt.pct(errorCount / invocations, 2) })) : null, tip: t('Model invocations reported by Cloud Monitoring.') })));
 

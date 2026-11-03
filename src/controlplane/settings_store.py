@@ -34,8 +34,10 @@ RELOAD_SECONDS = 30
 ACCOUNT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._@\-]{1,127}$")
 EMPTY_AUTH = {"requests": [], "lastLogin": {}, "revoked": {}, "accounts": {}}
 EMPTY_GOVERNANCE = {"exceptions": [], "suspensions": [], "notified": {}, "lastRun": None, "lastScheduledRun": None}
+EMPTY_PRICING = {"syncedAt": None, "syncedBy": None, "trigger": None, "fx": None, "models": {},
+                 "sources": [], "alerts": [], "lastError": None}
 EMPTY_DOC = {"version": 1, "overrides": {}, "connectors": [], "updatedAt": None, "updatedBy": None,
-             "auth": EMPTY_AUTH, "governance": EMPTY_GOVERNANCE}
+             "auth": EMPTY_AUTH, "governance": EMPTY_GOVERNANCE, "pricing": EMPTY_PRICING}
 MAX_ACCESS_REQUESTS = 200
 MAX_AUTH_ENTRIES = 5000
 MAX_GOVERNANCE_ENTRIES = 5000
@@ -157,6 +159,86 @@ def sanitize_governance(state):
     return {"exceptions": exceptions[-MAX_GOVERNANCE_ENTRIES:], "suspensions": suspensions[-MAX_GOVERNANCE_ENTRIES:],
             "notified": notified, "lastRun": _run_summary(state.get("lastRun")),
             "lastScheduledRun": _run_summary(state.get("lastScheduledRun"))}
+
+
+def sanitize_pricing(state):
+    """Bounded, type-checked copy of synced public token prices, USD/KRW FX, and change alerts."""
+    state = state if isinstance(state, dict) else {}
+    fx_raw = state.get("fx")
+    fx = None
+    if isinstance(fx_raw, dict):
+        rate = _opt_num(fx_raw.get("usdKrw"), 100.0, 20000.0)
+        if rate is not None:
+            fx = {
+                "usdKrw": round(rate, 4),
+                "previousUsdKrw": _opt_num(fx_raw.get("previousUsdKrw"), 100.0, 20000.0),
+                "source": _opt_str(fx_raw.get("source"), 80) or "unknown",
+                "asOf": _opt_str(fx_raw.get("asOf"), 60),
+                "updatedAt": _opt_str(fx_raw.get("updatedAt"), 40),
+            }
+    models = {}
+    for key, item in list((state.get("models") or {}).items())[:300]:
+        if not isinstance(key, str) or not key or len(key) > 80 or not isinstance(item, dict):
+            continue
+        inp = _opt_num(item.get("input"), 0.0, 100000.0)
+        out = _opt_num(item.get("output"), 0.0, 100000.0)
+        cached = _opt_num(item.get("cached"), 0.0, 100000.0)
+        if inp is None and out is None and cached is None:
+            continue
+        models[key] = {
+            "input": round(inp, 6) if inp is not None else None,
+            "output": round(out, 6) if out is not None else None,
+            "cached": round(cached, 6) if cached is not None else None,
+            "source": _opt_str(item.get("source"), 60) or "baseline",
+            "label": _opt_str(item.get("label"), 120) or key,
+        }
+    sources = []
+    for s in (state.get("sources") or [])[:12]:
+        if not isinstance(s, dict):
+            continue
+        sources.append({
+            "id": _opt_str(s.get("id"), 40) or "source",
+            "url": _opt_str(s.get("url"), 240) or "",
+            "status": _opt_str(s.get("status"), 20) or "unknown",
+            "checkedAt": _opt_str(s.get("checkedAt"), 40),
+            "detail": _opt_str(s.get("detail"), 240),
+            "modelsFound": _opt_num(s.get("modelsFound"), 0, 10000, integer=True) or 0,
+        })
+    alerts = []
+    seen_ids = set()
+    for a in (state.get("alerts") or [])[-100:]:
+        if not isinstance(a, dict):
+            continue
+        aid = _opt_str(a.get("id"), 60)
+        kind = _opt_str(a.get("kind"), 30)
+        if not aid or aid in seen_ids or kind not in ("fx", "model_price", "new_model"):
+            continue
+        seen_ids.add(aid)
+        alerts.append({
+            "id": aid,
+            "at": _opt_str(a.get("at"), 40) or "",
+            "kind": kind,
+            "target": _opt_str(a.get("target"), 80) or "",
+            "label": _opt_str(a.get("label"), 120) or "",
+            "field": _opt_str(a.get("field"), 30) or "",
+            "before": _opt_num(a.get("before"), 0.0, 1000000.0),
+            "after": _opt_num(a.get("after"), 0.0, 1000000.0),
+            "pctChange": _opt_num(a.get("pctChange"), -100.0, 100000.0),
+            "currency": _opt_str(a.get("currency"), 10) or "USD",
+            "source": _opt_str(a.get("source"), 80) or "",
+            "acknowledgedAt": _opt_str(a.get("acknowledgedAt"), 40),
+            "acknowledgedBy": _opt_str(a.get("acknowledgedBy"), 200),
+        })
+    return {
+        "syncedAt": _opt_str(state.get("syncedAt"), 40),
+        "syncedBy": _opt_str(state.get("syncedBy"), 200),
+        "trigger": _opt_str(state.get("trigger"), 40),
+        "fx": fx,
+        "models": models,
+        "sources": sources,
+        "alerts": alerts,
+        "lastError": _opt_str(state.get("lastError"), 240),
+    }
 
 
 def _settings_part(doc):
@@ -397,7 +479,8 @@ class SettingsManager:
         connectors = [c for c in (doc.get("connectors") or []) if isinstance(c, dict)][:200]
         return {"version": 1, "overrides": clean, "connectors": connectors,
                 "updatedAt": doc.get("updatedAt"), "updatedBy": doc.get("updatedBy"),
-                "auth": sanitize_auth(doc.get("auth")), "governance": sanitize_governance(doc.get("governance"))}
+                "auth": sanitize_auth(doc.get("auth")), "governance": sanitize_governance(doc.get("governance")),
+                "pricing": sanitize_pricing(doc.get("pricing"))}
 
     def _compute(self, doc=None):
         doc = self._doc if doc is None else doc
@@ -425,12 +508,16 @@ class SettingsManager:
                 return
             clean = self._sanitize(doc)
             changed = _settings_part(clean) != _settings_part(self._doc)
+            pricing_changed = (clean.get("pricing") or {}).get("models") != (self._doc.get("pricing") or {}).get("models") \
+                or (clean.get("pricing") or {}).get("fx") != (self._doc.get("pricing") or {}).get("fx")
             self._doc = clean
             self._generation = generation
             if changed or initial:
                 self._effective = self._compute()
                 if not initial:
                     self.version += 1
+            elif pricing_changed and not initial:
+                self.version += 1
 
     def maybe_reload(self):
         if time.monotonic() - self._loaded_at < RELOAD_SECONDS or self._reloading:
@@ -568,6 +655,23 @@ class SettingsManager:
             doc["governance"] = state
             return fn(state)
         return self._mutate(apply, actor, bump=False)
+
+    # -- internal synced public pricing & FX state ----------------------------------
+    def pricing_state(self):
+        with self._lock:
+            return copy.deepcopy(self._doc.get("pricing") or EMPTY_PRICING)
+
+    def mutate_pricing(self, fn, actor, bump_cache=False):
+        """Applies fn(state) to the pricing part; bumps cache version when prices/FX changed."""
+        def apply(doc):
+            state = sanitize_pricing(doc.get("pricing"))
+            doc["pricing"] = state
+            return fn(state)
+        result = self._mutate(apply, actor, bump=False)
+        if bump_cache:
+            with self._lock:
+                self.version += 1
+        return result
 
     def save_connectors(self, fn, actor):
         def apply(doc):

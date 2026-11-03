@@ -157,6 +157,16 @@ def summary(ctx):
         ctx.warn("settings:gateway.services", "not_configured", "No gateway services are configured.")
     elif labels or da or ac:
         ctx.warn(label, "unsupported_schema", "Audit log fields were not found in the table schema.")
+    elif ctx.audit_dataset_ready() and not ctx.has_transient_warning():
+        ctx.add_source("bigquery:%s" % ctx.audit_dataset)
+        zeros = [0] * len(rng.buckets())
+        out["kpis"] = {"requests": {"value": 0, "previous": 0}, "principals": {"value": 0, "previous": 0},
+                       "humanPrincipals": 0, "servicePrincipals": 0, "errorRate": None, "denied": 0, "throttled": 0}
+        out["trend"] = timeutil.timeline(rng, [timeutil.series(k, n, list(zeros)) for k, n in OUTCOMES])
+        out["byService"] = []
+        out["byMethod"] = []
+        out["topPrincipals"] = []
+        out["recentFailures"] = []
     ok, inv = res["invocations"]
     inv_label = "monitoring:%s" % monitoring.INVOCATION_METRIC
     if ok:

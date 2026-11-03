@@ -215,10 +215,16 @@ SCHEDULER_MODE = "scheduler"
 
 def scheduler_identity(headers, settings, verifier, path):
     """Identity of a Cloud Scheduler call authenticated with a Google OIDC token (Authorization:
-    Bearer). Only service accounts in governance.antigravity.scheduler_invokers are accepted, and
+    Bearer). Only service accounts in governance.antigravity.scheduler_invokers (plus the deployment's
+    own ai-control-plane-sa service account for /api/v1/finops/pricing/sync) are accepted, and
     the token audience must be this deployment's public URL (with or without the path)."""
     ag = (settings.get("governance") or {}).get("antigravity") or {}
     invokers = [str(e).strip().lower() for e in ag.get("scheduler_invokers") or []]
+    project_id = ((settings.get("workspace") or {}).get("project_id") or "").strip().lower()
+    if path == "/api/v1/finops/pricing/sync" and project_id:
+        default_sa = "ai-control-plane-sa@%s.iam.gserviceaccount.com" % project_id
+        if default_sa not in invokers:
+            invokers.append(default_sa)
     base = ((settings.get("security") or {}).get("public_base_url") or "").rstrip("/")
     if not invokers or not base:
         raise ApiError("unauthenticated", "Scheduled enforcement is not configured for this deployment.")

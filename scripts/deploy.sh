@@ -13,6 +13,7 @@
 # Options
 #   --project ID            Google Cloud project ID to deploy into
 #   --projects ID1,ID2      Deploy sequentially into multiple Google Cloud projects in one run
+#   --link-projects ID1,ID2 Link secondary GCP projects for unified multi-project scanning & grant read IAM
 #   --region REGION         Cloud Run, Artifact Registry & bucket region (default: asia-northeast3)
 #   --admins EMAILS         Comma-separated admin emails or *@domain (default: active gcloud account)
 #   --viewers EMAILS        Comma-separated viewer emails or *@domain
@@ -36,6 +37,7 @@ CONFIG_EXPLICIT=0
 DRY_RUN=0
 CLI_PROJECT=""
 CLI_PROJECTS=""
+CLI_LINK_PROJECTS=""
 CLI_REGION=""
 CLI_ADMINS=""
 CLI_VIEWERS=""
@@ -46,7 +48,7 @@ CLI_BILLING_ACCOUNT=""
 CLI_READ_ONLY=""
 CLI_DATA_ACCESS_LOGS=""
 
-usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
 normalize_cli_args "$@"
@@ -57,6 +59,7 @@ while [[ $# -gt 0 ]]; do
     --config) need_arg "$@"; CONFIG="$2"; CONFIG_EXPLICIT=1; shift 2 ;;
     --project) need_arg "$@"; CLI_PROJECT="$2"; shift 2 ;;
     --projects) need_arg "$@"; CLI_PROJECTS="$2"; shift 2 ;;
+    --link-projects|--scan-projects) need_arg "$@"; CLI_LINK_PROJECTS="$2"; shift 2 ;;
     --region) need_arg "$@"; CLI_REGION="$2"; shift 2 ;;
     --admins|--admin) need_arg "$@"; CLI_ADMINS="$2"; shift 2 ;;
     --viewers|--viewer|--allowed-users) need_arg "$@"; CLI_VIEWERS="$2"; shift 2 ;;
@@ -120,9 +123,11 @@ fi
 # Accept intuitive variable aliases so customers never hit naming mismatches.
 ADMIN_EMAILS="${ADMIN_EMAILS:-${INITIAL_ADMINS:-${ADMINS:-${ADMIN_EMAIL:-}}}}"
 ALLOWED_USERS="${ALLOWED_USERS:-${INITIAL_VIEWERS:-${VIEWERS:-${VIEWER_EMAILS:-}}}}"
+SCAN_PROJECTS="${SCAN_PROJECTS:-${LINKED_PROJECTS:-${WORKSPACE_PROJECTS:-}}}"
 
 # Apply CLI overrides on top of config file / environment values.
 [[ -n "$CLI_PROJECT" ]] && PROJECT_ID="$CLI_PROJECT"
+[[ -n "$CLI_LINK_PROJECTS" ]] && SCAN_PROJECTS="$CLI_LINK_PROJECTS"
 [[ -n "$CLI_REGION" ]] && REGION="$CLI_REGION"
 [[ -n "$CLI_ADMINS" ]] && ADMIN_EMAILS="$CLI_ADMINS"
 [[ -n "$CLI_VIEWERS" ]] && ALLOWED_USERS="$CLI_VIEWERS"
@@ -180,6 +185,7 @@ DISCOVERY_ENGINE_LOCATIONS="${DISCOVERY_ENGINE_LOCATIONS:-}"
 AGENT_ENGINE_REGIONS="${AGENT_ENGINE_REGIONS:-}"
 ENABLE_GOVERNANCE_ACTIONS="${ENABLE_GOVERNANCE_ACTIONS:-true}"
 ENFORCEMENT_SCHEDULE="${ENFORCEMENT_SCHEDULE:-}"
+PRICING_SYNC_SCHEDULE="${PRICING_SYNC_SCHEDULE:-0 4 * * *}"
 AI_DEFAULT_MODEL="${AI_DEFAULT_MODEL:-}"
 AI_LOCATION="${AI_LOCATION:-}"
 IMAGE="$(trim_ws "${IMAGE:-}")"
@@ -475,6 +481,48 @@ if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; the
   fi
 fi
 
+# Linked secondary projects (--link-projects / SCAN_PROJECTS): grant read-only multi-project scanning IAM.
+NORMALIZED_SCAN_PROJECTS=""
+if [[ -n "$SCAN_PROJECTS" ]]; then
+  LINKED_READ_ROLES=(
+    roles/bigquery.dataViewer
+    roles/logging.viewer
+    roles/logging.privateLogViewer
+    roles/monitoring.viewer
+    roles/aiplatform.viewer
+    roles/discoveryengine.viewer
+    roles/iam.securityReviewer
+    roles/modelarmor.viewer
+  )
+  IFS=',' read -r -a raw_linked <<<"$SCAN_PROJECTS"
+  CLEAN_LINKED=()
+  for raw_lp in "${raw_linked[@]}"; do
+    lp="$(normalize_project_id "$raw_lp")"
+    [[ -z "$lp" || "$lp" == "$PROJECT_ID" ]] && continue
+    validate_project_id "$lp" "--link-projects"
+    CLEAN_LINKED+=("$lp")
+    if [[ "$DRY_RUN" == "1" ]]; then
+      info "[dry-run] grant multi-project read roles on ${lp} -> ${SA_EMAIL}"
+    else
+      lp_ok=0
+      for lrole in "${LINKED_READ_ROLES[@]}"; do
+        if gcloud projects add-iam-policy-binding "$lp" --member "serviceAccount:${SA_EMAIL}" \
+            --role "$lrole" --condition=None --quiet >/dev/null 2>&1; then
+          lp_ok=$((lp_ok + 1))
+        fi
+      done
+      if [[ $lp_ok -gt 0 ]]; then
+        info "linked project ${lp}: granted ${lp_ok} read-only scanning role(s) to ${SA_EMAIL}"
+      else
+        warn "could not grant IAM roles on linked project ${lp} with ${ACCOUNT} (grant read roles to ${SA_EMAIL} if needed)"
+      fi
+    fi
+  done
+  if [[ ${#CLEAN_LINKED[@]} -gt 0 ]]; then
+    NORMALIZED_SCAN_PROJECTS="$(IFS=','; echo "${CLEAN_LINKED[*]}")"
+  fi
+fi
+
 # ------------------------------------------------------------------------------- 4. image
 log "4/8 Container image"
 if [[ -z "$IMAGE" ]]; then
@@ -688,6 +736,7 @@ ENV_VARS+="##AGENT_ENGINE_REGIONS=${AGENT_ENGINE_REGIONS}"
 add_env() { [[ -n "$2" ]] && ENV_VARS+="##$1=$2"; return 0; }
 add_env PRODUCT_NAME "$PRODUCT_NAME"
 add_env DISABLED_MODULES "$DISABLED_MODULES"
+add_env SCAN_PROJECTS "$NORMALIZED_SCAN_PROJECTS"
 add_env BILLING_PROJECT_ID "$BILLING_PROJECT_ID"
 add_env BILLING_DATASET_ID "$BILLING_DATASET"
 add_env BILLING_TABLE_ID "$BILLING_TABLE"
@@ -909,6 +958,30 @@ if [[ -n "$ENFORCEMENT_SCHEDULE" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
   info "job ${JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> ${ENFORCE_URL}"
 else
   info "enforcement schedule: on-demand from the dashboard (ENFORCEMENT_SCHEDULE empty)"
+fi
+
+if [[ -n "$PRICING_SYNC_SCHEDULE" && "$PRICING_SYNC_SCHEDULE" != "off" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
+  PRICING_JOB="${SERVICE_NAME}-pricing-sync"
+  PRICING_URL="${BASE_URL}/api/v1/finops/pricing/sync"
+  PRICING_TZ="${WORKSPACE_TIMEZONE:-Asia/Seoul}"
+  [[ "$PRICING_TZ" == "UTC" ]] && PRICING_TZ="Asia/Seoul"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] scheduler job ${PRICING_JOB}: ${PRICING_SYNC_SCHEDULE} (${PRICING_TZ}) -> ${PRICING_URL}"
+  else
+    PRICING_ARGS=(--project "$PROJECT_ID" --location "$REGION" --schedule "$PRICING_SYNC_SCHEDULE"
+      --time-zone "$PRICING_TZ" --uri "$PRICING_URL" --http-method POST --message-body '{}'
+      --oidc-service-account-email "$SA_EMAIL" --oidc-token-audience "$PRICING_URL"
+      --attempt-deadline 120s --max-retry-attempts 2 --quiet)
+    if gcloud scheduler jobs describe "$PRICING_JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
+      gcloud scheduler jobs update http "$PRICING_JOB" "${PRICING_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null 2>&1 \
+        && info "job ${PRICING_JOB}: ${PRICING_SYNC_SCHEDULE} (${PRICING_TZ}) -> ${PRICING_URL}" \
+        || info "in-process daily 04:00 KST pricing monitor active (Cloud Scheduler job update skipped)"
+    else
+      gcloud scheduler jobs create http "$PRICING_JOB" "${PRICING_ARGS[@]}" --headers Content-Type=application/json >/dev/null 2>&1 \
+        && info "job ${PRICING_JOB}: ${PRICING_SYNC_SCHEDULE} (${PRICING_TZ}) -> ${PRICING_URL}" \
+        || info "in-process daily 04:00 KST pricing monitor active (Cloud Scheduler optional)"
+    fi
+  fi
 fi
 
 if [[ "$DRY_RUN" != "1" ]]; then

@@ -236,12 +236,47 @@ function workspace(ctx, panel, data, editable) {
   const tzOptions = ['UTC', 'Asia/Seoul', 'Asia/Tokyo', 'Asia/Singapore', 'Asia/Shanghai', 'Asia/Kolkata', 'Europe/London', 'Europe/Berlin', 'Europe/Paris', 'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'Australia/Sydney'];
   const curTz = getPath(data.effective, ['workspace', 'timezone']);
   if (curTz && !tzOptions.includes(curTz)) tzOptions.unshift(curTz);
-  const activeProjects = (store.boot && store.boot.workspace && store.boot.workspace.projects) || [];
-  if (activeProjects.length > 0) {
+  const wsBoot = (store.boot && store.boot.workspace) || {};
+  const activeProjects = wsBoot.projects || [];
+  const projectDetails = Array.isArray(wsBoot.projectDetails) && wsBoot.projectDetails.length
+    ? wsBoot.projectDetails
+    : activeProjects.map((p) => ({
+      id: p,
+      name: p,
+      parent: null,
+      sameOrg: null,
+      source: p === getPath(data.effective, ['workspace', 'project_id']) ? 'primary' : 'configured',
+    }));
+  if (projectDetails.length > 0) {
+    const sourceBadge = (s) => {
+      if (s === 'primary') return badge(t('Primary'), 'info', { size: 'sm' });
+      if (s === 'configured') return badge(t('Explicitly linked'), 'accent', { size: 'sm' });
+      return badge(t('Auto-discovered'), 'success', { size: 'sm' });
+    };
     panel.append(card({
-      title: t('Scanned Google Cloud projects ({n})', { n: activeProjects.length }),
-      subtitle: t('Projects actively scanned across Agent Registry, Deployments, Gemini Enterprise, Cloud Monitoring and Telemetry.'),
-      body: h('div', { class: 'row wrap' }, activeProjects.map((p) => badge(p, p === getPath(data.effective, ['workspace', 'project_id']) ? 'info' : 'neutral', { mono: true }))),
+      title: t('Scanned Google Cloud projects ({n})', { n: projectDetails.length }),
+      subtitle: t('Unified multi-project scanning across Agent Registry, Deployments, Gemini Enterprise, BigQuery audit sinks, Cloud Monitoring, Cloud Logging and FinOps.'),
+      flush: true,
+      body: h('div', null,
+        dataTable({
+          columns: [
+            { key: 'id', label: t('Project ID'), render: (r) => h('span', { class: 'cell-mono fw-600' }, r.id) },
+            { key: 'name', label: t('Display name'), render: (r) => r.name || r.id },
+            { key: 'source', label: t('Grouping criteria'), render: (r) => sourceBadge(r.source) },
+            {
+              key: 'parent', label: t('Organization / Folder'),
+              render: (r) => h('div', { class: 'row wrap' },
+                h('span', { class: 'cell-mono muted' }, r.parent || DASH),
+                r.sameOrg ? badge(t('Same organization'), 'neutral', { size: 'sm' }) : null),
+            },
+          ],
+          rows: projectDetails,
+          searchable: projectDetails.length > 8,
+          pageSize: 10,
+          initialSort: { key: 'source', dir: 'asc' },
+        }),
+        h('div', { class: 'form-actions' },
+          h('span', { class: 'muted' }, t('Grouping rules: 1) Primary host project, 2) Explicitly linked projects below, 3) Active projects auto-discovered via Cloud Resource Manager (excluding auth bridge projects). Grant cross-project read IAM via scripts/deploy.sh --project {id} --link-projects projA,projB.', { id: getPath(data.effective, ['workspace', 'project_id']) || 'PROJECT_ID' })))),
     }));
   }
   panel.append(sectionForm(ctx, {

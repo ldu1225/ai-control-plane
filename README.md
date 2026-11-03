@@ -446,11 +446,11 @@ Data Access 로그는 양이 많을 수 있고 Cloud Logging 수집 비용이 �
 
 결제 내보내기를 쓰는 기능: 비용 및 FinOps, 모델별 비용, 에이전트 런타임 비용(resource 수준 내보내기 필요), Antigravity 1인당 비용 한도의 실제 단가.
 
-결제 내보내기를 쓰지 않는 조직은 `DISABLED_MODULES="finops"`로 비용 화면을 숨깁니다. 이때도 Antigravity 1인당 비용 한도는 Google 공개 가격표로 계산됩니다(계약 할인은 반영되지 않음).
+결제 내보내기가 구성되어 있으면 비용 및 FinOps, 모델별 비용, 에이전트 런타임 비용, Antigravity 1인당 비용 한도에 실제 청구 단가와 할인 내역이 반영됩니다. 결제 내보내기가 구성되지 않은 프로젝트에서는 Cloud Monitoring 및 추론 로그의 토큰 사용량에 Google Cloud 공식 공개 단가와 실시간 USD/KRW 환율을 곱해 비용을 자동 역산하며, 매일 새벽 공개 단가 페이지와 환율을 모니터링하여 변경 시 알림을 표시합니다(수동 동기화 지원).
 
 ### 6.5 Antigravity 추론 로그
 
-Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 프로젝트에 기록하는 `businessaicode.googleapis.com/inference_response` 로그에서 읽습니다. BigQuery 싱크 테이블이 있으면 BigQuery를, 없으면 Cloud Logging API를 씁니다(`usage_source: auto`). 개인 환경에서 쓰는 코딩 에이전트(예: Jetski)는 이 로그를 남기지 않습니다. 이런 에이전트가 사용자 자격 증명으로 호출한 Google Cloud API는 Antigravity 통제 화면의 **클라우드에서 에이전트가 실행한 작업**에 감사 로그 기준으로 표시됩니다.
+Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 프로젝트에 기록하는 `businessaicode.googleapis.com/inference_response` 로그에서 읽습니다. BigQuery 싱크 테이블이 있으면 BigQuery를, 없으면 Cloud Logging API를 씁니다(`usage_source: auto`). 코딩 에이전트가 사용자 자격 증명으로 호출한 Google Cloud API 작업은 Antigravity 통제 화면의 **클라우드에서 에이전트가 실행한 작업**에 감사 로그 기준으로 표시됩니다.
 
 ### 6.6 런타임 서비스 계정 권한
 

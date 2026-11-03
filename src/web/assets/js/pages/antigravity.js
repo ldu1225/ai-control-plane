@@ -210,7 +210,7 @@ function renderStatus(ctx, body, s) {
   if (usageUnavailable) {
     body.append(banner({ tone: 'warning', title: t('Antigravity usage could not be read'), text: t('The inference log query failed. Grant the service identity roles/logging.viewer (or read access to the BigQuery sink table) and check the data source notices above.') }));
   } else if (prereq.telemetryDetected === false) {
-    body.append(banner({ tone: 'info', title: t('No Antigravity token usage logs in this project'), text: t('Token usage appears here when Antigravity for organizations writes its inference log (businessaicode.googleapis.com/inference_response) to this project. Agents used from a personal setup, such as Jetski, do not write that log. What agents did in this project is shown under Agent activity in your cloud.') }));
+    body.append(banner({ tone: 'info', title: t('No Antigravity token usage logs in this project'), text: t('Token usage appears here when Antigravity for organizations writes its inference log (businessaicode.googleapis.com/inference_response) to this project. Google Cloud API calls made by coding agents are shown under Agent activity in your cloud.') }));
   }
   if (enforcement.durable === false) {
     body.append(banner({ tone: 'warning', title: t('Exception rules are not stored durably'), text: t('Settings are kept in memory on this deployment, so exception rules and suspension records are lost when the service restarts. Configure a settings bucket (SETTINGS_BUCKET).') }));
@@ -1011,12 +1011,12 @@ async function editPersonCap(ctx, s, user) {
 
 const KIND_LABELS = { read: 'Read', change: 'Change' };
 
-/** Google Cloud API calls that coding agents (Antigravity, Jetski) made with users' credentials. */
+/** Google Cloud API calls that coding agents made with users' credentials. */
 function agentActivityCard(ctx) {
   const host = h('div', null, skeleton('table'));
   const c = card({
     title: t('Agent activity in your cloud'),
-    subtitle: t('Google Cloud API calls that coding agents such as Antigravity and Jetski made with user credentials \u00b7 {range}', { range: rangeText() }),
+    subtitle: t('Google Cloud API calls that coding agents made with user credentials \u00b7 {range}', { range: rangeText() }),
     body: host, flush: true,
     source: 'cloudaudit data_access + activity (user agent "agent-name/...")',
   });

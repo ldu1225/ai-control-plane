@@ -102,23 +102,26 @@ def all_connectors(ctx):
 
 
 def discover_datasets(ctx):
-    out = [(ctx.project, ctx.audit_dataset)]
+    active_projects = list(getattr(ctx, "projects", None) or [ctx.project])
+    sel = getattr(ctx, "selected_project", "all") or "all"
+    out = []
+    for p in active_projects[:8]:
+        if config.valid_project(p or ""):
+            pair = (p, ctx.audit_dataset)
+            if pair not in out:
+                out.append(pair)
+    if not out:
+        out.append((ctx.project, ctx.audit_dataset))
     for ref in ctx.ws.get("telemetry_datasets") or []:
         parsed = config.parse_dataset_ref(ref, ctx.project)
-        if parsed and parsed not in out:
+        if parsed and (sel == "all" or parsed[0] == sel) and parsed not in out:
             out.append(parsed)
     # On live GCP, also auto-discover other BigQuery datasets sitting in the workspace project(s) so idle
     # telemetry/log tables appear immediately without requiring manual entry in Settings > Workspace.
     if type(getattr(ctx, "gcp", None)).__name__ == "Gcp" and config.valid_project(ctx.project or ""):
         billing_cfg = ctx.ws.get("billing") or {}
         billing_pair = (config.billing_project(ctx.settings), billing_cfg.get("dataset") or "")
-        scan_projects = [ctx.project]
-        for extra in (ctx.ws.get("projects") or []):
-            if config.valid_project(extra) and extra not in scan_projects and len(scan_projects) < 5:
-                scan_projects.append(extra)
-        sel = getattr(ctx, "selected_project", "all")
-        if sel and sel != "all" and config.valid_project(sel):
-            scan_projects = [sel]
+        scan_projects = [p for p in active_projects if config.valid_project(p or "")][:8]
         for proj in scan_projects:
             try:
                 data = ctx.rest("GET", "https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets" % proj,

@@ -394,11 +394,15 @@ def usage_data(ctx, rng):
             key = normalize_model_id(raw_id)
             entry = model(key, display_name_for_id(raw_id), authoritative=True)
             entry["sources"].add("monitoring")
-            mon = entry["mon"] or {"input": 0, "output": 0, "cached": 0, "total": 0, "daily": {}}
+            mon = entry["mon"] or {"input": 0, "output": 0, "cached": 0, "total": 0, "daily": {}, "dailyByKind": {}}
             for slot in ("input", "output", "cached"):
-                mon[slot] += sum(entry_counts[slot].values())
-            mon["total"] += sum(entry_counts["total"].values())
-            for day, v in entry_counts["total"].items():
+                mon[slot] += sum((entry_counts.get(slot) or {}).values())
+            for slot in ("input", "output", "cached", "other"):
+                for day, v in (entry_counts.get(slot) or {}).items():
+                    dbk = mon["dailyByKind"].setdefault(day, {"input": 0, "output": 0, "cached": 0, "other": 0})
+                    dbk[slot] += v
+            mon["total"] += sum((entry_counts.get("total") or {}).values())
+            for day, v in (entry_counts.get("total") or {}).items():
                 mon["daily"][day] = mon["daily"].get(day, 0) + v
             entry["mon"] = mon
         if not split:
@@ -555,12 +559,48 @@ def model_flags(ctx, keys):
     return enabled, is_new
 
 
+def _estimated_model_cost(entry, rate):
+    """Returns (total_cost, {day: cost}) for one model entry using per-1M rates."""
+    if not rate:
+        return 0.0, {}
+    inp_r = float(rate.get("input") or 0.0) / 1_000_000.0
+    out_r = float(rate.get("output") or 0.0) / 1_000_000.0
+    cache_r = float(rate.get("cached") or 0.0) / 1_000_000.0
+    daily = {}
+    if entry.get("mon") is not None:
+        dbk_map = entry["mon"].get("dailyByKind") or {}
+        if dbk_map:
+            for day, dbk in dbk_map.items():
+                c = ((dbk.get("input", 0) + dbk.get("other", 0)) * inp_r
+                     + dbk.get("output", 0) * out_r + dbk.get("cached", 0) * cache_r)
+                daily[day] = daily.get(day, 0.0) + c
+        else:
+            for day, v in (entry["mon"].get("daily") or {}).items():
+                daily[day] = daily.get(day, 0.0) + v * inp_r
+    for day, agy in (entry.get("agy") or {}).items():
+        prompt = agy.get("prompt", 0)
+        cand = agy.get("candidate", 0)
+        rem = max(0, agy.get("tokens", 0) - prompt - cand)
+        daily[day] = daily.get(day, 0.0) + prompt * inp_r + (cand + rem) * out_r
+    return sum(daily.values()), daily
+
+
 def build_usage(ctx, rng, data=None):
     data = data or usage_data(ctx, rng)
     entries = data["models"]
     enabled, is_new = model_flags(ctx, sorted(entries))
     status = data["status"]
+    any_tokens = bool(status["monitoring"] or status["billing"] or status["agy"])
+    any_source = any_tokens or bool(status["invocations"])
+    estimate_mode = bool(not status["billing"] and any_tokens)
+    rates_map = {}
+    est_currency = data["currency"]
+    est_fx = None
+    if estimate_mode:
+        from . import pricing_sync
+        rates_map, est_currency, est_fx = pricing_sync.effective_token_rates(ctx)
     models = []
+    est_daily_by_key = {}
     totals_tokens = {"input": 0, "output": 0, "cached": 0, "total": 0}
     total_cost = 0.0
     total_inv = 0
@@ -571,7 +611,39 @@ def build_usage(ctx, rng, data=None):
             token_sources.update(("monitoring", "billing"))
         elif tsource:
             token_sources.add(tsource)
-        cost = round(entry["cost"], 6) if status["billing"] else None
+        if status["billing"]:
+            cost = round(entry["cost"], 6)
+            skus_out = sorted(({"sku": sku, "service": service, "measure": measure, "unit": unit,
+                                "amount": round(v["amount"], 3), "cost": money(v["cost"])}
+                               for (sku, service, measure, unit), v in entry["skus"].items()),
+                              key=lambda s: -(s["cost"] or 0))
+        elif estimate_mode:
+            from . import pricing_sync
+            _, rate_info = pricing_sync.lookup_model_rate(rates_map, key)
+            est_val, est_daily = _estimated_model_cost(entry, rate_info)
+            est_daily_by_key[key] = est_daily
+            cost = round(est_val, 6)
+            skus_out = []
+            if rate_info:
+                if tokens["input"]:
+                    skus_out.append({"sku": "%s — Input Tokens (Estimated)" % entry["name"],
+                                     "service": "Agent Platform", "measure": "input_tokens", "unit": "tokens",
+                                     "amount": tokens["input"],
+                                     "cost": money(tokens["input"] * rate_info["input"] / 1_000_000.0)})
+                if tokens["output"]:
+                    skus_out.append({"sku": "%s — Output Tokens (Estimated)" % entry["name"],
+                                     "service": "Agent Platform", "measure": "output_tokens", "unit": "tokens",
+                                     "amount": tokens["output"],
+                                     "cost": money(tokens["output"] * rate_info["output"] / 1_000_000.0)})
+                if tokens["cached"]:
+                    skus_out.append({"sku": "%s — Context Cache Tokens (Estimated)" % entry["name"],
+                                     "service": "Agent Platform", "measure": "cached_tokens", "unit": "tokens",
+                                     "amount": tokens["cached"],
+                                     "cost": money(tokens["cached"] * rate_info["cached"] / 1_000_000.0)})
+                skus_out.sort(key=lambda s: -(s["cost"] or 0))
+        else:
+            cost = None
+            skus_out = []
         inv = entry["inv"]
         item = {"key": key, "name": entry["name"], "vendor": vendor_for(entry["name"]),
                 "enabled": enabled.get(key, True), "isNew": is_new.get(key, False),
@@ -580,19 +652,19 @@ def build_usage(ctx, rng, data=None):
                 "errorRate": ratio(inv["errors"], inv["invocations"]) if inv else None,
                 "otherUsage": [{"unit": m, "amount": round(entry["other"][m], 3)} for m in OTHER_MEASURES
                                if entry["other"].get(m)],
-                "cost": money(cost) if cost is not None else None, "share": None,
-                "skus": sorted(({"sku": sku, "service": service, "measure": measure, "unit": unit,
-                                 "amount": round(v["amount"], 3), "cost": money(v["cost"])}
-                                for (sku, service, measure, unit), v in entry["skus"].items()),
-                               key=lambda s: -(s["cost"] or 0))}
+                "cost": money(cost) if cost is not None else None,
+                "costEstimated": estimate_mode,
+                "share": None,
+                "skus": skus_out}
         models.append(item)
         if item["enabled"]:
             for slot in totals_tokens:
                 totals_tokens[slot] += tokens[slot]
             total_cost += cost or 0.0
             total_inv += inv["invocations"] if inv else 0
+    has_cost = bool(status["billing"] or estimate_mode)
     for item in models:
-        if item["enabled"] and status["billing"] and total_cost:
+        if item["enabled"] and has_cost and total_cost:
             item["share"] = ratio(item["cost"] or 0.0, total_cost)
     models.sort(key=lambda m: (-(m["cost"] or 0), -m["tokens"]["total"], m["key"]))
     enabled_entries = [entries[m["key"]] for m in models if m["enabled"]]
@@ -605,8 +677,10 @@ def build_usage(ctx, rng, data=None):
         if status["billing"]:
             cost_series.append(timeutil.series(entry["key"], entry["name"],
                                                [round(v, 2) for v in timeutil.fold(rng, list(entry["costDaily"].items()))]))
-    any_tokens = bool(status["monitoring"] or status["billing"] or status["agy"])
-    any_source = any_tokens or bool(status["invocations"])
+        elif estimate_mode:
+            est_d = est_daily_by_key.get(entry["key"]) or {}
+            cost_series.append(timeutil.series(entry["key"], entry["name"],
+                                               [round(v, 2) for v in timeutil.fold(rng, list(est_d.items()))]))
     if not any_tokens:
         token_source = None
         totals_tokens = {"input": None, "output": None, "cached": None, "total": None}
@@ -631,16 +705,22 @@ def build_usage(ctx, rng, data=None):
                                         for k, name in sorted(prod["models"].items())]})
         products.sort(key=lambda p: (-(p["cost"] or 0), p["name"]))
         product_cost = money(sum(p["cost"] for p in (data.get("products") or {}).values()))
+    cost_source = "billing_export" if status["billing"] else ("token_estimate" if estimate_mode else None)
     # Aggregates, lists and timelines are null unless a contributing source succeeded.
-    return {"currency": data["currency"], "models": models if any_source else None,
-            "totals": {"tokens": totals_tokens, "cost": money(total_cost) if status["billing"] else None,
+    return {"currency": est_currency if estimate_mode else data["currency"],
+            "costSource": cost_source,
+            "fx": est_fx if estimate_mode else None,
+            "models": models if any_source else None,
+            "totals": {"tokens": totals_tokens,
+                       "cost": money(total_cost) if has_cost else None,
+                       "costEstimated": estimate_mode,
                        "productCost": product_cost,
                        "invocations": total_inv if status["invocations"] else None,
                        "modelsTracked": sum(1 for m in models if m["enabled"]) if any_source else None,
                        "modelsDiscovered": len(models) if any_source else None},
             "products": products,
             "tokenTrend": timeutil.timeline(rng, token_series) if any_tokens else None,
-            "costTrend": timeutil.timeline(rng, cost_series) if status["billing"] else None,
+            "costTrend": timeutil.timeline(rng, cost_series) if has_cost else None,
             "tokenSource": token_source}
 
 

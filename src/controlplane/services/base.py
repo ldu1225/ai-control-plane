@@ -212,6 +212,48 @@ class Ctx:
             return raw
         return "all"
 
+    def _crm_discovered(self, blocking=True):
+        """Returns cached or freshly discovered [{id, name, parent}] from Cloud Resource Manager."""
+        if not (self.project and config.valid_project(self.project)
+                and self.project not in ("demo-project", "my-project")
+                and (config.workspace_configured(self.settings) or os.environ.get("K_SERVICE"))
+                and self.ws.get("scan_all_projects", True)
+                and hasattr(self.app, "cache")):
+            return []
+        cache_key = ("crm_project_meta", self.project)
+        if not blocking:
+            hit, cached = self.app.cache.get(cache_key)
+            return cached or [] if hit else []
+        if not (hasattr(self.app, "gcp") and type(self.gcp).__name__ == "Gcp"):
+            return []
+
+        def discover():
+            try:
+                payload, _ = self.gcp.request(
+                    "GET",
+                    "https://cloudresourcemanager.googleapis.com/v3/projects:search?pageSize=50",
+                    quota_project=self.quota_project,
+                    timeout=10,
+                )
+                found = []
+                for item in (payload or {}).get("projects") or []:
+                    if not isinstance(item, dict) or item.get("state") != "ACTIVE":
+                        continue
+                    pid = (item.get("projectId") or "").strip().lower()
+                    if not config.valid_project(pid) or pid.startswith("ai-control-plane-auth-"):
+                        continue
+                    found.append({
+                        "id": pid,
+                        "name": str(item.get("displayName") or pid)[:120],
+                        "parent": str(item.get("parent") or "")[:120] or None,
+                    })
+                return found
+            except Exception:  # pylint: disable=broad-except
+                return []
+
+        discovered, _ = self.app.cache.get_or_compute(cache_key, 300, discover)
+        return discovered or []
+
     @property
     def known_projects(self):
         """Projects known without making a blocking network call (configured + cached discovery)."""
@@ -221,12 +263,10 @@ class Ctx:
         for p in self.ws.get("projects") or []:
             if config.valid_project(p) and p not in out:
                 out.append(p)
-        if self.ws.get("scan_all_projects", True) and hasattr(self.app, "cache"):
-            hit, cached = self.app.cache.get(("crm_projects", self.project))
-            if hit:
-                for p in cached or []:
-                    if isinstance(p, str) and config.valid_project(p) and p not in out and len(out) < 25:
-                        out.append(p)
+        for item in self._crm_discovered(blocking=False):
+            pid = item.get("id") if isinstance(item, dict) else item
+            if isinstance(pid, str) and config.valid_project(pid) and pid not in out and len(out) < 25:
+                out.append(pid)
         return out or ([self.project] if self.project else [])
 
     @property
@@ -238,35 +278,37 @@ class Ctx:
         for p in self.ws.get("projects") or []:
             if config.valid_project(p) and p not in out:
                 out.append(p)
-        if (self.project and config.valid_project(self.project)
-                and self.project not in ("demo-project", "my-project")
-                and (config.workspace_configured(self.settings) or os.environ.get("K_SERVICE"))
-                and self.ws.get("scan_all_projects", True)
-                and hasattr(self.app, "gcp") and type(self.gcp).__name__ == "Gcp"):
-            def discover():
-                try:
-                    payload, _ = self.gcp.request(
-                        "GET",
-                        "https://cloudresourcemanager.googleapis.com/v3/projects:search?pageSize=50",
-                        quota_project=self.quota_project,
-                        timeout=10,
-                    )
-                    found = []
-                    for item in (payload or {}).get("projects") or []:
-                        if not isinstance(item, dict) or item.get("state") != "ACTIVE":
-                            continue
-                        pid = (item.get("projectId") or "").strip().lower()
-                        if not config.valid_project(pid) or pid.startswith("ai-control-plane-auth-"):
-                            continue
-                        found.append(pid)
-                    return found
-                except Exception:  # pylint: disable=broad-except
-                    return []
-            discovered, _ = self.app.cache.get_or_compute(("crm_projects", self.project), 300, discover)
-            for p in discovered or []:
-                if p not in out and len(out) < 25:
-                    out.append(p)
+        for item in self._crm_discovered(blocking=True):
+            pid = item.get("id") if isinstance(item, dict) else item
+            if isinstance(pid, str) and config.valid_project(pid) and pid not in out and len(out) < 25:
+                out.append(pid)
         return out or [self.project]
+
+    @property
+    def project_details(self):
+        """Metadata explaining how each project in the workspace was linked and grouped."""
+        crm_map = {item["id"]: item for item in self._crm_discovered(blocking=True)
+                   if isinstance(item, dict) and item.get("id")}
+        primary_parent = (crm_map.get(self.project) or {}).get("parent")
+        configured_set = {p for p in (self.ws.get("projects") or []) if config.valid_project(p)}
+        details = []
+        for pid in self.all_projects:
+            meta = crm_map.get(pid) or {}
+            parent = meta.get("parent")
+            if pid == self.project:
+                source = "primary"
+            elif pid in configured_set:
+                source = "configured"
+            else:
+                source = "auto_discovered"
+            details.append({
+                "id": pid,
+                "name": meta.get("name") or pid,
+                "parent": parent,
+                "sameOrg": bool(primary_parent and parent == primary_parent) if parent else None,
+                "source": source,
+            })
+        return details
 
     @property
     def projects(self):
@@ -276,6 +318,14 @@ class Ctx:
         if sel != "all" and sel in all_p:
             return [sel]
         return all_p
+
+    @property
+    def active_project(self):
+        """Single target project when filtered by ?project=<id>, otherwise the primary workspace project."""
+        sel = self.selected_project
+        if sel != "all" and sel in self.all_projects:
+            return sel
+        return self.project
 
     @property
     def quota_project(self):
@@ -298,7 +348,7 @@ class Ctx:
         return list(self.settings["model_catalog"]["excluded_sku_patterns"])
 
     def child(self, rng=None):
-        return Ctx(self.app, self.settings, self.version, self.identity, self.params, self.body,
+        return Ctx(self.app, self.settings, self.version, self.identity, dict(self.params), self.body,
                    rng if rng is not None else self.range)
 
     def absorb(self, other):
@@ -340,49 +390,113 @@ class Ctx:
     def rest(self, method, url, **kwargs):
         return self.gcp.request(method, url, quota_project=self.quota_project, **kwargs)[0]
 
-    def dataset_source(self, project, dataset, logical, required_time=True):
+    def _emit_dataset_failure(self, project, dataset, err):
+        key = (project, dataset)
+        if key in self._dataset_failed:
+            return
+        if isinstance(err, GcpError):
+            if err.kind == "not_found":
+                self.warn("bigquery:%s" % dataset, "dataset_not_found",
+                          "Dataset %s was not found in project %s." % (dataset, project))
+            else:
+                self.warn_error("bigquery:%s" % dataset, err, "BigQuery dataset %s" % dataset)
+        elif isinstance(err, ValueError):
+            self.warn("bigquery:%s" % dataset, "not_configured", "Dataset %s is not a valid identifier." % dataset)
+        self._dataset_failed[key] = True
+
+    def dataset_source(self, project, dataset, logical, required_time=True, warn_missing_table=True):
         label = "bigquery:%s.%s" % (dataset, logical)
         key = (project, dataset)
         if key in self._dataset_failed:
             return None
         try:
             src = self.registry.source(project, dataset, logical, self.quota_project, self.max_bytes)
-        except GcpError as err:
-            if err.kind == "not_found":
-                self.warn("bigquery:%s" % dataset, "dataset_not_found",
-                          "Dataset %s was not found in project %s." % (dataset, project))
-            else:
-                self.warn_error("bigquery:%s" % dataset, err, "BigQuery dataset %s" % dataset)
-            self._dataset_failed[key] = True
-            return None
-        except ValueError:
-            self.warn("bigquery:%s" % dataset, "not_configured", "Dataset %s is not a valid identifier." % dataset)
-            self._dataset_failed[key] = True
+        except (GcpError, ValueError) as err:
+            self._emit_dataset_failure(project, dataset, err)
             return None
         if src is None:
-            self.warn(label, "table_not_found", "Table not found in dataset %s" % dataset)
+            if warn_missing_table:
+                self.warn(label, "table_not_found", "Table not found in dataset %s" % dataset)
             return None
         if required_time and src.time_column() is None:
             self.warn(label, "unsupported_schema", "Table has no TIMESTAMP column to filter on.")
             return None
         return src
 
-    def audit_source(self, logical, optional=False):
-        if optional:
-            # Optional sinks (for example the Antigravity inference sink) do not warn when absent.
-            try:
-                groups = self.registry.tables(self.project, self.audit_dataset, self.quota_project, self.max_bytes)
-            except (GcpError, ValueError):
-                return None
-            if logical not in groups:
-                return None
-        return self.dataset_source(self.project, self.audit_dataset, logical)
+    def audit_dataset_ready(self):
+        """True when at least one scanned project has a readable audit dataset (`ge_analytics`).
 
-    def billing_source(self):
+        Cloud Logging sinks materialize BigQuery tables lazily on the first matching log entry, so an
+        accessible dataset with missing tables means zero recorded events yet rather than an error."""
+        dataset = self.audit_dataset
+        projects = self.projects
+        first_err = None
+        for idx, proj in enumerate(projects):
+            if (proj, dataset) in self._dataset_failed:
+                continue
+            try:
+                self.registry.tables(proj, dataset, self.quota_project, self.max_bytes)
+                return True
+            except (GcpError, ValueError) as err:
+                if idx == 0:
+                    first_err = (proj, err)
+        if first_err is not None:
+            self._emit_dataset_failure(first_err[0], dataset, first_err[1])
+        return False
+
+    def audit_source(self, logical, optional=False):
+        """Resolves `logical` across all scanned projects (single `Source` or multi-project `UnionSource`).
+
+        When the audit dataset exists and is readable, missing sink tables do NOT emit `table_not_found`
+        warnings because Log Router creates each table only after the first event arrives."""
+        from ..schema import UnionSource
+        dataset = self.audit_dataset
+        label = "bigquery:%s.%s" % (dataset, logical)
+        projects = self.projects
+        matched = []
+        any_dataset_ok = False
+        first_err = None
+        bad_schema = False
+        for idx, proj in enumerate(projects):
+            if (proj, dataset) in self._dataset_failed:
+                continue
+            try:
+                groups = self.registry.tables(proj, dataset, self.quota_project, self.max_bytes)
+                any_dataset_ok = True
+            except (GcpError, ValueError) as err:
+                if idx == 0:
+                    first_err = (proj, err)
+                continue
+            if logical not in groups:
+                continue
+            try:
+                src = self.registry.source(proj, dataset, logical, self.quota_project, self.max_bytes)
+            except (GcpError, ValueError) as err:
+                if idx == 0 and not optional:
+                    self.warn_error(label, err, "Table %s" % logical)
+                continue
+            if src is None:
+                continue
+            if src.time_column() is None:
+                bad_schema = True
+                continue
+            matched.append(src)
+        if len(matched) == 1:
+            return matched[0]
+        if len(matched) > 1:
+            return UnionSource(matched)
+        if bad_schema and not optional:
+            self.warn(label, "unsupported_schema", "Table has no TIMESTAMP column to filter on.")
+        elif not any_dataset_ok and first_err is not None and not optional:
+            self._emit_dataset_failure(first_err[0], dataset, first_err[1])
+        return None
+
+    def billing_source(self, warn_unconfigured=False):
         b = self.ws["billing"]
         label = "bigquery:%s.%s" % (b.get("dataset") or "billing", b.get("table") or "export")
         if not config.billing_configured(self.settings):
-            self.warn(label, "not_configured", "The billing export table is not configured.")
+            if warn_unconfigured:
+                self.warn(label, "not_configured", "The billing export table is not configured.")
             return None
         project = config.billing_project(self.settings)
         try:

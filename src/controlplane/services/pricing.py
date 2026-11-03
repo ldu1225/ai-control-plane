@@ -233,7 +233,24 @@ def build_price_table(ctx, currency):
         catalog, usd_rate, effective = catalog_prices(ctx, cap_currency)
         ctx.add_source(CATALOG_LABEL)
     except GcpError as err:
-        ctx.warn_error(CATALOG_LABEL, err, "The Google Cloud price list")
+        settings_mgr = getattr(getattr(ctx, "app", None), "settings", None)
+        synced = settings_mgr.pricing_state() if settings_mgr is not None else {}
+        if synced.get("syncedAt") and synced.get("models"):
+            fx_rate = to_float((synced.get("fx") or {}).get("usdKrw")) if cap_currency == "KRW" else 1.0
+            if cap_currency in ("USD", "KRW") and fx_rate:
+                usd_rate = fx_rate
+                effective = (synced.get("fx") or {}).get("asOf") or synced.get("syncedAt")
+                for key, item in (synced.get("models") or {}).items():
+                    entry = {}
+                    if to_float(item.get("input")) is not None:
+                        entry["input"] = float(item["input"]) * fx_rate
+                    if to_float(item.get("output")) is not None:
+                        entry["output"] = float(item["output"]) * fx_rate
+                    if entry:
+                        catalog[key] = entry
+                ctx.add_source("pricing:public_sync")
+        if not catalog:
+            ctx.warn_error(CATALOG_LABEL, err, "The Google Cloud price list")
     table, warning = combine(cap_currency, billing, billing_currency, billing_rate, catalog, usd_rate, effective)
     if warning:
         ctx.warn("pricing:fx", "fx_unavailable", warning)

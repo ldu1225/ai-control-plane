@@ -11,7 +11,7 @@ from ..gcp import GcpError
 from ..httpkit import ApiError, issue_csrf_token
 from ..security import GUEST_MODE, admin_guard, is_admin_email, mask_for_viewer, resolve_auth_mode
 from .base import AUDIT_DATA_ACCESS, describe_error
-from . import analyst
+from . import analyst, pricing_sync
 
 LOG = logging.getLogger("controlplane.system")
 
@@ -40,7 +40,13 @@ def bootstrap(ctx, handler):
                      "defaultTheme": s["branding"]["default_theme"]},
         "workspace": {"configured": config.workspace_configured(s), "projectId": ws["project_id"],
                       "projects": list(getattr(ctx, "all_projects", None) or getattr(ctx, "projects", None) or [ws["project_id"]]),
+                      "projectDetails": list(getattr(ctx, "project_details", None) or []),
                       "scanAllProjects": bool(ws.get("scan_all_projects", True)),
+                      "groupingCriteria": {
+                          "mode": "primary_configured_and_crm_discovery" if ws.get("scan_all_projects", True)
+                          else "primary_and_configured_only",
+                          "tiers": ["primary", "configured", "auto_discovered"],
+                      },
                       "auditDataset": ws["audit_dataset"],
                       # The billing account ID is an administrator detail; viewers do not receive it.
                       "billing": {"projectId": config.billing_project(s), "dataset": ws["billing"]["dataset"],
@@ -48,6 +54,7 @@ def bootstrap(ctx, handler):
                                   "accountId": ws["billing"]["account_id"] if ctx.identity.is_admin else ""},
                       "timezone": ws["timezone"], "defaultRangeDays": ws["default_range_days"],
                       "today": timeutil.today_in(ws["timezone"]).isoformat()},
+        "pricingAlerts": pricing_sync.pricing_alert_summary(ctx.app.settings),
         # AI Analyst is shown to viewers only when they may use it (analyst.available_to).
         "modules": [{"id": m, "enabled": bool(s["modules"].get(m, False)) and
                      (m != "analyst" or analyst.available_to(ctx.identity, s))} for m in config.MODULE_IDS],
@@ -161,11 +168,13 @@ def run_health(ctx):
             return unconfigured
         groups = ctx.registry.tables(ctx.project, ctx.audit_dataset, ctx.quota_project, ctx.max_bytes)
         core = [t for t in groups if t.startswith(("cloudaudit_", "discoveryengine_", "modelarmor_", "businessaicode_"))]
-        return ("ok" if groups else "warning"), "%d tables found (%d core log tables)" % (len(groups), len(core))
+        if not groups:
+            return "ok", "Dataset %s reachable (0 tables yet; log sinks create tables on first event)" % ctx.audit_dataset
+        return "ok", "%d tables found (%d core log tables)" % (len(groups), len(core))
 
     def bq_billing():
         if not config.billing_configured(s):
-            return "unconfigured", "The billing export table is not configured."
+            return "unconfigured", "Billing export unconfigured (using token-based cost estimation)"
         b = s["workspace"]["billing"]
         meta = ctx.registry.schema(config.billing_project(s), b["dataset"], b["table"], ctx.quota_project)
         schema = meta["schema"]

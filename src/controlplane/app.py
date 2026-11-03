@@ -24,7 +24,7 @@ from .services import base as svc_base
 from .services import access
 from .services import agent_activity
 from .services import (agents, analyst, finops, gateway, gemini_enterprise, governance, layouts, model_armor, models,
-                       notebooklm, overview, system, telemetry, users)
+                       notebooklm, overview, pricing_sync, system, telemetry, users)
 
 LOG = logging.getLogger("controlplane.app")
 
@@ -102,6 +102,11 @@ _route("GET", "/api/v1/governance/audit-log", governance.audit_log, module="anti
 _route("GET", "/api/v1/governance/antigravity/agent-activity", agent_activity.summary, module="antigravity", range=True,
        cache=True)
 _route("GET", "/api/v1/finops/summary", finops.summary, module="finops", range=True, cache=True)
+_route("GET", "/api/v1/finops/pricing", pricing_sync.get_pricing, module="finops", cache=True, ttl=60)
+_route("POST", "/api/v1/finops/pricing/sync", pricing_sync.trigger_sync, module="finops", admin=True,
+       rate="governance", scheduler=True)
+_route("POST", "/api/v1/finops/pricing/ack", pricing_sync.acknowledge_alerts, module="finops", admin=True,
+       rate="governance")
 # guest=True: one of the few POST routes a guest may call (read-only AI analysis, rate limited).
 _route("POST", "/api/v1/finops/spikes/analyze", finops.analyze_spike, module="finops", rate="ai", guest=True)
 _route("GET", "/api/v1/telemetry/discover", telemetry.discover, module="telemetry", cache=True, ttl=600)
@@ -371,9 +376,12 @@ def main():
         LOG.warning("settings persistence backend=%s is not durable", persistence["backend"])
     if not os.path.isfile(os.path.join(WEB_ROOT, "index.html")):
         LOG.warning("web frontend not found at src/web/index.html")
+    monitor = pricing_sync.PricingMonitor(app)
+    monitor.start()
     server = make_server(app, host, port)
 
     def _stop(*_args):
+        monitor.stop()
         threading.Thread(target=server.shutdown, daemon=True).start()
     try:
         signal.signal(signal.SIGTERM, _stop)
@@ -384,6 +392,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        monitor.stop()
         server.server_close()
         LOG.info("server stopped")
     return 0

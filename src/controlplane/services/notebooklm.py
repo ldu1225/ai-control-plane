@@ -66,6 +66,19 @@ def summary(ctx):
            "activity": None, "topUsers": None}
     src = ctx.audit_source(AUDIT_DATA_ACCESS)
     if src is None:
+        if ctx.audit_dataset_ready() and not ctx.has_transient_warning():
+            ctx.add_source("bigquery:%s" % ctx.audit_dataset)
+            zeros = [0] * len(rng.buckets())
+            return {
+                "kpis": {"notebooks": {"value": 0, "previous": 0},
+                         "activeUsers": {"value": 0, "previous": 0},
+                         "prompts": {"value": 0, "previous": 0}},
+                "activity": timeutil.timeline(rng, [
+                    timeutil.series("prompts", "Prompts", list(zeros)),
+                    timeutil.series("activeUsers", "Active users", list(zeros)),
+                ]),
+                "topUsers": [],
+            }
         return out
     if nb_ctes(src) is None:
         ctx.warn(src.label, "unsupported_schema", "Audit log fields were not found in the table schema.")

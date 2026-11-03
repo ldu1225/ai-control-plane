@@ -223,6 +223,20 @@ def summary(ctx):
         "activity": None, "agentUsage": None, "topUsers": None,
     }
     if not msrc and not asrc:
+        if ctx.audit_dataset_ready() and not ctx.has_transient_warning():
+            ctx.add_source("bigquery:%s" % ctx.audit_dataset)
+            zeros = [0] * len(rng.buckets())
+            return {
+                "kpis": {"activeUsers": {"value": 0, "previous": 0}, "prompts": {"value": 0, "previous": 0},
+                         "promptsPerUser": None, "fileUploads": {"value": 0, "previous": 0},
+                         "agentCalls": {"value": 0, "previous": 0}},
+                "activity": timeutil.timeline(rng, [
+                    timeutil.series("prompts", "Prompts", list(zeros)),
+                    timeutil.series("activeUsers", "Active users", list(zeros)),
+                ]),
+                "agentUsage": timeutil.timeline(rng, []),
+                "topUsers": [],
+            }
         return result
     tasks = {"kpi": lambda: ge_kpis(ctx, msrc, asrc, rng)}
     if asrc:
@@ -242,7 +256,7 @@ def summary(ctx):
         users_cur = to_int(cur.get("users"))
         users_prev = to_int(prev.get("users"))
         result["kpis"]["activeUsers"] = {"value": users_cur, "previous": users_prev}
-        if not msrc or not asrc:
+        if (not msrc or not asrc) and not ctx.audit_dataset_ready():
             ctx.warn(label, "partial_data", "Active users are counted from the available Gemini Enterprise "
                                             "log tables only.")
         has_prompts, has_uploads = prompt_caps(caps_m, kpi["caps_a"])
@@ -258,6 +272,8 @@ def summary(ctx):
         if asrc and (kpi["caps_a"] or {}).get("agent"):
             result["kpis"]["agentCalls"] = {"value": to_int(cur.get("agent_calls")),
                                             "previous": to_int(prev.get("agent_calls"))}
+        elif not asrc and ctx.audit_dataset_ready():
+            result["kpis"]["agentCalls"] = {"value": 0, "previous": 0}
         series = []
         if has_prompts:
             series.append(timeutil.series("prompts", "Prompts", bucket_values(rng, kpi["buckets"], "prompts")))
@@ -273,6 +289,8 @@ def summary(ctx):
                 result["agentUsage"] = agent_series(rng, rows, directory_for(ctx, rows))
         else:
             ctx.warn_error(asrc.label, rows, "Gemini Enterprise agent activity")
+    elif not asrc and ctx.audit_dataset_ready():
+        result["agentUsage"] = timeutil.timeline(rng, [])
     ok, top = res["top"]
     if ok:
         result["topUsers"] = top
@@ -557,6 +575,8 @@ def _inf_msgs_json(isrc, alias="i"):
     msgs = isrc.schema.node("jsonPayload.gen_ai_input_messages")
     if jp is None or msgs is None:
         return None
+    if jp.type == "JSON":
+        return "TO_JSON_STRING(JSON_QUERY(%s.%s, '$.%s'))" % (alias, quote_ident(jp.name), msgs.name)
     return "TO_JSON_STRING(%s.%s.%s)" % (alias, quote_ident(jp.name), quote_ident(msgs.name))
 
 
@@ -655,6 +675,9 @@ def file_uploads(ctx):
                 elif rows is None:
                     rows = []
     if rows is None:
+        if not msrc and not asrc and ctx.audit_dataset_ready() and not ctx.has_transient_warning():
+            ctx.add_source("bigquery:%s" % ctx.audit_dataset)
+            return {"items": [], "total": 0}
         return {"items": None, "total": None}
     total = to_int(rows[0].get("total")) if rows else 0
     return {"items": file_rows_to_items(rows), "total": total}

@@ -101,6 +101,12 @@ def summary(ctx):
 
     kpis = {}
     ge_disabled = not mods.get("gemini_enterprise")
+    dataset_ready = False
+    if (ge is None and not ge_disabled) or (armor is None and mods.get("model_armor")) or (nb is None and mods.get("notebooklm")):
+        dataset_ready = bool(ctx.audit_dataset_ready() and not ctx.has_transient_warning())
+        if dataset_ready:
+            ctx.add_source("bigquery:%s" % ctx.audit_dataset)
+    zeros = [0] * len(rng.buckets())
     if ge and ge["kpi"]:
         cur = ge["kpi"]["totals"].get("cur", {})
         before = ge["kpi"]["totals"].get("prev", {})
@@ -110,6 +116,9 @@ def summary(ctx):
             kpis["prompts"] = _kpi(to_int(cur.get("prompts")), to_int(before.get("prompts")))
         else:
             kpis["prompts"] = _kpi()
+    elif not ge_disabled and dataset_ready and "ge" in res and res["ge"][0]:
+        kpis["activeUsers"] = _kpi(0, 0)
+        kpis["prompts"] = _kpi(0, 0)
     else:
         kpis["activeUsers"] = _kpi(disabled=ge_disabled)
         kpis["prompts"] = _kpi(disabled=ge_disabled)
@@ -126,10 +135,12 @@ def summary(ctx):
     if spend is not None:
         kpis["aiSpend"] = {"gross": spend["gross"], "credits": spend["credits"], "net": spend["net"],
                            "previousNet": spend["previousNet"], "currency": spend["currency"],
-                           "hasCredits": spend["hasCredits"], "disabled": False}
+                           "hasCredits": spend["hasCredits"], "costSource": spend.get("costSource") or "billing_export",
+                           "estimated": spend.get("costSource") == "token_estimate", "disabled": False}
     else:
         kpis["aiSpend"] = {"gross": None, "credits": None, "net": None, "previousNet": None, "currency": "USD",
-                           "hasCredits": None, "disabled": not mods.get("finops")}
+                           "hasCredits": None, "costSource": None, "estimated": False,
+                           "disabled": not mods.get("finops")}
     if armor is not None:
         cur = armor["totals"].get("cur", {})
         before = armor["totals"].get("prev", {})
@@ -137,6 +148,8 @@ def summary(ctx):
         kpis["armorBlocks"] = _kpi(to_int(cur.get("blocked")) if verdict else None,
                                    to_int(before.get("blocked")) if verdict else None,
                                    operations=to_int(cur.get("ops")))
+    elif mods.get("model_armor") and dataset_ready and "armor" in res and res["armor"][0]:
+        kpis["armorBlocks"] = _kpi(0, 0, operations=0)
     else:
         kpis["armorBlocks"] = _kpi(disabled=not mods.get("model_armor"), operations=None)
     if reg is not None and reg.get("available"):
@@ -152,6 +165,8 @@ def summary(ctx):
         totals, _ = nb
         kpis["notebooklmPrompts"] = _kpi(to_int(totals.get("cur", {}).get("prompts")),
                                          to_int(totals.get("prev", {}).get("prompts")))
+    elif mods.get("notebooklm") and dataset_ready and "nb" in res and res["nb"][0]:
+        kpis["notebooklmPrompts"] = _kpi(0, 0)
     else:
         kpis["notebooklmPrompts"] = _kpi(disabled=not mods.get("notebooklm"))
     if agy is not None and agy.ok:
@@ -165,7 +180,8 @@ def summary(ctx):
     spend_trend = None
     if spend is not None:
         series = [timeutil.series("gross", "Gross", spend["grossSeries"])]
-        series.append(timeutil.series("net", "Net", spend["netSeries"]))
+        if spend.get("hasCredits") or spend.get("costSource") != "token_estimate":
+            series.append(timeutil.series("net", "Net", spend["netSeries"]))
         spend_trend = timeutil.timeline(rng, series)
     token_trend = None
     if models is not None and models.get("tokenTrend") is not None:
@@ -183,6 +199,11 @@ def summary(ctx):
         if armor["caps"]["verdict"]:
             armor_series.append(timeutil.series("blocked", "Blocked", bucket_values(rng, armor["buckets"], "blocked")))
         armor_trend = timeutil.timeline(rng, armor_series)
+    elif mods.get("model_armor") and dataset_ready and "armor" in res and res["armor"][0]:
+        armor_trend = timeutil.timeline(rng, [
+            timeutil.series("operations", "Operations", list(zeros)),
+            timeutil.series("blocked", "Blocked", list(zeros)),
+        ])
     top_users = None
     if ge and ge["top"] is not None:
         top_users = []
@@ -192,6 +213,8 @@ def summary(ctx):
                               "agentCalls": item["agentCalls"],
                               "antigravityTokens": (agy_users.get(item["email"]) or {}).get("tokens", 0)
                               if agy is not None and agy.ok else None})
+    elif not ge_disabled and dataset_ready and "ge" in res and res["ge"][0]:
+        top_users = []
     recent = None if actions is None else []
     for item in (actions or [])[:10]:
         recent.append({"time": item["time"], "actor": item["actor"], "action": item["action"],

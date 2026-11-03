@@ -677,74 +677,104 @@ def _bq_usage(ctx, src, start, end, email=None, rng=None):
     return usage
 
 
-def _logging_usage(ctx, start, end, email=None, rng=None):
-    ag = ctx.settings["governance"]["antigravity"]
-    log_id = ag["inference_log"]
-    if not config.LOG_NAME_RE.match(log_id):
-        raise GcpError("invalid", message="invalid log id")
+def _logging_usage_project(ctx, project, log_id, start, end, email=None, rng=None):
     flt = 'logName="projects/%s/logs/%s" AND timestamp>="%s" AND timestamp<"%s"' % (
-        ctx.project, log_id, iso(start), iso(end))
+        project, log_id, iso(start), iso(end))
     if email:
         if not config.EMAIL_RE.match(email):
             raise GcpError("invalid", message="invalid email")
         flt += ' AND labels.user_id="%s"' % email
+    ag = ctx.settings["governance"]["antigravity"]
     limit = int(ag.get("max_log_entries") or 20000)
-    usage = Usage("logging")
     tz = timeutil.get_zone(ctx.tz_name)
     token = None
     fetched = 0
+    entries_out = []
+    truncated = False
     while True:
-        body = {"resourceNames": ["projects/%s" % ctx.project], "filter": flt, "orderBy": "timestamp desc",
+        body = {"resourceNames": ["projects/%s" % project], "filter": flt, "orderBy": "timestamp desc",
                 "pageSize": min(1000, max(1, limit - fetched))}
         if token:
             body["pageToken"] = token
         data = ctx.rest("POST", "%s/entries:list" % LOGGING_V2, json_body=body, timeout=45)
         entries = data.get("entries") or []
-        for entry in entries:
-            labels = entry.get("labels") or {}
-            user = (labels.get("user_id") or "").strip().lower()
-            if not user:
-                continue
-            meta = ((entry.get("jsonPayload") or {}).get("metadata") or {})
-            total = to_int(meta.get("totalTokenCount"))
-            prompt = to_int(meta.get("promptTokenCount"))
-            cand = to_int(meta.get("candidatesTokenCount"))
-            client = labels.get("client_name")
-            model = labels.get("model_id") or labels.get("model")
-            ts = parse_rfc3339(entry.get("timestamp"))
-            u = usage.user(user)
-            u["requests"] += 1
-            u["tokens"] += total
-            u["promptTokens"] += prompt
-            u["candidateTokens"] += cand
-            if client:
-                u["clients"].add(client)
-            if model:
-                u["models"].add(model)
-            Usage.add_model(u, model, 1, total, prompt, cand)
-            if ts and (u["last"] is None or ts > u["last"]):
-                u["last"] = ts
-            usage.records += 1
-            if email:
-                for key, target in ((model or "unknown", usage.by_model), (client or "unknown", usage.by_client)):
-                    agg = target.setdefault(key, {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0})
-                    agg["requests"] += 1
-                    agg["tokens"] += total
-                    agg["promptTokens"] += prompt
-                    agg["candidateTokens"] += cand
-            if rng is not None and ts is not None:
-                bucket_idx = rng.bucket_index(ts.astimezone(tz).date())
-                if bucket_idx is not None:
-                    bucket = rng.buckets()[bucket_idx]
-                    req, tok = usage.daily.get((user, bucket), (0, 0))
-                    usage.daily[(user, bucket)] = (req + 1, tok + total)
+        entries_out.extend(entries)
         fetched += len(entries)
         token = data.get("nextPageToken")
         if not token:
             break
         if fetched >= limit:
-            usage.truncated = True
+            truncated = True
             break
+    return entries_out, truncated, tz
+
+
+def _logging_usage(ctx, start, end, email=None, rng=None):
+    ag = ctx.settings["governance"]["antigravity"]
+    log_id = ag["inference_log"]
+    if not config.LOG_NAME_RE.match(log_id):
+        raise GcpError("invalid", message="invalid log id")
+    projects = list(getattr(ctx, "projects", None) or [ctx.project])
+    usage = Usage("logging")
+    tz = timeutil.get_zone(ctx.tz_name)
+    all_entries = []
+    if len(projects) <= 1:
+        proj = projects[0] if projects else ctx.project
+        entries, truncated, tz = _logging_usage_project(ctx, proj, log_id, start, end, email=email, rng=rng)
+        all_entries.extend(entries)
+        usage.truncated = truncated
+    else:
+        tasks = {p: (lambda pr=p: _logging_usage_project(ctx, pr, log_id, start, end, email=email, rng=rng))
+                 for p in projects}
+        res = ctx.run(tasks)
+        for p in projects:
+            ok, val = res[p]
+            if not ok:
+                if p == ctx.project:
+                    raise val
+                continue
+            entries, truncated, _ = val
+            all_entries.extend(entries)
+            if truncated:
+                usage.truncated = True
+    for entry in all_entries:
+        labels = entry.get("labels") or {}
+        user = (labels.get("user_id") or "").strip().lower()
+        if not user:
+            continue
+        meta = ((entry.get("jsonPayload") or {}).get("metadata") or {})
+        total = to_int(meta.get("totalTokenCount"))
+        prompt = to_int(meta.get("promptTokenCount"))
+        cand = to_int(meta.get("candidatesTokenCount"))
+        client = labels.get("client_name")
+        model = labels.get("model_id") or labels.get("model")
+        ts = parse_rfc3339(entry.get("timestamp"))
+        u = usage.user(user)
+        u["requests"] += 1
+        u["tokens"] += total
+        u["promptTokens"] += prompt
+        u["candidateTokens"] += cand
+        if client:
+            u["clients"].add(client)
+        if model:
+            u["models"].add(model)
+        Usage.add_model(u, model, 1, total, prompt, cand)
+        if ts and (u["last"] is None or ts > u["last"]):
+            u["last"] = ts
+        usage.records += 1
+        if email:
+            for key, target in ((model or "unknown", usage.by_model), (client or "unknown", usage.by_client)):
+                agg = target.setdefault(key, {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0})
+                agg["requests"] += 1
+                agg["tokens"] += total
+                agg["promptTokens"] += prompt
+                agg["candidateTokens"] += cand
+        if rng is not None and ts is not None:
+            bucket_idx = rng.bucket_index(ts.astimezone(tz).date())
+            if bucket_idx is not None:
+                bucket = rng.buckets()[bucket_idx]
+                req, tok = usage.daily.get((user, bucket), (0, 0))
+                usage.daily[(user, bucket)] = (req + 1, tok + total)
     usage.ok = True
     return usage
 
@@ -769,7 +799,8 @@ def antigravity_usage(ctx, start, end, email=None, rng=None):
             return usage
     if mode == "bigquery":
         return Usage("unavailable")
-    cache_key = ("agy_logging", ctx.project, iso(start), iso(end), email or "", rng)
+    projects = tuple(getattr(ctx, "projects", None) or [ctx.project])
+    cache_key = ("agy_logging", projects, iso(start), iso(end), email or "", rng)
 
     def load():
         return _logging_usage(ctx, start, end, email=email, rng=rng)

@@ -145,6 +145,27 @@ def summary(ctx):
            "byApp": None, "byUser": None}
     src = ctx.audit_source(ARMOR_OPS)
     if src is None:
+        if ctx.audit_dataset_ready() and not ctx.has_transient_warning():
+            ctx.add_source("bigquery:%s" % ctx.audit_dataset)
+            zeros = [0] * len(rng.buckets())
+            return {
+                "kpis": {
+                    "operations": {"value": 0, "previous": 0},
+                    "blocked": {"value": 0, "previous": 0},
+                    "blockRate": None,
+                    "promptBlocks": 0,
+                    "responseBlocks": 0,
+                    "searchResultBlocks": 0,
+                    "blockedByOrigin": {"user": 0, "automatic": 0, "unknown": 0},
+                },
+                "trend": timeutil.timeline(rng, [
+                    timeutil.series("allowed", "Allowed", list(zeros)),
+                    timeutil.series("blocked", "Blocked", list(zeros)),
+                ]),
+                "filters": [{"key": k, "name": n, "matches": 0} for k, n, _ in FILTERS],
+                "byApp": [],
+                "byUser": [],
+            }
         return out
     asrc = ctx.audit_source(GE_ACTIVITY)
     attr = attribution_ctes(asrc)
@@ -288,6 +309,9 @@ def events(ctx):
     limit = max(1, min(limit, 500))
     src = ctx.audit_source(ARMOR_OPS)
     if src is None:
+        if ctx.audit_dataset_ready() and not ctx.has_transient_warning():
+            ctx.add_source("bigquery:%s" % ctx.audit_dataset)
+            return {"items": [], "total": 0}
         return {"items": None, "total": None}
     asrc = ctx.audit_source(GE_ACTIVITY)
     try:
