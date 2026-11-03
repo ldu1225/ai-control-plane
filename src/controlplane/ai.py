@@ -68,7 +68,7 @@ class AiEngine:
             import google.genai as genai
             from google.genai import types
             client = genai.Client(vertexai=True, project=project, location=location, credentials=creds,
-                                  http_options=types.HttpOptions(timeout=60000))
+                                  http_options=types.HttpOptions(timeout=90000))
         except Exception as err:  # pylint: disable=broad-except
             LOG.error("genai client init failed: %s", type(err).__name__)
             raise GcpError("unavailable", message=type(err).__name__)
@@ -178,7 +178,7 @@ class AiEngine:
 
     # -- generation ---------------------------------------------------------------
     def generate(self, settings, model, contents, *, system=None, schema=None, temperature=0.2,
-                 max_output_tokens=4096, module="ai"):
+                 max_output_tokens=4096, thinking_level=None, meta_out=None, module="ai"):
         """Calls generate_content. Returns parsed JSON (when schema is given) or text."""
         from google.genai import types
         project = settings["workspace"]["project_id"]
@@ -195,22 +195,25 @@ class AiEngine:
         attempts = 2 if schema is not None else 1
         started = time.monotonic()
         active_model = self.effective_model(settings, model) if type(self.gcp).__name__ == "Gcp" else model
+        _apply_thinking(cfg, types, active_model, thinking_level)
         for attempt in range(1, attempts + 1):
             try:
                 resp = client.models.generate_content(model=active_model, contents=contents,
                                                       config=types.GenerateContentConfig(**cfg))
             except Exception as err:  # pylint: disable=broad-except
                 status = getattr(err, "code", None) or getattr(err, "status_code", None)
-                if (status == 404 and type(self.gcp).__name__ == "Gcp"
+                if (status in (404, 429, 503, 504) and type(self.gcp).__name__ == "Gcp"
                         and (active_model == settings["ai_engine"].get("default_model")
                              or active_model.startswith("gemini-4-")
                              or active_model.startswith("gemini-3.8-"))):
-                    with self._lock:
-                        self._unavailable.add((project, location, active_model))
+                    if status == 404:
+                        with self._lock:
+                            self._unavailable.add((project, location, active_model))
                     fb = self.fallback_model(settings, active_model)
                     if fb:
-                        LOG.info("model %s returned 404; falling back to %s", active_model, fb)
+                        LOG.info("model %s returned %s; falling back to %s", active_model, status, fb)
                         active_model = fb
+                        _apply_thinking(cfg, types, active_model, thinking_level)
                         try:
                             resp = client.models.generate_content(model=active_model, contents=contents,
                                                                   config=types.GenerateContentConfig(**cfg))
@@ -222,6 +225,7 @@ class AiEngine:
                                 fb2 = self.fallback_model(settings, active_model)
                                 if fb2 and fb2 != active_model:
                                     active_model = fb2
+                                    _apply_thinking(cfg, types, active_model, thinking_level)
                                     resp = client.models.generate_content(model=active_model, contents=contents,
                                                                           config=types.GenerateContentConfig(**cfg))
                                 else:
@@ -231,12 +235,16 @@ class AiEngine:
                                 raise GcpError(kind, status=fb_st if isinstance(fb_st, int) else None,
                                                message=type(fb_err).__name__)
                     else:
-                        raise GcpError("not_found", status=404, message=type(err).__name__)
+                        kind = "not_found" if status == 404 else "unavailable"
+                        raise GcpError(kind, status=status if isinstance(status, int) else None,
+                                       message=type(err).__name__)
                 else:
                     LOG.warning("generate_content failed model=%s error=%s status=%s", active_model,
                                 type(err).__name__, status)
                     kind = "denied" if status in (401, 403) else ("not_found" if status == 404 else "unavailable")
                     raise GcpError(kind, status=status if isinstance(status, int) else None, message=type(err).__name__)
+            if isinstance(meta_out, dict):
+                meta_out["model"] = active_model
             text = (getattr(resp, "text", None) or "").strip()
             if schema is None:
                 return strip_emoji(text)
@@ -290,3 +298,24 @@ def _strip_emoji_deep(value):
     if isinstance(value, dict):
         return {k: _strip_emoji_deep(v) for k, v in value.items()}
     return value
+
+
+def _apply_thinking(cfg, types_mod, model_id, thinking_level):
+    if not thinking_level:
+        cfg.pop("thinking_config", None)
+        return
+    thinking_cls = getattr(types_mod, "ThinkingConfig", None)
+    if thinking_cls is None:
+        cfg.pop("thinking_config", None)
+        return
+    mid = (model_id or "").lower()
+    try:
+        if mid.startswith(("gemini-4-", "gemini-3")):
+            cfg["thinking_config"] = thinking_cls(thinking_level=thinking_level)
+        elif mid.startswith("gemini-2.5-") and str(thinking_level).upper() == "LOW":
+            cfg["thinking_config"] = thinking_cls(thinking_budget=512)
+        else:
+            cfg.pop("thinking_config", None)
+    except Exception:  # pylint: disable=broad-except
+        cfg.pop("thinking_config", None)
+

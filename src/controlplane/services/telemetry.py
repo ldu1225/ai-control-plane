@@ -850,13 +850,15 @@ def _ai_enrich_sources(ctx, tables, logs, schemas_by_table, log_leaves_by_short)
             "browse a clean semantic catalog.\nSources:\n%s"
             % (ctx.project, json.dumps(prompt_items, ensure_ascii=False))
         )
+        gen_meta = {}
         try:
             resp = ai_engine.generate(
                 ctx.settings, preferred, prompt,
                 system=AI_ENRICH_SYSTEM, schema=AI_ENRICH_SCHEMA,
-                temperature=0.1, max_output_tokens=8192, module="telemetry_ai",
+                temperature=0.1, max_output_tokens=8192,
+                thinking_level="LOW", meta_out=gen_meta, module="telemetry_ai",
             )
-            used_model = (
+            used_model = gen_meta.get("model") or (
                 ai_engine.effective_model(ctx.settings, preferred)
                 if hasattr(ai_engine, "effective_model") else preferred
             )
