@@ -252,6 +252,40 @@ class TokenMergeTest(unittest.TestCase):
         self.assertAlmostEqual(out["totals"]["productCost"], 0.1, places=6)
         self.assertAlmostEqual(out["totals"]["cost"], 0.15, places=6)
 
+    def test_cloud_tts_api_sku_merges_with_gemini_tts_monitoring_without_double_counting(self):
+        billing = [
+            {"bucket": D2, "sku": " Cloud TTS API audio output token count for Gemini 3.8 Flash ",
+             "service": "Cloud Text-to-Speech API", "unit": "requests", "pricing_unit": "count",
+             "amount": 500_000.0, "cost": 10.0, "currency": "USD"},
+            {"bucket": D2, "sku": "Cloud TTS API text input token count for Gemini 3.8 Flash",
+             "service": "Cloud Text-to-Speech API", "unit": "requests", "pricing_unit": "count",
+             "amount": 100_000.0, "cost": 0.1, "currency": "USD"},
+        ]
+        out = self._run(billing, {"gemini-3.8-flash-tts-001": (100_000, 500_000)})
+        self.assertEqual([m["key"] for m in out["models"]], ["gemini-3.8-flash-tts"])
+        self.assertEqual(out["products"], [])
+        tts = out["models"][0]
+        self.assertEqual(tts["tokens"]["total"], 600_000)
+        self.assertAlmostEqual(tts["cost"], 10.1, places=6)
+
+    def test_tts_image_footnote_and_non_token_helpers(self):
+        sku_tts = " Cloud TTS API audio output token count for Gemini 3.8 Flash "
+        info = models.parse_sku(sku_tts, "Cloud Text-to-Speech API")
+        self.assertEqual((info["key"], info["product"], models.classify_measure(sku_tts, "requests", "count")),
+                         ("gemini-3.8-flash-tts", None, "output_tokens"))
+        sku_img = "Gemini 2.5 Flash Image Output - Predictions"
+        img = models.parse_sku(sku_img, "Vertex AI")
+        self.assertEqual((img["key"], models.classify_measure(sku_img, "requests", "count")),
+                         ("gemini-2.5-flash-image", "output_tokens"))
+        self.assertEqual(models.normalize_model_id("Gemini 2.5 Flash Native Image"), "gemini-2.5-flash-image")
+        self.assertEqual(models.normalize_model_id("Gemini 3.8 Flash-TTS*through December 31, 2026"),
+                         "gemini-3.8-flash-tts")
+        self.assertTrue(models.is_non_token_model("veo-3.1-generate-001"))
+        self.assertTrue(models.is_non_token_model("lyria-3-pro-preview"))
+        self.assertTrue(models.is_non_token_model("imagen-4"))
+        self.assertFalse(models.is_non_token_model("gemini-3.8-flash-tts"))
+        self.assertFalse(models.is_non_token_model("gemini-3.1-flash-image"))
+
 
 class CatalogSnapshotTest(unittest.TestCase):
     def _manager(self):

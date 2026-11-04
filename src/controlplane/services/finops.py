@@ -280,6 +280,7 @@ def token_estimated_spend(ctx, rng, project, currency=None):
     cur_skus = {}
     cur_tokens = {"input": 0, "output": 0, "cached": 0, "total": 0}
     unpriced = {}
+    media_models = set()
     patterns = ctx.excluded_patterns
 
     def add_line(day, raw_id, service_name, kind, tok_count):
@@ -287,6 +288,10 @@ def token_estimated_spend(ctx, rng, project, currency=None):
             return
         norm_key, rate_info = pricing_sync.lookup_model_rate(rates, raw_id, aliases)
         if is_excluded(norm_key.replace("-", " "), patterns) or is_excluded(service_name, patterns):
+            return
+        if models_service.is_non_token_model(norm_key):
+            if rng.contains(day):
+                media_models.add(norm_key)
             return
         model_label = (rate_info or {}).get("label") or models_service.display_name_for_id(raw_id) or norm_key
         unit_per_m = (rate_info or {}).get(kind)
@@ -342,6 +347,7 @@ def token_estimated_spend(ctx, rng, project, currency=None):
     meta = dict(pricing_sync.pricing_alert_summary(getattr(ctx.app, "settings", None)),
                 costSource="token_estimate", currency=target_currency, supportedCurrencies=currencies, fx=fx,
                 tokens=cur_tokens, schedule=pricing_sync.schedule_info(ctx.settings),
+                mediaModels=sorted(media_models),
                 unpricedModels=[{"model": k, "tokens": v} for k, v in sorted(unpriced.items(), key=lambda kv: -kv[1])])
     return {"daily": daily, "sku_costs": sku_costs, "services": cur_services,
             "skus": list(cur_skus.values()), "currency": target_currency, "fx": fx, "meta": meta}

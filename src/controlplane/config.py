@@ -226,9 +226,12 @@ DEFAULTS = {
             "https://aistudio.google.com/docs/pricing.md",
             "https://ai.google.dev/gemini-api/docs/pricing",
             "https://cloud.google.com/vertex-ai/generative-ai/pricing",
+            "https://cloud.google.com/text-to-speech/pricing",
+            "https://cloud.google.com/speech-to-text/pricing",
         ],
         "fx_sources": ["https://open.er-api.com/v6/latest/USD", "https://api.frankfurter.dev/v1/latest?base=USD"],
-        "catalog_services": ["Vertex AI", "Agent Platform", "Gemini API"],  # Billing Catalog display names
+        "catalog_services": ["Vertex AI", "Agent Platform", "Gemini API",
+                             "Cloud Text-to-Speech API", "Cloud Speech API"],  # Billing Catalog display names
         "include_partner_models": True,     # partner models billed under their own service (for example Claude)
         "storage_service": "BigQuery",      # Billing Catalog service used for routing cost estimates
         "model_aliases": [],                # "my-tuned-model=gemini-2.5-flash"

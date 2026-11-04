@@ -214,6 +214,7 @@ def estimate_cost(rec, pricing):
     partial is True when some tokens belong to a model without a price (those tokens add nothing)."""
     if not pricing.configured:
         return None, False
+    from . import models as models_service
     parts = list((rec.get("byModel") or {}).items()) or [(None, rec)]
     total = 0.0
     partial = False
@@ -221,6 +222,8 @@ def estimate_cost(rec, pricing):
     used_tokens = 0
     for model, agg in parts:
         tokens = to_int(agg.get("tokens"))
+        if model and models_service.is_non_token_model(model):
+            continue
         prompt = max(0, to_int(agg.get("promptTokens")))
         output = max(tokens - prompt, to_int(agg.get("candidateTokens")), 0)
         pin, pout, priced = pricing.price(model)

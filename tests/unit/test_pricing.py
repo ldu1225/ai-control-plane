@@ -43,6 +43,28 @@ class SkuSelectionTest(unittest.TestCase):
                      "Gemini Code Assist monthly subscription"):
             self.assertIsNone(pricing.token_sku(desc), desc)
 
+    def test_modality_model_token_skus_and_free_tier_skipping(self):
+        self.assertEqual(
+            pricing.model_token_sku(" Cloud TTS API audio output token count for Gemini 3.8 Flash ",
+                                    "Cloud Text-to-Speech API")[:2],
+            ("gemini-3.8-flash-tts", "output"),
+        )
+        self.assertEqual(
+            pricing.model_token_sku("Gemini 3.8 Live Audio Output - Online Predictions", "Vertex AI")[:2],
+            ("gemini-3.8-live", "output"),
+        )
+        self.assertEqual(
+            pricing.model_token_sku("Gemini 3.1 Flash Image Image Output - Predictions", "Vertex AI")[:2],
+            ("gemini-3.1-flash-image", "output"),
+        )
+        self.assertIsNone(pricing.model_token_sku("Veo 3 Audio Video Generation", "Vertex AI"))
+        tiers = [
+            {"startUsageAmount": 0, "unitPrice": {"units": "0", "nanos": 0}},
+            {"startUsageAmount": 1000, "unitPrice": {"units": "0", "nanos": 20000}},
+            {"startUsageAmount": 2000000, "unitPrice": {"units": "0", "nanos": 5000}},
+        ]
+        self.assertAlmostEqual(pricing.first_positive_money(tiers), 2e-05, places=9)
+
 
 class EffectivePriceTest(unittest.TestCase):
     def test_weighted_price_per_million_and_product_fallback(self):

@@ -34,7 +34,7 @@ RELOAD_SECONDS = 30
 ACCOUNT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._@\-]{1,127}$")
 EMPTY_AUTH = {"requests": [], "lastLogin": {}, "revoked": {}, "accounts": {}}
 EMPTY_GOVERNANCE = {"exceptions": [], "suspensions": [], "notified": {}, "lastRun": None, "lastScheduledRun": None}
-EMPTY_PRICING = {"syncedAt": None, "syncedBy": None, "trigger": None, "fx": None, "models": {},
+EMPTY_PRICING = {"syncedAt": None, "syncedBy": None, "trigger": None, "fx": None, "models": {}, "unitPrices": [],
                  "sources": [], "alerts": [], "lastError": None, "catalogServices": [], "storage": None}
 EMPTY_DOC = {"version": 1, "overrides": {}, "connectors": [], "updatedAt": None, "updatedBy": None,
              "auth": EMPTY_AUTH, "governance": EMPTY_GOVERNANCE, "pricing": EMPTY_PRICING}
@@ -250,12 +250,30 @@ def sanitize_pricing(state):
                    "ingestPerGiB": _opt_num(raw_storage.get("ingestPerGiB"), 0.0, 1e6),
                    "storagePerGiBMonth": _opt_num(raw_storage.get("storagePerGiBMonth"), 0.0, 1e6),
                    "source": _opt_str(raw_storage.get("source"), 60), "updatedAt": _opt_str(raw_storage.get("updatedAt"), 40)}
+    unit_prices = []
+    for u in (state.get("unitPrices") or [])[:200]:
+        if not isinstance(u, dict):
+            continue
+        ukey = _opt_str(u.get("key"), 120)
+        usd_p = _opt_num(u.get("usdPrice"), 0.0, 1e6)
+        if not ukey or usd_p is None:
+            continue
+        unit_prices.append({
+            "key": ukey,
+            "category": _opt_str(u.get("category"), 60) or "Other",
+            "label": _opt_str(u.get("label"), 160) or ukey,
+            "service": _opt_str(u.get("service"), 120) or "",
+            "unit": _opt_str(u.get("unit"), 40) or "unit",
+            "usdPrice": round(usd_p, 6),
+            "source": _opt_str(u.get("source"), 60) or "cloud_billing_catalog",
+        })
     return {
         "syncedAt": _opt_str(state.get("syncedAt"), 40),
         "syncedBy": _opt_str(state.get("syncedBy"), 200),
         "trigger": _opt_str(state.get("trigger"), 40),
         "fx": _sanitize_fx(state.get("fx")),
         "models": models,
+        "unitPrices": unit_prices,
         "sources": sources,
         "alerts": alerts,
         "lastError": _opt_str(state.get("lastError"), 240),

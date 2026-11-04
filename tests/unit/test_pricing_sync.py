@@ -314,5 +314,121 @@ class MaintenanceTickTest(unittest.TestCase):
         self.assertEqual(maintenance.tick(app), {"skipped": "workspace not configured"})
 
 
+class MultimodalAndUnitPricingTest(unittest.TestCase):
+    def test_tts_and_rowspan_html_tables_with_effective_dates(self):
+        html = """
+        <table>
+          <tr><th>Model</th><th>Price (USD)</th></tr>
+          <tr>
+            <td>Gemini 3.8 Flash-TTS<br>*through December 31, 2026</td>
+            <td>Input tokens: $0.50 / 1M tokens<br>Output tokens: $10.00 / 1M tokens</td>
+          </tr>
+          <tr>
+            <td>Gemini 3.8 Flash-TTS<br>starting January 1, 2027</td>
+            <td>Input tokens: $1.00 / 1M tokens<br>Output tokens: $20.00 / 1M tokens</td>
+          </tr>
+        </table>
+        <table>
+          <tr><th>Model</th><th>Type</th><th>&lt;= 200K</th></tr>
+          <tr><td>Gemini 3.1 Flash Image</td><td>Input (text, image)</td><td>$0.50</td></tr>
+          <tr><td>Output (image)</td><td>$60.00</td></tr>
+        </table>
+        <table>
+          <tr><th>Batch Model</th><th>Input</th><th>Output</th></tr>
+          <tr><td>Gemini 3.1 Flash Image</td><td>$0.25</td><td>$30.00</td></tr>
+        </table>
+        """
+        active_2026 = pricing_sync.parse_html_table_pricing(
+            html, source="page:cloud.google.com/text-to-speech", today=dt.date(2026, 11, 4)
+        )
+        self.assertEqual(active_2026["gemini-3.8-flash-tts"]["input"], 0.50)
+        self.assertEqual(active_2026["gemini-3.8-flash-tts"]["output"], 10.00)
+        self.assertEqual(active_2026["gemini-3.1-flash-image"]["input"], 0.50)
+        self.assertEqual(active_2026["gemini-3.1-flash-image"]["output"], 60.00)
+
+        active_2027 = pricing_sync.parse_html_table_pricing(
+            html, source="page:cloud.google.com/text-to-speech", today=dt.date(2027, 2, 1)
+        )
+        self.assertEqual(active_2027["gemini-3.8-flash-tts"]["input"], 1.00)
+        self.assertEqual(active_2027["gemini-3.8-flash-tts"]["output"], 20.00)
+
+    def test_valid_token_entry_rejects_polluted_and_non_token_keys(self):
+        self.assertFalse(pricing_sync.valid_token_entry("gemini-3.8-flash-gemini-3.8-pro", {"input": 1.0, "output": 2.0}))
+        self.assertFalse(pricing_sync.valid_token_entry("veo-3.1-generate", {"input": 1.0, "output": 2.0}))
+        self.assertTrue(pricing_sync.valid_token_entry("gemini-3.8-flash-tts", {"input": 1.0, "output": 20.0}))
+
+    def test_catalog_extracts_unit_prices_and_excludes_media_from_unpriced_warnings(self):
+        from controlplane.services import finops
+        from controlplane import timeutil
+
+        skus_by_svc = {
+            "vertex": [
+                catalog_sku("Veo 3.1 Video plus Audio Output", 0.40, unit="s"),
+                catalog_sku("Lyria 3 Pro Output", 0.08, unit="count"),
+                catalog_sku("Imagen 4 Image Generation", 0.04, unit="count"),
+                catalog_sku("Gemini 3.8 Live Audio Input - Online Predictions", 3e-06, unit="count"),
+                catalog_sku("Gemini 3.8 Live Audio Output - Online Predictions", 1.2e-05, unit="count"),
+            ],
+            "tts": [
+                catalog_sku(" Cloud TTS API audio output token count for Gemini 3.8 Flash ", 2e-05, unit="count"),
+                catalog_sku("Cloud TTS API text input token count for Gemini 3.8 Flash", 1e-06, unit="count"),
+                catalog_sku("Chirp 3: HD Voices", 3e-05, unit="char"),
+            ],
+            "stt": [
+                catalog_sku("Speech-to-Text V2 Dynamic Batch", 0.016, unit="min"),
+            ],
+        }
+        class UnitCatalogCtx(support.FakeCtx):
+            def rest(self, method, url, **_kw):
+                return {"skus": skus_by_svc[url.split("/services/")[1].split("/")[0]]}
+
+        services = [
+            {"id": "vertex", "name": "Vertex AI"},
+            {"id": "tts", "name": "Cloud Text-to-Speech API"},
+            {"id": "stt", "name": "Cloud Speech API"},
+        ]
+        token_entries, unit_list, _ = pricing_sync.catalog_prices_and_units(UnitCatalogCtx(), services)
+        self.assertEqual((token_entries["gemini-3.8-flash-tts"]["input"], token_entries["gemini-3.8-flash-tts"]["output"]),
+                         (1.0, 20.0))
+        self.assertEqual((token_entries["gemini-3.8-live"]["input"], token_entries["gemini-3.8-live"]["output"]),
+                         (3.0, 12.0))
+        cats = {u["category"]: u for u in unit_list}
+        self.assertAlmostEqual(cats["Video"]["usdPrice"], 0.40, places=6)
+        self.assertAlmostEqual(cats["Audio / Music"]["usdPrice"], 0.08, places=6)
+        self.assertAlmostEqual(cats["Image"]["usdPrice"], 0.04, places=6)
+        self.assertAlmostEqual(cats["Text-to-Speech"]["usdPrice"], 30.0, places=6)  # $0.00003/char * 1M chars
+        self.assertAlmostEqual(cats["Speech-to-Text"]["usdPrice"], 0.016, places=6)
+
+        app = make_app()
+        saved_models = {k: dict(v, source="cloud_billing_catalog") for k, v in token_entries.items()}
+        app.settings.mutate_pricing(
+            lambda s: s.update(models=saved_models, unitPrices=unit_list,
+                               fx={"base": "USD", "rates": {"USD": {"rate": 1.0, "source": "identity"}}}),
+            "test",
+        )
+        # Verify sanitize_pricing preserves unitPrices across state reloads
+        app.settings.mutate_pricing(lambda s: s, "test")
+        self.assertEqual(len(app.settings.pricing_state()["unitPrices"]), 5)
+        fctx = support.FakeCtx(settings=app.settings.snapshot()[0])
+        fctx.app = app
+        rng = timeutil.parse_range({"start": "2026-10-18", "end": "2026-10-19"}, "UTC", 14)
+        d19 = dt.date(2026, 10, 19)
+        fake_mon = {
+            "gemini-3.8-flash-tts-001": {"input": {d19: 100_000}, "output": {d19: 500_000},
+                                         "cached": {d19: 0}, "total": {d19: 600_000}},
+            "veo-3.1-generate-001": {"input": {d19: 50}, "output": {d19: 1000},
+                                     "cached": {d19: 0}, "total": {d19: 1050}},
+            "lyria-3-pro-preview": {"input": {d19: 20}, "output": {d19: 400},
+                                    "cached": {d19: 0}, "total": {d19: 420}},
+        }
+        with mock.patch("controlplane.services.monitoring.token_counts", return_value=(fake_mon, True)), \
+                mock.patch("controlplane.services.finops._agy_daily_model_tokens", return_value=({}, None)):
+            est = finops.token_estimated_spend(fctx, rng, "all", "USD")
+        self.assertEqual(est["meta"]["unpricedModels"], [])
+        self.assertEqual(est["meta"]["mediaModels"], ["lyria-3-pro", "veo-3.1-generate"])
+        self.assertAlmostEqual(sum(r["cost"] for r in est["skus"]), 0.1 + 10.0, places=6)
+
+
 if __name__ == "__main__":
     unittest.main()
+

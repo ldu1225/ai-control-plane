@@ -48,17 +48,25 @@ MAX_HTTP_BYTES = 3 * 1024 * 1024
 HTTP_TIMEOUT_SECONDS = 15
 MAX_CATALOG_SERVICE_PAGES = 4
 MAX_SKU_PAGES = 8
-# A per-token price above this is a per-request/per-clip SKU, not a text token rate (USD per 1M tokens).
+# A per-token price above this is a per-request/per-clip SKU, not a token rate (USD per 1M tokens).
 MAX_TOKEN_USD_PER_MILLION = 500.0
 
 DOLLAR_RE = re.compile(r"\$\s*(\d+(?:\.\d+)?)")
+INPUT_TOK_PRICE_RE = re.compile(r"(?i)input(?:\s*\([^)]*\))?\s*tokens?\s*:\s*\$\s*(\d+(?:\.\d+)?)")
+OUTPUT_TOK_PRICE_RE = re.compile(r"(?i)output(?:\s*\([^)]*\))?\s*tokens?\s*:\s*\$\s*(\d+(?:\.\d+)?)")
 HEADING_RE = re.compile(r'^##\s+(.+?)(?:\s+\{%\s*id=(?:"|&quot;)([^"&]+)(?:"|&quot;)\s*%\})?\s*$', re.MULTILINE)
 TAB_RE = re.compile(r'\{%\s*tab\s+title=(?:"|&quot;)([^"&]+)(?:"|&quot;)\s*%\}(.*?)\{%\s*/tab\s*%\}', re.DOTALL)
 TABLE_BLOCK_RE = re.compile(r"\{%\s*table\s*%\}(.*?)\{%\s*/table\s*%\}", re.DOTALL)
 NOSCRIPT_PRE_RE = re.compile(r"<noscript>\s*<pre>(.*?)</pre>\s*</noscript>", re.DOTALL | re.IGNORECASE)
-# Words of price-page sections that are not text-token models (images, audio, video, music, robotics).
-NON_TEXT_MODEL_WORDS = ("image", "banana", "tts", "transcribe", "live", "native-audio", "robotics",
-                        "veo", "imagen", "lyria", "music", "song", "clip", "track", "chirp")
+MONTH_NUMS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+              "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+SCHEDULE_DATE_RE = re.compile(
+    r"(?i)(?:\b|(?<=[a-z0-9]))(through|starting|effective)\s+"
+    r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+    r"sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2}),?\s+(\d{4})"
+)
+# Words of price-page sections that are non-token media or image-only Markdoc sections without input+output tables.
+NON_TEXT_MODEL_WORDS = ("image", "banana", "robotics", "veo", "imagen", "lyria", "music", "song", "clip", "track", "chirp")
 
 
 # ---------------------------------------------------------------------------
@@ -177,18 +185,60 @@ def make_fetcher(hosts):
     return fetch
 
 
+def _page_source_id(url):
+    parsed = urllib.parse.urlparse(url or "")
+    host = (parsed.hostname or "page").lower()
+    path = (parsed.path or "").strip("/").lower()
+    if host == "cloud.google.com" and path:
+        first = path.split("/", 1)[0]
+        if first in ("text-to-speech", "speech-to-text"):
+            return "page:%s/%s" % (host, first)
+    return "page:%s" % host
+
+
 # ---------------------------------------------------------------------------
 # Price page parsers
 # ---------------------------------------------------------------------------
 
-def _first_usd(text):
+def _schedule_active(text, today=None):
+    """False when `text` carries an explicit effective-date window ('through Dec 31, 2026' or 'starting Jan 1, 2027')
+    that does not include `today`."""
+    if not text:
+        return True
+    m = SCHEDULE_DATE_RE.search(text)
+    if not m:
+        return True
+    kind = m.group(1).lower()
+    mon = MONTH_NUMS.get(m.group(2)[:3].lower())
+    try:
+        bound = dt.date(int(m.group(4)), mon, int(m.group(3)))
+    except (TypeError, ValueError):
+        return True
+    today = today or dt.datetime.now(dt.timezone.utc).date()
+    if kind == "through":
+        return today <= bound
+    return today >= bound
+
+
+def _first_usd(text, prefer_audio=False, allow_media=False):
     if not text or "not available" in text.lower():
         return None
+    if prefer_audio:
+        for line in text.splitlines():
+            low = line.lower()
+            if "storage price" in low or "> 200k" in low or ">200k" in low or "&gt; 200k" in low:
+                continue
+            if "audio" in low:
+                m = DOLLAR_RE.search(line)
+                if m:
+                    val = to_float(m.group(1))
+                    if val is not None and 0.0 <= val <= 10000.0:
+                        return val
     for line in text.splitlines():
         low = line.lower()
         if "storage price" in low or "> 200k" in low or ">200k" in low or "&gt; 200k" in low:
             continue
-        if "(audio" in low or "(video" in low or "(image" in low:
+        if not allow_media and ("(audio" in low or "(video" in low or "(image" in low):
             continue
         m = DOLLAR_RE.search(line)
         if m:
@@ -204,7 +254,7 @@ def _first_usd(text):
 
 
 def parse_markdoc_pricing(raw_text, source="public_page"):
-    """Standard (online, <= 200K context) text token prices from Markdoc/Markdown price pages."""
+    """Standard (online, <= 200K context) token prices from Markdoc/Markdown price pages."""
     if not raw_text:
         return {}
     ns = NOSCRIPT_PRE_RE.search(raw_text)
@@ -221,8 +271,11 @@ def parse_markdoc_pricing(raw_text, source="public_page"):
         if any(w in ident for w in NON_TEXT_MODEL_WORDS):
             continue
         key = models.normalize_model_id(raw_id) if raw_id else models.model_key(models.family_name(raw_title))
-        if not key or not models.parse_sku(key.replace("-", " ")):
+        if not key or models.is_non_token_model(key) or not models.parse_sku(key.replace("-", " ")):
             continue
+        is_tts = key.endswith("-tts") or "-tts-" in key
+        is_audio = key.endswith("-live") or "-live-" in key or "native-audio" in key
+        is_transcribe = "transcribe" in key and "translate" not in key
         target_block = section
         tabs = TAB_RE.findall(section)
         if tabs:
@@ -251,15 +304,15 @@ def parse_markdoc_pricing(raw_text, source="public_page"):
             feature = bullets[0].lower()
             paid_cell = bullets[-1]
             if "input price" in feature and "caching" not in feature:
-                inp_price = _first_usd(paid_cell)
+                inp_price = _first_usd(paid_cell, prefer_audio=(is_audio or is_transcribe))
             elif "output price" in feature:
-                out_price = _first_usd(paid_cell)
+                out_price = _first_usd(paid_cell, prefer_audio=(is_tts or is_audio))
             elif "context caching" in feature or "caching price" in feature:
-                cache_price = _first_usd(paid_cell)
-        if inp_price is not None or out_price is not None:
-            label = models.display_name_for_id(raw_id) if raw_id else (raw_title or models.display_from_key(key))
-            parsed[key] = {"input": inp_price, "output": out_price, "cached": cache_price, "source": source,
-                           "label": label}
+                cache_price = _first_usd(paid_cell, prefer_audio=(is_audio or is_transcribe))
+        entry = {"input": inp_price, "output": out_price, "cached": cache_price, "source": source,
+                 "label": models.display_name_for_id(raw_id) if raw_id else (raw_title or models.display_from_key(key))}
+        if valid_token_entry(key, entry):
+            parsed[key] = entry
     return parsed
 
 
@@ -267,6 +320,8 @@ class _SimpleTableParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.rows = []
+        self.tables = []
+        self._cur_table = None
         self._in_row = False
         self._in_cell = False
         self._cur_row = []
@@ -274,30 +329,97 @@ class _SimpleTableParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         t = tag.lower()
-        if t == "tr":
+        if t == "table":
+            self._cur_table = []
+        elif t == "tr":
             self._in_row = True
             self._cur_row = []
         elif t in ("td", "th") and self._in_row:
             self._in_cell = True
             self._cur_cell = []
+        elif self._in_cell and t in ("br", "p", "div", "li"):
+            self._cur_cell.append(" ")
 
     def handle_endtag(self, tag):
         t = tag.lower()
         if t in ("td", "th") and self._in_cell:
             self._in_cell = False
             self._cur_row.append(" ".join("".join(self._cur_cell).split()))
+        elif t in ("p", "div", "li") and self._in_cell:
+            self._cur_cell.append(" ")
         elif t == "tr" and self._in_row:
             self._in_row = False
             if self._cur_row:
                 self.rows.append(self._cur_row)
+                if self._cur_table is not None:
+                    self._cur_table.append(self._cur_row)
+        elif t == "table":
+            if self._cur_table:
+                self.tables.append(self._cur_table)
+            self._cur_table = None
 
     def handle_data(self, data):
         if self._in_cell:
             self._cur_cell.append(data)
 
 
-def parse_html_table_pricing(html_text, source="public_page"):
-    """Standard text input/output prices (USD per 1M tokens) from HTML price tables."""
+def _parse_rowspan_model_table(table_rows, source, today, out):
+    """Parses Vertex AI style `[Model, Type, <= 200K price, ...]` rowspan tables."""
+    cur_info = None
+    cur_active = True
+    acc = {}
+    for row in table_rows[1:]:
+        if not row:
+            continue
+        first_low = row[0].lower()
+        is_metric_cell = any(w in first_low for w in ("input", "output", "caching", "cached", "grounding"))
+        cand = None if is_metric_cell else models.parse_sku(row[0])
+        if cand and not cand.get("product") and not models.is_non_token_model(cand["key"]):
+            cur_info = cand
+            cur_active = _schedule_active(row[0], today)
+            type_cell = row[1] if len(row) > 1 else ""
+            price_cell = row[2] if len(row) > 2 else ""
+        elif cur_info is not None and len(row) >= 2:
+            type_cell = row[0]
+            price_cell = row[1]
+        else:
+            continue
+        if not cur_active:
+            continue
+        val = _first_usd(price_cell, allow_media=True)
+        if val is None or val > MAX_TOKEN_USD_PER_MILLION:
+            continue
+        key = cur_info["key"]
+        tlow = type_cell.lower()
+        rec = acc.setdefault(key, {"label": cur_info["name"], "source": source})
+        is_tts = key.endswith("-tts") or "-tts-" in key
+        is_live = key.endswith("-live") or "-live-" in key or "native-audio" in key
+        is_transcribe = "transcribe" in key and "translate" not in key
+        is_img = key.endswith("-image") or "-image-" in key or "banana" in key
+        if "cach" in tlow and "storage" not in tlow:
+            prefer = "audio" in tlow if (is_live or is_transcribe) else "audio" not in tlow
+            if prefer or rec.get("cached") is None:
+                rec["cached"] = val
+        elif "input" in tlow and "cach" not in tlow:
+            prefer = "audio" in tlow if (is_live or is_transcribe) else ("text" in tlow or "audio" not in tlow)
+            if prefer or rec.get("input") is None:
+                rec["input"] = val
+        elif "output" in tlow:
+            if is_tts or is_live:
+                prefer = "audio" in tlow
+            elif is_img:
+                prefer = "image" in tlow
+            else:
+                prefer = "text" in tlow or ("audio" not in tlow and "image" not in tlow)
+            if prefer or rec.get("output") is None:
+                rec["output"] = val
+    for key, rec in acc.items():
+        if valid_token_entry(key, rec):
+            out.setdefault(key, rec)
+
+
+def parse_html_table_pricing(html_text, source="public_page", today=None):
+    """Standard online input/output prices (USD per 1M tokens) from HTML price tables."""
     if not html_text or "<table" not in html_text.lower():
         return {}
     parser = _SimpleTableParser()
@@ -306,22 +428,48 @@ def parse_html_table_pricing(html_text, source="public_page"):
     except Exception:  # pylint: disable=broad-except
         return {}
     out = {}
-    for row in parser.rows:
-        if len(row) < 3:
+    svc_hint = "Cloud Text-to-Speech API" if "text-to-speech" in (source or "") else None
+    tables = parser.tables or ([parser.rows] if parser.rows else [])
+    for table_rows in tables:
+        if not table_rows:
             continue
-        first = row[0]
-        low = first.lower()
-        if any(w in low for w in NON_TEXT_MODEL_WORDS) or "batch" in low or "> 200k" in low or ">200k" in low:
+        hdr_low = " ".join(table_rows[0]).lower()
+        if any(w in hdr_low for w in ("priority", "flex", "batch", "provisioned")):
             continue
-        info = models.parse_sku(first)
-        if not info or info.get("product"):
+        if len(table_rows[0]) >= 3 and "type" in table_rows[0][1].lower() and "model" in table_rows[0][0].lower():
+            _parse_rowspan_model_table(table_rows, source, today, out)
             continue
-        key = info["key"]
-        prices = [p for p in (_first_usd(c) for c in row[1:]) if p is not None]
-        if len(prices) >= 2:
-            out.setdefault(key, {"input": prices[0], "output": prices[1],
-                                 "cached": prices[2] if len(prices) >= 3 and prices[2] < prices[0] else None,
-                                 "source": source, "label": info["name"]})
+        for row in table_rows:
+            if len(row) < 2 or not _schedule_active(row[0], today):
+                continue
+            first = row[0]
+            rest_text = " ".join(row[1:])
+            in_m = INPUT_TOK_PRICE_RE.search(rest_text)
+            out_m = OUTPUT_TOK_PRICE_RE.search(rest_text)
+            if in_m or out_m:
+                info = models.parse_sku(first, svc_hint)
+                if info and not info.get("product") and not models.is_non_token_model(info["key"]):
+                    entry = {"input": to_float(in_m.group(1)) if in_m else None,
+                             "output": to_float(out_m.group(1)) if out_m else None,
+                             "cached": None, "source": source, "label": info["name"]}
+                    if valid_token_entry(info["key"], entry):
+                        out.setdefault(info["key"], entry)
+                continue
+            if len(row) < 3:
+                continue
+            low = first.lower()
+            if any(w in low for w in NON_TEXT_MODEL_WORDS) or "batch" in low or "> 200k" in low or ">200k" in low:
+                continue
+            info = models.parse_sku(first)
+            if not info or info.get("product") or models.is_non_token_model(info["key"]):
+                continue
+            prices = [p for p in (_first_usd(c) for c in row[1:]) if p is not None]
+            if len(prices) >= 2:
+                entry = {"input": prices[0], "output": prices[1],
+                         "cached": prices[2] if len(prices) >= 3 and prices[2] < prices[0] else None,
+                         "source": source, "label": info["name"]}
+                if valid_token_entry(info["key"], entry):
+                    out.setdefault(info["key"], entry)
     return out
 
 
@@ -331,8 +479,12 @@ def parse_price_page(text, source):
 
 
 def valid_token_entry(key, item):
-    """True for a realistic per-1M-token text rate (not a per-clip/per-image media SKU)."""
-    if not isinstance(item, dict) or not key:
+    """True for a realistic per-1M-token model rate with a clean normalized model id."""
+    if not isinstance(item, dict) or not key or not config.MODEL_ID_RE.match(key):
+        return False
+    if models.is_non_token_model(key):
+        return False
+    if sum(1 for p in key.split("-") if p in models.FAMILIES and p != "embedding") > 1:
         return False
     vals = [to_float(item.get(k)) for k in ("input", "output")]
     if all(v is None for v in vals):
@@ -364,8 +516,8 @@ def list_catalog_services(ctx):
 
 
 def select_model_services(services, settings):
-    """Catalog services that bill model tokens: display names matching pricing.catalog_services, plus partner
-    model services (a service named after a model, for example "Claude Sonnet 4.5") when enabled."""
+    """Catalog services that bill model tokens or AI media/speech units: display names matching
+    pricing.catalog_services, plus partner model services when enabled."""
     p = _pricing_settings(settings)
     patterns = [s.lower() for s in p.get("catalog_services") or [] if s]
     out = []
@@ -407,51 +559,122 @@ def _service_skus(ctx, service_id, currency="USD", max_pages=MAX_SKU_PAGES):
             break
 
 
-def _service_model_rows(ctx, svc):
-    """[(key, direction, rank, per_million_usd, label)] for the token SKUs of one catalog service."""
-    rows = []
+def _clean_unit_label(desc):
+    txt = re.sub(r"(?i)\s*-\s*(?:online\s+)?predictions?\s*$", "", (desc or "").strip())
+    txt = re.sub(r"(?i)\s+(?:in|across)\s+[a-z0-9\-]+(?:\s+region)?\s*$", "", txt)
+    return " ".join(txt.split())
+
+
+def _extract_unit_price(desc, svc_name, pexpr):
+    """(unit_key, category, label, service, unit_label, usd_price) for non-token AI media & speech SKUs, else None."""
+    tiers = pexpr.get("tieredRates") or []
+    raw_price = pricing.first_positive_money(tiers)
+    if raw_price <= 0:
+        return None
+    unit = (pexpr.get("usageUnit") or "").lower()
+    udesc = (pexpr.get("usageUnitDescription") or "").lower()
+    factor = float(pexpr.get("baseUnitConversionFactor") or 1)
+    low = (desc or "").lower()
+    svc_low = (svc_name or "").lower()
+    if any(w in low for w in ("offline", "priority", "flex", "provisioned", "commit", "training", "tuning",
+                              "storage", "upscal", "edit", "custom voice")):
+        return None
+    label = _clean_unit_label(desc)
+    if not label:
+        return None
+    if "veo" in low and unit == "s" and "batch" not in low:
+        return ("veo:" + models.model_key(label), "Video", label, svc_name, "second", raw_price)
+    if "lyria" in low and unit == "count" and "token" not in low and raw_price >= 0.005:
+        unit_lbl = "30s clip" if "lyria 2" in low else ("track" if "pro" in low else "clip")
+        return ("lyria:" + models.model_key(label), "Audio / Music", label, svc_name, unit_lbl, raw_price)
+    if "imagen" in low and unit == "count" and "token" not in low and raw_price >= 0.005 and "batch" not in low:
+        return ("imagen:" + models.model_key(label), "Image", label, svc_name, "image", raw_price)
+    if "text-to-speech" in svc_low and unit in ("count", "char", "character") and "token" not in low:
+        if "character" in low or "character" in udesc or "synthesize" in low or "voice" in low or unit in ("char", "character"):
+            per_1m = raw_price / factor * 1_000_000.0
+            if 0.1 <= per_1m <= 5000.0:
+                return ("tts:" + models.model_key(label), "Text-to-Speech", label, svc_name, "1M characters", per_1m)
+    if "speech" in svc_low and "text-to-speech" not in svc_low and unit in ("min", "s"):
+        per_min = raw_price if unit == "min" else raw_price * 60.0
+        if 0.0005 <= per_min <= 10.0:
+            return ("stt:" + models.model_key(label), "Speech-to-Text", label, svc_name, "minute", per_min)
+    return None
+
+
+def _service_catalog_rows(ctx, svc):
+    """([(key, direction, rank, per_million_usd, label)], [unit_row]) for one catalog service."""
+    rows, unit_rows = [], []
     for sku in _service_skus(ctx, svc["id"]):
         info = ((sku.get("pricingInfo") or [None])[0]) or {}
         pexpr = info.get("pricingExpression") or {}
         tiers = pexpr.get("tieredRates") or []
-        if pexpr.get("usageUnit") != "count" or not tiers:
+        if not tiers:
             continue
         desc = sku.get("description") or ""
-        hit = pricing.token_sku(desc, svc["name"], pexpr.get("usageUnit"), pexpr.get("usageUnitDescription"))
+        unit_hit = _extract_unit_price(desc, svc["name"], pexpr)
+        if unit_hit:
+            unit_rows.append(unit_hit)
+        if pexpr.get("usageUnit") != "count":
+            continue
+        hit = pricing.model_token_sku(desc, svc["name"], pexpr.get("usageUnit"), pexpr.get("usageUnitDescription"))
         if not hit:
-            hit = pricing.cached_token_sku(desc, svc["name"], pexpr.get("usageUnit"), pexpr.get("usageUnitDescription"))
+            hit = pricing.model_cached_token_sku(desc, svc["name"], pexpr.get("usageUnit"),
+                                                 pexpr.get("usageUnitDescription"))
         if not hit:
             continue
-        key, direction, prod = hit
-        per_million = pricing.money(tiers[-1].get("unitPrice")) / float(pexpr.get("baseUnitConversionFactor") or 1) * 1e6
+        key, direction, prod, mrank = hit
+        per_million = (pricing.first_positive_money(tiers)
+                       / float(pexpr.get("baseUnitConversionFactor") or 1) * 1e6)
         if per_million <= 0 or per_million > MAX_TOKEN_USD_PER_MILLION:
             continue
-        rank = (1 if prod else 0, 0 if "global" in desc.lower() else 1)
+        rank = (1 if prod else 0, mrank, 0 if "global" in desc.lower() else 1)
         label = (models.parse_sku(desc, svc["name"]) or {}).get("name") or models.display_from_key(key)
         rows.append((key, direction, rank, per_million, label))
-    return rows
+    return rows, unit_rows
 
 
-def catalog_model_prices(ctx, services):
-    """({key: {"input", "output", "cached", "label"}} USD per 1M tokens, {service name: SKUs used})."""
-    results = ctx.run({svc["id"]: (lambda s=svc: _service_model_rows(ctx, s)) for svc in services})
+def catalog_prices_and_units(ctx, services):
+    """({key: {"input", "output", "cached", "label"}}, [unit price dicts], {service name: SKUs used})."""
+    results = ctx.run({svc["id"]: (lambda s=svc: _service_catalog_rows(ctx, s)) for svc in services})
     candidates, labels, found = {}, {}, {}
+    unit_groups = {}
     for svc in services:
-        ok, rows = results.get(svc["id"], (False, None))
+        ok, pair = results.get(svc["id"], (False, None))
         if not ok:
-            if isinstance(rows, GcpError):
-                LOG.info("catalog SKUs of %s unavailable: %s", svc["name"], rows.kind)
+            if isinstance(pair, GcpError):
+                LOG.info("catalog SKUs of %s unavailable: %s", svc["name"], pair.kind)
             found[svc["name"]] = 0
             continue
-        found[svc["name"]] = len(rows)
+        rows, unit_rows = pair
+        found[svc["name"]] = len(rows) + len(unit_rows)
         for key, direction, rank, per_million, label in rows:
             candidates.setdefault((key, direction), []).append((rank, per_million))
             labels.setdefault(key, label)
+        for ukey, cat, ulabel, sname, uunit, uprice in unit_rows:
+            grp = unit_groups.setdefault(ukey, {"key": ukey, "category": cat, "label": ulabel,
+                                                "service": sname, "unit": uunit, "prices": []})
+            grp["prices"].append(uprice)
     out = {}
     for (key, direction), items in candidates.items():
         best = min(rank for rank, _ in items)
         out.setdefault(key, {"label": labels.get(key) or models.display_from_key(key)})[direction] = round(
             statistics.median(sorted(p for r, p in items if r == best)), 6)
+    unit_prices = []
+    for ukey in sorted(unit_groups):
+        grp = unit_groups[ukey]
+        unit_prices.append({
+            "key": grp["key"], "category": grp["category"], "label": grp["label"],
+            "service": grp["service"], "unit": grp["unit"],
+            "usdPrice": round(statistics.median(sorted(grp["prices"])), 6),
+            "source": "cloud_billing_catalog",
+        })
+    unit_prices.sort(key=lambda x: (x["category"], x["label"]))
+    return out, unit_prices, found
+
+
+def catalog_model_prices(ctx, services):
+    """({key: {"input", "output", "cached", "label"}} USD per 1M tokens, {service name: SKUs used})."""
+    out, _units, found = catalog_prices_and_units(ctx, services)
     return out, found
 
 
@@ -602,7 +825,7 @@ def diff_snapshots(prev_state, new_models, new_fx, now_str, settings=None):
             if abs(pct) >= fx_pct:
                 alerts.append(_alert(now_str, "fx", "USD/%s" % cur, "USD/%s" % cur, "rate", round(before, 4),
                                      round(after, 4), round(pct, 2), cur, item.get("source")))
-    prev_models = prev_state.get("models") or {}
+    prev_models = {k: v for k, v in (prev_state.get("models") or {}).items() if valid_token_entry(k, v)}
     for key, cur in sorted((new_models or {}).items()):
         old = prev_models.get(key)
         label = cur.get("label") or models.display_from_key(key)
@@ -644,7 +867,7 @@ def sync_pricing(app, actor="system", trigger="manual", fetcher=None):
 
     # 1. Official Google price pages (fill models the catalog does not list yet).
     for url in p.get("public_sources") or []:
-        sid = "page:%s" % (urllib.parse.urlparse(url).hostname or "page")
+        sid = _page_source_id(url)
         try:
             found = parse_price_page(fetcher(url), source=sid)
             for key, entry in found.items():
@@ -662,6 +885,7 @@ def sync_pricing(app, actor="system", trigger="manual", fetcher=None):
     # 2. Cloud Billing Catalog list prices (official SKUs) win over page prices.
     catalog_services = list(prev_state.get("catalogServices") or [])
     storage = dict(prev_state.get("storage") or {}) or None
+    unit_prices = list(prev_state.get("unitPrices") or [])
     catalog_rates = {}
     currencies = wanted_currencies(settings)
     if getattr(app, "gcp", None) is not None and config.workspace_configured(settings):
@@ -670,7 +894,9 @@ def sync_pricing(app, actor="system", trigger="manual", fetcher=None):
             all_services = list_catalog_services(ctx)
             model_services = select_model_services(all_services, settings)
             catalog_services = model_services
-            cat_models, per_service = catalog_model_prices(ctx, model_services)
+            cat_models, cat_units, _per_service = catalog_prices_and_units(ctx, model_services)
+            if cat_units:
+                unit_prices = cat_units
             for key, entry in cat_models.items():
                 if not valid_token_entry(key, entry):
                     continue
@@ -707,7 +933,9 @@ def sync_pricing(app, actor="system", trigger="manual", fetcher=None):
     fx_obj = {"base": "USD", "rates": rates, "updatedAt": now_str}
 
     added_alerts = diff_snapshots(prev_state, merged, fx_obj, now_str, settings)
-    changed = merged != (prev_state.get("models") or {}) or rates != ((prev_state.get("fx") or {}).get("rates") or {})
+    changed = (merged != (prev_state.get("models") or {})
+               or unit_prices != (prev_state.get("unitPrices") or [])
+               or rates != ((prev_state.get("fx") or {}).get("rates") or {}))
 
     if settings_mgr is not None:
         def update(state):
@@ -715,7 +943,8 @@ def sync_pricing(app, actor="system", trigger="manual", fetcher=None):
             ids = {a.get("id") for a in existing}
             existing.extend(a for a in added_alerts if a["id"] not in ids)
             state.update({"syncedAt": now_str, "syncedBy": actor, "trigger": trigger, "fx": fx_obj,
-                          "models": merged, "sources": sources, "alerts": existing[-100:], "lastError": None,
+                          "models": merged, "unitPrices": unit_prices, "sources": sources,
+                          "alerts": existing[-100:], "lastError": None,
                           "catalogServices": catalog_services, "storage": storage})
             return state
 
@@ -726,8 +955,8 @@ def sync_pricing(app, actor="system", trigger="manual", fetcher=None):
             app.on_settings_changed()
     else:
         saved = {"syncedAt": now_str, "syncedBy": actor, "trigger": trigger, "fx": fx_obj, "models": merged,
-                 "sources": sources, "alerts": added_alerts, "lastError": None, "catalogServices": catalog_services,
-                 "storage": storage}
+                 "unitPrices": unit_prices, "sources": sources, "alerts": added_alerts, "lastError": None,
+                 "catalogServices": catalog_services, "storage": storage}
     return format_pricing_response(saved, settings, new_alerts_count=len(added_alerts))
 
 
@@ -844,11 +1073,14 @@ def pricing_alert_summary(settings_mgr):
             "unacknowledgedCount": len(unack), "alerts": unack[:10]}
 
 
-def format_pricing_response(state, settings, new_alerts_count=0):
+def format_pricing_response(state, settings, new_alerts_count=0, currency=None):
     state = state or {}
     p = _pricing_settings(settings)
     fx = state.get("fx") or {"base": "USD", "rates": {}}
-    display = (p.get("currency") or (((settings or {}).get("governance") or {}).get("antigravity") or {})
+    explicit_cur = (currency or "").strip().upper()
+    if not re.match(r"^[A-Z]{3}$", explicit_cur):
+        explicit_cur = ""
+    display = (explicit_cur or p.get("currency") or (((settings or {}).get("governance") or {}).get("antigravity") or {})
                .get("currency") or "USD").upper()
     display_rate = to_float(((fx.get("rates") or {}).get(display) or {}).get("rate")) if display != "USD" else 1.0
     overrides = {o["model"]: o for o in p.get("model_overrides") or []}
@@ -867,11 +1099,27 @@ def format_pricing_response(state, settings, new_alerts_count=0):
         model_rows.append({"key": key, "label": item.get("label") or models.display_from_key(key),
                            "vendor": models.vendor_for(item.get("label") or key), "source": item.get("source"),
                            "usdPerMillion": usd, "localPerMillion": local})
+    unit_rows = []
+    for u in state.get("unitPrices") or []:
+        if not isinstance(u, dict) or to_float(u.get("usdPrice")) is None:
+            continue
+        u_usd = float(u["usdPrice"])
+        unit_rows.append({
+            "key": u.get("key") or "",
+            "category": u.get("category") or "Media",
+            "label": u.get("label") or "",
+            "service": u.get("service") or "",
+            "unit": u.get("unit") or "unit",
+            "source": u.get("source") or "cloud_billing_catalog",
+            "usdPrice": u_usd,
+            "localPrice": round(u_usd * display_rate, 6) if display_rate else None,
+        })
     alerts = sorted(state.get("alerts") or [], key=lambda a: a.get("at") or "", reverse=True)
     return {
         "syncedAt": state.get("syncedAt"), "syncedBy": state.get("syncedBy"), "trigger": state.get("trigger"),
         "fx": fx, "displayCurrency": display, "displayRate": display_rate,
-        "models": model_rows, "sources": state.get("sources") or [], "storage": state.get("storage"),
+        "models": model_rows, "unitPrices": unit_rows,
+        "sources": state.get("sources") or [], "storage": state.get("storage"),
         "alerts": alerts[:50], "unacknowledgedCount": sum(1 for a in alerts if not a.get("acknowledgedAt")),
         "newAlertsCount": new_alerts_count,
         "schedule": dict(schedule_info(settings), enabled=True),
@@ -882,7 +1130,8 @@ def format_pricing_response(state, settings, new_alerts_count=0):
 def get_pricing(ctx):
     settings_mgr = getattr(ctx.app, "settings", None)
     state = settings_mgr.pricing_state() if settings_mgr is not None else {}
-    return format_pricing_response(state, ctx.settings)
+    req_cur = (ctx.params or {}).get("currency") if hasattr(ctx, "params") else None
+    return format_pricing_response(state, ctx.settings, currency=req_cur)
 
 
 def trigger_sync(ctx, scheduled=False):

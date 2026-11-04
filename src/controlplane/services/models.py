@@ -17,6 +17,13 @@ LOG = logging.getLogger("controlplane.models")
 
 QUALIFIER_RE = re.compile(r"(?i)(?:<=|>=|=<|=>|<|>|\u2264|\u2265|up to|over|above|below)\s*\d+(?:\.\d+)?\s*[km]\b"
                           r"(?:\s*(?:input\s+)?tokens?)?")
+FOOTNOTE_RE = re.compile(
+    r"(?i)(?:\*+.*|[\u00b9\u00b2\u00b3\u2070-\u2079]+.*"
+    r"|(?:\b|(?<=[a-z0-9]))(?:through|starting|effective)\s+"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+    r"sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b.*"
+    r"|\bwhen\s+.*)"
+)
 WORD_SPLIT_RE = re.compile(r"[\s_\-\u2013\u2014,:;/|\[\]{}]+")
 PAREN_RE = re.compile(r"\(([^)]*)\)")
 DIGIT_RE = re.compile(r"\d")
@@ -24,6 +31,8 @@ DIGIT_RE = re.compile(r"\d")
 # families are still recognized through their billing service name (see parse_sku). No versions are listed.
 FAMILIES = {"gemini", "gemma", "medgemma", "claude", "llama", "mistral", "mixtral", "codestral", "ministral",
             "pixtral", "imagen", "veo", "chirp", "lyria", "jamba", "deepseek", "qwen", "gpt", "embedding"}
+# Media and speech model families billed per second, clip, image or minute rather than per token.
+NON_TOKEN_FAMILIES = frozenset({"imagen", "veo", "chirp", "lyria"})
 # Words that can directly follow the family word as the start of a model name (besides a version).
 TIERS = {"pro", "flash", "lite", "ultra", "nano", "omni", "sonnet", "opus", "haiku", "instant", "large", "medium",
          "small", "fast", "oss", "live", "embedding", "native", "image", "tts", "hd", "clip", "coder", "maverick",
@@ -43,6 +52,7 @@ GENERIC_WORDS = {"generate", "content", "generatecontent", "bidi", "batch", "onl
                  "predictions", "token", "tokens", "count", "input", "output", "cached", "cache", "caching", "text",
                  "image", "audio", "video", "for", "the", "search", "query", "grounding", "request", "requests",
                  "live", "streaming", "stream", "api", "model", "models", "vertex", "ai", "garden", "a", "an",
+                 "cloud", "tts", "speech",
                  "anthropic", "google", "meta", "openai", "ai21", "labs", "nvidia", "partner", "maas"}
 ACRONYMS = {"tts": "TTS", "hd": "HD", "gpt": "GPT", "oss": "OSS", "ai": "AI", "api": "API"}
 VENDORS = {"gemini": "Google", "gemma": "Google", "imagen": "Google", "veo": "Google", "chirp": "Google",
@@ -76,8 +86,14 @@ def _model_words(low, i, for_form):
             continue
         if word == "image":
             # "Flash Image Image Output": the first "image" names the model. In the call form
-            # "... token count for Gemini 3 Pro Image" the full model name comes last.
-            if following in MODALITIES or (for_form and (following is None or following in STOP_WORDS)):
+            # "... token count for Gemini 3 Pro Image" the full model name comes last. For Gemini SKUs
+            # ("Gemini 2.5 Flash Image Output - Predictions" or standalone "Gemini 3.1 Flash Image"),
+            # "image" before output/generation or at the end of a standalone title also names the model.
+            if "image" not in out and (
+                    following in MODALITIES
+                    or (for_form and (following is None or following in STOP_WORDS))
+                    or (low[i] == "gemini" and (following in ("output", "generation", "generations")
+                                                or (i == 0 and following is None)))):
                 out.append(word)
                 j += 1
                 continue
@@ -119,7 +135,7 @@ def parse_sku(description, service=None):
     """
     if not description or not isinstance(description, str):
         return None
-    text = QUALIFIER_RE.sub(" ", description)
+    text = FOOTNOTE_RE.sub(" ", QUALIFIER_RE.sub(" ", description))
     parens = PAREN_RE.findall(text)
     original = [w.strip(".") for w in WORD_SPLIT_RE.split(PAREN_RE.sub(" ", text)) if w.strip(".")]
     low = [w.lower() for w in original]
@@ -127,10 +143,12 @@ def parse_sku(description, service=None):
     product = []
     brand_family = None
     model = None
+    model_idx = len(low)
     for i, word in enumerate(low):
         if word in FAMILIES:
             model = _model_words(low, i, for_form)
             if model:
+                model_idx = i
                 break
             brand_family = brand_family or word
             product.append(original[i])
@@ -154,6 +172,9 @@ def parse_sku(description, service=None):
             return None
         model = [w.lower() for w in WORD_SPLIT_RE.split(service) if w and w.lower() not in SKIP_WORDS]
         product = []
+    if (model and model[0] == "gemini" and "tts" not in model
+            and ("tts" in low[:model_idx] or "text-to-speech" in (service or "").lower())):
+        model = list(model) + ["tts"]
     display_key = _base_id("-".join(model))
     if not display_key:
         return None
@@ -202,12 +223,14 @@ def _base_id(model_id):
     mid = (model_id or "").strip().lower()
     if "/" in mid:
         mid = mid.rsplit("/", 1)[-1]
+    mid = FOOTNOTE_RE.sub("", mid).strip()
     mid = mid.split("@", 1)[0]
     mid = re.sub(r"[\s_]+", "-", mid)
     mid = re.sub(r"-\d{8}$", "", mid)
     mid = re.sub(r"-\d{2}-\d{4}$", "", mid)
     mid = re.sub(r"-(?:preview|experimental|exp(?:-\d+)?|latest)(?=-|$)", "", mid)
     mid = re.sub(r"-\d{2}-\d{4}$", "", mid)
+    mid = re.sub(r"-native-image(?=-|$)", "-image", mid)
     if "embedding" not in mid:
         mid = re.sub(r"-\d{3}$", "", mid)
     if mid.startswith("claude-") and "." not in mid:
@@ -219,6 +242,14 @@ def normalize_model_id(model_id):
     """Normalizes Monitoring, Antigravity, audit log and billing model ids to catalog keys. "X.0" versions
     collapse to "X" so that billing names (Gemini 3.0 Pro) and API ids (gemini-3-pro-preview) merge."""
     return re.sub(r"(?<=-)(\d+)\.0(?=-|$)", r"\1", _base_id(model_id))
+
+
+def is_non_token_model(model_or_key):
+    """True for media/speech model families billed per second, clip, image or minute rather than per token."""
+    key = normalize_model_id(str(model_or_key or ""))
+    if not key:
+        return False
+    return key.split("-", 1)[0] in NON_TOKEN_FAMILIES
 
 
 def display_name_for_id(model_id):
@@ -453,10 +484,12 @@ def usage_data(ctx, rng):
 
 def _monitored_service(service):
     """True when the billing service reports tokens to the Agent Platform publisher metrics in Cloud Monitoring
-    (Agent Platform and partner models served on Agent Platform). Gemini API (generativelanguage) traffic is not."""
+    (Agent Platform, Cloud Text-to-Speech Gemini voices, and partner models served on Agent Platform).
+    Gemini API (generativelanguage) traffic is not."""
     name = (service or "").strip().lower()
     # The billing export may name Agent Platform by its former service name.
-    return name == "vertex ai" or "agent platform" in name or _is_model_service(service)
+    return (name == "vertex ai" or "agent platform" in name or "text-to-speech" in name
+            or _is_model_service(service))
 
 
 def _model_tokens(entry):
@@ -619,22 +652,26 @@ def build_usage(ctx, rng, data=None):
                               key=lambda s: -(s["cost"] or 0))
         elif estimate_mode:
             from . import pricing_sync
-            _, rate_info = pricing_sync.lookup_model_rate(rates_map, key, pricing_sync.model_aliases(ctx))
-            est_val, est_daily = _estimated_model_cost(entry, rate_info)
-            est_daily_by_key[key] = est_daily
-            cost = round(est_val, 6)
-            skus_out = []
-            if rate_info:
-                for slot, measure, label in (("input", "input_tokens", "Input Tokens"),
-                                             ("output", "output_tokens", "Output Tokens"),
-                                             ("cached", "cached_tokens", "Context Cache Tokens")):
-                    if tokens[slot]:
-                        unit = rate_info.get(slot)
-                        skus_out.append({"sku": "%s — %s (Estimated)" % (entry["name"], label),
-                                         "service": "Agent Platform", "measure": measure, "unit": "tokens",
-                                         "amount": tokens[slot],
-                                         "cost": money(tokens[slot] * unit / 1_000_000.0) if unit is not None else None})
-                skus_out.sort(key=lambda s: -(s["cost"] or 0))
+            if is_non_token_model(key):
+                cost = None
+                skus_out = []
+            else:
+                _, rate_info = pricing_sync.lookup_model_rate(rates_map, key, pricing_sync.model_aliases(ctx))
+                est_val, est_daily = _estimated_model_cost(entry, rate_info)
+                est_daily_by_key[key] = est_daily
+                cost = round(est_val, 6) if (rate_info or not tokens["total"]) else None
+                skus_out = []
+                if rate_info:
+                    for slot, measure, label in (("input", "input_tokens", "Input Tokens"),
+                                                 ("output", "output_tokens", "Output Tokens"),
+                                                 ("cached", "cached_tokens", "Context Cache Tokens")):
+                        if tokens[slot]:
+                            unit = rate_info.get(slot)
+                            skus_out.append({"sku": "%s — %s (Estimated)" % (entry["name"], label),
+                                             "service": "Agent Platform", "measure": measure, "unit": "tokens",
+                                             "amount": tokens[slot],
+                                             "cost": money(tokens[slot] * unit / 1_000_000.0) if unit is not None else None})
+                    skus_out.sort(key=lambda s: -(s["cost"] or 0))
         else:
             cost = None
             skus_out = []

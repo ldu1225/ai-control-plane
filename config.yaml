@@ -231,10 +231,17 @@ pricing:
     - "https://aistudio.google.com/docs/pricing.md"
     - "https://ai.google.dev/gemini-api/docs/pricing"
     - "https://cloud.google.com/vertex-ai/generative-ai/pricing"
+    - "https://cloud.google.com/text-to-speech/pricing"
+    - "https://cloud.google.com/speech-to-text/pricing"
   fx_sources:                     # exchange-rate feeds used when the Cloud Billing Catalog has no rate for a currency
     - "https://open.er-api.com/v6/latest/USD"
     - "https://api.frankfurter.dev/v1/latest?base=USD"
-  catalog_services: ["Vertex AI", "Agent Platform", "Gemini API"]   # Cloud Billing Catalog service display names
+  catalog_services:               # Cloud Billing Catalog service display names
+    - "Vertex AI"
+    - "Agent Platform"
+    - "Gemini API"
+    - "Cloud Text-to-Speech API"
+    - "Cloud Speech API"
   include_partner_models: true    # partner models billed under their own service (for example Claude)
   storage_service: "BigQuery"     # Cloud Billing Catalog service used for telemetry routing cost estimates
   model_aliases: []               # "my-tuned-model=gemini-2.5-flash": price a model like another

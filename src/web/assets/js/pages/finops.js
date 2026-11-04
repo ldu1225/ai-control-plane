@@ -212,13 +212,15 @@ function renderPage(ctx, body, d) {
     const fxNote = ccy !== 'USD' && isNum(fx.rate)
       ? t('1 USD = {rate} {currency} ({source})', { rate: fxRateText(fx.rate), currency: ccy, source: fxSourceLabel(fx.source) || t('exchange rate feed') })
       : 'USD';
+    const baseEstText = t('BigQuery Billing Export is not configured. Spend is calculated from observed token usage ({tokens} tokens) multiplied by official Google per-1M-token rates ({fx}).', {
+      tokens: tokTotal, fx: fxNote,
+    });
+    const nonTokenNote = t('Non-token media units (video seconds, audio clips, speech minutes) and VM/storage infrastructure require BigQuery Billing Export for actual usage totals.');
     body.append(banner({
       tone: 'info',
       iconName: 'spark',
       title: t('Token-based reverse cost estimation active'),
-      text: t('BigQuery Billing Export is not configured. Spend is calculated from observed token usage ({tokens} tokens) multiplied by official Google per-1M-token rates ({fx}).', {
-        tokens: tokTotal, fx: fxNote,
-      }),
+      text: `${baseEstText} ${nonTokenNote}`,
     }));
   }
 
@@ -374,6 +376,7 @@ function renderPricingMonitor(ctx, host, p, activeCcy) {
   const rates = fx.rates || {};
   const sched = p.schedule || {};
   const models = p.models || [];
+  const unitPrices = Array.isArray(p.unitPrices) ? p.unitPrices : [];
   const sources = p.sources || [];
   const storage = p.storage || null;
   const dispCcy = (p.displayCurrency || activeCcy || 'USD').toUpperCase();
@@ -394,7 +397,8 @@ function renderPricingMonitor(ctx, host, p, activeCcy) {
     stat(dispCcy === 'USD' ? t('Pricing currency') : t('Exchange rate (USD/{currency})', { currency: dispCcy }), fxStatVal, fxStatSub),
     stat(t('Last synced'), p.syncedAt ? fmt.dateTime(p.syncedAt) : t('Not checked yet'), p.trigger ? t('Trigger: {t}', { t: p.trigger }) : null),
     stat(t('Daily schedule'), schedLabel, schedSub),
-    stat(t('Tracked model rates'), fmt.int(models.length), p.unacknowledgedCount > 0 ? t('{n} unacknowledged changes', { n: p.unacknowledgedCount }) : t('Up to date')));
+    stat(t('Tracked model rates'), fmt.int(models.length), p.unacknowledgedCount > 0 ? t('{n} unacknowledged changes', { n: p.unacknowledgedCount }) : t('Up to date')),
+    unitPrices.length ? stat(t('Media & speech unit rates'), fmt.int(unitPrices.length), t('Catalog list prices')) : null);
 
   const otherRates = Object.entries(rates).filter(([code, r]) => code !== dispCcy && r && isNum(r.rate));
   const fxChips = otherRates.length
@@ -471,7 +475,44 @@ function renderPricingMonitor(ctx, host, p, activeCcy) {
       compact: true,
     });
 
-  append(host, [h('div', { class: 'stack' }, statsRow, fxChips, storageLine, sourceList, table)]);
+  let unitSection = null;
+  if (unitPrices.length) {
+    const unitCols = [
+      { key: 'category', label: t('Category'), render: (u) => badge(t(u.category || ''), 'neutral', { size: 'sm' }), value: (u) => u.category || '' },
+      {
+        key: 'label', label: t('SKU'),
+        render: (u) => h('div', { class: 'cell-stack' },
+          h('span', { class: 'cell-main' }, u.label || u.key),
+          h('span', { class: 'cell-sub' }, u.service || '')),
+      },
+      { key: 'unitLabel', label: t('Billing unit'), render: (u) => h('span', { class: 'cell-mono' }, u.unitLabel || u.unit || '') },
+      {
+        key: 'usdPrice', label: t('List price (USD)'), align: 'num',
+        value: (u) => u.usdPrice || 0,
+        render: (u) => (isNum(u.usdPrice) ? fmt.currency(u.usdPrice, 'USD', { precise: true }) : DASH),
+      },
+    ];
+    if (dispCcy !== 'USD') {
+      unitCols.push({
+        key: 'localPrice', label: t('List price ({currency})', { currency: dispCcy }), align: 'num',
+        value: (u) => u.localPrice || 0,
+        render: (u) => (isNum(u.localPrice) ? fmt.currency(u.localPrice, dispCcy, { precise: true }) : DASH),
+      });
+    }
+    unitSection = h('div', { class: 'stack' },
+      h('div', { class: 'stack-xs' },
+        h('strong', null, t('Official media & speech unit prices (non-token SKUs)')),
+        h('div', { class: 'muted' }, t('Synced from Cloud Billing Catalog API for video, music, image, Text-to-Speech character and Speech-to-Text minute SKUs. Actual billed quantities require BigQuery Billing Export.'))),
+      dataTable({
+        columns: unitCols,
+        rows: unitPrices,
+        pageSize: 8,
+        exportName: 'official-unit-pricing',
+        initialSort: { key: 'category', dir: 'asc' },
+      }));
+  }
+
+  append(host, [h('div', { class: 'stack' }, statsRow, fxChips, storageLine, sourceList, table, unitSection)]);
 }
 
 function spikeBlock(sp, ccy) {

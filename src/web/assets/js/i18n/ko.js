@@ -2238,6 +2238,18 @@ const KO = {
   "The sink name may contain only letters, digits, '_' and '-'.": "싱크 이름에는 영문자, 숫자, '_', '-'만 사용할 수 있습니다.",
   "Specify 'id' or 'all': true to acknowledge pricing alerts.": "단가 알림을 확인 처리하려면 'id' 또는 'all': true를 지정하십시오.",
   "The group dashboard could not be created.": "그룹 대시보드를 생성할 수 없습니다.",
+  "Non-token media units (video seconds, audio clips, speech minutes) and VM/storage infrastructure require BigQuery Billing Export for actual usage totals.": "토큰 외 과금 항목(동영상 초, 오디오 클립, 음성 인식 분 단위) 및 VM·스토리지 인프라 실사용 비용은 BigQuery 결제 내보내기 연결 시 집계됩니다.",
+  "Media & speech unit rates": "미디어·음성 비토큰 단가",
+  "Catalog list prices": "카탈로그 공시 단가",
+  "Official media & speech unit prices (non-token SKUs)": "공식 미디어·음성 단위 단가 (비토큰 SKU)",
+  "Synced from Cloud Billing Catalog API for video, music, image, Text-to-Speech character and Speech-to-Text minute SKUs. Actual billed quantities require BigQuery Billing Export.": "동영상(Veo), 음악(Lyria), 이미지(Imagen), 음성 합성(문자당), 음성 인식(분당) SKU의 Cloud Billing 카탈로그 공시 단가입니다. 실제 청구 수량 집계에는 BigQuery 결제 내보내기가 필요합니다.",
+  "Billing unit": "과금 단위",
+  "List price (USD)": "공시 단가 (USD)",
+  "List price ({currency})": "공시 단가 ({currency})",
+  "Video": "동영상",
+  "Audio / Music": "오디오·음악",
+  "Text-to-Speech": "음성 합성 (TTS)",
+  "Speech-to-Text": "음성 인식 (STT)",
 };
 
 export default KO;
