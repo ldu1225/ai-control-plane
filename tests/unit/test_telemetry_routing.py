@@ -426,5 +426,26 @@ class EnforcementTest(unittest.TestCase):
         self.assertEqual((summary["routes"], summary["paused"]), (1, 1))
 
 
+class GetRoutingFastPathTest(unittest.TestCase):
+    def test_empty_or_filter_only_routes_skip_log_volumes(self):
+        ctx, cloud = ctx_with()
+        with mock.patch.object(routing, "log_volumes", side_effect=AssertionError("should not fetch volumes")) as vol:
+            res = routing.get_routing(ctx)
+        self.assertEqual(res["routes"], [])
+        self.assertEqual(vol.call_count, 0)
+        self.assertEqual(cloud.calls, [])
+
+        # Filter-only route (logs == []) also skips log_volumes, only querying exported bytes.
+        ctx.body = {"title": "Workload filter", "project": PROJECT, "logs": [], "filter": 'resource.type="cloud_run_revision"'}
+        with mock.patch.object(routing, "log_volumes", return_value={}):
+            routing.save_route(ctx)
+        cloud.calls.clear()
+        with mock.patch.object(routing, "log_volumes", side_effect=AssertionError("should not fetch volumes")) as vol:
+            res = routing.get_routing(ctx)
+        self.assertEqual(len(res["routes"]), 1)
+        self.assertEqual(vol.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
+

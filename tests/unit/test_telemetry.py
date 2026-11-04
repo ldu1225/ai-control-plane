@@ -608,5 +608,137 @@ class GroupDashboardTest(unittest.TestCase):
         self.assertEqual(telemetry._get_path(entry, "logName"), "run.googleapis.com/stdout")
 
 
+class DiscoverySnapshotAndOverlayTest(unittest.TestCase):
+    def _make_env(self):
+        base_settings = support.make_settings(workspace={"project_id": "demo-project", "projects": ["sub-project"],
+                                                         "timezone": "UTC"})
+        mgr = settings_store.SettingsManager(base_settings, settings_store.MemoryStore())
+        ctx = support.FakeCtx(settings=mgr.snapshot()[0])
+        ctx.app.settings = mgr
+        ctx.app.gcp = object()
+        return ctx, mgr
+
+    @staticmethod
+    def _fake_base():
+        tb_demo = {
+            "id": "rag_events", "key": "bq:demo-project.ops.rag_events", "kind": "bigquery",
+            "project": "demo-project", "dataset": "ops", "logical": "rag_events", "table": "rag_events",
+            "rows": 120, "bytes": 4096, "volume": {"bytesPerDay": 1024.0},
+            "catalog": {"title": "RAG events", "titleKo": "RAG 이벤트", "category": "ai",
+                        "group": "RAG pipeline", "groupKo": "RAG 파이프라인"},
+            "quickAdd": {"name": "RAG events", "enabled": True, "source": "bigquery",
+                         "bigquery": {"project": "demo-project", "dataset": "ops", "table": "rag_events"},
+                         "logging": None, "mapping": {"time": "event_ts", "operation": "step"}},
+        }
+        lg_demo = {
+            "id": "run_googleapis_com_stdout", "key": "log:demo-project:run.googleapis.com/stdout", "kind": "logging",
+            "project": "demo-project", "logName": "projects/demo-project/logs/run.googleapis.com%2Fstdout",
+            "shortName": "run.googleapis.com/stdout", "core": False, "volume": {"bytesPerDay": 2048.0},
+            "catalog": {"title": "Cloud Run stdout", "titleKo": "Cloud Run 표준출력", "category": "runtime",
+                        "group": "RAG pipeline", "groupKo": "RAG 파이프라인"},
+            "quickAdd": {"name": "Cloud Run stdout", "enabled": True, "source": "logging", "bigquery": None,
+                         "logging": {"filter": 'logName="projects/demo-project/logs/run.googleapis.com%2Fstdout"'},
+                         "mapping": {"time": "timestamp", "operation": "severity"}},
+        }
+        lg_sub = {
+            "id": "sub_worker", "key": "log:sub-project:sub_worker", "kind": "logging",
+            "project": "sub-project", "logName": "projects/sub-project/logs/sub_worker",
+            "shortName": "sub_worker", "core": False, "volume": {"bytesPerDay": 512.0},
+            "catalog": {"title": "Sub worker", "titleKo": "서브 워커", "category": "ai",
+                        "group": "Sub agents", "groupKo": "서브 에이전트"},
+            "quickAdd": {"name": "Sub worker", "enabled": True, "source": "logging", "bigquery": None,
+                         "logging": {"filter": 'logName="projects/sub-project/logs/sub_worker"'},
+                         "mapping": {"time": "timestamp", "operation": "severity"}},
+        }
+        return {"tables": [tb_demo], "logs": [lg_demo, lg_sub], "activityDays": 7,
+                "aiGrouping": {"enabled": True, "model": "gemini-4-argon", "profiled": 3, "newlyProfiled": 0, "pending": 0},
+                "maxLogEntries": 2000}
+
+    def test_snapshot_serves_cold_start_filters_projects_and_overlays_live_mutations(self):
+        from controlplane.services import telemetry_routing as routing
+
+        ctx, mgr = self._make_env()
+
+        def fake_compute(full_ctx, allow_uncached_ai=True):
+            full_ctx.warn("bigquery:demo-project.ops", "access_denied", "demo warning")
+            full_ctx.warn("bigquery:sub-project.ops", "access_denied", "sub warning")
+            full_ctx.add_source("api:logging.logs_list")
+            return self._fake_base()
+
+        with mock.patch.object(telemetry, "_compute_discover_base", side_effect=fake_compute) as comp:
+            snap = telemetry.refresh_discovery_snapshot(ctx.app)
+            self.assertEqual(comp.call_count, 1)
+            self.assertIn("updatedAt", snap)
+
+        # Simulate Cloud Run cold start: clear in-memory cache; discover() must serve from aux_docs with 0 scans.
+        ctx.app.cache.clear()
+        with mock.patch.object(telemetry, "_compute_discover_base", side_effect=AssertionError("must not rescan")):
+            all_res = telemetry.discover(ctx)
+        self.assertEqual(len(all_res["tables"]), 1)
+        self.assertEqual(len(all_res["logs"]), 2)
+        self.assertEqual({g["name"] for g in all_res["groups"]}, {"RAG pipeline", "Sub agents"})
+        self.assertEqual(all_res["snapshotAt"], snap["updatedAt"])
+        self.assertEqual(len(ctx.warnings), 2)
+
+        # Single-project filter (?project=sub-project) slices tables, logs, groups and warnings from the shared snapshot.
+        sub_ctx = support.FakeCtx(settings=mgr.snapshot()[0], params={"project": "sub-project"})
+        sub_ctx.app = ctx.app
+        with mock.patch.object(telemetry, "_compute_discover_base", side_effect=AssertionError("must not rescan")):
+            sub_res = telemetry.discover(sub_ctx)
+        self.assertEqual(sub_res["tables"], [])
+        self.assertEqual([lg["project"] for lg in sub_res["logs"]], ["sub-project"])
+        self.assertEqual([g["name"] for g in sub_res["groups"]], ["Sub agents"])
+        self.assertEqual([w["source"] for w in sub_ctx.warnings], ["bigquery:sub-project.ops"])
+
+        # Live overlay: connector registration, route state, source override, and override reset take effect immediately.
+        conn_id = "cn_rag_events"
+        settings_with_conn = support.make_settings(
+            workspace={"project_id": "demo-project", "projects": ["sub-project"], "timezone": "UTC"},
+            telemetry={"connectors": [{
+                "id": conn_id, "name": "RAG events", "enabled": True, "source": "bigquery",
+                "bigquery": {"project": "demo-project", "dataset": "ops", "table": "rag_events"},
+                "mapping": {"time": "event_ts", "operation": "step"},
+            }]},
+        )
+        ctx.settings = settings_with_conn
+        settings_store.aux_docs(ctx.app).mutate(routing.STATE_DOC, lambda doc: doc.update(routes=[{
+            "id": "rt_01", "title": "Runtime route", "status": "active", "sink": "acp-tx-rt",
+            "logs": ["projects/demo-project/logs/run.googleapis.com%2Fstdout"],
+        }]))
+        ctx.body = {"key": "log:demo-project:run.googleapis.com/stdout", "title": "Custom Stdout", "hidden": False}
+        telemetry.save_override(ctx)
+
+        with mock.patch.object(telemetry, "_compute_discover_base", side_effect=AssertionError("must not rescan")), \
+                mock.patch.object(telemetry, "_connector_health", return_value=("ok", None)):
+            live_res = telemetry.discover(ctx)
+        self.assertTrue(live_res["tables"][0]["registered"])
+        self.assertEqual(live_res["tables"][0]["connectorId"], conn_id)
+        stdout_log = next(lg for lg in live_res["logs"] if lg["id"] == "run_googleapis_com_stdout")
+        self.assertEqual(stdout_log["routedBy"], "rt_01")
+        self.assertEqual(stdout_log["catalog"]["title"], "Custom Stdout")
+        self.assertTrue(stdout_log["catalog"]["overridden"])
+
+        # Resetting the override restores the original Gemini-profiled title immediately without rescanning!
+        ctx.body = {"key": "log:demo-project:run.googleapis.com/stdout", "reset": True}
+        telemetry.save_override(ctx)
+        with mock.patch.object(telemetry, "_compute_discover_base", side_effect=AssertionError("must not rescan")), \
+                mock.patch.object(telemetry, "_connector_health", return_value=("ok", None)):
+            reset_res = telemetry.discover(ctx)
+        stdout_after = next(lg for lg in reset_res["logs"] if lg["id"] == "run_googleapis_com_stdout")
+        self.assertEqual(stdout_after["catalog"]["title"], "Cloud Run stdout")
+        self.assertFalse(stdout_after["catalog"].get("overridden", False))
+
+    def test_non_blocking_ai_profile_skips_gemini_rpc_and_marks_pending(self):
+        ai = MockAi({"sources": [AiProfileTest.PROFILE]})
+        ctx = support.FakeCtx()
+        ctx.app.ai = ai
+        src = AiProfileTest().source()
+        info = telemetry._ai_profile(ctx, [src], {AiProfileTest.SKEY: AiProfileTest.RAG}, allow_uncached=False)
+        self.assertEqual(ai.calls, [])
+        self.assertEqual(info["newlyProfiled"], 0)
+        self.assertEqual(info["pending"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+

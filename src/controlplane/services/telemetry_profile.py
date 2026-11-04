@@ -360,24 +360,46 @@ def service_titles(ctx):
     if not _live(ctx):
         return {}
     projects = [p for p in list(getattr(ctx, "projects", None) or [ctx.project])[:3] if config.valid_project(p or "")]
+    if not projects:
+        return {}
+    cache = _cache(ctx)
 
-    def load():
-        out = {}
-        for proj in projects:
+    def fetch_project(proj):
+        def _load_one():
             try:
                 items, _ = ctx.gcp.paginate("https://serviceusage.googleapis.com/v1/projects/%s/services" % proj,
                                             quota_project=ctx.quota_project, items_key="services",
                                             params={"filter": "state:ENABLED"}, page_size=200, max_pages=5)
             except Exception:  # pylint: disable=broad-except
-                continue
+                return {}
+            proj_out = {}
             for item in items:
                 name = (item.get("config") or {}).get("name") or (item.get("name") or "").rsplit("/", 1)[-1]
                 title = (item.get("config") or {}).get("title")
                 if name and title:
-                    out.setdefault(name, title)
+                    proj_out.setdefault(name, title)
+            return proj_out
+
+        if cache is None:
+            return _load_one()
+        val, _ = cache.get_or_compute(("svc_titles_proj", proj), DIRECTORY_TTL, _load_one, cacheable=bool)
+        return val or {}
+
+    def load():
+        out = {}
+        if len(projects) > 1 and hasattr(ctx, "run"):
+            res = ctx.run({p: (lambda proj=p: fetch_project(proj)) for p in projects})
+            for proj in projects:
+                ok, pmap = res.get(proj, (False, None))
+                if ok and pmap:
+                    for k, v in pmap.items():
+                        out.setdefault(k, v)
+        else:
+            for proj in projects:
+                for k, v in fetch_project(proj).items():
+                    out.setdefault(k, v)
         return out
 
-    cache = _cache(ctx)
     if cache is None:
         return load()
     val, _ = cache.get_or_compute(("svc_titles", tuple(projects)), DIRECTORY_TTL, load, cacheable=bool)

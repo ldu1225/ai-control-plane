@@ -410,11 +410,14 @@ def get_routing(ctx):
     prices = storage_prices(ctx)
     routes = [dict(r) for r in state.get("routes") or []]
     projects = sorted({r.get("project") for r in routes if r.get("project")})
+    need_volumes = any(r.get("logs") for r in routes)
     tasks = {}
     for proj in projects:
         tasks["bytes:%s" % proj] = (lambda p=proj: exported_bytes_today(ctx, p, ctx.tz_name))
     for route in routes:
         tasks["sink:%s" % route["id"]] = (lambda r=route: ctx.rest("GET", _sink_url(r["project"], r["sink"])))
+    if need_volumes:
+        tasks["volumes"] = (lambda: log_volumes(ctx))
     results = ctx.run(tasks) if tasks else {}
     bytes_today = {}
     for proj in projects:
@@ -423,11 +426,13 @@ def get_routing(ctx):
             bytes_today.update(val or {})
         else:
             ctx.warn_error("monitoring:%s" % EXPORT_BYTES_METRIC, val, "Exported log volume from Cloud Monitoring")
-    try:
-        volumes = log_volumes(ctx)
-    except GcpError as err:
-        ctx.warn_error("monitoring:%s" % LOG_BYTES_METRIC, err, "Log volume from Cloud Monitoring")
-        volumes = {}
+    volumes = {}
+    if need_volumes:
+        ok_vol, val_vol = results.get("volumes", (False, None))
+        if ok_vol:
+            volumes = val_vol or {}
+        elif isinstance(val_vol, GcpError):
+            ctx.warn_error("monitoring:%s" % LOG_BYTES_METRIC, val_vol, "Log volume from Cloud Monitoring")
     total_today = 0
     for route in routes:
         ok, sink = results.get("sink:%s" % route["id"], (False, None))

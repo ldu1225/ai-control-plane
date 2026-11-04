@@ -132,41 +132,16 @@ async function renderList(ctx) {
   });
   const body = h('div', { class: 'stack-lg' });
   mount(ctx.root, header, body);
-  mount(body, pageSkeleton(3, 2));
 
-  const discoveryReq = api.get('/api/v1/telemetry/discover', ctx.refresh ? { refresh: 1 } : null, { signal: ctx.signal }).catch((e) => ({ error: e }));
-  const routingReq = api.get('/api/v1/telemetry/routing', null, { signal: ctx.signal }).catch((e) => ({ error: e }));
-  let cRes;
-  try {
-    cRes = await api.get('/api/v1/telemetry/connectors', null, { signal: ctx.signal });
-  } catch (err) {
-    if (isAbort(err) || ctx.signal.aborted) return null;
-    mount(body, card({ body: errorState(err, { onRetry: () => ctx.rerender() }) }));
-    return null;
-  }
-  if (ctx.signal.aborted) return null;
-  const connectors = cRes.data.connectors || [];
-  const routingPlaceholder = card({ title: t('BigQuery Log Router & cost controls'), body: skeleton('lines') });
-  const pending = card({ title: t('Data you can add'), body: skeleton('block') });
-  mount(body, warningsNotice(cRes.meta.warnings || []), howItWorks(), dashboardsSection(ctx, connectors), routingPlaceholder, pending);
-
-  const [dRes, rRes] = await Promise.all([discoveryReq, routingReq]);
-  if (ctx.signal.aborted || isAbort(dRes.error) || isAbort(rRes.error)) return null;
-  const discovery = dRes.error ? null : dRes.data;
-  const routing = rRes.error ? null : rRes.data;
-  ctx.discovery = discovery;
-  ctx.routing = routing;
-
-  const sources = buildSources(discovery);
   const env = {
     admin,
-    days: (discovery && discovery.activityDays) || 7,
-    maxLogEntries: (discovery && discovery.maxLogEntries) || 1000,
-    logs: (discovery && Array.isArray(discovery.logs)) ? discovery.logs : [],
-    groups: (discovery && Array.isArray(discovery.groups)) ? discovery.groups : [],
-    listed: Boolean(discovery && (Array.isArray(discovery.tables) || Array.isArray(discovery.logs))),
-    aiGrouping: (discovery && discovery.aiGrouping) || null,
-    routing,
+    days: 7,
+    maxLogEntries: 1000,
+    logs: [],
+    groups: [],
+    listed: false,
+    aiGrouping: null,
+    routing: null,
   };
 
   const newRouteBtn = button({
@@ -210,20 +185,84 @@ async function renderList(ctx) {
   });
   mount(actionsSlot, newRouteBtn, refreshAiBtn, policyBtn);
 
-  routingPlaceholder.replaceWith(
-    rRes.error
-      ? banner({ tone: 'warning', title: t('BigQuery routing status could not be loaded'), text: errorText(rRes.error) })
-      : routingSection(ctx, routing, env),
-  );
+  const connectorsWarnSlot = h('div');
+  const connectorsSlot = card({ title: t('My dashboards'), body: skeleton('block', 96) });
+  const routingPlaceholder = card({ title: t('BigQuery Log Router & cost controls'), body: skeleton('lines') });
+  const pending = card({ title: t('Data you can add'), body: skeleton('block') });
+  mount(body, connectorsWarnSlot, howItWorks(), connectorsSlot, routingPlaceholder, pending);
 
-  pending.replaceWith(...[
-    warningsNotice((dRes.meta && dRes.meta.warnings) || []),
-    dRes.error ? banner({ tone: 'warning', title: t('The sources of this project could not be listed'), text: errorText(dRes.error) }) : null,
-    sourcesSection(ctx, sources, env),
-    builtinSection(sources),
-    hiddenSourcesSection(ctx, sources, env),
-    notListedCard(ctx, env),
-  ].filter(Boolean));
+  let latestRoutingNode = routingPlaceholder;
+  let discoveryDone = false;
+
+  const connectorsTask = api.get('/api/v1/telemetry/connectors', null, { signal: ctx.signal })
+    .then((cRes) => {
+      if (ctx.signal.aborted) return;
+      const warnNode = warningsNotice(cRes.meta.warnings || []);
+      if (warnNode) mount(connectorsWarnSlot, warnNode);
+      connectorsSlot.replaceWith(dashboardsSection(ctx, cRes.data.connectors || []));
+    })
+    .catch((err) => {
+      if (isAbort(err) || ctx.signal.aborted) return;
+      connectorsSlot.replaceWith(card({ body: errorState(err, { onRetry: () => ctx.rerender() }) }));
+    });
+
+  const routingTask = api.get('/api/v1/telemetry/routing', null, { signal: ctx.signal })
+    .then((rRes) => {
+      if (ctx.signal.aborted) return;
+      ctx.routing = rRes.data;
+      env.routing = rRes.data;
+      const nextNode = routingSection(ctx, rRes.data, env);
+      latestRoutingNode.replaceWith(nextNode);
+      latestRoutingNode = nextNode;
+    })
+    .catch((err) => {
+      if (isAbort(err) || ctx.signal.aborted) return;
+      const errNode = banner({ tone: 'warning', title: t('BigQuery routing status could not be loaded'), text: errorText(err) });
+      latestRoutingNode.replaceWith(errNode);
+      latestRoutingNode = errNode;
+    });
+
+  const discoveryTask = api.get('/api/v1/telemetry/discover', ctx.refresh ? { refresh: 1 } : null, { signal: ctx.signal })
+    .then((dRes) => {
+      if (ctx.signal.aborted) return;
+      discoveryDone = true;
+      const discovery = dRes.data;
+      ctx.discovery = discovery;
+      env.days = (discovery && discovery.activityDays) || 7;
+      env.maxLogEntries = (discovery && discovery.maxLogEntries) || 1000;
+      env.logs = (discovery && Array.isArray(discovery.logs)) ? discovery.logs : [];
+      env.groups = (discovery && Array.isArray(discovery.groups)) ? discovery.groups : [];
+      env.listed = Boolean(discovery && (Array.isArray(discovery.tables) || Array.isArray(discovery.logs)));
+      env.aiGrouping = (discovery && discovery.aiGrouping) || null;
+
+      if (env.routing && latestRoutingNode.isConnected) {
+        const refreshedRouting = routingSection(ctx, env.routing, env);
+        latestRoutingNode.replaceWith(refreshedRouting);
+        latestRoutingNode = refreshedRouting;
+      }
+
+      const sources = buildSources(discovery);
+      pending.replaceWith(...[
+        warningsNotice((dRes.meta && dRes.meta.warnings) || []),
+        sourcesSection(ctx, sources, env),
+        builtinSection(sources),
+        hiddenSourcesSection(ctx, sources, env),
+        notListedCard(ctx, env),
+      ].filter(Boolean));
+    })
+    .catch((err) => {
+      if (isAbort(err) || ctx.signal.aborted) return;
+      discoveryDone = true;
+      const sources = buildSources(null);
+      pending.replaceWith(...[
+        banner({ tone: 'warning', title: t('The sources of this project could not be listed'), text: errorText(err) }),
+        sourcesSection(ctx, sources, env),
+        notListedCard(ctx, env),
+      ].filter(Boolean));
+    });
+
+  await Promise.all([connectorsTask, routingTask, discoveryTask]);
+  void discoveryDone;
   return null;
 }
 

@@ -313,6 +313,41 @@ class MaintenanceTickTest(unittest.TestCase):
         app = make_app(workspace={"project_id": "your-gcp-project-id"})
         self.assertEqual(maintenance.tick(app), {"skipped": "workspace not configured"})
 
+    def test_telemetry_discovery_runs_periodically_even_without_routes(self):
+        from controlplane.services import telemetry
+
+        app = make_app()
+        app.gcp = object()
+
+        def fake_refresh(target_app, **_kw):
+            now_str = dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            snap = {"updatedAt": now_str, "project": "demo-project", "projects": ["demo-project"],
+                    "data": {"tables": [{"id": "t1"}], "logs": [{"id": "l1"}, {"id": "l2"}],
+                             "aiGrouping": {"profiled": 3, "pending": 0}}}
+            settings_store.aux_docs(target_app).mutate(
+                telemetry.DISCOVERY_DOC, lambda doc: (doc.clear(), doc.update(snap), True)[-1]
+            )
+            return snap
+
+        with mock.patch.object(pricing_sync, "sync_pricing", return_value={"models": [], "newAlertsCount": 0}), \
+                mock.patch.object(telemetry, "refresh_discovery_snapshot", side_effect=fake_refresh) as disc:
+            out1 = maintenance.tick(app)
+            self.assertEqual(disc.call_count, 1)
+            self.assertEqual(out1["telemetry_discovery"], {"projects": 1, "tables": 1, "logs": 2, "profiled": 3})
+
+            # Immediate second tick skips telemetry_discovery because snapshot is fresh (< 900s).
+            maintenance.tick(app)
+            self.assertEqual(disc.call_count, 1)
+
+            # Aging updatedAt past DISCOVERY_REFRESH_SECONDS triggers periodic refresh again.
+            old_ts = (dt.datetime.now(UTC) - dt.timedelta(seconds=telemetry.DISCOVERY_REFRESH_SECONDS + 10)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            settings_store.aux_docs(app).mutate(telemetry.DISCOVERY_DOC, lambda doc: doc.update(updatedAt=old_ts))
+            maintenance.tick(app)
+            self.assertEqual(disc.call_count, 2)
+
+
 
 class MultimodalAndUnitPricingTest(unittest.TestCase):
     def test_tts_and_rowspan_html_tables_with_effective_dates(self):

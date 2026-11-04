@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import urllib.parse
 
 from .. import config, timeutil
@@ -43,13 +44,17 @@ MESSAGE_CHARS = 300
 CONNECTOR_ID_RE = re.compile(r"^conn_[0-9a-f]{8}$")
 SOURCE_KEY_RE = re.compile(r"^(log|bq|wl):[A-Za-z0-9_.:%/@\-]{1,600}$")
 HEALTH_TTL = 300
+DISCOVERY_REFRESH_SECONDS = 900
 LOG_ENTRY_METRIC = "logging.googleapis.com/log_entry_count"
 ENGINE_ID_RE = re.compile(r"(?:reasoningEngines/)?([0-9]{6,})$")
 NAMES_TTL = 600
 NUMERIC_TYPES = profile.NUMERIC
 PROFILES_DOC = "telemetry_profiles"
 OVERRIDES_DOC = "telemetry_overrides"
+DISCOVERY_DOC = "telemetry_discovery"
 MAX_PROFILES = 600
+_BG_LOCK = threading.Lock()
+_BG_RUNNING = set()
 # Labels that only locate a resource and never name a workload.
 LOCATION_LABELS = {"project_id", "location", "zone", "region"}
 
@@ -121,11 +126,30 @@ def discover_datasets(ctx):
         billing_cfg = ctx.ws.get("billing") or {}
         billing_pair = (config.billing_project(ctx.settings), billing_cfg.get("dataset") or "")
         hints = [h.lower() for h in disc["dataset_hints"] or []]
-        for proj in [p for p in active_projects if config.valid_project(p or "")][:disc["max_projects"]]:
-            try:
-                data = ctx.rest("GET", "https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets" % proj,
+        projs = [p for p in active_projects if config.valid_project(p or "")][:disc["max_projects"]]
+        cache = getattr(getattr(ctx, "app", None), "cache", None) if _live(ctx) else None
+
+        def list_proj(proj):
+            def _fetch():
+                return ctx.rest("GET", "https://bigquery.googleapis.com/bigquery/v2/projects/%s/datasets" % proj,
                                 params={"maxResults": max(30, disc["max_datasets_per_project"])}, timeout=8)
-            except Exception:  # pylint: disable=broad-except
+            if cache is not None:
+                val, _ = cache.get_or_compute(("bq_datasets", proj, disc["max_datasets_per_project"]), HEALTH_TTL, _fetch)
+                return val
+            return _fetch()
+
+        if len(projs) > 1 and hasattr(ctx, "run"):
+            fetched = ctx.run({p: (lambda proj=p: list_proj(proj)) for p in projs})
+        else:
+            fetched = {}
+            for proj in projs:
+                try:
+                    fetched[proj] = (True, list_proj(proj))
+                except Exception as err:  # pylint: disable=broad-except
+                    fetched[proj] = (False, err)
+        for proj in projs:
+            ok, data = fetched.get(proj, (False, None))
+            if not ok:
                 continue
             ds_ids = [((item or {}).get("datasetReference") or {}).get("datasetId") or ""
                       for item in (data or {}).get("datasets") or []]
@@ -144,41 +168,61 @@ def _table_stats(ctx, project, dataset):
     return {r["table_id"]: r for r in rows if r.get("table_id")}
 
 
+def _format_meta_modified(mod):
+    if mod is None:
+        return None
+    if isinstance(mod, dt.datetime):
+        return iso(mod)
+    ms = to_int(mod)
+    return iso(dt.datetime.fromtimestamp(ms / 1000.0, tz=dt.timezone.utc)) if ms else None
+
+
 def _discover_tables(ctx, connectors_by_table, schemas_out):
     """Tables of the audit, routing, configured and auto-discovered datasets, or None when none could be scanned."""
     disc = _tcfg(ctx.settings, "discovery")
-    tables = []
-    scanned = 0
     explicit = _explicit_datasets(ctx)
-    for project, dataset in discover_datasets(ctx):
+    routing_ds = _routing_dataset(ctx)
+    pairs = discover_datasets(ctx)
+    if not pairs:
+        return None
+    live = _live(ctx)
+
+    def scan_dataset(project, dataset):
         is_explicit = (project, dataset) in explicit
         label = "bigquery:%s" % dataset if project == ctx.project else "bigquery:%s.%s" % (project, dataset)
         try:
             groups = ctx.registry.tables(project, dataset, ctx.quota_project, ctx.max_bytes)
         except GcpError as err:
-            if is_explicit and dataset != _routing_dataset(ctx):
+            if is_explicit and dataset != routing_ds:
                 ctx.warn_error(label, err, "BigQuery dataset %s" % dataset)
-            continue
+            return None
         ctx.add_source("bigquery:%s.INFORMATION_SCHEMA.TABLES" % dataset)
-        scanned += 1
-        try:
-            stats = _table_stats(ctx, project, dataset)
-        except GcpError as err:
-            if is_explicit:
-                ctx.warn_error(label, err, "Table statistics for %s" % dataset)
-            stats = {}
+        if not groups:
+            return {"tables": [], "schemas": {}}
         names = sorted(groups)
         if len(names) > disc["max_tables_per_dataset"]:
             if is_explicit:
                 ctx.warn(label, "truncated", "Only the first %d tables of %s are inspected." % (
                     disc["max_tables_per_dataset"], dataset))
             names = names[:disc["max_tables_per_dataset"]]
-        schema_tasks = {n: (lambda n=n: ctx.registry.schema(project, dataset, groups[n]["latest"], ctx.quota_project))
-                        for n in names}
-        schemas = ctx.run(schema_tasks)
-        failed = sum(1 for ok, _ in schemas.values() if not ok)
+        need_stats = any(groups[n]["kind"] == "sharded" for n in names) or not live
+        inner_tasks = {n: (lambda n=n: ctx.registry.schema(project, dataset, groups[n]["latest"], ctx.quota_project))
+                       for n in names}
+        if need_stats:
+            inner_tasks["__stats__"] = (lambda: _table_stats(ctx, project, dataset))
+        inner_res = ctx.run(inner_tasks)
+        stats = {}
+        if need_stats:
+            ok_st, val_st = inner_res.pop("__stats__", (False, None))
+            if ok_st:
+                stats = val_st or {}
+            elif is_explicit and isinstance(val_st, GcpError):
+                ctx.warn_error(label, val_st, "Table statistics for %s" % dataset)
+        failed = sum(1 for ok, _ in inner_res.values() if not ok)
         if failed and is_explicit:
             ctx.warn(label, "partial_data", "The schema of %d table(s) in %s could not be read." % (failed, dataset))
+        ds_tables = []
+        ds_schemas = {}
         for name in names:
             info = groups[name]
             sharded = info["kind"] == "sharded"
@@ -186,27 +230,49 @@ def _discover_tables(ctx, connectors_by_table, schemas_out):
                 members = [s for tid, s in stats.items() if tid.startswith(name + "_") and tid[len(name) + 1:].isdigit()]
             else:
                 members = [stats[name]] if name in stats else []
-            ok, meta = schemas.get(name, (False, None))
+            ok, meta = inner_res.get(name, (False, None))
             schema = meta["schema"] if ok and meta else None
             has_time = schema is not None and any(n.type == "TIMESTAMP" and n.mode != "REPEATED" for n in schema.tree.values())
             conn_id = connectors_by_table.get((project, dataset, name))
             if not is_explicit and not has_time and conn_id is None:
                 continue  # static lookup tables in opportunistically scanned datasets
             if schema is not None:
-                schemas_out[(project, dataset, name)] = schema
-            modified = max((to_int(s.get("last_modified_time")) for s in members), default=None) if members else None
-            tables.append({
+                ds_schemas[(project, dataset, name)] = schema
+            if members:
+                rows_val = sum(to_int(s.get("row_count")) for s in members)
+                bytes_val = sum(to_int(s.get("size_bytes")) for s in members)
+                modified = max((to_int(s.get("last_modified_time")) for s in members), default=None)
+                mod_iso = iso(dt.datetime.fromtimestamp(modified / 1000.0, tz=dt.timezone.utc)) if modified else None
+            elif not sharded and ok and isinstance(meta, dict):
+                rows_val = to_int(meta["rows"]) if meta.get("rows") is not None else None
+                bytes_val = to_int(meta["bytes"]) if meta.get("bytes") is not None else None
+                mod_iso = _format_meta_modified(meta.get("modified"))
+            else:
+                rows_val, bytes_val, mod_iso = None, None, None
+            ds_tables.append({
                 "id": name.lower(), "project": project, "dataset": dataset, "table": name + ("_*" if sharded else ""),
                 "logical": name, "sharded": sharded,
-                "rows": sum(to_int(s.get("row_count")) for s in members) if members else None,
-                "sizeBytes": sum(to_int(s.get("size_bytes")) for s in members) if members else None,
-                "lastModified": iso(dt.datetime.fromtimestamp(modified / 1000.0, tz=dt.timezone.utc)) if modified else None,
+                "rows": rows_val,
+                "sizeBytes": bytes_val,
+                "lastModified": mod_iso,
                 "core": name in CORE_TABLES and (project, dataset) == (ctx.project, ctx.audit_dataset),
-                "routedDataset": dataset == _routing_dataset(ctx) and project == ctx.project,
+                "routedDataset": dataset == routing_ds and project == ctx.project,
                 "registered": conn_id is not None, "connectorId": conn_id,
                 "columns": schema.leaf_paths(200) if schema is not None else None,
                 "entries7d": None, "daily": None,
             })
+        return {"tables": ds_tables, "schemas": ds_schemas}
+
+    ds_results = ctx.run({str(i): (lambda p=proj, d=ds: scan_dataset(p, d)) for i, (proj, ds) in enumerate(pairs)})
+    tables = []
+    scanned = 0
+    for i in range(len(pairs)):
+        ok, item = ds_results.get(str(i), (False, None))
+        if not ok or item is None:
+            continue
+        scanned += 1
+        tables.extend(item["tables"])
+        schemas_out.update(item["schemas"])
     return tables if scanned else None
 
 
@@ -645,7 +711,7 @@ def _apply_profile(src, prof, model_used, schema=None, settings=None):
     src["catalog"] = card
 
 
-def _ai_profile(ctx, sources, schemas):
+def _ai_profile(ctx, sources, schemas, allow_uncached=True):
     """Profiles sources with Gemini (only new or changed ones are sent), merges group names and applies profiles."""
     ai_cfg = _tcfg(ctx.settings, "ai")
     app = getattr(ctx, "app", None)
@@ -669,7 +735,7 @@ def _ai_profile(ctx, sources, schemas):
             todo.append(src)
     used_model = engine.effective_model(ctx.settings, preferred) if hasattr(engine, "effective_model") else preferred
     new_profiles = {}
-    if todo:
+    if todo and allow_uncached:
         batches = [todo[i:i + ai_cfg["batch_size"]] for i in range(0, len(todo), ai_cfg["batch_size"])]
         known_groups = sorted({(e.get("profile") or {}).get("group") for e in stored.values()
                                if (e.get("profile") or {}).get("group")})[:40]
@@ -737,8 +803,11 @@ def _ai_profile(ctx, sources, schemas):
             prof["group"], prof["groupKo"] = canon["name"], canon.get("nameKo") or canon["name"]
         _apply_profile(src, prof, entry.get("model") or used_model, schemas.get(src.get("_skey")), ctx.settings)
         applied += 1
-    return {"enabled": applied > 0, "model": used_model if applied else None, "profiled": applied,
-            "newlyProfiled": len(new_profiles), "candidates": len(ranked)}
+    out = {"enabled": applied > 0, "model": used_model if applied else None, "profiled": applied,
+           "newlyProfiled": len(new_profiles), "candidates": len(ranked)}
+    if todo and not allow_uncached:
+        out["pending"] = len(todo)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -831,18 +900,28 @@ def refresh_profiles(ctx):
             doc["profiles"], doc["groups"] = {}, {}
             return removed
         return sum(1 for k in keys if profiles.pop(k, None) is not None)
-    removed = aux_docs(getattr(ctx, "app", None)).mutate(PROFILES_DOC, apply)
-    ctx.app.cache.clear()
+    app = getattr(ctx, "app", None)
+    removed = aux_docs(app).mutate(PROFILES_DOC, apply)
+    if app is not None:
+        try:
+            aux_docs(app).mutate(DISCOVERY_DOC, lambda doc: doc.clear() or True)
+        except Exception:  # pylint: disable=broad-except
+            pass
+        app.cache.clear()
+        if _live(ctx):
+            try:
+                refresh_discovery_snapshot(app, actor=getattr(ctx.identity, "email", None) or "admin",
+                                           allow_uncached_ai=True)
+            except Exception as err:  # pylint: disable=broad-except
+                LOG.warning("discovery refresh after profile reset failed: %s", type(err).__name__)
     return {"removed": removed}
 
 
 # ---------------------------------------------------------------------------
-# Discovery
+# Discovery & persistent snapshot
 # ---------------------------------------------------------------------------
 
-def _compute_discover(ctx):
-    disc = _tcfg(ctx.settings, "discovery")
-    days = disc["activity_days"]
+def _connector_indexes(ctx):
     by_table, by_log, by_filter = {}, {}, {}
     for conn in all_connectors(ctx):
         bq = conn.get("bigquery") or {}
@@ -856,6 +935,32 @@ def _compute_discover(ctx):
             flt = ((conn.get("logging") or {}).get("filter") or "").strip()
             if flt:
                 by_filter.setdefault(flt, conn.get("id"))
+    return by_table, by_log, by_filter
+
+
+def _discovery_config_fp(settings):
+    ws = (settings or {}).get("workspace") or {}
+    tel = (settings or {}).get("telemetry") or {}
+    payload = {
+        "project": ws.get("project_id"),
+        "projects": ws.get("projects"),
+        "scan_all": ws.get("scan_all_projects", True),
+        "audit_dataset": ws.get("audit_dataset"),
+        "telemetry_datasets": ws.get("telemetry_datasets"),
+        "routing_dataset": ((tel.get("routing") or {}).get("dataset")),
+        "discovery": _tcfg(settings, "discovery"),
+        "renames": tel.get("display_renames"),
+        "gateway_services": ((settings or {}).get("gateway") or {}).get("services"),
+    }
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def _compute_discover_base(ctx, allow_uncached_ai=True):
+    """Scans Cloud Logging, Cloud Monitoring and BigQuery across `ctx.projects` and profiles sources with Gemini
+    (without baking in mutable overrides/routes/connectors, which `_finalize_discover` overlays dynamically)."""
+    disc = _tcfg(ctx.settings, "discovery")
+    days = disc["activity_days"]
+    by_table, by_log, by_filter = _connector_indexes(ctx)
     schemas = {}
     res = ctx.run_composite({
         "tables": lambda: _discover_tables(ctx, by_table, schemas),
@@ -953,15 +1058,85 @@ def _compute_discover(ctx):
             if stats else [{"path": p, "type": t} for p, t in list(tb["_types"].items())[:60]]
         tb["_fp"] = _fingerprint(tb["_ident"], ["%s:%s" % kv for kv in tb["_types"].items()])
         sources.append(tb)
-    ai_info = _ai_profile(ctx, sources, schemas)
-    overrides = _overrides(ctx)
+    ai_info = _ai_profile(ctx, sources, schemas, allow_uncached=allow_uncached_ai)
     for src in sources:
-        if src["key"] in overrides:
-            _apply_override(src, overrides[src["key"]])
         for private in ("_fields", "_types", "_ident", "_days", "_skey", "_digest", "_fp"):
             src.pop(private, None)
+    return {"tables": tables, "logs": logs, "activityDays": days, "aiGrouping": ai_info,
+            "maxLogEntries": disc["max_log_entries"]}
+
+
+def _finalize_discover(ctx, base_data, snapshot_at=None):
+    """Overlays live connectors, routes, prices, administrator overrides and `?project=` filtering in <2ms."""
+    disc = _tcfg(ctx.settings, "discovery")
+    by_table, by_log, by_filter = _connector_indexes(ctx)
+    state = routing.load_state(ctx)
+    routed = routing.routed_index(state)
+    pol = routing.policy(ctx.settings)
+    prices = routing.storage_prices(ctx)
+    overrides = _overrides(ctx)
+    sel = getattr(ctx, "selected_project", "all") or "all"
+    selected_projects = set(getattr(ctx, "projects", None) or [ctx.project])
+
+    raw_tables = base_data.get("tables")
+    if raw_tables is None:
+        tables = None
+    else:
+        tables = []
+        for orig in raw_tables:
+            if sel != "all" and orig.get("project") not in selected_projects:
+                continue
+            tb = copy.deepcopy(orig)
+            conn_id = by_table.get((tb["project"], tb["dataset"], tb["logical"]))
+            tb["registered"] = conn_id is not None
+            tb["connectorId"] = conn_id
+            bpd = (tb.get("volume") or {}).get("bytesPerDay")
+            tb["estimate"] = routing.estimate(bpd, pol["samplePercent"], pol["retentionDays"], prices)
+            if tb["key"] in overrides:
+                _apply_override(tb, overrides[tb["key"]])
+            tables.append(tb)
+
+    logical = {tb["id"] for tb in tables or []}
+    raw_logs = base_data.get("logs")
+    if raw_logs is None:
+        logs = None
+    else:
+        logs = []
+        for orig in raw_logs:
+            if sel != "all" and orig.get("project") not in selected_projects:
+                continue
+            lg = copy.deepcopy(orig)
+            if lg.get("sinkFilter"):
+                conn_id = by_filter.get(lg["sinkFilter"])
+                lg["registered"] = conn_id is not None
+                lg["connectorId"] = conn_id
+                lg["estimate"] = routing.estimate(None, 100, 0, prices)
+            else:
+                sid = lg["id"]
+                conn_id = by_log.get(sid)
+                lg["registered"] = conn_id is not None
+                lg["connectorId"] = conn_id
+                lg["routedToBigQuery"] = sid in logical
+                lg["routedBy"] = routed.get(lg.get("logName"))
+                bpd = (lg.get("volume") or {}).get("bytesPerDay")
+                lg["estimate"] = routing.estimate(bpd, pol["samplePercent"], pol["retentionDays"], prices)
+            if lg["key"] in overrides:
+                _apply_override(lg, overrides[lg["key"]])
+            logs.append(lg)
+
+    by_id = {}
+    for lg in logs or []:
+        if not lg.get("sinkFilter"):
+            by_id.setdefault(lg["id"], lg)
+    for tb in tables or []:
+        lg = by_id.get(tb["id"])
+        tb["routedBy"] = lg.get("routedBy") if lg else None
+
+    ordered_sources = ([lg for lg in (logs or []) if not lg.get("sinkFilter")] +
+                       [lg for lg in (logs or []) if lg.get("sinkFilter")] +
+                       (tables or []))
     groups = {}
-    for src in sources:
+    for src in ordered_sources:
         card = src.get("catalog") or {}
         if card.get("group") and not src.get("core") and not card.get("hidden"):
             g = groups.setdefault(card["group"], {"name": card["group"], "nameKo": card.get("groupKo") or card["group"],
@@ -971,21 +1146,137 @@ def _compute_discover(ctx):
                 g["logs"].append(src["logName"])
                 g["projects"].add(src.get("project"))
     group_list = [dict(g, projects=sorted(p for p in g["projects"] if p)) for g in groups.values()]
-    return {"tables": tables, "logs": logs, "activityDays": days, "aiGrouping": ai_info, "groups": group_list,
-            "maxLogEntries": disc["max_log_entries"],
-            "routing": {"dataset": pol["dataset"], "routes": len(state.get("routes") or []),
-                        "samplePercent": pol["samplePercent"], "retentionDays": pol["retentionDays"],
-                        "priced": prices is not None, "currency": (prices or {}).get("currency")}}
+    out = {
+        "tables": tables,
+        "logs": logs,
+        "activityDays": base_data.get("activityDays") or disc["activity_days"],
+        "aiGrouping": copy.deepcopy(base_data.get("aiGrouping")),
+        "groups": group_list,
+        "maxLogEntries": disc["max_log_entries"],
+        "routing": {"dataset": pol["dataset"], "routes": len(state.get("routes") or []),
+                    "samplePercent": pol["samplePercent"], "retentionDays": pol["retentionDays"],
+                    "priced": prices is not None, "currency": (prices or {}).get("currency")},
+    }
+    if snapshot_at:
+        out["snapshotAt"] = snapshot_at
+    return out
+
+
+def _compute_discover(ctx, allow_uncached_ai=True):
+    return _finalize_discover(ctx, _compute_discover_base(ctx, allow_uncached_ai=allow_uncached_ai))
+
+
+def _load_discovery_snapshot(ctx):
+    app = getattr(ctx, "app", None)
+    if app is None:
+        return None
+    cache = getattr(app, "cache", None)
+    mem_key = ("telemetry_discovery_snap", ctx.project)
+    if cache is not None:
+        hit, cached = cache.get(mem_key)
+        if hit and isinstance(cached, dict) and cached.get("project") == ctx.project:
+            return cached
+    doc, _ = aux_docs(app).load(DISCOVERY_DOC)
+    if isinstance(doc, dict) and doc.get("project") == ctx.project and isinstance(doc.get("data"), dict):
+        if cache is not None:
+            cache.set(mem_key, doc, DISCOVERY_REFRESH_SECONDS * 4)
+        return doc
+    return None
+
+
+def _serve_from_snapshot(ctx, snap):
+    sel = getattr(ctx, "selected_project", "all") or "all"
+    selected_projects = set(getattr(ctx, "projects", None) or [ctx.project])
+    for w in snap.get("warnings") or []:
+        src = w.get("source") or ""
+        if sel != "all" and src.startswith("bigquery:") and "." in src:
+            w_proj = src.split(":", 1)[1].split(".", 1)[0]
+            if config.valid_project(w_proj) and w_proj not in selected_projects:
+                continue
+        ctx.warn(src, w.get("code") or "warning", w.get("message") or "")
+    for label in snap.get("sources") or []:
+        ctx.add_source(label)
+    return _finalize_discover(ctx, snap["data"], snapshot_at=snap.get("updatedAt"))
+
+
+def refresh_discovery_snapshot(app, actor="system:maintenance", allow_uncached_ai=True):
+    """Scans all workspace projects, profiles new sources with Gemini, and persists the snapshot in `aux_docs`."""
+    from .base import Ctx
+    from ..security import Identity
+    settings, version = app.settings.snapshot()
+    full_ctx = Ctx(app, settings, version, Identity(actor, "admin", "scheduler", "discovery:%s" % actor),
+                   params={"project": "all"})
+    base_data = _compute_discover_base(full_ctx, allow_uncached_ai=allow_uncached_ai)
+    snap = {
+        "updatedAt": now_iso(),
+        "project": full_ctx.project,
+        "projects": list(getattr(full_ctx, "all_projects", None) or [full_ctx.project]),
+        "configFp": _discovery_config_fp(settings),
+        "data": base_data,
+        "warnings": list(full_ctx.warnings),
+        "sources": sorted(full_ctx.sources),
+    }
+    existing, _ = aux_docs(app).load(DISCOVERY_DOC)
+    has_data = base_data.get("tables") is not None or base_data.get("logs") is not None
+    if has_data or not (isinstance(existing, dict) and existing.get("project") == full_ctx.project
+                        and isinstance(existing.get("data"), dict)):
+        try:
+            aux_docs(app).mutate(DISCOVERY_DOC, lambda doc: (doc.clear(), doc.update(snap), True)[-1])
+        except Exception as err:  # pylint: disable=broad-except
+            LOG.warning("telemetry discovery snapshot not saved: %s", type(err).__name__)
+        cache = getattr(app, "cache", None)
+        if cache is not None:
+            cache.set(("telemetry_discovery_snap", full_ctx.project), snap, DISCOVERY_REFRESH_SECONDS * 4)
+        return snap
+    return existing
+
+
+def ensure_background_discovery(app, actor="system:background", allow_uncached_ai=True):
+    """Starts at most one background thread per app instance to refresh `telemetry_discovery` asynchronously."""
+    if app is None:
+        return False
+    key = id(app)
+    with _BG_LOCK:
+        if key in _BG_RUNNING:
+            return False
+        _BG_RUNNING.add(key)
+
+    def _worker():
+        try:
+            refresh_discovery_snapshot(app, actor=actor, allow_uncached_ai=allow_uncached_ai)
+        except Exception as err:  # pylint: disable=broad-except
+            LOG.warning("background telemetry discovery failed: %s", type(err).__name__)
+        finally:
+            with _BG_LOCK:
+                _BG_RUNNING.discard(key)
+
+    threading.Thread(target=_worker, name="telemetry-discovery-bg", daemon=True).start()
+    return True
 
 
 def discover(ctx):
-    """Every telemetry source of the scanned projects, described and grouped dynamically."""
-    if type(getattr(ctx, "gcp", None)).__name__ == "Gcp" and getattr(ctx, "app", None):
-        key = ("telemetry_discover", ctx.project, tuple(getattr(ctx, "projects", None) or [ctx.project]),
-               getattr(ctx, "version", 0))
-        val, _ = ctx.app.cache.get_or_compute(key, HEALTH_TTL, lambda: _compute_discover(ctx))
-        return copy.deepcopy(val)
-    return _compute_discover(ctx)
+    """Every telemetry source of the scanned projects, served immediately from the periodic snapshot when available."""
+    force_refresh = str((ctx.params or {}).get("refresh") or "").strip().lower() in ("1", "true", "yes")
+    app = getattr(ctx, "app", None)
+    snap = _load_discovery_snapshot(ctx) if (app is not None and not force_refresh) else None
+    if snap is not None:
+        updated = parse_rfc3339(snap.get("updatedAt"))
+        age = (dt.datetime.now(dt.timezone.utc) - updated).total_seconds() if updated is not None else 1e9
+        cfg_changed = snap.get("configFp") != _discovery_config_fp(ctx.settings)
+        pending_ai = bool(((snap.get("data") or {}).get("aiGrouping") or {}).get("pending"))
+        if _live(ctx) and (age >= DISCOVERY_REFRESH_SECONDS or cfg_changed or pending_ai):
+            ensure_background_discovery(app, allow_uncached_ai=True)
+        return _serve_from_snapshot(ctx, snap)
+    if _live(ctx) and app is not None:
+        if force_refresh:
+            snap = refresh_discovery_snapshot(app, actor=getattr(ctx.identity, "email", None) or "admin",
+                                              allow_uncached_ai=True)
+            return _serve_from_snapshot(ctx, snap)
+        snap = refresh_discovery_snapshot(app, actor="system:initial", allow_uncached_ai=False)
+        if ((snap.get("data") or {}).get("aiGrouping") or {}).get("pending"):
+            ensure_background_discovery(app, allow_uncached_ai=True)
+        return _serve_from_snapshot(ctx, snap)
+    return _compute_discover(ctx, allow_uncached_ai=True)
 
 
 # ---------------------------------------------------------------------------

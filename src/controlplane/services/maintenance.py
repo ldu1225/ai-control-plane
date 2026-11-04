@@ -83,7 +83,7 @@ def _system_ctx(app, actor):
 
 def tick(app, actor="system:maintenance", trigger="scheduled"):
     """Runs every task that is due. Returns {task: summary or error}."""
-    from . import pricing_sync, telemetry_routing
+    from . import pricing_sync, telemetry, telemetry_routing
     from .. import config
     settings, _ = app.settings.snapshot()
     out = {}
@@ -104,17 +104,47 @@ def tick(app, actor="system:maintenance", trigger="scheduled"):
 
     if not (settings.get("modules") or {}).get("telemetry", True):
         return out
+
+    # 2. Periodic telemetry discovery snapshot (all projects + Gemini source profiling) so opening Telemetry Extensions
+    #    is always instant even on cold Cloud Run instances.
+    if getattr(app, "gcp", None) is not None:
+        snap_doc, _ = aux_docs(app).load(telemetry.DISCOVERY_DOC)
+        snap_project = snap_doc.get("project") if isinstance(snap_doc, dict) else None
+        snap_updated = parse_rfc3339(snap_doc.get("updatedAt")) if isinstance(snap_doc, dict) else None
+
+        def discovery_due(_rec):
+            if snap_project != settings["workspace"]["project_id"] or snap_updated is None:
+                return True
+            return (_now() - snap_updated).total_seconds() >= telemetry.DISCOVERY_REFRESH_SECONDS
+
+        if _claim(app, "telemetry_discovery", discovery_due):
+            try:
+                snap = telemetry.refresh_discovery_snapshot(app, actor=actor, allow_uncached_ai=True)
+                data = (snap or {}).get("data") or {}
+                disc_summary = {
+                    "projects": len((snap or {}).get("projects") or []),
+                    "tables": len(data.get("tables") or []),
+                    "logs": len(data.get("logs") or []),
+                    "profiled": ((data.get("aiGrouping") or {}).get("profiled")) or 0,
+                }
+                out["telemetry_discovery"] = disc_summary
+                _finish(app, "telemetry_discovery", True, disc_summary)
+            except Exception as err:  # pylint: disable=broad-except
+                LOG.warning("scheduled telemetry discovery failed: %s", type(err).__name__)
+                out["telemetry_discovery"] = {"error": type(err).__name__}
+                _finish(app, "telemetry_discovery", False, error=type(err).__name__)
+
     state, _ = aux_docs(app).load(telemetry_routing.STATE_DOC)
     if not state.get("routes"):
         return out
 
-    # 2. Daily route upkeep after the price check: retention and group following.
+    # 3. Daily route upkeep after the price check: retention and group following.
     def daily_due(rec):
         return pricing_sync.is_due(settings, rec.get("lastSuccess"))
 
     daily = _claim(app, "telemetry_daily", daily_due)
 
-    # 3. Route budget guard on every tick (at most every GUARD_MIN_SECONDS), always when the daily upkeep runs.
+    # 4. Route budget guard on every tick (at most every GUARD_MIN_SECONDS), always when the daily upkeep runs.
     def guard_due(rec):
         last = parse_rfc3339(rec.get("lastSuccess"))
         return last is None or (_now() - last).total_seconds() >= GUARD_MIN_SECONDS
@@ -164,7 +194,7 @@ class MaintenanceMonitor:
         self._stop.set()
 
     def _loop(self):
-        if self._stop.wait(20.0):
+        if self._stop.wait(3.0):
             return
         while True:
             try:

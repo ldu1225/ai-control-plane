@@ -110,7 +110,7 @@ _route("POST", "/api/v1/finops/pricing/ack", pricing_sync.acknowledge_alerts, mo
        rate="governance")
 # guest=True: one of the few POST routes a guest may call (read-only AI analysis, rate limited).
 _route("POST", "/api/v1/finops/spikes/analyze", finops.analyze_spike, module="finops", rate="ai", guest=True)
-_route("GET", "/api/v1/telemetry/discover", telemetry.discover, module="telemetry", cache=True, ttl=600)
+_route("GET", "/api/v1/telemetry/discover", telemetry.discover, module="telemetry")
 _route("GET", "/api/v1/telemetry/connectors", telemetry.list_connectors, module="telemetry", cache=True, ttl=60)
 _route("POST", "/api/v1/telemetry/connectors", telemetry.save_connector, module="telemetry", admin=True)
 _route("POST", "/api/v1/telemetry/connectors/delete", telemetry.delete_connector, module="telemetry", admin=True)
