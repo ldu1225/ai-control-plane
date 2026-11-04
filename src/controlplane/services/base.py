@@ -22,6 +22,15 @@ GE_ACTIVITY = "discoveryengine_googleapis_com_gemini_enterprise_user_activity"
 ARMOR_OPS = "modelarmor_googleapis_com_sanitize_operations"
 AGY_SINK = "businessaicode_googleapis_com_inference_response"
 CORE_TABLES = (AUDIT_ACTIVITY, AUDIT_DATA_ACCESS, GE_MESSAGE, GE_ACTIVITY, ARMOR_OPS, AGY_SINK)
+# Route ids of this product's built-in pages that read each core table (shown as links in Telemetry Extensions).
+BUILTIN_PAGES = {
+    AUDIT_ACTIVITY: ("registry", "deployments", "gateway"),
+    AUDIT_DATA_ACCESS: ("overview", "gateway", "notebooklm", "users"),
+    GE_ACTIVITY: ("gemini-enterprise", "model-armor", "users"),
+    GE_MESSAGE: ("gemini-enterprise", "overview", "users"),
+    ARMOR_OPS: ("model-armor", "overview", "users"),
+    AGY_SINK: ("antigravity", "models", "users"),
+}
 
 TRANSIENT_CODES = {"timeout", "query_failed", "upstream_unavailable", "credentials_unavailable", "api_error"}
 

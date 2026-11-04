@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -11,7 +12,7 @@ from ..gcp import GcpError
 from ..httpkit import ApiError, issue_csrf_token
 from ..security import GUEST_MODE, admin_guard, is_admin_email, mask_for_viewer, resolve_auth_mode
 from .base import AUDIT_DATA_ACCESS, describe_error
-from . import analyst, pricing_sync
+from . import analyst, pricing_sync, telemetry_routing
 
 LOG = logging.getLogger("controlplane.system")
 
@@ -54,7 +55,9 @@ def bootstrap(ctx, handler):
                                   "accountId": ws["billing"]["account_id"] if ctx.identity.is_admin else ""},
                       "timezone": ws["timezone"], "defaultRangeDays": ws["default_range_days"],
                       "today": timeutil.today_in(ws["timezone"]).isoformat()},
-        "pricingAlerts": pricing_sync.pricing_alert_summary(ctx.app.settings),
+        "pricingAlerts": dict(pricing_sync.pricing_alert_summary(ctx.app.settings),
+                              schedule=pricing_sync.schedule_info(s)),
+        "telemetryRouting": telemetry_routing.alert_summary(ctx.app) if s["modules"].get("telemetry") else None,
         # AI Analyst is shown to viewers only when they may use it (analyst.available_to).
         "modules": [{"id": m, "enabled": bool(s["modules"].get(m, False)) and
                      (m != "analyst" or analyst.available_to(ctx.identity, s))} for m in config.MODULE_IDS],
@@ -311,7 +314,9 @@ def settings_payload(ctx):
     """Full settings payload. GET /api/v1/settings declares settings_viewer_view for viewers in the registry;
     the write routes that also return this payload are administrator-only."""
     effective, _ = ctx.app.settings.snapshot()
+    # defaults = built-in defaults + config.yaml + environment, i.e. what a field returns to when its saved value is reset.
     return {"effective": effective, "overrides": ctx.app.settings.overrides(),
+            "defaults": copy.deepcopy(getattr(ctx.app.settings, "base", None) or {}),
             "persistence": ctx.app.settings.persistence(), "editable": ctx.identity.can_write}
 
 
@@ -322,6 +327,7 @@ def settings_viewer_view(payload):
     persistence = payload.get("persistence") or {}
     return {"effective": mask_for_viewer(config.mask_settings_for_viewer(payload.get("effective") or {})),
             "overrides": mask_for_viewer(config.mask_settings_for_viewer(payload.get("overrides") or {})),
+            "defaults": mask_for_viewer(config.mask_settings_for_viewer(payload.get("defaults") or {})),
             "persistence": {"backend": persistence.get("backend"), "durable": persistence.get("durable"),
                             "updatedAt": persistence.get("updatedAt")},
             "editable": False}

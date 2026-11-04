@@ -1080,7 +1080,8 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
                         "scheduler": scheduler_status(ctx, gstate),
                         "durable": store.governance_durable() if store is not None else None},
         "prerequisites": {"markerRoles": markers, "permissions": perms,
-                          "telemetryDetected": bool(usage.ok and usage.records > 0)},
+                          "telemetryDetected": bool(usage.ok and usage.records > 0),
+                          "inferenceLog": urllib.parse.unquote(ag.get("inference_log") or "")},
     }
     internal = {"policy": policy, "readable": readable, "cfg": cfg, "usage": usage, "idx": idx, "now": now,
                 "nextReset": next_reset, "tz": tz, "mode": mode, "state": gstate,

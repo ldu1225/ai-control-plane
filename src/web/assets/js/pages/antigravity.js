@@ -210,7 +210,7 @@ function renderStatus(ctx, body, s) {
   if (usageUnavailable) {
     body.append(banner({ tone: 'warning', title: t('Antigravity usage could not be read'), text: t('The inference log query failed. Grant the service identity roles/logging.viewer (or read access to the BigQuery sink table) and check the data source notices above.') }));
   } else if (prereq.telemetryDetected === false) {
-    body.append(banner({ tone: 'info', title: t('No Antigravity token usage logs in this project'), text: t('Token usage appears here when Antigravity for organizations writes its inference log (businessaicode.googleapis.com/inference_response) to this project. Google Cloud API calls made by coding agents are shown under Agent activity in your cloud.') }));
+    body.append(banner({ tone: 'info', title: t('No Antigravity token usage logs in this project'), text: t('Token usage appears here when Antigravity for organizations writes its inference log ({log}) to this project.', { log: prereq.inferenceLog || t('set in Settings') }) }));
   }
   if (enforcement.durable === false) {
     body.append(banner({ tone: 'warning', title: t('Exception rules are not stored durably'), text: t('Settings are kept in memory on this deployment, so exception rules and suspension records are lost when the service restarts. Configure a settings bucket (SETTINGS_BUCKET).') }));
@@ -284,7 +284,7 @@ function renderStatus(ctx, body, s) {
   }));
 
   body.append(card({
-    title: t('Usage against cap'), subtitle: windowText(policy), flush: true, source: 'businessaicode.googleapis.com/inference_response',
+    title: t('Usage against cap'), subtitle: windowText(policy), flush: true, source: prereq.inferenceLog || undefined,
     body: dataTable({
       columns: [
         { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
@@ -672,7 +672,7 @@ async function editException(ctx, s, existing) {
   const tokenIn = textInput({ value: existing && isNum(existing.tokenCap) ? String(existing.tokenCap) : '', type: 'number', placeholder: t('Default'), attrs: { min: 0, step: 1000 } });
   const reqIn = textInput({ value: existing && isNum(existing.requestCap) ? String(existing.requestCap) : '', type: 'number', placeholder: t('Default'), attrs: { min: 0, step: 10 } });
   const ownCost = existing && isNum(existing.costCap) ? existing.costCap : null;
-  const costPick = amountPicker({ value: ownCost || 0, currency: ccy, allowDefault: true, isDefault: ownCost === null, defaultLabel: defaultCostLabel(policy, ccy) });
+  const costPick = amountPicker({ value: ownCost || 0, currency: ccy, pricing: policy.pricing, allowDefault: true, isDefault: ownCost === null, defaultLabel: defaultCostLabel(policy, ccy) });
   const noteIn = textInput({ value: existing ? existing.note || '' : '', placeholder: t('Reason (optional)'), attrs: { maxlength: 200 } });
   const capsRow = h('div', { class: 'stack' },
     field({ label: t('Cost cap ({ccy})', { ccy }), help: t('Use default keeps the cost cap of the cap policy.'), control: costPick }),
@@ -799,18 +799,48 @@ function prerequisites(ctx, p) {
     btn);
 }
 
-const CURRENCIES = ['KRW', 'USD', 'JPY', 'EUR', 'GBP', 'SGD', 'AUD', 'CNY', 'INR', 'TWD'];
-const COST_PRESETS = { KRW: [1000000, 2000000, 3000000], JPY: [100000, 200000, 300000] };
+/** Values the browser knows for an Intl key ('currency', 'timeZone'); [] in browsers without Intl.supportedValuesOf. */
+function intlValues(key) {
+  try {
+    return typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf(key) : [];
+  } catch (e) {
+    return [];
+  }
+}
 
-function costPresets(ccy) {
-  return COST_PRESETS[ccy] || [1000, 2000, 3000];
+/** USD -> ccy from the daily official exchange-rate sync (or the rate of the price table in use), else null. */
+function usdRate(ccy, pricing) {
+  if (!ccy) return null;
+  if (ccy === 'USD') return 1;
+  if (pricing && pricing.fx && pricing.fx.to === ccy && isNum(pricing.fx.rate)) return pricing.fx.rate;
+  const rates = (store.boot && store.boot.pricingAlerts && store.boot.pricingAlerts.fx && store.boot.pricingAlerts.fx.rates) || {};
+  return rates[ccy] && isNum(rates[ccy].rate) ? rates[ccy].rate : null;
+}
+
+/** Every ISO 4217 code: the saved one and the currencies with a synced exchange rate first, then all others. */
+function currencyCodes(saved) {
+  const rates = (store.boot && store.boot.pricingAlerts && store.boot.pricingAlerts.fx && store.boot.pricingAlerts.fx.rates) || {};
+  return [...new Set([saved, ...Object.keys(rates), 'USD', ...intlValues('currency')].filter(Boolean))];
+}
+
+/**
+ * One-click amounts: 1x, 2x and 3x the power of ten closest to USD 1,000 in the cap currency, using the synced
+ * exchange rate (KRW at about 1,400 per USD gives 1,000,000 / 2,000,000 / 3,000,000). No rate, no presets.
+ */
+const PRESET_BASE_USD = 1000;
+
+function costPresets(ccy, pricing) {
+  const rate = usdRate(ccy, pricing);
+  if (!isNum(rate) || rate <= 0) return [];
+  const unit = 10 ** Math.round(Math.log10(PRESET_BASE_USD * rate));
+  return [1, 2, 3].map((k) => k * unit);
 }
 
 /**
  * Amount input with one-click presets (for example 1,000,000 / 2,000,000 / 3,000,000 KRW).
  * read() returns null for "use default", 0 for no cost cap, else the amount.
  */
-function amountPicker({ value, currency, allowDefault = false, isDefault = false, defaultLabel = '' }) {
+function amountPicker({ value, currency, pricing = null, allowDefault = false, isDefault = false, defaultLabel = '' }) {
   const state = { value: isNum(value) ? value : 0, useDefault: isDefault };
   const input = textInput({ value: state.value ? String(state.value) : '', type: 'number', placeholder: t('Amount'), attrs: { min: 0, step: 'any', 'aria-label': t('Amount') } });
   const chips = h('div', { class: 'chips' });
@@ -819,7 +849,7 @@ function amountPicker({ value, currency, allowDefault = false, isDefault = false
     const opts = [];
     if (allowDefault) opts.push({ key: 'default', label: t('Use default'), pressed: state.useDefault });
     opts.push({ key: 'off', label: t('No cost cap'), pressed: !state.useDefault && !state.value });
-    costPresets(currency).forEach((amount) => opts.push({ key: amount, label: fmt.currency(amount, currency, { compact: true }), pressed: !state.useDefault && state.value === amount }));
+    costPresets(currency, pricing).forEach((amount) => opts.push({ key: amount, label: fmt.currency(amount, currency, { compact: true }), pressed: !state.useDefault && state.value === amount }));
     mount(chips, opts.map((o) => h('button', {
       type: 'button', class: 'chip', 'aria-pressed': o.pressed ? 'true' : 'false',
       onclick: () => {
@@ -898,18 +928,18 @@ async function editPolicy(ctx, policy) {
   let cost = null;
   const renderCost = () => {
     const prev = cost ? cost.read() : (policy.costCap || 0);
-    cost = amountPicker({ value: prev || 0, currency: shownCcy() });
+    cost = amountPicker({ value: prev || 0, currency: shownCcy(), pricing });
     mount(costHost, cost);
   };
   const billingLabel = saved ? t('Billing account currency') : t('Billing account currency ({ccy})', { ccy: ccyOf(policy) });
-  const currencyOptions = [{ value: '', label: billingLabel }, ...[...new Set([saved, ...CURRENCIES])].filter(Boolean).map((c) => ({ value: c, label: c }))];
+  const currencyOptions = [{ value: '', label: billingLabel }, ...currencyCodes(saved).map((c) => ({ value: c, label: c }))];
   const currencySel = selectInput(currencyOptions, state.currency, (v) => { state.currency = v; renderCost(); }, { 'aria-label': t('Currency') });
   const priceInfo = h('div', { class: 'stack-sm' },
     h('div', { class: pricing.configured ? 'fw-600' : 'fw-600 text-warning' }, pricingSummary(pricing, ccyOf(policy))),
     h('p', { class: 'muted' }, pricing.source === 'manual'
       ? t('Entered token prices from Settings > Governance policy are used.')
       : t('Prices are found automatically: what your billing account actually paid per token in the last 30 days, and the public Google Cloud price list for models without billed usage. Amounts are converted with the Google exchange rate.')));
-  const tzOptions = [...new Set(['UTC', workspaceTz, state.tz, 'Asia/Seoul', 'Asia/Tokyo', 'America/Los_Angeles', 'Europe/London'])].map((z) => ({ value: z, label: z === workspaceTz ? `${z} (${t('workspace')})` : z }));
+  const tzOptions = [...new Set([workspaceTz, state.tz, 'UTC', ...intlValues('timeZone')].filter(Boolean))].map((z) => ({ value: z, label: z === workspaceTz ? `${z} (${t('workspace')})` : z }));
   const err = h('div', { class: 'field-error' });
   const save = button({ label: t('Save policy'), variant: 'primary' });
   renderCost();
@@ -967,7 +997,7 @@ async function editPersonCap(ctx, s, user) {
   const rule = user.exception;
   const isLimit = rule && rule.type === 'limit';
   const ownCost = isLimit && isNum(rule.costCap) ? rule.costCap : null;
-  const picker = amountPicker({ value: ownCost || 0, currency: ccy, allowDefault: true, isDefault: ownCost === null, defaultLabel: defaultCostLabel(policy, ccy) });
+  const picker = amountPicker({ value: ownCost || 0, currency: ccy, pricing: policy.pricing, allowDefault: true, isDefault: ownCost === null, defaultLabel: defaultCostLabel(policy, ccy) });
   const err = h('div', { class: 'field-error' });
   const save = button({ label: t('Save'), variant: 'primary' });
   const usage = isNum(user.estimatedCost) ? t('Estimated cost this period: {v}', { v: money(user.estimatedCost, ccy) }) : t('No estimated cost this period');

@@ -70,7 +70,7 @@ function renderPage(ctx, body, d) {
         ? h('span', null, t('Plus {v} in product charges', { v: fmt.currency(totals.productCost, ccy, { compact: true }) }))
         : (d.costSource === 'token_estimate' ? h('span', null, t('Token-estimated ({ccy})', { ccy })) : null),
       tip: d.costSource === 'token_estimate'
-        ? t('Estimated from observed token usage multiplied by official public token pricing and live USD/KRW FX.')
+        ? t('Estimated from observed token usage multiplied by official Google token prices, converted with the synced exchange rate.')
         : t('Billing export cost attributed to model SKUs. SKUs matching the excluded patterns are not counted.'),
     }),
     kpi({ label: t('Models tracked'), value: fmt.int(totals.modelsTracked), meta: h('span', null, t('{n} discovered', { n: fmt.int(totals.modelsDiscovered) })) }),

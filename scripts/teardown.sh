@@ -100,16 +100,18 @@ BRIDGE_SA="${SERVICE_NAME:0:23}-signin@${PROJECT_ID}.iam.gserviceaccount.com"
 BILLING_DATASET="${BILLING_DATASET:-}"
 BRIDGE_NAME="${SERVICE_NAME}-signin"
 SINK="${SERVICE_NAME}-ai-logs"
+TELEMETRY_DATASET="${TELEMETRY_DATASET:-telemetry_routed}"
 
 echo "This removes ${SERVICE_NAME} from project ${PROJECT_ID} (${REGION})."
 [[ "$DELETE_DATA" == "1" ]] && echo "It also deletes gs://${SETTINGS_BUCKET} and the log sink ${SINK}."
 if [[ "$DRY_RUN" == "1" ]]; then
-  info "[dry-run] scheduler jobs: ${SERVICE_NAME}-enforce, ${SERVICE_NAME}-pricing-sync"
+  info "[dry-run] scheduler jobs: ${SERVICE_NAME}-enforce, ${SERVICE_NAME}-maintenance, ${SERVICE_NAME}-pricing-sync"
+  info "[dry-run] telemetry route sinks (description \"AI Control Plane telemetry route\") on ${PROJECT_ID}${SCAN_PROJECTS:+ and linked projects}"
   info "[dry-run] Cloud Run services: ${SERVICE_NAME}, ${BRIDGE_NAME}"
   info "[dry-run] IAM bindings on ${PROJECT_ID}${SCAN_PROJECTS:+ and linked projects (${SCAN_PROJECTS})} for ${SA_EMAIL}"
   info "[dry-run] service accounts: ${SA_EMAIL}, ${BUILD_SA}, ${SCHEDULER_SA}, ${BRIDGE_SA}"
   info "[dry-run] secrets: ${SESSION_SECRET_NAME}, ${OAUTH_SECRET_NAME}"
-  [[ "$DELETE_DATA" == "1" ]] && info "[dry-run] delete gs://${SETTINGS_BUCKET} and log sink ${SINK}"
+  [[ "$DELETE_DATA" == "1" ]] && info "[dry-run] delete gs://${SETTINGS_BUCKET}, log sink ${SINK} and the routed telemetry dataset ${TELEMETRY_DATASET} (only if labelled managed-by=ai-control-plane)"
   exit 0
 fi
 if [[ "$YES" != "1" ]]; then
@@ -118,10 +120,33 @@ if [[ "$YES" != "1" ]]; then
 fi
 
 log "Cloud Scheduler jobs"
-for job in "${SERVICE_NAME}-enforce" "${SERVICE_NAME}-pricing-sync"; do
+for job in "${SERVICE_NAME}-enforce" "${SERVICE_NAME}-maintenance" "${SERVICE_NAME}-pricing-sync"; do
   quiet gcloud scheduler jobs delete "$job" --project "$PROJECT_ID" --location "$REGION" --quiet \
     && info "deleted ${job}" || info "${job} not found"
 done
+
+# Telemetry routes created from the dashboard are Log Router sinks that keep exporting (and costing) once the control
+# plane that enforces their budgets is gone, so they are always removed. They are recognized by their description.
+log "Telemetry route sinks"
+delete_route_sinks() {  # delete_route_sinks PROJECT
+  local names name
+  names="$(gcloud logging sinks list --project "$1" \
+    --filter='description:"AI Control Plane telemetry route"' --format='value(name)' 2>/dev/null || true)"
+  for name in $names; do
+    quiet gcloud logging sinks delete "$name" --project "$1" --quiet && info "deleted sink ${name} on $1" \
+      || info "could not delete sink ${name} on $1; delete it in Logging > Log Router"
+  done
+  return 0
+}
+delete_route_sinks "$PROJECT_ID"
+if [[ -n "$SCAN_PROJECTS" ]]; then
+  IFS=',' read -r -a raw_route_projects <<<"$SCAN_PROJECTS"
+  for raw_rp in "${raw_route_projects[@]}"; do
+    rp="$(normalize_project_id "$raw_rp")"
+    [[ -z "$rp" || "$rp" == "$PROJECT_ID" ]] && continue
+    delete_route_sinks "$rp"
+  done
+fi
 
 log "Cloud Run services"
 for svc in "$SERVICE_NAME" "$BRIDGE_NAME"; do
@@ -205,8 +230,16 @@ if [[ "$DELETE_DATA" == "1" ]]; then
   else
     info "sink ${SINK} not found"
   fi
+  # The routed telemetry dataset is deleted only when this control plane created it (label managed-by).
+  if bq --project_id "$PROJECT_ID" show --format=json "${PROJECT_ID}:${TELEMETRY_DATASET}" 2>/dev/null \
+      | python3 -c 'import json,sys; sys.exit(0 if (json.load(sys.stdin).get("labels") or {}).get("managed-by") == "ai-control-plane" else 3)' 2>/dev/null; then
+    quiet bq --project_id "$PROJECT_ID" rm -r -f -d "${PROJECT_ID}:${TELEMETRY_DATASET}" \
+      && info "deleted dataset ${PROJECT_ID}:${TELEMETRY_DATASET}" || info "could not delete ${PROJECT_ID}:${TELEMETRY_DATASET}"
+  else
+    info "dataset ${TELEMETRY_DATASET} not found or not created by the control plane; kept"
+  fi
 else
-  info "kept gs://${SETTINGS_BUCKET} and the log sink ${SINK} (use --delete-data to remove them)"
+  info "kept gs://${SETTINGS_BUCKET}, the log sink ${SINK} and the routed telemetry dataset ${TELEMETRY_DATASET} (use --delete-data to remove them)"
 fi
 
 log "Kept on purpose"

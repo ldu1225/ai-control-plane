@@ -122,9 +122,19 @@ class DeployModulesTest(unittest.TestCase):
             "SCAN_PROJECTS",
             "SCAN_ALL_PROJECTS",
             "PREPARE_LINKED_PROJECTS",
-            "PRICING_SYNC_SCHEDULE",
+            "MAINTENANCE_SCHEDULE",
+            "PRICING_SYNC_TIME",
+            "PRICING_CURRENCY",
         ):
             self.assertRegex(example, r"(?m)^%s=" % key)
+
+    def test_no_fixed_price_check_time_or_timezone_in_deploy(self):
+        deploy = read("scripts/deploy.sh")
+        self.assertNotIn("0 4 * * *", deploy)
+        self.assertNotIn('PRICING_TZ="Asia/Seoul"', deploy)
+        self.assertNotIn("04:00 KST", deploy)
+        self.assertIn('add_env RUNTIME_SERVICE_ACCOUNT "$SA_EMAIL"', deploy)
+        self.assertIn('MAINT_URL="${BASE_URL}/api/v1/system/maintenance"', deploy)
 
 
 def ge_script():
@@ -447,6 +457,21 @@ esac
                 )
                 self.assertEqual(res.returncode, 0, msg=(access_mode, res.stdout, res.stderr))
                 self.assertIn("Deployment complete:", res.stdout)
+                if access_mode == "iap":
+                    self.assertIn("maintenance schedule: IAP blocks Cloud Scheduler calls", res.stdout)
+                else:
+                    self.assertIn("[dry-run] scheduler job ai-control-plane-maintenance: */15 * * * * -> ",
+                                  res.stdout)
+                    self.assertIn("/api/v1/system/maintenance", res.stdout)
+            # Invalid scheduling values stop the deployment before anything changes.
+            for bad in ('PRICING_SYNC_TIME="25:00"', 'MAINTENANCE_SCHEDULE="every hour"', 'PRICING_CURRENCY="won!"'):
+                env_file = os.path.join(tmp, "deploy-bad.env")
+                with open(env_file, "w", encoding="utf-8") as fh:
+                    fh.write('PROJECT_ID="demo-project-260520"\nREGION="asia-northeast3"\nADMIN_EMAILS="admin@example.org"\n'
+                             'ACCESS_MODE="google"\n%s\n' % bad)
+                res = subprocess.run(["bash", os.path.join(ROOT, "scripts/deploy.sh"), "--config", env_file, "--dry-run"],
+                                     capture_output=True, text=True, env=env, check=False)
+                self.assertNotEqual(res.returncode, 0, msg=(bad, res.stdout))
 
     def test_zero_config_cli_and_multi_project_install_dry_run(self):
         import subprocess
@@ -930,7 +955,9 @@ class MultiProjectHubAndTeardownTest(unittest.TestCase):
             self.assertIn("project demo-hub (asia-northeast3)", res_dry.stdout)
             self.assertNotIn("unrelated-other-proj-bucket", res_dry.stdout)
             self.assertIn("gs://demo-hub-ai-control-plane-settings", res_dry.stdout)
-            self.assertIn("[dry-run] scheduler jobs: ai-control-plane-enforce, ai-control-plane-pricing-sync", res_dry.stdout)
+            self.assertIn("[dry-run] scheduler jobs: ai-control-plane-enforce, ai-control-plane-maintenance, "
+                          "ai-control-plane-pricing-sync", res_dry.stdout)
+            self.assertIn("[dry-run] telemetry route sinks", res_dry.stdout)
             self.assertIn("[dry-run] IAM bindings on demo-hub and linked projects (demo-spoke-a,demo-spoke-b)", res_dry.stdout)
             self.assertFalse(os.path.exists(gcloud_log) and "delete" in open(gcloud_log, encoding="utf-8").read())
 
@@ -955,6 +982,12 @@ class MultiProjectHubAndTeardownTest(unittest.TestCase):
             with open(gcloud_log, encoding="utf-8") as fh:
                 calls = fh.read()
             self.assertIn("scheduler jobs delete ai-control-plane-pricing-sync", calls)
+            self.assertIn("scheduler jobs delete ai-control-plane-maintenance", calls)
+            # Managed telemetry route sinks are found by description on the hub and every linked project.
+            self.assertIn('logging sinks list --project demo-hub --filter=description:"AI Control Plane telemetry route"',
+                          calls)
+            self.assertIn("logging sinks list --project demo-spoke-a", calls)
+            self.assertIn("logging sinks list --project demo-spoke-b", calls)
             self.assertIn("scheduler jobs delete ai-control-plane-enforce", calls)
             self.assertIn("projects remove-iam-policy-binding demo-spoke-a", calls)
             self.assertIn("projects remove-iam-policy-binding demo-spoke-b", calls)

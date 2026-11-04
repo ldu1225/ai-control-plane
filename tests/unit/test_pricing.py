@@ -74,7 +74,8 @@ class CatalogTest(unittest.TestCase):
             catalog_sku("Generate content input token count gemini 4 argon text", 4e-06 * 1358.75, rate=1358.75)]}]}
         ctx = mock.MagicMock()
         ctx.rest.side_effect = lambda method, url, **kw: pages[url.split("/services/")[1].split("/")[0]].pop(0)
-        prices, rate, effective = pricing.catalog_prices(ctx, "KRW")
+        services = [{"id": "C7E2-9256-1C43", "name": "Vertex AI"}, {"id": "AEFD-7695-64FA", "name": "Gemini API"}]
+        prices, rate, effective = pricing.catalog_prices(ctx, "KRW", services=services)
         self.assertAlmostEqual(prices["gemini-4-argon"]["input"], 4 * 1358.75, places=3)
         self.assertAlmostEqual(prices["gemini-4-argon"]["output"], 20 * 1358.75, places=3)
         self.assertEqual((rate, effective), (1358.75, "2026-10-20T07:00:00Z"))

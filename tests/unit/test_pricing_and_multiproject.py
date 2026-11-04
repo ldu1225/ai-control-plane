@@ -76,10 +76,15 @@ class PricingSyncTest(unittest.TestCase):
         self.assertAlmostEqual(pro["cached"], 0.125)
 
     def test_ssrf_allowlist_blocks_untrusted_hosts(self):
+        settings = support.make_settings()
+        fetch = pricing_sync.make_fetcher(pricing_sync.allowed_hosts(settings))
         with self.assertRaises(ValueError):
-            pricing_sync._fetch_public_url("https://evil.example.com/pricing")
+            fetch("https://evil.example.com/pricing")
         with self.assertRaises(ValueError):
-            pricing_sync._fetch_public_url("http://aistudio.google.com/docs/pricing.md")
+            fetch("http://aistudio.google.com/docs/pricing.md")
+        # Only hosts of the configured official price pages and exchange-rate feeds are reachable.
+        self.assertIn("aistudio.google.com", pricing_sync.allowed_hosts(settings))
+        self.assertNotIn("evil.example.com", pricing_sync.allowed_hosts(settings))
 
     def test_diff_snapshots_silent_on_first_sync_and_alerts_on_changes(self):
         models_v1 = {
@@ -88,7 +93,7 @@ class PricingSyncTest(unittest.TestCase):
                 "source": "google_public_docs", "label": "Gemini 2.5 Pro",
             },
         }
-        fx_v1 = {"usdKrw": 1380.0, "source": "open.er-api.com"}
+        fx_v1 = {"base": "USD", "rates": {"KRW": {"rate": 1380.0, "source": "open.er-api.com"}}}
         first_alerts = pricing_sync.diff_snapshots({}, models_v1, fx_v1, "2026-04-17T04:00:00Z")
         self.assertEqual(first_alerts, [])
 
@@ -107,7 +112,7 @@ class PricingSyncTest(unittest.TestCase):
                 "source": "google_public_docs", "label": "Gemini 5 Ultra",
             },
         }
-        fx_v2 = {"usdKrw": 1415.0, "source": "open.er-api.com"}  # +2.54% shift
+        fx_v2 = {"base": "USD", "rates": {"KRW": {"rate": 1415.0, "source": "open.er-api.com"}}}  # +2.54% shift
         alerts = pricing_sync.diff_snapshots(prev_state, models_v2, fx_v2, "2026-04-18T04:00:00Z")
         kinds = {a["kind"] for a in alerts}
         self.assertEqual(kinds, {"fx", "model_price", "new_model"})
@@ -160,12 +165,14 @@ class TokenCostEstimationFallbackTest(unittest.TestCase):
         base_cfg = support.make_settings(
             workspace={"project_id": "acme-ai-prod", "timezone": "Asia/Seoul"},
             branding={"default_locale": "ko"},
+            pricing={"currency": "KRW"},
         )
         mgr = settings_store.SettingsManager(base_cfg, settings_store.MemoryStore())
 
         def seed(state):
             state["syncedAt"] = "2026-04-17T04:00:00Z"
-            state["fx"] = {"usdKrw": usd_krw, "source": "open.er-api.com", "asOf": "2026-04-17"}
+            state["fx"] = {"base": "USD", "rates": {"KRW": {"rate": usd_krw, "source": "open.er-api.com",
+                                                             "asOf": "2026-04-17"}}}
             state["models"] = {
                 "gemini-2.5-pro": {
                     "input": 1.25,
@@ -213,7 +220,7 @@ class TokenCostEstimationFallbackTest(unittest.TestCase):
             usage = models.usage(ctx)
             self.assertEqual(ctx.warnings, [])
             self.assertEqual(usage["costSource"], "token_estimate")
-            # Default currency in ko/Asia-Seoul is KRW: 10,500 KRW
+            # The display currency is the configured pricing.currency (no locale guess): 10,500 KRW
             self.assertEqual(usage["currency"], "KRW")
             self.assertAlmostEqual(usage["totals"]["cost"], 10500.0, places=1)
             pro_row = next(m for m in usage["models"] if m["key"] == "gemini-2.5-pro")
@@ -335,7 +342,7 @@ class MultiProjectUnionAndAuditZeroStateTest(unittest.TestCase):
         ]
         parsed = [(k, d) for k, d, *_ in pricing.catalog_entries(skus) if k]
         self.assertEqual(parsed, [("gemini-2.5-flash", "input")])
-        self.assertFalse(pricing_sync._valid_token_entry("lyria-3", {"output": 80000.0}))
+        self.assertFalse(pricing_sync.valid_token_entry("lyria-3", {"output": 80000.0}))
         _, rate = pricing_sync.lookup_model_rate({"gemini-2.5-flash": {"input": 0.3, "output": 2.5}}, "lyria-3")
         self.assertIsNone(rate)
 

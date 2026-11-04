@@ -91,6 +91,8 @@ DEFAULTS = {
         "models": ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-4-carbon", "gemini-4-argon"],
         "discover_models": True,
         "restrict_to_allowed": True,
+        # Tried in order when a requested model is not available in this project (for example a preview model).
+        "fallback_models": ["gemini-2.5-flash", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-2.5-flash-lite"],
     },
     "modules": {module_id: True for module_id in MODULE_IDS},
     "model_catalog": {
@@ -157,6 +159,82 @@ DEFAULTS = {
     },
     "telemetry": {
         "connectors": [],
+        # Discovery limits. Sources are found from what the project actually writes (Cloud Logging log list,
+        # Cloud Monitoring log volume, sampled entries and BigQuery schemas); these values only bound the work.
+        "discovery": {
+            "max_projects": 8,
+            "max_datasets_per_project": 20,
+            "max_tables_per_dataset": 100,
+            "activity_days": 7,
+            "sample_entries": 300,          # entries read in one call to learn payload fields
+            "targeted_samples": 12,         # extra per-log reads for logs the shared sample missed
+            "max_log_entries": 1000,        # entries a Cloud Logging dashboard reads per view (1000 = one API call)
+            "dataset_hints": ["log", "audit", "telemetry", "agent", "gemini", "event"],  # scan order only
+            "hidden_logs": [],              # log id substrings never listed
+        },
+        # Gemini describes, maps and groups every discovered source. Results are kept per source fingerprint.
+        "ai": {
+            "enabled": True,
+            "model": "gemini-4-argon",      # empty = ai_engine.default_model; unavailable -> automatic fallback
+            "batch_size": 25,
+            "max_sources": 150,
+            "profile_ttl_hours": 168,
+            "share_value_examples": True,   # send short, masked examples of low-cardinality values
+        },
+        # Generic name hints used together with value statistics (email ratio, cardinality, numeric type).
+        "inference": {
+            "time_hints": ["timestamp", "receivetimestamp", "event_time", "event_timestamp", "event_ts", "created_at",
+                           "occurred_at", "start_time", "logged_at", "recorded_at", "ts"],
+            "user_hints": ["principalemail", "user_email", "useremail", "email", "user_id", "userid", "user",
+                           "actor", "principal", "caller", "account"],
+            "model_hints": ["model"],
+            "token_hints": ["token"],
+            "operation_hints": ["method", "operation", "action", "event", "step", "tool", "command", "task",
+                                "route", "function", "type", "name"],
+            "status_hints": ["status", "code", "severity", "result", "outcome", "verdict", "reason", "state",
+                             "phase", "level"],
+            "sensitive_hints": ["prompt", "response", "content", "message", "messages", "text", "parts",
+                                "instruction", "query"],
+        },
+        # Brand naming policy applied to service titles read from the Service Usage API ("From=To").
+        "display_renames": ["Vertex AI=Agent Platform"],
+        # Log Router -> BigQuery routing created from the dashboard, with cost controls.
+        "routing": {
+            "dataset": "telemetry_routed",  # dedicated dataset, so retention never touches the audit dataset
+            "dataset_location": "",         # empty = location of the audit dataset
+            "sink_prefix": "acp-tx-",
+            "sample_percent": 100.0,        # sample(insertId, ...) in the sink filter
+            "min_severity": "",             # empty = every severity
+            "exclusion_filters": [],        # Logging filters added as sink exclusions
+            "retention_days": 30,           # partition expiration of routed tables; 0 = keep
+            "daily_budget_gb": 5.0,         # all managed sinks together per local day; 0 = unlimited
+            "sink_daily_gb": 1.0,           # default per sink per local day; 0 = unlimited
+            "over_budget_action": "pause",  # pause (disable the sink until the next day) | alert
+            "auto_resume": True,
+            "max_sinks": 20,
+            "follow_groups": True,          # add new logs of a routed group automatically (within budget)
+            "notify_webhook_url": "",
+        },
+    },
+    # Token prices for cost estimates when the billing export is not readable. Prices come only from
+    # official sources (Cloud Billing Catalog API and Google pricing pages), never from a built-in table.
+    "pricing": {
+        "currency": "",                     # ISO 4217 display currency; empty = governance currency, else USD
+        "sync_time": "00:00",               # local time of the daily price and exchange rate check
+        "sync_timezone": "",                # empty = workspace timezone
+        "public_sources": [
+            "https://aistudio.google.com/docs/pricing.md",
+            "https://ai.google.dev/gemini-api/docs/pricing",
+            "https://cloud.google.com/vertex-ai/generative-ai/pricing",
+        ],
+        "fx_sources": ["https://open.er-api.com/v6/latest/USD", "https://api.frankfurter.dev/v1/latest?base=USD"],
+        "catalog_services": ["Vertex AI", "Agent Platform", "Gemini API"],  # Billing Catalog display names
+        "include_partner_models": True,     # partner models billed under their own service (for example Claude)
+        "storage_service": "BigQuery",      # Billing Catalog service used for routing cost estimates
+        "model_aliases": [],                # "my-tuned-model=gemini-2.5-flash"
+        "model_overrides": [],              # [{model, input, output, cached}] USD per 1M tokens
+        "alert_price_change_pct": 0.5,
+        "alert_fx_change_pct": 1.0,
     },
     "analyst": {
         "max_bytes_billed": 10000000000,
@@ -448,6 +526,113 @@ def _model_prices(value):
     return out
 
 
+HINT_RE = re.compile(r"^[a-z0-9_.\-]{1,40}$")
+TIME_OF_DAY_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
+SINK_PREFIX_RE = re.compile(r"^[a-z][a-z0-9_\-]{0,30}$")
+BQ_LOCATION_RE = re.compile(r"^([A-Za-z][A-Za-z0-9\-]{1,40})?$")
+SEVERITIES = ("", "DEFAULT", "DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY")
+# Google documentation hosts accepted for price pages ("official Google pricing documentation only").
+OFFICIAL_DOC_SUFFIXES = (".google.com", ".google.dev")
+
+
+def _hint(value):
+    if not isinstance(value, str) or not HINT_RE.match(value.strip().lower()):
+        raise Invalid("must be a lowercase word of letters, digits, '_', '-' or '.'")
+    return value.strip().lower()
+
+
+def _pair(lower_left=False, left_rx=None):
+    """'Left=Right' text pairs (renames and model aliases)."""
+    def check(value):
+        if not isinstance(value, str) or value.count("=") != 1:
+            raise Invalid("must look like 'from=to'")
+        left, right = (part.strip() for part in value.split("="))
+        if lower_left:
+            left, right = left.lower(), right.lower()
+        if not left or not right or len(left) > 120 or len(right) > 120 or CONTROL_RE.search(left + right):
+            raise Invalid("must look like 'from=to' with 1 to 120 characters on each side")
+        if left_rx is not None and not (left_rx.match(left) and left_rx.match(right)):
+            raise Invalid("must contain valid model ids")
+        return "%s=%s" % (left, right)
+    return check
+
+
+def _model_overrides(value):
+    """[{model, input, output, cached}] USD per million tokens set by an administrator."""
+    if not isinstance(value, list):
+        raise Invalid("must be a list")
+    if len(value) > 100:
+        raise Invalid("must contain at most 100 items")
+    out, seen = [], set()
+    price = _float(0, 1e6)
+    for idx, item in enumerate(value):
+        if not isinstance(item, dict) or set(item) - {"model", "input", "output", "cached"}:
+            raise Invalid("item %d must be an object with model, input, output and cached" % (idx + 1))
+        model = str(item.get("model") or "").strip().lower()
+        if not MODEL_KEY_RE.match(model) or model in seen:
+            raise Invalid("item %d has an invalid or repeated model id" % (idx + 1))
+        seen.add(model)
+        try:
+            row = {"model": model, "input": price(item.get("input", 0)), "output": price(item.get("output", 0))}
+            row["cached"] = price(item["cached"]) if item.get("cached") is not None else None
+        except Invalid as err:
+            raise Invalid("item %d price %s" % (idx + 1, err))
+        out.append(row)
+    return out
+
+
+def public_https_host(url):
+    """Host of an https URL on a public DNS name (no IP literal, credentials, ports or internal names)."""
+    if not isinstance(url, str) or len(url) > 500 or CONTROL_RE.search(url):
+        return None
+    parts = urllib.parse.urlsplit(url.strip())
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not host or "." not in host or parts.username or parts.password:
+        return None
+    if parts.port not in (None, 443) or re.match(r"^[0-9.]+$", host) or ":" in host:
+        return None
+    if host == "localhost" or host.endswith((".internal", ".local", ".localhost")):
+        return None
+    return host
+
+
+def _official_doc_url(value):
+    host = public_https_host(value)
+    if not host or not (host.endswith(OFFICIAL_DOC_SUFFIXES) or host in ("google.com", "google.dev")):
+        raise Invalid("must be an https URL on an official Google documentation host (*.google.com, *.google.dev)")
+    return value.strip()
+
+
+def _public_url(value):
+    if not public_https_host(value):
+        raise Invalid("must be an https URL on a public host name")
+    return value.strip()
+
+
+def _time_of_day(value):
+    if not isinstance(value, str) or not TIME_OF_DAY_RE.match(value.strip()):
+        raise Invalid("must be a time of day such as 00:00")
+    return value.strip()
+
+
+def _timezone_or_empty(value):
+    if value == "":
+        return ""
+    return _timezone(value)
+
+
+def _currency_or_empty(value):
+    """ISO 4217 code (upper-cased) or empty."""
+    if not isinstance(value, str) or not CURRENCY_RE.match(value.strip().upper()):
+        raise Invalid("must be a valid ISO 4217 currency code (for example KRW) or empty")
+    return value.strip().upper()
+
+
+def _model_or_empty(value):
+    if value == "":
+        return ""
+    return _regex(MODEL_ID_RE, "model id")(value)
+
 VALIDATORS = {
     "product.name": _text(60, allow_empty=False),
     "product.tagline": _text(140),
@@ -496,6 +681,7 @@ VALIDATORS = {
     "ai_engine.models": _list(_regex(MODEL_ID_RE, "model id"), 30),
     "ai_engine.discover_models": _bool,
     "ai_engine.restrict_to_allowed": _bool,
+    "ai_engine.fallback_models": _list(_regex(MODEL_ID_RE, "model id"), 10),
     "model_catalog.auto_enable_new_models": _bool,
     "model_catalog.disabled_models": _list(_regex(re.compile(r"^[a-z0-9][a-z0-9.\-_]{0,120}$"), "model key"), 500),
     "model_catalog.excluded_sku_patterns": _list(_sku_pattern, 50),
@@ -524,7 +710,7 @@ VALIDATORS = {
     "governance.antigravity.webhook_url": _pred(valid_webhook, "https webhook URL on an allowlisted host"),
     "governance.antigravity.enforcement_mode": _enum("manual", "auto"),
     "governance.antigravity.cost_cap": _float(0, 1e9),
-    "governance.antigravity.currency": _regex(CURRENCY_RE, "ISO 4217 currency code (for example KRW) or empty"),
+    "governance.antigravity.currency": _currency_or_empty,
     "governance.antigravity.pricing_source": _enum("auto", "manual"),
     "governance.antigravity.input_price_per_million": _float(0, 1e6),
     "governance.antigravity.output_price_per_million": _float(0, 1e6),
@@ -534,6 +720,58 @@ VALIDATORS = {
     "analyst.max_bytes_billed": _int(10000000, 10 ** 13),
     "analyst.max_rows": _int(1, 5000),
     "analyst.allow_viewers": _bool,
+    # Telemetry discovery, Gemini profiling and field inference
+    "telemetry.discovery.max_projects": _int(1, 50),
+    "telemetry.discovery.max_datasets_per_project": _int(0, 200),
+    "telemetry.discovery.max_tables_per_dataset": _int(1, 1000),
+    "telemetry.discovery.activity_days": _int(1, 30),
+    "telemetry.discovery.sample_entries": _int(0, 1000),
+    "telemetry.discovery.targeted_samples": _int(0, 50),
+    "telemetry.discovery.max_log_entries": _int(100, 50000),
+    "telemetry.discovery.dataset_hints": _list(_hint, 30),
+    "telemetry.discovery.hidden_logs": _list(_text(200, allow_empty=False), 100),
+    "telemetry.ai.enabled": _bool,
+    "telemetry.ai.model": _model_or_empty,
+    "telemetry.ai.batch_size": _int(5, 60),
+    "telemetry.ai.max_sources": _int(0, 500),
+    "telemetry.ai.profile_ttl_hours": _int(1, 24 * 90),
+    "telemetry.ai.share_value_examples": _bool,
+    "telemetry.inference.time_hints": _list(_hint, 50),
+    "telemetry.inference.user_hints": _list(_hint, 50),
+    "telemetry.inference.model_hints": _list(_hint, 50),
+    "telemetry.inference.token_hints": _list(_hint, 50),
+    "telemetry.inference.operation_hints": _list(_hint, 50),
+    "telemetry.inference.status_hints": _list(_hint, 50),
+    "telemetry.inference.sensitive_hints": _list(_hint, 50),
+    "telemetry.display_renames": _list(_pair(), 30),
+    # Log Router -> BigQuery routing cost controls
+    "telemetry.routing.dataset": _pred(valid_dataset, "dataset id"),
+    "telemetry.routing.dataset_location": _regex(BQ_LOCATION_RE, "BigQuery location (for example asia-northeast3) or empty"),
+    "telemetry.routing.sink_prefix": _regex(SINK_PREFIX_RE, "sink name prefix (lowercase letters, digits, '-' or '_')"),
+    "telemetry.routing.sample_percent": _float(0.01, 100),
+    "telemetry.routing.min_severity": _enum(*SEVERITIES),
+    "telemetry.routing.exclusion_filters": _list(_text(2000, allow_empty=False), 20),
+    "telemetry.routing.retention_days": _int(0, 3650),
+    "telemetry.routing.daily_budget_gb": _float(0, 1e6),
+    "telemetry.routing.sink_daily_gb": _float(0, 1e6),
+    "telemetry.routing.over_budget_action": _enum("pause", "alert"),
+    "telemetry.routing.auto_resume": _bool,
+    "telemetry.routing.max_sinks": _int(1, 200),
+    "telemetry.routing.follow_groups": _bool,
+    "telemetry.routing.notify_webhook_url": _pred(valid_webhook, "https webhook URL on an allowlisted host"),
+    # Token prices and exchange rates (official sources only)
+    "pricing.currency": _currency_or_empty,
+    "pricing.sync_time": _time_of_day,
+    "pricing.sync_timezone": _timezone_or_empty,
+    "pricing.public_sources": _list(_official_doc_url, 10),
+    "pricing.fx_sources": _list(_public_url, 5),
+    "pricing.catalog_services": _list(_text(80, allow_empty=False), 20),
+    "pricing.include_partner_models": _bool,
+    "pricing.storage_service": _text(80),
+    "pricing.model_aliases": _list(_pair(lower_left=True, left_rx=MODEL_KEY_RE), 100),
+    "pricing.model_overrides": _model_overrides,
+    "pricing.alert_price_change_pct": _float(0, 1000),
+    "pricing.alert_fx_change_pct": _float(0, 1000),
 }
 for _module in MODULE_IDS:
     VALIDATORS["modules.%s" % _module] = _bool
@@ -546,7 +784,8 @@ UI_LOCKED_KEYS = {"security.auth_mode", "security.iap_audience", "security.googl
 INTERNAL_KEYS = {"model_catalog.known_models", "telemetry.connectors"}
 
 EDITABLE_SECTIONS = ("product", "branding", "workspace", "security", "modules", "model_catalog",
-                     "ai_engine", "agent_lifecycle", "finops", "governance", "analyst", "gateway")
+                     "ai_engine", "agent_lifecycle", "finops", "governance", "analyst", "gateway",
+                     "telemetry", "pricing")
 
 
 def section_prefix(section):
@@ -710,6 +949,10 @@ ENV_MAP = {
     "SETTINGS_BUCKET": "storage.gcs_bucket",
     "AI_DEFAULT_MODEL": "ai_engine.default_model",
     "AI_LOCATION": "ai_engine.location",
+    "PRICING_CURRENCY": "pricing.currency",
+    "PRICING_SYNC_TIME": "pricing.sync_time",
+    "TELEMETRY_AI_MODEL": "telemetry.ai.model",
+    "TELEMETRY_DATASET": "telemetry.routing.dataset",
     "HOST": "server.host",
     "PORT": "server.port",
 }
@@ -940,10 +1183,11 @@ def mask_settings_for_viewer(effective):
     (VIEWER_HIDDEN_KEYS) replaced by ***. Policy values such as caps, periods and prices stay visible."""
     from .security import mask_email  # local import to avoid a cycle
     out = copy.deepcopy(effective)
-    hook = get_path(out, "governance.antigravity.webhook_url") or ""
-    if hook:
-        host = urllib.parse.urlsplit(hook).hostname or "webhook"
-        set_path(out, "governance.antigravity.webhook_url", "https://%s/***" % host)
+    for dotted_hook in ("governance.antigravity.webhook_url", "telemetry.routing.notify_webhook_url"):
+        hook = get_path(out, dotted_hook) or ""
+        if hook:
+            host = urllib.parse.urlsplit(hook).hostname or "webhook"
+            set_path(out, dotted_hook, "https://%s/***" % host)
     for dotted in MEMBER_LIST_KEYS:
         members = get_path(out, dotted)
         if members:  # absent keys stay absent (this also masks partial override documents)

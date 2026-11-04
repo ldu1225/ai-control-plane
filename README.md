@@ -61,10 +61,10 @@ Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registr
 | 에이전트 배포 | `agent_deployments` | Agent Engine 런타임, 실행 ID(서비스 계정), 호출량, ID별 모델 사용량, 런타임 비용 | Agent Platform API, 감사 로그, 결제 내보내기 |
 | Model Armor | `model_armor` | 판정 추이, 필터 일치, 애플리케이션과 사용자별 차단, 이벤트 상세 | BigQuery `modelarmor_googleapis_com_sanitize_operations` |
 | 모델 및 토큰 | `model_usage` | 모델 자동 탐지, 모델별 입력/출력/캐시 토큰, 호출 수, 오류율, 비용, 카탈로그 관리 | Cloud Monitoring, 결제 내보내기, Antigravity 로그, 공개 가격표 |
-| 비용 및 FinOps | `finops` | 총 비용, 크레딧, 순 비용, 서비스와 SKU별 비용, 급증 감지와 AI 원인 분석, 일일 공개 단가·환율 동기화 | 결제 내보내기 (미연결 시 실측 토큰 × 공식 공개 단가·실시간 환율 역산) |
+| 비용 및 FinOps | `finops` | 총 비용, 크레딧, 순 비용, 서비스·SKU별 청구액 또는 모델별 토큰 역산 비용, 자정(`00:00`, 설정 가능) 공식 단가·다중 통화 환율 동기화 및 변동 알림, 급증 감지와 AI 원인 분석 | 결제 내보내기 (미연결 시 실측 토큰 × 공식 공개 단가·환율 역산) |
 | 사용자 및 액세스 | `users` | 사용자 360 뷰(서비스 전체 사용량), Antigravity IAM 상태, 개별 허용과 차단 | 전체 소스, Resource Manager IAM |
 | Antigravity 통제 | `antigravity` | 사용자별 비용/토큰/요청 한도, 자동 또는 수동 정지, 예외 규칙, 정산 기간, 안전 게이트, 클라우드에서 에이전트가 실행한 작업, 감사 로그 | Cloud Logging 또는 BigQuery, IAM, 결제 내보내기, Cloud Billing Catalog API |
-| 텔레메트리 확장 | `telemetry` | 로그·테이블 자동 발견과 쉬운 설명, 클릭 한 번으로 만드는 표준 대시보드, BigQuery 내보내기 명령 | BigQuery, Cloud Logging, Cloud Monitoring |
+| 텔레메트리 확장 | `telemetry` | 스키마·필드 통계 + Gemini 기반 동적 로그·테이블 분석 및 그룹 묶음 대시보드, 비용 제어형(샘플링·심각도·제외 필터·보존 기간·일일 GiB 한도 자동 일시 중지/재개) Log Router → BigQuery 자동 라우팅 | BigQuery, Cloud Logging, Cloud Monitoring, Gemini on Agent Platform |
 | AI 애널리스트 | `analyst` | 자연어 질문, 검증된 읽기 전용 SQL, 결과 표와 차트, 요약 | BigQuery, Gemini on Agent Platform |
 
 공통 기능: 멀티 프로젝트 통합/개별 전환 선택기, 라이트/다크 테마, 한국어/영어 전환, 통화(KRW/USD) 전환, 명령 팔레트(Ctrl/Cmd+K), 기간 선택(프리셋과 직접 지정), 표 검색/정렬/CSV 내보내기, 데이터 소스 상태 패널.
@@ -194,7 +194,7 @@ scripts/deploy.sh --project my-project-id --link-projects project-b,project-c
 | 5. 세션 서명 키 | 리전 제한 조직 정책(`constraints/gcp.resourceLocations`)을 준수하여 Secret Manager 시크릿을 생성합니다. |
 | 6. 데이터 소스 일괄 활성화 | BigQuery 데이터셋(`ge_analytics`)과 파티션 Log Router 싱크 생성, **AI 서비스 전체 Data Access 감사 로그 활성화**, 모든 Gemini Enterprise 앱의 **사용 로그 + 프롬프트·사용자 식별 로깅 활성화**, 연동 프로젝트 로그 싱크 온보딩(권한 보유 시), 조직명 및 Agent Platform 엔드포인트 자동 탐지를 수행합니다. |
 | 7. Cloud Run & 인증 자동 대응 | 로그인 브리지(IAP)와 대시보드를 배포합니다. 도메인 제한 공유(`iam.allowedPolicyMemberDomains`)나 비인증 호출 차단 조직 정책이 있어도 `--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** 또는 내장 ID/비밀번호 로그인으로 자동 전환하여 실패 없이 배포합니다. |
-| 8. 단가 동기화 스케줄 & 헬스체크 | 매일 새벽 `04:00 KST` 공식 공개 단가·환율 자동 동기화 작업(`ai-control-plane-pricing-sync`)을 등록하고, 배포 직후 실제 엔드포인트 응답 상태(`HTTP 200/302/401`)를 검증해 접속 주소를 출력합니다. |
+| 8. 정기 유지관리 스케줄 & 헬스체크 | 자정(`00:00`, 설정 가능) 공식 단가·환율 동기화와 텔레메트리 BigQuery 라우팅 일일 예산 점검·다음 날 자동 재개를 수행하는 유지관리 작업(`${SERVICE_NAME}-maintenance`)을 등록하고, 배포 직후 실제 엔드포인트 응답 상태(`HTTP 200/302/401`)를 검증해 접속 주소를 출력합니다. |
 
 - **다시 실행해도 안전합니다(멱등성 보장).** 없는 것은 만들고 있는 것은 최신 설정으로 갱신합니다.
 - `install.sh` 실행 시 프로젝트별 설정 스냅샷(`deploy.<PROJECT_ID>.env`, Git 제외, `SCAN_PROJECTS` 포함)을 자동 저장하므로 추후 재배포도 명령 한 줄로 끝납니다.
@@ -299,7 +299,8 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 |---|---|---|
 | `ENABLE_GOVERNANCE_ACTIONS` | `true` | IAM 쓰기 역할 부여(`--read-only` 지정 시 `false`). 한도 초과 사용자 정지, 복원, 개별 허용/차단, 마커 역할 생성에 필요 |
 | `ENFORCEMENT_SCHEDULE` | 비어 있음 | 자동 집행 일정(cron). 예: `*/15 * * * *`. `ENABLE_GOVERNANCE_ACTIONS=true`와 `google` 또는 `google_oauth` 방식이 필요합니다. 정지된 사용자는 집행 실행에서 복원되므로, 일정이 없으면 기간이 초기화된 뒤 관리자가 집행을 실행해야 접근이 돌아옵니다. |
-| `PRICING_SYNC_SCHEDULE` | `0 4 * * *` | 매일 새벽 `04:00 KST`에 Google 공식 모델 단가와 실시간 USD/KRW 환율을 동기화하는 Cloud Scheduler 일정(`off` 지정 시 스케줄러 생략, 앱 내장 모니터만 동작) |
+| `MAINTENANCE_SCHEDULE` | `0 * * * *` | 공식 단가·다중 통화 환율 일일 동기화(`PRICING_SYNC_TIME`, 기본 `00:00`) 및 텔레메트리 BigQuery 라우팅 일일 GiB 한도 점검·다음 날 자동 재개를 수행하는 Cloud Scheduler 일정(`off` 지정 시 생략) |
+| `PRICING_SYNC_TIME`, `PRICING_CURRENCY` | `00:00`, `KRW` | 공식 단가·환율 일일 자동 동기화 시각(`WORKSPACE_TIMEZONE` 기준) 및 결제 내보내기 미연결 시 기본 표시 통화 |
 
 ### 4.6 기타
 
@@ -459,7 +460,7 @@ Data Access 로그는 양이 많을 수 있고 Cloud Logging 수집 비용이 �
 
 결제 내보내기를 쓰는 기능: 비용 및 FinOps, 모델별 비용, 에이전트 런타임 비용(resource 수준 내보내기 필요), Antigravity 1인당 비용 한도의 실제 단가.
 
-결제 내보내기가 구성되어 있으면 비용 및 FinOps, 모델별 비용, 에이전트 런타임 비용, Antigravity 1인당 비용 한도에 실제 청구 단가와 할인 내역이 반영됩니다. 결제 내보내기가 구성되지 않은 프로젝트에서는 Cloud Monitoring 및 추론 로그의 토큰 사용량에 Google Cloud 공식 공개 단가와 실시간 USD/KRW 환율을 곱해 비용을 자동 역산하며, 매일 새벽 공개 단가 페이지와 환율을 모니터링하여 변경 시 알림을 표시합니다(수동 동기화 지원).
+결제 내보내기가 구성되어 있으면 비용 및 FinOps, 모델별 비용, 에이전트 런타임 비용, Antigravity 1인당 비용 한도에 실제 청구 단가와 할인 내역이 반영됩니다. 결제 내보내기가 구성되지 않은 프로젝트에서는 Cloud Monitoring 및 추론 로그의 토큰 사용량에 Google Cloud 공식 공개 단가(Cloud Billing Catalog API + 공식 가격 문서 + 별칭/수동 단가)와 실시간 다중 통화 환율을 곱해 비용을 자동 역산하며, 매일 자정(`00:00`, 변경 가능) 공식 단가와 환율을 동기화하고 변동 시 알림을 표시합니다(수동 동기화 지원).
 
 ### 6.5 Antigravity 추론 로그
 
@@ -543,7 +544,7 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.8 비용 및 FinOps
 
-결제 내보내기(Billing Export)가 연결된 프로젝트에서는 총 비용, 크레딧, 순 비용, 서비스와 SKU별 실제 청구 비용, AI 비중을 계산합니다. 결제 내보내기가 아직 연결되지 않은 프로젝트에서는 관측된 토큰 사용량(Cloud Monitoring 및 추론 로그)에 Google 공식 공개 단가와 실시간 USD/KRW 환율을 곱해 모델·서비스별 비용을 자동 역산하며, 매일 새벽 `04:00 KST`에 공개 단가와 환율을 동기화하고 가격 변동이 감지되면 알림 배너로 고지합니다(관리자는 즉시 동기화 및 알림 확인 가능). 전일 대비 `finops.spike_threshold_pct`(기본 50%) 이상, `spike_min_delta` 이상 늘어난 날을 급증으로 표시하고, 원인 분석을 누르면 Gemini가 변화를 근거로 원인을 요약합니다.
+결제 내보내기(Billing Export)가 연결된 프로젝트에서는 총 비용, 크레딧, 순 비용, 서비스와 SKU별 실제 청구 비용, AI 비중을 계산합니다. 결제 내보내기가 아직 연결되지 않은 프로젝트에서는 관측된 토큰 사용량(Cloud Monitoring 및 추론 로그)에 Google 공식 공개 단가(Cloud Billing Catalog API + 공식 가격 문서 + 모델 별칭/관리자 단가 재정의)와 선택한 표시 통화의 실시간 환율(`USD/<통화>`)을 곱해 모델·서비스별 비용을 자동 역산합니다. 공식 단가와 환율은 워크스페이스 시간대 기준 매일 자정(`00:00`, **설정 > 데이터 수집 및 비용**에서 변경 가능) 자동 동기화되며 가격 변동이나 미등록 모델이 감지되면 배너로 안내합니다. 전일 대비 `finops.spike_threshold_pct`(기본 50%) 이상, `spike_min_delta` 이상 늘어난 날을 급증으로 표시하고, 원인 분석을 누르면 Gemini가 변화를 근거로 원인을 요약합니다.
 
 ### 7.9 사용자 및 액세스
 
@@ -551,15 +552,12 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.10 텔레메트리 확장
 
-이 프로젝트에서 이미 수집되고 있지만 기본 화면에는 나오지 않는 로그와 테이블을 골라, 클릭 한 번으로 대시보드를 만듭니다. 직접 입력할 것은 없습니다.
+하드코딩된 로그 카탈로그 없이, 프로젝트에 쌓이는 Cloud Logging 스트림과 BigQuery 테이블을 실시간 스키마·필드 통계와 Gemini 프로파일링으로 분석해 동적으로 대시보드화하고 비용 제어 정책과 함께 BigQuery로 자동 라우팅합니다.
 
-1. **자동으로 찾기**: 프로젝트의 Cloud Logging 로그 목록과 감사 로그 데이터셋(및 `workspace.telemetry_datasets`)의 BigQuery 테이블을 찾습니다. 로그마다 최근 7일 기록 건수를 Cloud Monitoring의 `logging.googleapis.com/log_entry_count` 지표로 보여 줍니다(로그 수와 상관없이 API 호출 1회).
-2. **쉬운 설명 카드**: 소스마다 무엇인지, 대시보드에서 무엇을 볼 수 있는지(예: 서비스별 건수, HTTP 상태별 건수, 상위 사용자), 최근 양, 전체 기술 이름(잘리지 않음)을 카드로 보여 줍니다. AI·에이전트, 보안·감사, 운영·인프라로 나누고 최근 양이 많은 순서로 정렬합니다. 최근 7일 동안 데이터가 없는 소스는 접어 둡니다. 설명은 [`telemetry_catalog.py`](src/controlplane/services/telemetry_catalog.py)의 카탈로그에서 오며, 카탈로그에 없는 로그는 제품 이름을 바탕으로 정직한 일반 설명을 붙입니다.
-3. **대시보드에 추가**: 버튼 하나로 커넥터가 만들어집니다. 차트로 볼 필드는 카탈로그가 정하며, BigQuery로 내보낸 테이블은 실제 스키마에 맞춰 경로를 바꿉니다(`protoPayload` → `protopayload_auditlog`, 타입이 있는 `jsonpayload_*` 열, 대소문자). 로그가 BigQuery로 라우팅되어 있으면 테이블 카드 하나로 합쳐 보여 줍니다(전체 기록, 읽기 상한 없음). 프롬프트·응답 원문이 들어 있는 소스는 추가 전에 확인을 받습니다.
-4. **표준 대시보드**: 일별 건수, 주요 항목별 분포(카탈로그 이름 사용), 상태별 분포, 상위 사용자·모델(매핑된 경우), 메시지 열이 있는 최근 로그 20건을 보여 줍니다. 뷰어에게는 원본 로그와 메시지가 가려집니다(`security.mask_pii_for_viewers`).
-5. **기본 화면에서 이미 쓰는 데이터**: 감사 로그, Gemini Enterprise 활동, Model Armor 등 기본 화면이 쓰는 소스는 따로 모아, 어느 화면에서 보는지 링크로 알려 줍니다.
-
-Cloud Logging을 직접 읽는 대시보드는 보존 기간(기본 30일) 안에서 한 번에 최대 5,000건까지 집계합니다. 양이 많은 로그는 카드에 안내가 표시되며, **로그를 BigQuery로 내보내기**가 `gcloud logging sinks create` 명령을 만들어 줍니다. 로그 일부만 보거나 매핑을 바꾸려면 **직접 설정**(기존 수동 커넥터 양식)을 사용합니다.
+1. **동적 탐지 및 스키마 분석**: 프로젝트의 Cloud Logging 로그와 BigQuery 테이블(`workspace.audit_dataset`, `telemetry.routing.dataset`, `workspace.telemetry_datasets`)을 자동 탐지하고, 최근 기록 건수·수집 바이트(`logging.googleapis.com/log_entry_count`, `byte_count`)와 샘플 필드 통계(카디널리티, 타임스탬프·사용자·모델·상태·수치·메시지 후보 열)를 추출합니다.
+2. **Gemini 자동 프로파일링 및 그룹 묶기**: Gemini(기본 `gemini-4-argon`, 변경 가능)가 실제 필드 구조만을 근거로 소스별 설명, 권장 집계 차원, 민감 텍스트 포함 여부, 의미 있는 **기능 그룹**을 생성해 캐시합니다. 관리자는 소스별 이름·그룹·필드 매핑·숨김 여부를 직접 재정의할 수 있습니다.
+3. **단일 또는 그룹 통합 대시보드**: 개별 소스를 클릭 한 번으로 추가하거나, 같은 그룹의 여러 로그를 **통합 대시보드로 묶기**로 한 번에 시각화합니다(일별 건수, 주요 차원 분포, 상태 분포, 상위 사용자·모델, 최근 로그).
+4. **비용 제어형 Log Router → BigQuery 자동 라우팅**: 대용량 로그나 그룹 전체를 화면에서 바로 파티션된 BigQuery 데이터셋(`telemetry_routed`, 변경 가능)으로 라우팅합니다. 무제한 적재로 인한 비용 급증을 막기 위해 경로마다 **샘플링 비율**(`sample(insertId, rate)`), **최소 심각도**, **제외 필터**, **파티션 보존 일수**, **경로별·전체 일일 GiB 한도**와 생성 전 **월간 예상 적재·보관 비용**을 계산합니다. 일일 한도를 초과한 싱크는 자동으로 일시 중지(`disabled=true`)되고 다음 날 자정 이후 예산 범위 안에서 자동 재개됩니다(권한이 없을 때는 동일한 조건의 `gcloud` / `bq` 명령을 제공).
 
 ### 7.11 AI 애널리스트
 
@@ -730,7 +728,8 @@ flowchart TD
 | 워크스페이스 및 데이터 소스 | 프로젝트, 시간대, 감사 로그 데이터셋, 결제 내보내기, API 위치, 데이터 소스 상태 |
 | 모듈 | 모듈 켜고 끄기(즉시 모든 사용자에게 적용) |
 | 모델 카탈로그 | 새 모델 자동 추적, 모델별 추적 끄기 |
-| AI 엔진 | 기본 모델, 허용 모델, 연결 테스트 |
+| 데이터 수집 및 비용 | 공식 단가·환율 동기화 시각 및 통화, 모델 단가·별칭 재정의, 텔레메트리 탐지 한도, Gemini 텔레메트리 분석 설정, 필드 힌트 및 서비스 표시 이름, BigQuery 라우팅 비용 제어 정책 |
+| AI 엔진 | 기본 모델, 대체 모델 순서, 허용 모델, 연결 테스트 |
 | 거버넌스 정책 | Antigravity 한도 정책, 마커 역할, 변경 예산, 웹훅, 에이전트 수명 주기, 비용 급증 기준 |
 | 액세스 제어 | 승인된 계정, 역할, 접근 요청 승인과 거절 |
 | 정보 | 버전, 워크스페이스 프로젝트, Cloud Run 서비스와 리비전, 설정 저장소 영속 여부와 마지막 변경, 데이터 처리 방식 |

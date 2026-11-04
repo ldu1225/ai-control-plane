@@ -211,23 +211,53 @@ class IapVerifier:
 
 
 SCHEDULER_MODE = "scheduler"
+# Endpoints the deployment's own runtime service account may call with a Cloud Scheduler OIDC token.
+MAINTENANCE_PATHS = frozenset({"/api/v1/system/maintenance", "/api/v1/finops/pricing/sync",
+                               "/api/v1/telemetry/routing/enforce"})
+_RUNTIME_SA = {"value": None, "checked": False}
+_RUNTIME_SA_LOCK = threading.Lock()
+
+
+def runtime_service_account(environ=None):
+    """E-mail of the service account this deployment runs as: RUNTIME_SERVICE_ACCOUNT, else the metadata server
+    (Cloud Run), else None."""
+    environ = os.environ if environ is None else environ
+    explicit = (environ.get("RUNTIME_SERVICE_ACCOUNT") or "").strip().lower()
+    if explicit:
+        return explicit
+    with _RUNTIME_SA_LOCK:
+        if _RUNTIME_SA["checked"]:
+            return _RUNTIME_SA["value"]
+        _RUNTIME_SA["checked"] = True
+        if not environ.get("K_SERVICE"):
+            return None
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+                headers={"Metadata-Flavor": "Google"})
+            with urllib.request.urlopen(req, timeout=2) as resp:  # nosec B310 - fixed metadata server URL
+                value = resp.read(320).decode("utf-8").strip().lower()
+            _RUNTIME_SA["value"] = value if "@" in value else None
+        except Exception:  # pylint: disable=broad-except
+            _RUNTIME_SA["value"] = None
+        return _RUNTIME_SA["value"]
 
 
 def scheduler_identity(headers, settings, verifier, path):
     """Identity of a Cloud Scheduler call authenticated with a Google OIDC token (Authorization:
-    Bearer). Only service accounts in governance.antigravity.scheduler_invokers (plus the deployment's
-    own ai-control-plane-sa service account for /api/v1/finops/pricing/sync) are accepted, and
-    the token audience must be this deployment's public URL (with or without the path)."""
+    Bearer). Service accounts in governance.antigravity.scheduler_invokers are accepted on every scheduler route;
+    the deployment's own runtime service account is accepted on the maintenance routes (MAINTENANCE_PATHS). The
+    token audience must be this deployment's public URL (with or without the path)."""
     ag = (settings.get("governance") or {}).get("antigravity") or {}
     invokers = [str(e).strip().lower() for e in ag.get("scheduler_invokers") or []]
-    project_id = ((settings.get("workspace") or {}).get("project_id") or "").strip().lower()
-    if path == "/api/v1/finops/pricing/sync" and project_id:
-        default_sa = "ai-control-plane-sa@%s.iam.gserviceaccount.com" % project_id
-        if default_sa not in invokers:
-            invokers.append(default_sa)
+    if path in MAINTENANCE_PATHS:
+        own = runtime_service_account()
+        if own and own not in invokers:
+            invokers.append(own)
     base = ((settings.get("security") or {}).get("public_base_url") or "").rstrip("/")
     if not invokers or not base:
-        raise ApiError("unauthenticated", "Scheduled enforcement is not configured for this deployment.")
+        raise ApiError("unauthenticated", "Scheduled calls are not configured for this deployment.")
     auth = headers.get("Authorization") or ""
     token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
     try:
@@ -237,7 +267,7 @@ def scheduler_identity(headers, settings, verifier, path):
         raise ApiError("unauthenticated", "Authentication is required.")
     if email not in invokers:
         LOG.warning("scheduler token from a service account that is not allowed")
-        raise ApiError("forbidden", "This service account may not run enforcement.")
+        raise ApiError("forbidden", "This service account may not call this scheduled endpoint.")
     return Identity(email, "admin", SCHEDULER_MODE, "scheduler:" + email)
 
 

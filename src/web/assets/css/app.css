@@ -1239,3 +1239,31 @@ a.chip-link:hover { border-color: var(--border-strong); background: var(--hover)
 .wb-hint { margin: 0; font-size: 12px; color: var(--text-3); }
 @media (max-width: 1100px) { .wb-s, .wb-m { grid-column: span 6; } }
 @media (max-width: 760px) { .wb-s, .wb-m, .wb-l { grid-column: span 12; } }
+
+/* ===== data collection, pricing & telemetry routing ===== */
+.form-subhead { grid-column: 1 / -1; margin-top: 6px; padding-top: 10px; border-top: 1px solid var(--border); font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: .04em; color: var(--text-2); }
+.field-row > .form-subhead:first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+.field-wide { grid-column: 1 / -1; }
+.field-default { display: inline-block; margin-left: 6px; font-family: var(--mono); font-size: 11.5px; color: var(--text-3); }
+.settings-form-2col .field-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.form-status { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); font-size: 12.5px; color: var(--text-2); }
+.form-status-text { display: inline-flex; align-items: center; gap: 6px; }
+.price-editor { display: grid; gap: 8px; }
+.price-rows { display: grid; gap: 6px; }
+.price-row { display: grid; grid-template-columns: minmax(180px, 2fr) repeat(3, minmax(96px, 1fr)) 36px; gap: 8px; align-items: center; }
+.price-head { font-size: 11.5px; font-weight: 600; color: var(--text-3); padding: 0 2px; }
+.price-row.invalid input { border-color: var(--danger); }
+.price-empty { padding: 10px 12px; border: 1px dashed var(--border-strong); border-radius: var(--radius); font-size: 12.5px; color: var(--text-3); }
+.src-group-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.rt-budget-bar { display: flex; align-items: center; gap: 12px; }
+.rt-budget-bar .progress { flex: 1 1 auto; }
+.rt-estimate-box { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2); }
+.tx-no-margin { margin: 0; }
+.tx-col-user { max-width: 180px; }
+.tx-col-op { max-width: 240px; }
+@media (max-width: 760px) {
+  .settings-form-2col .field-row { grid-template-columns: minmax(0, 1fr); }
+  .price-row { grid-template-columns: 1fr 1fr; }
+  .price-head { display: none; }
+}
+

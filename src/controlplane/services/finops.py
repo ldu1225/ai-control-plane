@@ -241,19 +241,21 @@ def _agy_daily_model_tokens(ctx, start_ts, end_ts, tz_name):
 
 
 def token_estimated_spend(ctx, rng, project, currency=None):
-    """Reverse-calculates AI spend from Cloud Monitoring + Antigravity token counts x synced public rates."""
+    """Reverse-calculates AI spend from Cloud Monitoring + Antigravity token counts x official per-token prices."""
     from . import models as models_service
     from . import monitoring, pricing_sync
     from .billing import is_excluded
 
     prev = rng.previous()
     rates, target_currency, fx = pricing_sync.effective_token_rates(ctx, currency)
+    aliases = pricing_sync.model_aliases(ctx)
+    currencies = pricing_sync.supported_currencies(ctx)
     sub = ctx.child(rng)
     sub.params = {**ctx.params, "project": project if project and project != "all" else "all"}
     if project != "all" and project not in sub.all_projects:
         empty_meta = dict(pricing_sync.pricing_alert_summary(getattr(ctx.app, "settings", None)),
                           costSource="token_estimate", currency=target_currency,
-                          supportedCurrencies=["KRW", "USD"], fx=fx,
+                          supportedCurrencies=currencies, fx=fx, unpricedModels=[],
                           tokens={"input": 0, "output": 0, "cached": 0, "total": 0})
         return {"daily": {}, "sku_costs": {}, "services": {}, "skus": [], "currency": target_currency,
                 "fx": fx, "meta": empty_meta}
@@ -277,17 +279,22 @@ def token_estimated_spend(ctx, rng, project, currency=None):
     cur_services = {}
     cur_skus = {}
     cur_tokens = {"input": 0, "output": 0, "cached": 0, "total": 0}
+    unpriced = {}
     patterns = ctx.excluded_patterns
 
     def add_line(day, raw_id, service_name, kind, tok_count):
         if not tok_count or tok_count <= 0 or day is None:
             return
-        norm_key, rate_info = pricing_sync.lookup_model_rate(rates, raw_id)
+        norm_key, rate_info = pricing_sync.lookup_model_rate(rates, raw_id, aliases)
         if is_excluded(norm_key.replace("-", " "), patterns) or is_excluded(service_name, patterns):
             return
         model_label = (rate_info or {}).get("label") or models_service.display_name_for_id(raw_id) or norm_key
-        unit_per_m = float((rate_info or {}).get(kind) or 0.0)
-        cost = float(tok_count) * unit_per_m / 1_000_000.0
+        unit_per_m = (rate_info or {}).get(kind)
+        if unit_per_m is None:
+            if rng.contains(day):
+                unpriced[norm_key] = unpriced.get(norm_key, 0) + int(tok_count)
+            unit_per_m = 0.0
+        cost = float(tok_count) * float(unit_per_m) / 1_000_000.0
         kind_label = {"input": "Input Tokens", "output": "Output Tokens", "cached": "Context Cache Tokens"}[kind]
         sku_name = "%s — %s (Estimated)" % (model_label, kind_label)
         d_rec = daily.setdefault(day, {"gross": 0.0, "credits": 0.0, "ai": 0.0})
@@ -300,7 +307,7 @@ def token_estimated_spend(ctx, rng, project, currency=None):
             cur_services[service_name] = cur_services.get(service_name, 0.0) + cost
             s_rec = cur_skus.setdefault((sku_name, service_name), {
                 "sku": sku_name, "service": service_name, "model": norm_key, "kind": kind,
-                "tokens": 0, "unitPricePerMillion": round(unit_per_m, 4),
+                "tokens": 0, "unitPricePerMillion": round(float(unit_per_m), 4) if rate_info else None,
                 "priceSource": (rate_info or {}).get("source") or "unpriced", "cost": 0.0,
             })
             s_rec["tokens"] += int(tok_count)
@@ -327,10 +334,15 @@ def token_estimated_spend(ctx, rng, project, currency=None):
             add_line(day, raw_id, "Antigravity", "input", prompt)
             add_line(day, raw_id, "Antigravity", "output", cand + rem)
 
-    ctx.add_source("pricing:public_token_rates")
+    if unpriced:
+        ctx.warn("pricing:unpriced", "partial_data",
+                 "%d model(s) have no official price yet (%s); their tokens are counted at zero cost. Add an alias or "
+                 "a price in Settings > Data collection and cost." % (len(unpriced), ", ".join(sorted(unpriced)[:5])))
+    ctx.add_source("pricing:official_token_rates")
     meta = dict(pricing_sync.pricing_alert_summary(getattr(ctx.app, "settings", None)),
-                costSource="token_estimate", currency=target_currency,
-                supportedCurrencies=["KRW", "USD"], fx=fx, tokens=cur_tokens)
+                costSource="token_estimate", currency=target_currency, supportedCurrencies=currencies, fx=fx,
+                tokens=cur_tokens, schedule=pricing_sync.schedule_info(ctx.settings),
+                unpricedModels=[{"model": k, "tokens": v} for k, v in sorted(unpriced.items(), key=lambda kv: -kv[1])])
     return {"daily": daily, "sku_costs": sku_costs, "services": cur_services,
             "skus": list(cur_skus.values()), "currency": target_currency, "fx": fx, "meta": meta}
 
@@ -356,8 +368,8 @@ def summary(ctx):
         daily = est["daily"]
         s = spend_summary(daily, rng)
         currency = est["currency"]
-        fx_rate = float((est["fx"] or {}).get("usdKrw") or 1400.0)
-        min_delta = float(fin["spike_min_delta"]) * (fx_rate if currency == "KRW" else 1.0)
+        fx_rate = float((est["fx"] or {}).get("rate") or 1.0)
+        min_delta = float(fin["spike_min_delta"]) * fx_rate
         spikes = detect_spikes(daily, rng, float(fin["spike_threshold_pct"]), min_delta)
         if spikes:
             rising = _rising_from_cost_map(est["sku_costs"], [dt.date.fromisoformat(sp["date"]) for sp in spikes])
@@ -365,7 +377,7 @@ def summary(ctx):
                 sp["risingSkus"] = rising.get(dt.date.fromisoformat(sp["date"]), [])
         gross = s["gross"]
         out["currency"] = currency
-        out["supportedCurrencies"] = ["KRW", "USD"]
+        out["supportedCurrencies"] = list(est["meta"].get("supportedCurrencies") or [currency])
         out["costSource"] = "token_estimate"
         out["projects"] = list(getattr(ctx, "all_projects", None) or [ctx.project])
         out["kpis"] = {

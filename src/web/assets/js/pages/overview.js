@@ -75,7 +75,7 @@ function renderOverview(ctx, body, d) {
       meta: spend.hasCredits ? h('span', null, t('{c} credits applied', { c: fmt.currency(spend.credits, ccy) })) : (spend.estimated ? h('span', null, t('Token-estimated')) : null),
       spark: seriesValues(d.spendTrend, spend.hasCredits ? 'net' : 'gross'), sparkColor: TONES.teal,
       tip: spend.estimated
-        ? t('Estimated from observed token usage multiplied by official public token pricing and live USD/KRW FX.')
+        ? t('Estimated from observed token usage multiplied by official Google token prices, converted with the synced exchange rate.')
         : t('Billing export cost for the period. Net cost subtracts credits only when credit rows exist.'),
       onClick: nav('#/finops'),
     }),
@@ -109,7 +109,7 @@ function renderOverview(ctx, body, d) {
   const row1 = h('div', { class: 'grid' });
   const spendCard = chartCard({
     title: t('Spend trend'), subtitle: rangeText(),
-    source: spend.estimated ? t('Token usage \u00d7 public pricing') : t('Cloud Billing export'),
+    source: spend.estimated ? t('Token usage \u00d7 official pricing') : t('Cloud Billing export'),
     build: (host) => lineChart(host, {
       ...fromTimeline(d.spendTrend, { names: { gross: t('Gross cost'), net: t('Net cost') }, colors: { gross: TONES.info, net: TONES.teal } }),
       yFormat: (v) => fmt.currency(v, ccy, { compact: true }), valueFormat: (v) => fmt.currency(v, ccy), height: 250,

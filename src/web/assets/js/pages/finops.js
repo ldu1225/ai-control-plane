@@ -1,6 +1,6 @@
 /**
  * Cost & FinOps: gross/net spend, credits, services, SKUs, spike investigations,
- * token-based reverse cost estimation fallback, and public pricing & USD/KRW FX monitor.
+ * token-based reverse cost estimation fallback, and official pricing & multi-currency FX monitor.
  */
 import { h, mount, append } from '../core/dom.js';
 import { t, getLocale } from '../core/i18n.js';
@@ -11,38 +11,84 @@ import {
   pageHeader, kpi, card, dataTable, badge, button, banner, progress, chip, selectInput, segmented,
   stat, load, setBusy, toast, emptyState, markdownLite, requireAdmin, statusBadge,
 } from '../core/components.js';
-import { errorText } from '../core/messages.js';
+import { errorText, serverText } from '../core/messages.js';
 import { barChart, lineChart, hbarList, mapList, TONES, colorAt } from '../core/charts.js';
 import { pageFlow, rangeText, chartCard, mountCharts } from './_shared.js';
 
 let selectedProject = 'all';
 let selectedCurrency = null;
 
-const PRICE_SOURCE_LABELS = {
-  google_public_docs: 'Google Public Docs',
-  agent_platform_public_page: 'Agent Platform Docs',
+const SOURCE_LABELS = {
   cloud_billing_catalog: 'Cloud Billing Catalog',
-  baseline: 'Baseline Reference',
+  override: 'Administrator price',
+  alias: 'Model alias',
 };
 
-function formatAlertSummary(a) {
+export function fxRateText(rate) {
+  if (!isNum(rate)) return DASH;
+  if (rate >= 100) return fmt.num(rate, 2);
+  if (rate >= 1) return fmt.num(rate, 4);
+  return fmt.num(rate, 6);
+}
+
+export function fxSourceLabel(source) {
+  if (!source) return '';
+  if (source === 'cloud_billing_catalog') return t('Cloud Billing Catalog');
+  if (source === 'identity') return 'USD = USD';
+  if (source.startsWith('fx:')) return source.slice(3);
+  return source;
+}
+
+export function priceSourceLabel(source) {
+  if (!source) return DASH;
+  if (SOURCE_LABELS[source]) return t(SOURCE_LABELS[source]);
+  if (source.startsWith('page:')) return `${t('Official pricing page')} (${source.slice(5)})`;
+  if (source.startsWith('alias:')) return `${t('Alias')} \u2192 ${source.slice(6)}`;
+  return source;
+}
+
+export function pricingSyncText(p, preferredCurrency) {
+  const ccy = (preferredCurrency || (p && p.displayCurrency) || 'USD').toUpperCase();
+  const modelsCount = Array.isArray(p && p.models) ? p.models.length : 0;
+  const rates = (p && p.fx && p.fx.rates) || {};
+  if (ccy !== 'USD' && rates[ccy] && isNum(rates[ccy].rate)) {
+    return t('1 USD = {rate} {currency} \u00b7 {n} models synced', {
+      rate: fxRateText(rates[ccy].rate),
+      currency: ccy,
+      n: fmt.int(modelsCount),
+    });
+  }
+  const rateKeys = Object.keys(rates).filter((k) => rates[k] && isNum(rates[k].rate));
+  if (rateKeys.length) {
+    return t('{n} models \u00b7 {k} exchange rates synced', {
+      n: fmt.int(modelsCount),
+      k: fmt.int(rateKeys.length),
+    });
+  }
+  return t('{n} models synced', { n: fmt.int(modelsCount) });
+}
+
+export function formatPricingAlert(a) {
   if (!a) return '';
   if (a.kind === 'fx') {
     const sign = isNum(a.pctChange) && a.pctChange > 0 ? '+' : '';
-    return `USD/KRW: ${fmt.num(a.before, 2)} \u2192 ${fmt.num(a.after, 2)} KRW (${sign}${fmt.num(a.pctChange, 2)}%)`;
+    const pair = a.target || `USD/${a.currency || ''}`;
+    const ccy = a.currency || (pair.includes('/') ? pair.split('/')[1] : '');
+    return `${pair}: ${fxRateText(a.before)} \u2192 ${fxRateText(a.after)}${ccy ? ` ${ccy}` : ''} (${sign}${fmt.num(a.pctChange, 2)}%)`;
   }
   if (a.kind === 'new_model') {
-    return `${a.label || a.target}: ${t('New public model rate')} ($${fmt.num(a.after, 3)} / 1M)`;
+    return `${a.label || a.target}: ${t('New official model price')} (${fmt.currency(a.after, 'USD', { precise: true })} / 1M)`;
   }
   const sign = isNum(a.pctChange) && a.pctChange > 0 ? '+' : '';
-  return `${a.label || a.target} (${a.field}): $${fmt.num(a.before, 3)} \u2192 $${fmt.num(a.after, 3)} / 1M (${sign}${fmt.num(a.pctChange, 1)}%)`;
+  const fieldLabel = a.field ? t(a.field.charAt(0).toUpperCase() + a.field.slice(1)) : '';
+  return `${a.label || a.target}${fieldLabel ? ` (${fieldLabel})` : ''}: ${fmt.currency(a.before, 'USD', { precise: true })} \u2192 ${fmt.currency(a.after, 'USD', { precise: true })} / 1M (${sign}${fmt.num(a.pctChange, 1)}%)`;
 }
 
 export default async function render(ctx) {
   const actionSlot = h('div', { class: 'row wrap' });
   const header = pageHeader({
     title: t('Cost & FinOps'),
-    desc: t('Billing export spend (or automatic token-based cost estimation with live USD/KRW FX), service and SKU breakdowns, and AI spike investigation.'),
+    desc: t('Billing export spend (or automatic token-based cost estimation from official Google prices and synced exchange rates), service and SKU breakdowns, and AI spike investigation.'),
     actions: actionSlot,
   });
   const queryArgs = { project: selectedProject };
@@ -58,30 +104,30 @@ export default async function render(ctx) {
       const activeCcy = currencies.includes(d.currency) ? d.currency : currencies[0];
 
       const syncBtn = button({
-        label: t('Sync pricing & FX now'),
+        label: t('Check prices now'),
         icon: 'refresh',
         size: 'sm',
         onClick: async () => {
-          if (!requireAdmin(t('Sync public token pricing & USD/KRW FX'))) return;
-          setBusy(syncBtn, true, t('Syncing'));
+          if (!requireAdmin(t('Check official prices and exchange rates'))) return;
+          setBusy(syncBtn, true, t('Checking'));
           try {
             const res = await api.post('/api/v1/finops/pricing/sync', {});
             const p = res.data || {};
-            const fxRate = p.fx && p.fx.usdKrw ? fmt.num(p.fx.usdKrw, 2) : DASH;
             if (ctx.onBootChange) {
               ctx.onBootChange({
                 pricingAlerts: {
                   syncedAt: p.syncedAt,
                   trigger: p.trigger,
                   fx: p.fx,
+                  schedule: p.schedule,
                   unacknowledgedCount: p.unacknowledgedCount || 0,
                   alerts: (p.alerts || []).filter((x) => !x.acknowledgedAt).slice(0, 10),
                 },
               });
             }
             toast({
-              title: t('Pricing & FX synced'),
-              text: t('1 USD = {rate} KRW \u00b7 {n} models updated', { rate: fxRate, n: (p.models || []).length }),
+              title: t('Prices and exchange rates synced'),
+              text: pricingSyncText(p, activeCcy),
               tone: (p.newAlertsCount || 0) > 0 ? 'warning' : 'success',
               timeout: 3600,
             });
@@ -93,15 +139,26 @@ export default async function render(ctx) {
         },
       });
 
+      const settingsBtn = button({
+        label: t('Pricing settings'),
+        icon: 'sliders',
+        size: 'sm',
+        variant: 'ghost',
+        onClick: () => ctx.navigate('#/settings/data-collection'),
+      });
+
       const ccyToggle = currencies.length > 1
-        ? segmented(currencies.map((c) => ({ value: c, label: c })), activeCcy, (v) => { selectedCurrency = v; ctx.rerender(); }, { label: t('Currency') })
+        ? (currencies.length <= 4
+          ? segmented(currencies.map((c) => ({ value: c, label: c })), activeCcy, (v) => { selectedCurrency = v; ctx.rerender(); }, { label: t('Currency') })
+          : selectInput(currencies.map((c) => ({ value: c, label: c })), activeCcy, (v) => { selectedCurrency = v; ctx.rerender(); }, { 'aria-label': t('Currency') }))
         : null;
 
       mount(actionSlot,
         ccyToggle,
         h('span', { class: 'muted' }, t('Billing scope')),
         selectInput(projects.map((p) => ({ value: p, label: p === 'all' ? t('All projects') : p })), selectedProject, (v) => { selectedProject = v; ctx.rerender(); }, { 'aria-label': t('Billing scope') }),
-        syncBtn);
+        syncBtn,
+        settingsBtn);
       return renderPage(ctx, body, d);
     },
   });
@@ -114,6 +171,7 @@ function renderPage(ctx, body, d) {
   const isEstimate = d.costSource === 'token_estimate';
   const pm = d.pricingMeta || {};
   const fx = pm.fx || {};
+  const sched = pm.schedule || {};
   const money = (v) => fmt.currency(v, ccy);
   const moneyC = (v) => fmt.currency(v, ccy, { compact: true });
 
@@ -143,33 +201,62 @@ function renderPage(ctx, body, d) {
     }) : null;
     body.append(banner({
       tone: 'warning',
-      title: t('Public token pricing or USD/KRW rate changed ({n})', { n: pm.unacknowledgedCount }),
-      text: pm.alerts.slice(0, 4).map(formatAlertSummary).filter(Boolean).join(' \u00b7 '),
+      title: t('Official token prices or exchange rates changed ({n})', { n: pm.unacknowledgedCount }),
+      text: pm.alerts.slice(0, 4).map(formatPricingAlert).filter(Boolean).join(' \u00b7 '),
       actions: ackBtn,
     }));
   }
 
   if (isEstimate) {
-    const fxVal = isNum(fx.usdKrw) ? fmt.num(fx.usdKrw, 2) : DASH;
-    const fxSrc = fx.source || 'live FX';
     const tokTotal = pm.tokens && isNum(pm.tokens.total) ? fmt.compact(pm.tokens.total) : '0';
+    const fxNote = ccy !== 'USD' && isNum(fx.rate)
+      ? t('1 USD = {rate} {currency} ({source})', { rate: fxRateText(fx.rate), currency: ccy, source: fxSourceLabel(fx.source) || t('exchange rate feed') })
+      : 'USD';
     body.append(banner({
       tone: 'info',
       iconName: 'spark',
       title: t('Token-based reverse cost estimation active'),
-      text: t('BigQuery Billing Export is not configured. Spend is calculated from observed token usage ({tokens} tokens) multiplied by official Google public per-1M-token rates and live FX (1 USD = {rate} KRW, source: {src}).', {
-        tokens: tokTotal, rate: fxVal, src: fxSrc,
+      text: t('BigQuery Billing Export is not configured. Spend is calculated from observed token usage ({tokens} tokens) multiplied by official Google per-1M-token rates ({fx}).', {
+        tokens: tokTotal, fx: fxNote,
       }),
     }));
   }
+
+  const unpriced = Array.isArray(pm.unpricedModels) ? pm.unpricedModels : [];
+  if (unpriced.length) {
+    body.append(banner({
+      tone: 'warning',
+      title: t('{n} models have token usage without an official price', { n: unpriced.length }),
+      text: t('Tokens of unpriced models are excluded from cost estimates until an alias or administrator price is set in Settings > Data collection and cost.'),
+      actions: h('div', { class: 'row wrap' },
+        ...unpriced.slice(0, 3).flatMap((u) => [
+          button({
+            label: t('Set price: {model}', { model: u.model }),
+            size: 'sm',
+            variant: 'primary',
+            onClick: () => ctx.navigate(`#/settings/data-collection?price=${encodeURIComponent(u.model)}`),
+          }),
+          button({
+            label: t('Map alias: {model}', { model: u.model }),
+            size: 'sm',
+            variant: 'ghost',
+            onClick: () => ctx.navigate(`#/settings/data-collection?alias=${encodeURIComponent(u.model)}`),
+          }),
+        ])),
+    }));
+  }
+
+  const fxMeta = isEstimate && ccy !== 'USD' && isNum(fx.rate)
+    ? h('span', null, t('1 USD = {rate} {currency}', { rate: fxRateText(fx.rate), currency: ccy }))
+    : null;
 
   body.append(h('div', { class: 'kpi-grid' },
     kpi({
       label: isEstimate ? t('Estimated cost') : t('Gross cost'),
       value: moneyC(k.gross),
-      meta: isEstimate && isNum(fx.usdKrw) ? h('span', null, `1 USD = ${fmt.num(fx.usdKrw, 2)} KRW`) : null,
+      meta: fxMeta,
       tip: isEstimate
-        ? t('Reverse-calculated from observed token usage across Cloud Monitoring and Antigravity logs using official public token pricing.')
+        ? t('Reverse-calculated from observed token usage across Cloud Monitoring and Antigravity logs using official Google token prices.')
         : t('Sum of cost in the billing export for the selected scope and period.'),
     }),
     k.hasCredits ? kpi({ label: t('Credits'), value: money(k.credits), meta: h('span', null, t('Applied from credit rows in the export')), goodWhen: null }) : null,
@@ -184,7 +271,7 @@ function renderPage(ctx, body, d) {
   const row1 = h('div', { class: 'grid' });
   const trend = chartCard({
     title: t('Daily cost'), subtitle: rangeText(),
-    source: isEstimate ? t('Token usage \u00d7 public pricing') : t('Cloud Billing export'),
+    source: isEstimate ? t('Token usage \u00d7 official pricing') : t('Cloud Billing export'),
     actions: highlight.length ? badge(t('{n} spikes highlighted', { n: highlight.length }), 'danger', { size: 'sm', dot: true }) : null,
     build: (host) => {
       if (k.hasCredits) {
@@ -221,7 +308,7 @@ function renderPage(ctx, body, d) {
   if (isEstimate) {
     skuCols.push(
       { key: 'tokens', label: t('Tokens'), align: 'num', render: (r) => fmt.compact(r.tokens), value: (r) => r.tokens || 0 },
-      { key: 'unitPricePerMillion', label: t('Rate / 1M'), align: 'num', render: (r) => (isNum(r.unitPricePerMillion) ? money(r.unitPricePerMillion) : DASH), value: (r) => r.unitPricePerMillion || 0 },
+      { key: 'unitPricePerMillion', label: t('Rate / 1M'), align: 'num', render: (r) => (isNum(r.unitPricePerMillion) ? fmt.currency(r.unitPricePerMillion, ccy, { precise: true }) : DASH), value: (r) => r.unitPricePerMillion || 0 },
     );
   }
   skuCols.push(
@@ -230,7 +317,7 @@ function renderPage(ctx, body, d) {
   );
   const skus = card({
     title: isEstimate ? t('Estimated cost by model & token type') : t('Top SKUs'),
-    subtitle: isEstimate ? t('Observed token volume multiplied by synced per-1M public rates') : t('Highest cost SKUs in the period'),
+    subtitle: isEstimate ? t('Observed token volume multiplied by synced official per-1M rates') : t('Highest cost SKUs in the period'),
     flush: true,
     body: dataTable({
       columns: skuCols,
@@ -238,6 +325,11 @@ function renderPage(ctx, body, d) {
     }),
   });
   skus.classList.add('span-7');
+
+  const scheduleText = sched.time
+    ? t('Checked automatically every day at {time} ({timezone}).', { time: sched.time, timezone: sched.timezone || 'UTC' })
+    : t('Checked automatically on the configured daily schedule.');
+
   const side = k.hasCredits
     ? card({
       title: t('Credits applied'), subtitle: t('By credit type'),
@@ -247,10 +339,10 @@ function renderPage(ctx, body, d) {
       title: t('Cost policy'), subtitle: t('How spend is measured'),
       body: h('div', { class: 'stack' },
         h('p', { class: 'muted' }, isEstimate
-          ? t('Priority 1: BigQuery Billing Export when configured. Priority 2 (active): reverse cost estimation from observed tokens multiplied by official Google public pricing and live USD/KRW FX, checked automatically every day at 04:00 KST.')
+          ? `${t('Priority 1: BigQuery Billing Export when configured. Priority 2 (active): reverse cost estimation from observed tokens multiplied by official Google token prices and synced exchange rates.')} ${scheduleText}`
           : t('No credit rows were found in the billing export for this period, so gross and net cost are identical.')),
-        h('div', { class: 'field-label' }, t('Excluded SKUs')),
-        h('div', { class: 'chips' }, (d.excludedSkuPatterns || []).map((p) => chip(p))),
+        (d.excludedSkuPatterns && d.excludedSkuPatterns.length) ? h('div', { class: 'field-label' }, t('Excluded SKUs')) : null,
+        (d.excludedSkuPatterns && d.excludedSkuPatterns.length) ? h('div', { class: 'chips' }, d.excludedSkuPatterns.map((p) => chip(p))) : null,
         d.billingAccountId ? h('div', { class: 'muted' }, t('Billing account {id}', { id: d.billingAccountId })) : null),
     });
   side.classList.add('span-5');
@@ -267,74 +359,119 @@ function renderPage(ctx, body, d) {
 
   const pricingHost = h('div');
   const pricingCard = card({
-    title: t('Public token pricing & live USD/KRW monitor'),
-    subtitle: t('Checked automatically every morning at 04:00 KST against official Google pricing pages, Cloud Billing Catalog API and live FX feeds.'),
+    title: t('Official token pricing & exchange rate monitor'),
+    subtitle: t('Synced from Cloud Billing Catalog API, official Google pricing pages and configured exchange rate feeds.'),
     body: pricingHost,
   });
   body.append(pricingCard);
-  load(pricingHost, () => api.get('/api/v1/finops/pricing', null, { signal: ctx.signal }), (res) => {
-    renderPricingMonitor(pricingHost, res.data || {});
+  load(pricingHost, () => api.get('/api/v1/finops/pricing', { currency: ccy }, { signal: ctx.signal }), (res) => {
+    renderPricingMonitor(ctx, pricingHost, res.data || {}, ccy);
   }, { skeletonKind: 'lines', signal: ctx.signal });
 }
 
-function renderPricingMonitor(host, p) {
+function renderPricingMonitor(ctx, host, p, activeCcy) {
   const fx = p.fx || {};
+  const rates = fx.rates || {};
   const sched = p.schedule || {};
   const models = p.models || [];
   const sources = p.sources || [];
-  const fxText = isNum(fx.usdKrw) ? `${fmt.num(fx.usdKrw, 2)} KRW` : DASH;
+  const storage = p.storage || null;
+  const dispCcy = (p.displayCurrency || activeCcy || 'USD').toUpperCase();
+  const dispRateObj = rates[dispCcy] || null;
+  const dispRate = isNum(p.displayRate) ? p.displayRate : (dispRateObj && isNum(dispRateObj.rate) ? dispRateObj.rate : (dispCcy === 'USD' ? 1 : null));
+
+  const fxStatVal = dispCcy === 'USD'
+    ? '1 USD'
+    : (isNum(dispRate) ? `${fxRateText(dispRate)} ${dispCcy}` : DASH);
+  const fxStatSub = dispCcy === 'USD'
+    ? t('Base pricing currency')
+    : (dispRateObj ? `${fxSourceLabel(dispRateObj.source)}${dispRateObj.asOf ? ` \u00b7 ${dispRateObj.asOf}` : ''}` : t('Rate not synced yet'));
+
+  const schedLabel = sched.time ? `${sched.time} (${sched.timezone || 'UTC'})` : DASH;
+  const schedSub = sched.nextRunAt ? t('Next check {when}', { when: fmt.relative(sched.nextRunAt) }) : t('Automatic daily check');
 
   const statsRow = h('div', { class: 'stat-row' },
-    stat(t('Live USD/KRW rate'), fxText, fx.source ? `${fx.source}${fx.asOf ? ` \u00b7 ${fx.asOf}` : ''}` : null),
-    stat(t('Last synced'), p.syncedAt ? fmt.dateTime(p.syncedAt) : t('Pending initial sync'), p.trigger ? t('Trigger: {t}', { t: p.trigger }) : null),
-    stat(t('Daily monitor'), `${String(sched.dailyHourLocal ?? 4).padStart(2, '0')}:00 ${sched.timezone || 'Asia/Seoul'}`, t('Automatic early-morning check')),
+    stat(dispCcy === 'USD' ? t('Pricing currency') : t('Exchange rate (USD/{currency})', { currency: dispCcy }), fxStatVal, fxStatSub),
+    stat(t('Last synced'), p.syncedAt ? fmt.dateTime(p.syncedAt) : t('Not checked yet'), p.trigger ? t('Trigger: {t}', { t: p.trigger }) : null),
+    stat(t('Daily schedule'), schedLabel, schedSub),
     stat(t('Tracked model rates'), fmt.int(models.length), p.unacknowledgedCount > 0 ? t('{n} unacknowledged changes', { n: p.unacknowledgedCount }) : t('Up to date')));
+
+  const otherRates = Object.entries(rates).filter(([code, r]) => code !== dispCcy && r && isNum(r.rate));
+  const fxChips = otherRates.length
+    ? h('div', { class: 'chips' }, otherRates.slice(0, 12).map(([code, r]) => chip(`1 USD = ${fxRateText(r.rate)} ${code}`, { title: fxSourceLabel(r.source) })))
+    : null;
+
+  const storageLine = storage && (isNum(storage.ingestPerGiB) || isNum(storage.storagePerGiBMonth))
+    ? h('div', { class: 'muted' }, t('{service} routing list prices: streaming insert {ingest} / GiB \u00b7 active storage {storage} / GiB-month (USD)', {
+      service: storage.service || 'BigQuery',
+      ingest: isNum(storage.ingestPerGiB) ? fmt.currency(storage.ingestPerGiB, 'USD', { precise: true }) : DASH,
+      storage: isNum(storage.storagePerGiBMonth) ? fmt.currency(storage.storagePerGiBMonth, 'USD', { precise: true }) : DASH,
+    }))
+    : null;
 
   const sourceList = sources.length ? h('div', { class: 'row wrap' },
     sources.map((s) => h('span', { class: 'row' },
       statusBadge(s.status === 'ok' ? 'ok' : 'warning', { size: 'sm' }),
-      h('span', { class: 'muted' }, `${s.id}${s.detail ? `: ${s.detail}` : ''}`)))) : null;
+      h('span', { class: 'muted' }, `${s.id}${s.detail ? `: ${serverText(s.detail)}` : ''}`)))) : null;
 
-  const table = dataTable({
-    columns: [
+  const columns = [
+    {
+      key: 'label', label: t('Model'),
+      render: (m) => h('div', { class: 'cell-stack' },
+        h('span', { class: 'cell-main' }, m.label || m.key),
+        h('span', { class: 'cell-sub cell-mono' }, `${m.vendor || 'Google'} \u00b7 ${m.key}`)),
+    },
+    {
+      key: 'source', label: t('Rate source'),
+      render: (m) => badge(priceSourceLabel(m.source), m.source === 'override' ? 'accent' : 'success', { size: 'sm' }),
+    },
+    {
+      key: 'usdIn', label: t('Input / 1M (USD)'), align: 'num',
+      value: (m) => (m.usdPerMillion && m.usdPerMillion.input) || 0,
+      render: (m) => (m.usdPerMillion && isNum(m.usdPerMillion.input) ? fmt.currency(m.usdPerMillion.input, 'USD', { precise: true }) : DASH),
+    },
+    {
+      key: 'usdOut', label: t('Output / 1M (USD)'), align: 'num',
+      value: (m) => (m.usdPerMillion && m.usdPerMillion.output) || 0,
+      render: (m) => (m.usdPerMillion && isNum(m.usdPerMillion.output) ? fmt.currency(m.usdPerMillion.output, 'USD', { precise: true }) : DASH),
+    },
+    {
+      key: 'usdCached', label: t('Cached / 1M (USD)'), align: 'num',
+      value: (m) => (m.usdPerMillion && m.usdPerMillion.cached) || 0,
+      render: (m) => (m.usdPerMillion && isNum(m.usdPerMillion.cached) ? fmt.currency(m.usdPerMillion.cached, 'USD', { precise: true }) : DASH),
+    },
+  ];
+  if (dispCcy !== 'USD') {
+    columns.push(
       {
-        key: 'label', label: t('Model'),
-        render: (m) => h('div', { class: 'cell-stack' },
-          h('span', { class: 'cell-main' }, m.label),
-          h('span', { class: 'cell-sub cell-mono' }, `${m.vendor || 'Google'} \u00b7 ${m.key}`)),
+        key: 'localIn', label: t('Input / 1M ({currency})', { currency: dispCcy }), align: 'num',
+        value: (m) => (m.localPerMillion && m.localPerMillion.input) || 0,
+        render: (m) => (m.localPerMillion && isNum(m.localPerMillion.input) ? fmt.currency(m.localPerMillion.input, dispCcy, { precise: true }) : DASH),
       },
       {
-        key: 'source', label: t('Rate source'),
-        render: (m) => badge(t(PRICE_SOURCE_LABELS[m.source] || m.source || 'baseline'), m.source === 'baseline' ? 'neutral' : 'success', { size: 'sm' }),
+        key: 'localOut', label: t('Output / 1M ({currency})', { currency: dispCcy }), align: 'num',
+        value: (m) => (m.localPerMillion && m.localPerMillion.output) || 0,
+        render: (m) => (m.localPerMillion && isNum(m.localPerMillion.output) ? fmt.currency(m.localPerMillion.output, dispCcy, { precise: true }) : DASH),
       },
-      {
-        key: 'usdIn', label: t('Input / 1M (USD)'), align: 'num',
-        value: (m) => (m.usdPerMillion && m.usdPerMillion.input) || 0,
-        render: (m) => (m.usdPerMillion && isNum(m.usdPerMillion.input) ? fmt.currency(m.usdPerMillion.input, 'USD', { precise: true }) : DASH),
-      },
-      {
-        key: 'usdOut', label: t('Output / 1M (USD)'), align: 'num',
-        value: (m) => (m.usdPerMillion && m.usdPerMillion.output) || 0,
-        render: (m) => (m.usdPerMillion && isNum(m.usdPerMillion.output) ? fmt.currency(m.usdPerMillion.output, 'USD', { precise: true }) : DASH),
-      },
-      {
-        key: 'krwIn', label: t('Input / 1M (KRW)'), align: 'num',
-        value: (m) => (m.krwPerMillion && m.krwPerMillion.input) || 0,
-        render: (m) => (m.krwPerMillion && isNum(m.krwPerMillion.input) ? fmt.currency(m.krwPerMillion.input, 'KRW') : DASH),
-      },
-      {
-        key: 'krwOut', label: t('Output / 1M (KRW)'), align: 'num',
-        value: (m) => (m.krwPerMillion && m.krwPerMillion.output) || 0,
-        render: (m) => (m.krwPerMillion && isNum(m.krwPerMillion.output) ? fmt.currency(m.krwPerMillion.output, 'KRW') : DASH),
-      },
-    ],
-    rows: models,
-    pageSize: 10,
-    exportName: 'public-token-pricing',
-    initialSort: { key: 'label', dir: 'asc' },
-  });
+    );
+  }
 
-  append(host, [h('div', { class: 'stack' }, statsRow, sourceList, table)]);
+  const table = models.length
+    ? dataTable({
+      columns,
+      rows: models,
+      pageSize: 10,
+      exportName: 'official-token-pricing',
+      initialSort: { key: 'label', dir: 'asc' },
+    })
+    : emptyState({
+      icon: 'refresh',
+      title: t('No synced model prices yet'),
+      body: t('Select Check prices now to fetch official token prices from Cloud Billing Catalog API and Google pricing pages, or add administrator prices in Settings > Data collection and cost.'),
+      compact: true,
+    });
+
+  append(host, [h('div', { class: 'stack' }, statsRow, fxChips, storageLine, sourceList, table)]);
 }
 
 function spikeBlock(sp, ccy) {

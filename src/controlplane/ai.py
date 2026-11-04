@@ -149,8 +149,10 @@ class AiEngine:
         location = settings["ai_engine"].get("location") or "global"
         default_m = settings["ai_engine"].get("default_model") or ""
         base = [default_m] if default_m and default_m != failed_model else []
-        candidates = tuple(base) + ("gemini-2.5-flash", "gemini-3-flash-preview", "gemini-2.5-pro",
-                                    "gemini-2.5-flash-lite")
+        # ai_engine.fallback_models, then the configured models (no built-in model list).
+        ordered = base + list(settings["ai_engine"].get("fallback_models") or []) + \
+            list(settings["ai_engine"].get("models") or [])
+        candidates = tuple(dict.fromkeys(m for m in ordered if m))
         with self._lock:
             dead = set(self._unavailable)
         if settings["ai_engine"].get("discover_models"):

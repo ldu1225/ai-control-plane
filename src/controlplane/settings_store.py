@@ -35,7 +35,7 @@ ACCOUNT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._@\-]{1,127}$")
 EMPTY_AUTH = {"requests": [], "lastLogin": {}, "revoked": {}, "accounts": {}}
 EMPTY_GOVERNANCE = {"exceptions": [], "suspensions": [], "notified": {}, "lastRun": None, "lastScheduledRun": None}
 EMPTY_PRICING = {"syncedAt": None, "syncedBy": None, "trigger": None, "fx": None, "models": {},
-                 "sources": [], "alerts": [], "lastError": None}
+                 "sources": [], "alerts": [], "lastError": None, "catalogServices": [], "storage": None}
 EMPTY_DOC = {"version": 1, "overrides": {}, "connectors": [], "updatedAt": None, "updatedBy": None,
              "auth": EMPTY_AUTH, "governance": EMPTY_GOVERNANCE, "pricing": EMPTY_PRICING}
 MAX_ACCESS_REQUESTS = 200
@@ -161,25 +161,35 @@ def sanitize_governance(state):
             "lastScheduledRun": _run_summary(state.get("lastScheduledRun"))}
 
 
+def _sanitize_fx(fx_raw):
+    """{"base": "USD", "rates": {CUR: {"rate", "previous", "source", "asOf"}}, "updatedAt"} (legacy usdKrw migrated)."""
+    if not isinstance(fx_raw, dict):
+        return None
+    rates_raw = fx_raw.get("rates") if isinstance(fx_raw.get("rates"), dict) else {}
+    if not rates_raw and fx_raw.get("usdKrw") is not None:
+        rates_raw = {"KRW": {"rate": fx_raw.get("usdKrw"), "previous": fx_raw.get("previousUsdKrw"),
+                             "source": fx_raw.get("source"), "asOf": fx_raw.get("asOf")}}
+    rates = {}
+    for cur, item in list(rates_raw.items())[:40]:
+        if not isinstance(cur, str) or not re.match(r"^[A-Z]{3}$", cur) or not isinstance(item, dict):
+            continue
+        rate = _opt_num(item.get("rate"), 1e-9, 1e9)
+        if rate is None:
+            continue
+        rates[cur] = {"rate": round(rate, 6), "previous": _opt_num(item.get("previous"), 1e-9, 1e9),
+                      "source": _opt_str(item.get("source"), 80) or "unknown", "asOf": _opt_str(item.get("asOf"), 60)}
+    return {"base": "USD", "rates": rates, "updatedAt": _opt_str(fx_raw.get("updatedAt"), 40)}
+
+
 def sanitize_pricing(state):
-    """Bounded, type-checked copy of synced public token prices, USD/KRW FX, and change alerts."""
+    """Bounded, type-checked copy of synced official token prices, exchange rates, storage prices and alerts."""
     state = state if isinstance(state, dict) else {}
-    fx_raw = state.get("fx")
-    fx = None
-    if isinstance(fx_raw, dict):
-        rate = _opt_num(fx_raw.get("usdKrw"), 100.0, 20000.0)
-        if rate is not None:
-            fx = {
-                "usdKrw": round(rate, 4),
-                "previousUsdKrw": _opt_num(fx_raw.get("previousUsdKrw"), 100.0, 20000.0),
-                "source": _opt_str(fx_raw.get("source"), 80) or "unknown",
-                "asOf": _opt_str(fx_raw.get("asOf"), 60),
-                "updatedAt": _opt_str(fx_raw.get("updatedAt"), 40),
-            }
     models = {}
-    for key, item in list((state.get("models") or {}).items())[:300]:
+    for key, item in list((state.get("models") or {}).items())[:400]:
         if not isinstance(key, str) or not key or len(key) > 80 or not isinstance(item, dict):
             continue
+        if item.get("source") == "baseline":
+            continue  # left over from the removed built-in price table
         inp = _opt_num(item.get("input"), 0.0, 100000.0)
         out = _opt_num(item.get("output"), 0.0, 100000.0)
         cached = _opt_num(item.get("cached"), 0.0, 100000.0)
@@ -189,15 +199,15 @@ def sanitize_pricing(state):
             "input": round(inp, 6) if inp is not None else None,
             "output": round(out, 6) if out is not None else None,
             "cached": round(cached, 6) if cached is not None else None,
-            "source": _opt_str(item.get("source"), 60) or "baseline",
+            "source": _opt_str(item.get("source"), 60) or "unknown",
             "label": _opt_str(item.get("label"), 120) or key,
         }
     sources = []
-    for s in (state.get("sources") or [])[:12]:
+    for s in (state.get("sources") or [])[:20]:
         if not isinstance(s, dict):
             continue
         sources.append({
-            "id": _opt_str(s.get("id"), 40) or "source",
+            "id": _opt_str(s.get("id"), 80) or "source",
             "url": _opt_str(s.get("url"), 240) or "",
             "status": _opt_str(s.get("status"), 20) or "unknown",
             "checkedAt": _opt_str(s.get("checkedAt"), 40),
@@ -221,23 +231,36 @@ def sanitize_pricing(state):
             "target": _opt_str(a.get("target"), 80) or "",
             "label": _opt_str(a.get("label"), 120) or "",
             "field": _opt_str(a.get("field"), 30) or "",
-            "before": _opt_num(a.get("before"), 0.0, 1000000.0),
-            "after": _opt_num(a.get("after"), 0.0, 1000000.0),
+            "before": _opt_num(a.get("before"), 0.0, 1e9),
+            "after": _opt_num(a.get("after"), 0.0, 1e9),
             "pctChange": _opt_num(a.get("pctChange"), -100.0, 100000.0),
             "currency": _opt_str(a.get("currency"), 10) or "USD",
             "source": _opt_str(a.get("source"), 80) or "",
             "acknowledgedAt": _opt_str(a.get("acknowledgedAt"), 40),
             "acknowledgedBy": _opt_str(a.get("acknowledgedBy"), 200),
         })
+    services = []
+    for svc in (state.get("catalogServices") or [])[:60]:
+        if isinstance(svc, dict) and _opt_str(svc.get("id"), 40) and _opt_str(svc.get("name"), 120):
+            services.append({"id": svc["id"][:40], "name": svc["name"][:120]})
+    storage = None
+    raw_storage = state.get("storage")
+    if isinstance(raw_storage, dict):
+        storage = {"service": _opt_str(raw_storage.get("service"), 80), "currency": "USD",
+                   "ingestPerGiB": _opt_num(raw_storage.get("ingestPerGiB"), 0.0, 1e6),
+                   "storagePerGiBMonth": _opt_num(raw_storage.get("storagePerGiBMonth"), 0.0, 1e6),
+                   "source": _opt_str(raw_storage.get("source"), 60), "updatedAt": _opt_str(raw_storage.get("updatedAt"), 40)}
     return {
         "syncedAt": _opt_str(state.get("syncedAt"), 40),
         "syncedBy": _opt_str(state.get("syncedBy"), 200),
         "trigger": _opt_str(state.get("trigger"), 40),
-        "fx": fx,
+        "fx": _sanitize_fx(state.get("fx")),
         "models": models,
         "sources": sources,
         "alerts": alerts,
         "lastError": _opt_str(state.get("lastError"), 240),
+        "catalogServices": services,
+        "storage": storage,
     }
 
 
@@ -451,6 +474,102 @@ class UserDocStore:
             except StoreConflict:
                 continue
         raise StoreConflict()
+
+
+class AuxDocStore:
+    """Named internal JSON documents next to the settings document (telemetry profiles and overrides,
+    managed Log Router sinks, maintenance runs).
+
+    <settings folder>/aux/<name>.json in the same bucket or directory, or process memory. Reads are cached for
+    a few seconds per instance; writes use optimistic concurrency and retry on a concurrent change."""
+
+    NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+    READ_TTL = 10.0
+
+    def __init__(self, settings_store):
+        self.base = settings_store
+        self._memory = {}
+        self._cache = {}
+        self._lock = threading.Lock()
+
+    def _store(self, name):
+        if not isinstance(name, str) or not self.NAME_RE.match(name):
+            raise ValueError("invalid document name")
+        base = self.base
+        if isinstance(base, GcsStore):
+            folder = base.obj.rsplit("/", 1)[0] + "/" if "/" in base.obj else ""
+            return GcsStore(base.gcp, base.bucket, "%saux/%s.json" % (folder, name), base.quota_project_fn)
+        if isinstance(base, FileStore):
+            return FileStore(os.path.join(os.path.dirname(base.path), "aux", name + ".json"), base.durable)
+        return None
+
+    @property
+    def durable(self):
+        return bool(getattr(self.base, "durable", False))
+
+    def load(self, name, fresh=False):
+        """Returns (doc, generation); a missing document is ({}, 0)."""
+        store = self._store(name)
+        if store is None:
+            with self._lock:
+                doc, generation = self._memory.get(name, ({}, 0))
+                return copy.deepcopy(doc), generation
+        now = time.monotonic()
+        with self._lock:
+            hit = self._cache.get(name)
+        if hit and not fresh and now - hit[2] < self.READ_TTL:
+            return copy.deepcopy(hit[0]), hit[1]
+        doc, generation = store.load()
+        doc = doc if generation and isinstance(doc, dict) else {}
+        with self._lock:
+            self._cache[name] = (copy.deepcopy(doc), generation, now)
+        return doc, generation
+
+    def mutate(self, name, fn, attempts=4):
+        """Applies fn(doc) to the current document, saves it and returns fn's result."""
+        for _ in range(attempts):
+            doc, generation = self.load(name, fresh=True)
+            result = fn(doc)
+            store = self._store(name)
+            try:
+                if store is None:
+                    with self._lock:
+                        if self._memory.get(name, ({}, 0))[1] != generation:
+                            raise StoreConflict()
+                        self._memory[name] = (copy.deepcopy(doc), generation + 1)
+                else:
+                    new_gen = store.save(doc, generation)
+                    with self._lock:
+                        self._cache[name] = (copy.deepcopy(doc), new_gen, time.monotonic())
+                return result
+            except StoreConflict:
+                with self._lock:
+                    self._cache.pop(name, None)
+                continue
+        raise StoreConflict()
+
+
+_FALLBACK_AUX = {}
+_FALLBACK_LOCK = threading.Lock()
+
+
+def aux_docs(app):
+    """The application's AuxDocStore; a process-memory store for contexts without one (tests, tools)."""
+    store = getattr(app, "aux_docs", None) if app is not None else None
+    if store is not None:
+        return store
+    with _FALLBACK_LOCK:
+        store = getattr(app, "aux_docs", None) if app is not None else None
+        if store is not None:
+            return store
+        store = AuxDocStore(MemoryStore())
+        if app is not None:
+            try:
+                app.aux_docs = store  # kept with the object, so state never leaks to a later object with the same id
+                return store
+            except (AttributeError, TypeError):
+                pass
+        return _FALLBACK_AUX.setdefault(id(app) if app is not None else None, store)
 
 
 class SettingsManager:

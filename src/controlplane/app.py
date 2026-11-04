@@ -19,12 +19,13 @@ from .httpkit import ApiError, BaseHandler, Router, Server, StaticSite, csrf_val
 from .schema import SchemaRegistry
 from .security import GUEST_MODE, GUEST_READ_ONLY_MESSAGE, Identity, IapVerifier, RateLimiter, authenticate, \
     guest_scrub, is_loopback_host, mask_for_viewer, resolve_auth_mode, scheduler_identity
-from .settings_store import SettingsManager, UserDocStore, make_store
+from .settings_store import AuxDocStore, SettingsManager, UserDocStore, make_store
 from .services import base as svc_base
 from .services import access
 from .services import agent_activity
-from .services import (agents, analyst, finops, gateway, gemini_enterprise, governance, layouts, model_armor, models,
-                       notebooklm, overview, pricing_sync, system, telemetry, users)
+from .services import (agents, analyst, finops, gateway, gemini_enterprise, governance, layouts, maintenance,
+                       model_armor, models, notebooklm, overview, pricing_sync, system, telemetry, telemetry_routing,
+                       users)
 
 LOG = logging.getLogger("controlplane.app")
 
@@ -113,9 +114,24 @@ _route("GET", "/api/v1/telemetry/discover", telemetry.discover, module="telemetr
 _route("GET", "/api/v1/telemetry/connectors", telemetry.list_connectors, module="telemetry", cache=True, ttl=60)
 _route("POST", "/api/v1/telemetry/connectors", telemetry.save_connector, module="telemetry", admin=True)
 _route("POST", "/api/v1/telemetry/connectors/delete", telemetry.delete_connector, module="telemetry", admin=True)
-_route("POST", "/api/v1/telemetry/sinks", telemetry.create_sink, module="telemetry", admin=True)
+_route("POST", "/api/v1/telemetry/sources/override", telemetry.save_override, module="telemetry", admin=True)
+_route("POST", "/api/v1/telemetry/profiles/refresh", telemetry.refresh_profiles, module="telemetry", admin=True,
+       rate="ai")
+_route("POST", "/api/v1/telemetry/groups/dashboard", telemetry.group_dashboard, module="telemetry", admin=True)
+# Log Router -> BigQuery routes with cost controls (sampling, severity, exclusions, retention, daily budgets).
+_route("POST", "/api/v1/telemetry/sinks", telemetry_routing.legacy_create_sink, module="telemetry", admin=True)
+_route("GET", "/api/v1/telemetry/routing", telemetry_routing.get_routing, module="telemetry", cache=True, ttl=30)
+_route("POST", "/api/v1/telemetry/routing/estimate", telemetry_routing.estimate_route, module="telemetry", admin=True)
+_route("POST", "/api/v1/telemetry/routing/routes", telemetry_routing.save_route, module="telemetry", admin=True,
+       rate="governance")
+_route("POST", "/api/v1/telemetry/routing/routes/action", telemetry_routing.route_action, module="telemetry",
+       admin=True, rate="governance")
+_route("POST", "/api/v1/telemetry/routing/enforce", telemetry_routing.enforce, module="telemetry", admin=True,
+       rate="governance", scheduler=True)
 _route("GET", "/api/v1/telemetry/connectors/data", telemetry.connector_data, module="telemetry", range=True,
        cache=True, mask={"nulls": ("payload", "message")})
+# Scheduled maintenance tick: daily price check at the configured time, route budget guard, route upkeep.
+_route("POST", "/api/v1/system/maintenance", maintenance.run, admin=True, rate="governance", scheduler=True)
 # Results can contain free text that the dashboards withhold from viewers: administrators always, viewers
 # only when an administrator allows it (analyst.available_to); guests follow the viewer policy.
 _route("POST", "/api/v1/analyst/chat", analyst.chat, module="analyst", rate="ai", allow=analyst.available_to,
@@ -138,6 +154,7 @@ class App:
         self.router = ROUTER
         self.settings = SettingsManager(base, make_store(base, self.gcp, self.environ))
         self.user_docs = UserDocStore(self.settings.store)
+        self.aux_docs = AuxDocStore(self.settings.store)
         mode = resolve_auth_mode(base["security"]["auth_mode"], self.environ)
         self.auth = None
         if mode == "google":
@@ -376,7 +393,7 @@ def main():
         LOG.warning("settings persistence backend=%s is not durable", persistence["backend"])
     if not os.path.isfile(os.path.join(WEB_ROOT, "index.html")):
         LOG.warning("web frontend not found at src/web/index.html")
-    monitor = pricing_sync.PricingMonitor(app)
+    monitor = maintenance.MaintenanceMonitor(app)
     monitor.start()
     server = make_server(app, host, port)
 

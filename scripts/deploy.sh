@@ -197,7 +197,15 @@ DISCOVERY_ENGINE_LOCATIONS="${DISCOVERY_ENGINE_LOCATIONS:-}"
 AGENT_ENGINE_REGIONS="${AGENT_ENGINE_REGIONS:-}"
 ENABLE_GOVERNANCE_ACTIONS="${ENABLE_GOVERNANCE_ACTIONS:-true}"
 ENFORCEMENT_SCHEDULE="${ENFORCEMENT_SCHEDULE:-}"
-PRICING_SYNC_SCHEDULE="${PRICING_SYNC_SCHEDULE:-0 4 * * *}"
+# Scheduler tick for scheduled work: the daily official price and exchange-rate check (at pricing.sync_time, default
+# 00:00 in the workspace timezone; a setting, not a cron here) and the telemetry route budget guard. "off" disables it.
+MAINTENANCE_SCHEDULE="$(trim_ws "${MAINTENANCE_SCHEDULE:-*/15 * * * *}")"
+# Earlier releases had a fixed-time price job (PRICING_SYNC_SCHEDULE); "off"/"none" there still turns scheduling off.
+case "$(trim_ws "${PRICING_SYNC_SCHEDULE:-}")" in off|none) MAINTENANCE_SCHEDULE="off" ;; esac
+PRICING_SYNC_TIME="$(trim_ws "${PRICING_SYNC_TIME:-}")"
+PRICING_CURRENCY="$(trim_ws "${PRICING_CURRENCY:-}" | tr '[:lower:]' '[:upper:]')"
+TELEMETRY_AI_MODEL="$(trim_ws "${TELEMETRY_AI_MODEL:-}")"
+TELEMETRY_DATASET="$(trim_ws "${TELEMETRY_DATASET:-}")"
 AI_DEFAULT_MODEL="${AI_DEFAULT_MODEL:-}"
 AI_LOCATION="${AI_LOCATION:-}"
 IMAGE="$(trim_ws "${IMAGE:-}")"
@@ -251,6 +259,15 @@ PY
   false) ;;
   *) die "GUEST_ACCESS must be true or false" ;;
 esac
+[[ -z "$PRICING_SYNC_TIME" || "$PRICING_SYNC_TIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
+  || die "PRICING_SYNC_TIME must be a time of day such as 00:00"
+[[ -z "$PRICING_CURRENCY" || "$PRICING_CURRENCY" =~ ^[A-Z]{3}$ ]] || die "PRICING_CURRENCY must be an ISO 4217 code such as KRW"
+[[ -z "$TELEMETRY_DATASET" || "$TELEMETRY_DATASET" =~ ^[A-Za-z0-9_]{1,1024}$ ]] \
+  || die "TELEMETRY_DATASET must be a BigQuery dataset id (letters, digits and _)"
+if [[ "$MAINTENANCE_SCHEDULE" != "off" ]]; then
+  read -r -a _cron_fields <<<"$MAINTENANCE_SCHEDULE"
+  [[ "${#_cron_fields[@]}" -eq 5 ]] || die "MAINTENANCE_SCHEDULE must be a 5-field cron expression (for example */15 * * * *) or off"
+fi
 if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
   [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]] || die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
   [[ "$ACCESS_MODE" != "iap" ]] || die "ENFORCEMENT_SCHEDULE needs ACCESS_MODE google, google_oauth or password (IAP blocks the scheduler's OIDC token)"
@@ -511,6 +528,8 @@ if [[ -n "$SCAN_PROJECTS" ]]; then
     roles/iam.securityReviewer
     roles/modelarmor.viewer
   )
+  # Telemetry routes of a linked project's logs are Log Router sinks in that project (cost-controlled from the hub).
+  [[ "${ENABLE_LINKED_TELEMETRY_ROUTING:-true}" == "true" ]] && LINKED_READ_ROLES+=(roles/logging.configWriter)
   IFS=',' read -r -a raw_linked <<<"$SCAN_PROJECTS"
   for raw_lp in "${raw_linked[@]}"; do
     lp="$(normalize_project_id "$raw_lp")"
@@ -777,6 +796,12 @@ if [[ "$GUEST_ACCESS" == "true" ]]; then
   warn "guest access is on: anyone with the link can browse read-only, identifiers hidden (demo use only)"
 fi
 [[ -n "$ENFORCEMENT_SCHEDULE" ]] && add_env SCHEDULER_INVOKERS "$SCHEDULER_SA"
+# The maintenance tick authenticates as this deployment's own service account.
+add_env RUNTIME_SERVICE_ACCOUNT "$SA_EMAIL"
+add_env PRICING_SYNC_TIME "$PRICING_SYNC_TIME"
+add_env PRICING_CURRENCY "$PRICING_CURRENCY"
+add_env TELEMETRY_AI_MODEL "$TELEMETRY_AI_MODEL"
+add_env TELEMETRY_DATASET "$TELEMETRY_DATASET"
 COMMON=(--image "$IMAGE" --project "$PROJECT_ID" --region "$REGION" --cpu-boost --quiet)
 MAIN=("${COMMON[@]}" --service-account "$SA_EMAIL")
 
@@ -984,28 +1009,37 @@ else
   info "enforcement schedule: on-demand from the dashboard (ENFORCEMENT_SCHEDULE empty)"
 fi
 
-if [[ -n "$PRICING_SYNC_SCHEDULE" && "$PRICING_SYNC_SCHEDULE" != "off" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
-  PRICING_JOB="${SERVICE_NAME}-pricing-sync"
-  PRICING_URL="${BASE_URL}/api/v1/finops/pricing/sync"
-  PRICING_TZ="${WORKSPACE_TIMEZONE:-Asia/Seoul}"
-  [[ "$PRICING_TZ" == "UTC" ]] && PRICING_TZ="Asia/Seoul"
+# Maintenance tick: daily official price/FX check at pricing.sync_time (Settings > Data collection and cost) and the
+# telemetry route budget guard. It replaces the earlier fixed-time pricing job, which is removed when found.
+MAINT_JOB="${SERVICE_NAME}-maintenance"
+MAINT_URL="${BASE_URL}/api/v1/system/maintenance"
+LEGACY_PRICING_JOB="${SERVICE_NAME}-pricing-sync"
+if [[ "$MAINTENANCE_SCHEDULE" != "off" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
   if [[ "$DRY_RUN" == "1" ]]; then
-    info "[dry-run] scheduler job ${PRICING_JOB}: ${PRICING_SYNC_SCHEDULE} (${PRICING_TZ}) -> ${PRICING_URL}"
+    info "[dry-run] scheduler job ${MAINT_JOB}: ${MAINTENANCE_SCHEDULE} -> ${MAINT_URL} (OIDC ${SA_EMAIL})"
   else
-    PRICING_ARGS=(--project "$PROJECT_ID" --location "$REGION" --schedule "$PRICING_SYNC_SCHEDULE"
-      --time-zone "$PRICING_TZ" --uri "$PRICING_URL" --http-method POST --message-body '{}'
-      --oidc-service-account-email "$SA_EMAIL" --oidc-token-audience "$PRICING_URL"
-      --attempt-deadline 120s --max-retry-attempts 2 --quiet)
-    if gcloud scheduler jobs describe "$PRICING_JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
-      gcloud scheduler jobs update http "$PRICING_JOB" "${PRICING_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null 2>&1 \
-        && info "job ${PRICING_JOB}: ${PRICING_SYNC_SCHEDULE} (${PRICING_TZ}) -> ${PRICING_URL}" \
-        || info "in-process daily 04:00 KST pricing monitor active (Cloud Scheduler job update skipped)"
+    MAINT_ARGS=(--project "$PROJECT_ID" --location "$REGION" --schedule "$MAINTENANCE_SCHEDULE"
+      --time-zone "Etc/UTC" --uri "$MAINT_URL" --http-method POST --message-body '{}'
+      --oidc-service-account-email "$SA_EMAIL" --oidc-token-audience "$MAINT_URL"
+      --attempt-deadline 600s --max-retry-attempts 1 --quiet)
+    if gcloud scheduler jobs describe "$MAINT_JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
+      run retry gcloud scheduler jobs update http "$MAINT_JOB" "${MAINT_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null \
+        && info "job ${MAINT_JOB}: ${MAINTENANCE_SCHEDULE} -> ${MAINT_URL}" \
+        || warn "could not update ${MAINT_JOB}; the in-process monitor still runs scheduled work while an instance is up"
     else
-      gcloud scheduler jobs create http "$PRICING_JOB" "${PRICING_ARGS[@]}" --headers Content-Type=application/json >/dev/null 2>&1 \
-        && info "job ${PRICING_JOB}: ${PRICING_SYNC_SCHEDULE} (${PRICING_TZ}) -> ${PRICING_URL}" \
-        || info "in-process daily 04:00 KST pricing monitor active (Cloud Scheduler optional)"
+      run retry gcloud scheduler jobs create http "$MAINT_JOB" "${MAINT_ARGS[@]}" --headers Content-Type=application/json >/dev/null \
+        && info "job ${MAINT_JOB}: ${MAINTENANCE_SCHEDULE} -> ${MAINT_URL}" \
+        || warn "could not create ${MAINT_JOB}; the in-process monitor still runs scheduled work while an instance is up"
     fi
   fi
+elif [[ "$EFFECTIVE_ACCESS_MODE" == "iap" ]]; then
+  info "maintenance schedule: IAP blocks Cloud Scheduler calls; scheduled work runs in-process while an instance is up (use ACCESS_MODE google, google_oauth or password for a reliable schedule)"
+else
+  info "maintenance schedule: off (MAINTENANCE_SCHEDULE=off); run the price check from the FinOps page"
+fi
+if [[ "$DRY_RUN" != "1" ]] && gcloud scheduler jobs describe "$LEGACY_PRICING_JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
+  gcloud scheduler jobs delete "$LEGACY_PRICING_JOB" --project "$PROJECT_ID" --location "$REGION" --quiet >/dev/null 2>&1 \
+    && info "removed ${LEGACY_PRICING_JOB} (replaced by ${MAINT_JOB})" || true
 fi
 
 if [[ "$DRY_RUN" != "1" ]]; then

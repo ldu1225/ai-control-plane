@@ -88,8 +88,9 @@ class PricingTest(unittest.TestCase):
                     [{"model": "m", "input": 1, "output": 1, "extra": 1}]):
             with self.assertRaises(config.Invalid):
                 check(bad)
+        self.assertEqual(config.VALIDATORS["governance.antigravity.currency"]("usd"), "USD")
         with self.assertRaises(config.Invalid):
-            config.VALIDATORS["governance.antigravity.currency"]("usd")
+            config.VALIDATORS["governance.antigravity.currency"]("us dollar")
         self.assertIn("governance.antigravity.scheduler_invokers", config.UI_LOCKED_KEYS)
 
 
@@ -454,6 +455,22 @@ class SchedulerAuthTest(unittest.TestCase):
                 scheduler_identity({"Authorization": "Bearer a.b.c"}, settings, verifier, self.PATH)
             self.assertEqual(caught.exception.code, "unauthenticated")
 
+    def test_runtime_service_account_only_on_maintenance_paths(self):
+        own = "ai-control-plane-sa@demo-project.iam.gserviceaccount.com"
+        verifier = mock.MagicMock()
+        verifier.verify_google_oidc.return_value = own
+        settings = self.settings(invokers=())
+        with mock.patch.dict("os.environ", {"RUNTIME_SERVICE_ACCOUNT": own}):
+            for path in ("/api/v1/system/maintenance", "/api/v1/finops/pricing/sync",
+                         "/api/v1/telemetry/routing/enforce"):
+                identity = scheduler_identity({"Authorization": "Bearer a.b.c"}, settings, verifier, path)
+                self.assertEqual((identity.email, identity.auth_mode), (own, "scheduler"))
+                self.assertIn("https://cp.example.com" + path, verifier.verify_google_oidc.call_args.args[1])
+            # The deployment's own account cannot run governance enforcement unless it is an invoker.
+            with self.assertRaises(ApiError) as caught:
+                scheduler_identity({"Authorization": "Bearer a.b.c"}, settings, verifier, self.PATH)
+            self.assertEqual(caught.exception.code, "unauthenticated")
+
     def test_real_verifier_rejects_unsigned_or_wrong_algorithm(self):
         from controlplane.security import IapVerifier
         verifier = IapVerifier()
@@ -519,6 +536,26 @@ class SchedulerRouteTest(unittest.TestCase):
         # Without a bearer token the enforce route keeps the session + CSRF path.
         status, body = self.post("/api/v1/governance/antigravity/enforce", {})
         self.assertEqual((status, body["error"]["code"]), (403, "csrf_failed"))
+
+    def test_maintenance_tick_accepts_the_runtime_service_account(self):
+        own = "ai-control-plane-sa@demo-project.iam.gserviceaccount.com"
+        self.app.verifier.verify_google_oidc = mock.MagicMock(return_value=own)
+        try:
+            with mock.patch.dict("os.environ", {"RUNTIME_SERVICE_ACCOUNT": own}), \
+                    mock.patch("controlplane.services.pricing_sync.sync_pricing",
+                               return_value={"models": [], "newAlertsCount": 0}) as sync:
+                status, body = self.post("/api/v1/system/maintenance", {"Authorization": "Bearer a.b.c"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(sync.call_args.kwargs["trigger"], "scheduled")
+            self.assertIn("pricing_sync", body["data"]["results"])
+            self.assertEqual(body["data"]["runs"]["pricing_sync"]["status"], "ok")
+            # Another account is refused.
+            self.app.verifier.verify_google_oidc = mock.MagicMock(return_value="intruder@example.com")
+            with mock.patch.dict("os.environ", {"RUNTIME_SERVICE_ACCOUNT": own}):
+                status, body = self.post("/api/v1/system/maintenance", {"Authorization": "Bearer a.b.c"})
+            self.assertEqual(status, 403, body)
+        finally:
+            self.app.verifier.verify_google_oidc = mock.MagicMock(return_value=self.SA)
 
 
 if __name__ == "__main__":

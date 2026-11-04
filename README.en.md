@@ -7,7 +7,7 @@ This is an AI governance dashboard for viewing and controlling Gemini Enterprise
 Click **Open in Cloud Shell** above or run `scripts/install.sh` in Cloud Shell to enable all required APIs, provision service agents and least-privilege identities, configure audit log routing, Data Access audit logs and Gemini Enterprise prompt logging, and deploy the dashboard to Cloud Run in one step. The product name, organization name, logo, colors, language, modules to use and models to track can all be changed in settings.
 
 > [!IMPORTANT]
-> **There is no sample data, no demo mode and no fake data.** Every number in the UI is a value actually read from the connected Google Cloud project(s). When a BigQuery Billing Export table is not connected yet, cost metrics automatically fall back to **Token-Based Reverse Cost Estimation** (measured token usage × official Google Cloud public pricing × live USD/KRW exchange rate, clearly badged as estimated cost in the UI). Metrics whose underlying telemetry cannot be read are never fabricated — they are shown as `—` with the exact cause and remediation steps.
+> **There is no sample data, no demo mode and no fake data.** Every number in the UI is a value actually read from the connected Google Cloud project(s). When a BigQuery Billing Export table is not connected yet, cost metrics automatically fall back to **Token-Based Reverse Cost Estimation** (measured token usage × official Google Cloud public pricing × synced multi-currency exchange rates, clearly badged as estimated cost in the UI). Metrics whose underlying telemetry cannot be read are never fabricated — they are shown as `—` with the exact cause and remediation steps.
 
 > [!NOTE]
 > This repository is a management solution built to run in Google Cloud customer environments. It is not an officially supported Google product. Korean: [README.md](README.md)
@@ -61,10 +61,10 @@ Click **Open in Cloud Shell** above or run `scripts/install.sh` in Cloud Shell t
 | Deployments | `agent_deployments` | Agent Engine runtimes, runtime identities (service accounts), invocation volume, model usage by identity, runtime cost | Agent Platform API, audit logs, billing export |
 | Model Armor | `model_armor` | Verdicts over time, matched filters, blocks by application and user, event details | BigQuery `modelarmor_googleapis_com_sanitize_operations` |
 | Models & Tokens | `model_usage` | Automatic model discovery, input/output/cached tokens per model, invocations, error rate, cost, catalog management | Cloud Monitoring, billing export, Antigravity logs |
-| Cost & FinOps | `finops` | Gross cost, credits, net cost, cost by service/SKU or per-model token cost estimate, daily `04:00 KST` pricing/FX sync & change alerts, spike detection and AI root-cause analysis | Billing export or Token-Based Reverse Cost Estimation (Cloud Billing Catalog API + live FX) |
+| Cost & FinOps | `finops` | Gross cost, credits, net cost, cost by service/SKU or per-model token cost estimate, daily `00:00` (configurable) official pricing & multi-currency FX sync with change alerts, spike detection and AI root-cause analysis | Billing export or Token-Based Reverse Cost Estimation (Cloud Billing Catalog API + official pricing docs + live FX) |
 | Users & Access | `users` | 360-degree user view (usage across all services), Antigravity IAM state, individual allow and disallow | All sources, Resource Manager IAM |
 | Antigravity Controls | `antigravity` | Per-user cost/token/request caps, automatic or manual suspension, exception rules, settlement periods, safety gates, Agent activity in your cloud, audit log | Cloud Logging or BigQuery, IAM, billing export, Cloud Billing Catalog API |
-| Telemetry Extensions | `telemetry` | Automatic discovery of logs and tables with plain-language descriptions, one-click standard dashboards, BigQuery export commands | BigQuery, Cloud Logging, Cloud Monitoring |
+| Telemetry Extensions | `telemetry` | Dynamic schema/field-stats + Gemini profiling of logs and tables, multi-log group bundling dashboards, and cost-controlled Log Router -> BigQuery routing (sampling, min severity, exclusions, retention, daily GiB caps with auto-pause/resume) | BigQuery, Cloud Logging, Cloud Monitoring, Gemini on Agent Platform |
 | AI Analyst | `analyst` | Natural language questions, validated read-only SQL, result tables and charts, summaries | BigQuery, Gemini on Agent Platform |
 
 Common features: light/dark theme, Korean/English switching, unified multi-project selector (`All Projects` or per-project filter), currency selector (`KRW`/`USD`), command palette (Ctrl/Cmd+K), date range selection (presets and custom range), table search/sort/CSV export, data source health panel.
@@ -198,7 +198,7 @@ What the script automates end-to-end on a brand-new project:
 | 4. Container image | Creates the Artifact Registry repository and builds with Cloud Build using the dedicated builder SA (automatically falls back to local/Cloud Shell Docker if Cloud Build is restricted). |
 | 5. Session signing key | Creates a regional Secret Manager secret compliant with `constraints/gcp.resourceLocations` org policies. |
 | 6. Full data-source onboarding | Creates the BigQuery dataset (`ge_analytics`) and partitioned Log Router sink, **enables Data Access audit logs across AI services**, turns on **Gemini Enterprise usage + prompt/user logging**, onboards `--link-projects` secondary projects in the same BigQuery region, and auto-detects org name and Agent Platform endpoints. |
-| 7. Resilient Cloud Run, Auth & Pricing Sync | Deploys the IAP sign-in bridge and dashboard (adapting automatically to enterprise org policies: `--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** or built-in ID/Password sign-in) and provisions the daily `04:00 KST` public pricing & USD/KRW FX sync scheduler (`ai-control-plane-pricing-sync`). |
+| 7. Resilient Cloud Run, Auth & Scheduled Maintenance | Deploys the IAP sign-in bridge and dashboard (adapting automatically to enterprise org policies: `--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** or built-in ID/Password sign-in) and provisions the `${SERVICE_NAME}-maintenance` Cloud Scheduler job for daily `00:00` (configurable) official pricing & FX sync and telemetry BigQuery budget enforcement/auto-resume. |
 | 8. Live readiness probe | Verifies live HTTP response from the deployed Cloud Run URL and prints the exact login link. |
 
 - **Safe to re-run (idempotent).** Creates what is missing and updates what exists.
@@ -213,7 +213,7 @@ What the script automates end-to-end on a brand-new project:
 ### 3.4 Post-deployment checks
 
 1. Use the **Project selector** (`All Projects` or individual project) and **Currency selector** (`KRW` / `USD`) in the top header bar to verify unified visibility.
-2. Select **Data sources** in the top bar to check connection status. Even before a BigQuery Billing Export table is connected, **Overview**, **Models & Tokens** and **Cost & FinOps** automatically calculate estimated costs from measured token usage, Google Cloud public pricing and live USD/KRW FX rates. When you later export Cloud Billing to BigQuery, connect the table in **Settings > Workspace and data sources** to switch automatically to exact invoiced SKU costs and credits.
+2. Select **Data sources** in the top bar to check connection status. Even before a BigQuery Billing Export table is connected, **Overview**, **Models & Tokens** and **Cost & FinOps** automatically calculate estimated costs from measured token usage, official Google Cloud pricing and synced exchange rates. When you later export Cloud Billing to BigQuery, connect the table in **Settings > Workspace and data sources** to switch automatically to exact invoiced SKU costs and credits.
 3. If you created a new audit log sink, each BigQuery table is created automatically when its first log entry arrives.
 4. To use Antigravity per-user caps, follow [Section 8](#8-antigravity-per-user-caps-and-suspension).
 
@@ -303,7 +303,8 @@ You can also enter or update the billing values after deployment in **Settings >
 |---|---|---|
 | `ENABLE_GOVERNANCE_ACTIONS` | `false` | Grants IAM write roles. Required to suspend users over their cap, restore them, allow or disallow individual users and create marker roles |
 | `ENFORCEMENT_SCHEDULE` | Empty | Automatic enforcement schedule (cron). Example: `*/15 * * * *`. Requires `ENABLE_GOVERNANCE_ACTIONS=true`. Suspended users are restored by enforcement runs, so without a schedule they get access back only when an administrator runs enforcement after the period resets. |
-| `PRICING_SYNC_SCHEDULE` | `0 4 * * *` | Daily Cloud Scheduler cron (`WORKSPACE_TIMEZONE`, default `04:00 KST`) that syncs official Google Cloud model pricing and live USD/KRW exchange rates (`off` or `none` disables the job) |
+| `MAINTENANCE_SCHEDULE` | `0 * * * *` | Cloud Scheduler cron for `${SERVICE_NAME}-maintenance`: runs daily official pricing & multi-currency FX sync at `PRICING_SYNC_TIME` (default `00:00` in `WORKSPACE_TIMEZONE`) and enforces/resumes Telemetry BigQuery route daily GiB caps (`off` or `none` disables the job) |
+| `PRICING_SYNC_TIME`, `PRICING_CURRENCY` | `00:00`, `KRW` | Daily pricing/FX sync time (in `WORKSPACE_TIMEZONE`) and default display currency when no billing export is connected |
 
 ### 4.6 Other
 
@@ -464,7 +465,7 @@ In **Billing > Billing export**, turn on the **Detailed usage cost** export to B
 
 Features that use the billing export: Cost & FinOps, cost per model, agent runtime cost (requires the resource-level export), and the actual unit prices for Antigravity per-person cost caps.
 
-When a billing export is configured, Cost & FinOps, cost per model, agent runtime cost, and Antigravity per-person cost caps reflect actual billed unit prices and negotiated credits. When no billing export is configured, the control plane automatically estimates spend from observed token usage (Cloud Monitoring and inference logs) multiplied by official Google Cloud public token prices and live USD/KRW exchange rates, with a daily early-morning pricing & FX monitor, manual sync, and change alerts.
+When a billing export is configured, Cost & FinOps, cost per model, agent runtime cost, and Antigravity per-person cost caps reflect actual billed unit prices and negotiated credits. When no billing export is configured, the control plane automatically estimates spend from observed token usage (Cloud Monitoring and inference logs) multiplied by official Google Cloud public token prices (Cloud Billing Catalog API + official pricing pages + model aliases/overrides) and synced multi-currency exchange rates, with a daily midnight (`00:00`, configurable) pricing & FX sync, manual sync, and change alerts.
 
 ### 6.5 Antigravity inference logs
 
@@ -549,8 +550,8 @@ Shows verdicts over time, matched filters (prompt injection, sensitive data and 
 ### 7.8 Cost & FinOps
 
 - **When a BigQuery Billing Export table is connected** (`costSource: "billing_export"`): Calculates exact gross cost, credits, net cost, cost by service and SKU, and the AI share of spend directly from invoiced SKUs.
-- **When a Billing Export table is not connected yet** (`costSource: "token_estimate"`): Automatically computes **Token-Based Reverse Cost Estimation** from measured input/output token usage across Cloud Monitoring and audit logs × official Google Cloud public pricing × live USD/KRW exchange rate, broken down per model and per day, with a transparent UI status badge indicating estimated cost.
-- **Daily `04:00 KST` public pricing & FX sync**: Cloud Scheduler (`ai-control-plane-pricing-sync`) syncs Google Cloud Billing Catalog SKUs, official generative AI pricing docs, and live USD/KRW FX rates daily at `04:00 KST` (administrators can also trigger an immediate sync from the Cost & FinOps page). Any model rate change or newly added SKU raises a persistent review banner until acknowledged.
+- **When a Billing Export table is not connected yet** (`costSource: "token_estimate"`): Automatically computes **Token-Based Reverse Cost Estimation** from measured input/output token usage across Cloud Monitoring and audit logs × official Google Cloud public pricing (Cloud Billing Catalog SKUs + official pricing docs + model aliases/admin overrides) × synced `USD/<currency>` exchange rate, broken down per model and per day, with a transparent UI status badge indicating estimated cost.
+- **Daily `00:00` (configurable) official pricing & multi-currency FX sync**: Cloud Scheduler (`${SERVICE_NAME}-maintenance`) syncs Google Cloud Billing Catalog SKUs, official generative AI pricing docs, BigQuery streaming/storage list prices, and multi-currency FX rates daily at midnight (`00:00` by default in `WORKSPACE_TIMEZONE`, configurable in **Settings > Data collection and cost**; administrators can also trigger an immediate sync). Any model rate change, FX shift, or unpriced model raises a review banner.
 - **Spike detection**: A day is marked as a spike when cost rose by at least `finops.spike_threshold_pct` (default 50%) and by at least `spike_min_delta` compared with the previous day. When you select Explain with AI, Gemini summarizes the cause based on the SKU or model changes.
 
 ### 7.9 Users & Access
@@ -559,15 +560,12 @@ Brings each user's usage of all services, such as Gemini Enterprise, NotebookLM,
 
 ### 7.10 Telemetry Extensions
 
-Pick logs and tables that the project already collects but the built-in pages do not show, and get a ready-made dashboard with one click. Nothing needs to be typed.
+Without any hardcoded log catalog, Telemetry Extensions inspects live Cloud Logging streams and BigQuery tables using real schemas, field-level statistics and Gemini profiling so administrators can bundle related logs into dashboards and route high-volume streams to BigQuery under strict cost controls.
 
-1. **Found automatically**: Lists the Cloud Logging logs of the project and the BigQuery tables of the audit log dataset (and `workspace.telemetry_datasets`). The entries written per log over the last 7 days come from the Cloud Monitoring metric `logging.googleapis.com/log_entry_count` (one API call regardless of the number of logs).
-2. **Plain-language cards**: Each source says what it is, what its dashboard shows (for example counts by service, by HTTP status, top users), its recent volume and its full technical name (never truncated). Cards are grouped into AI and agents, Security and audit, and Operations, sorted by recent volume; sources without data in the last 7 days are folded away. The text comes from the catalog in [`telemetry_catalog.py`](src/controlplane/services/telemetry_catalog.py); logs that are not in the catalog get an honest generic description based on the product name.
-3. **Add to dashboard**: One button creates the connector. The catalog decides which fields to chart, and for tables exported to BigQuery the paths are resolved against the real schema (`protoPayload` -> `protopayload_auditlog`, typed `jsonpayload_*` columns, case). A log routed to BigQuery is shown once, as its table (complete history, no read cap). Sources that contain prompt or response text ask for confirmation first.
-4. **Standard dashboard**: Events per day, the main breakdown (named by the catalog), a status breakdown, top users and models (when mapped) and the latest 20 entries with a message column. Raw entries and messages are hidden from viewers (`security.mask_pii_for_viewers`).
-5. **Already shown on the built-in pages**: Sources used by the built-in pages, such as the audit logs, Gemini Enterprise activity and Model Armor, are listed separately with links to the pages that show them.
-
-Dashboards that read Cloud Logging directly cover its retention period (30 days by default) and count at most 5,000 entries per view. Busy logs show a note on their card, and **Export logs to BigQuery** builds the `gcloud logging sinks create` command. To chart only part of a log or change the mapping, use **Custom setup** (the manual connector form).
+1. **Dynamic discovery & field statistics**: Automatically discovers Cloud Logging streams and BigQuery tables (`workspace.audit_dataset`, `telemetry.routing.dataset`, `workspace.telemetry_datasets`), measuring 7-day entry counts and ingested bytes (`logging.googleapis.com/log_entry_count` and `byte_count`) plus observed field cardinality and candidate timestamp, actor, model, status, metric and message columns.
+2. **Gemini profiling & semantic grouping**: Gemini (`gemini-4-argon` by default, configurable) profiles discovered schemas to generate plain-language titles/descriptions, recommended breakdown fields, sensitive-text warnings, and semantic **functional groups** cached in the settings store. Administrators can override any source's title, group, field mapping or visibility.
+3. **Single-source & bundled group dashboards**: Add any source in one click or select **Bundle N logs into dashboard** on a group to aggregate multiple related logs into one unified dashboard (events per day, primary/status breakdowns, top users/models, and latest entries with viewer PII masking).
+4. **Cost-controlled Log Router -> BigQuery routing**: Provision partitioned BigQuery sinks (`telemetry_routed` dataset by default) directly from a source or group with live monthly ingestion/storage cost estimates and full spend guardrails: **sampling %** (`sample(insertId, rate)`), **minimum severity**, **exclusion filters**, **partition retention days**, and **per-route + workspace daily GiB caps**. Routes that exceed their daily cap are automatically paused (`disabled=true`) and automatically resumed on the next day when budget resets (when IAM write roles are absent, ready-to-run `gcloud` / `bq` commands with the exact same filters and retention are generated).
 
 ### 7.11 AI Analyst
 
@@ -738,7 +736,8 @@ If `workspace.project_id` is empty or starts with `your-`, the data APIs return 
 | Workspace and data sources | Project, time zone, audit log dataset, billing export, API locations, data source health |
 | Modules | Turn modules on or off (applies to every user immediately) |
 | Model catalog | Automatic tracking of new models, turning off tracking for individual models |
-| AI engine | Default model, allowed models, connection test |
+| Data collection and cost | Pricing/FX sync schedule & currency, manual model rates & aliases, telemetry discovery limits, Gemini telemetry analysis settings, field hints & display renames, BigQuery routing cost controls |
+| AI engine | Default model, fallback model order, allowed models, connection test |
 | Governance policy | Antigravity cap policy, marker roles, change budget, webhook, agent lifecycle, cost spike thresholds |
 | Access control | Approved accounts, roles, approving and dismissing access requests |
 | About | Version, workspace project, Cloud Run service and revision, whether the settings store is durable and its last change, data handling |

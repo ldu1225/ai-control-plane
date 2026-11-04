@@ -4,7 +4,7 @@
 import { h, mount, append } from './core/dom.js';
 import { icon } from './core/icons.js';
 import { t, setLocale, getLocale } from './core/i18n.js';
-import { fmt, setTimezone, parseDate } from './core/format.js';
+import { fmt, isNum, setTimezone, parseDate } from './core/format.js';
 import { api, setCsrfToken, setUnauthenticatedHandler, setForbiddenHandler, isAbort } from './core/api.js';
 import {
   store, on, initState, setRange, setGranularity, setProject, setModel, isModuleEnabled, session, isAdmin, PRESETS, computeRange, savePrefs,
@@ -344,13 +344,16 @@ function formatPricingAlertLine(a) {
   if (!a) return '';
   if (a.kind === 'fx') {
     const sign = isNum(a.pctChange) && a.pctChange > 0 ? '+' : '';
-    return `USD/KRW: ${fmt.num(a.before, 2)} \u2192 ${fmt.num(a.after, 2)} KRW (${sign}${fmt.num(a.pctChange, 2)}%)`;
+    const pair = a.target || `USD/${a.currency || ''}`;
+    const ccy = a.currency || (pair.includes('/') ? pair.split('/')[1] : '');
+    const dec = isNum(a.after) && a.after >= 100 ? 2 : 4;
+    return `${pair}: ${fmt.num(a.before, dec)} \u2192 ${fmt.num(a.after, dec)}${ccy ? ` ${ccy}` : ''} (${sign}${fmt.num(a.pctChange, 2)}%)`;
   }
   if (a.kind === 'new_model') {
-    return `${a.label || a.target}: ${t('New public model rate')} ($${fmt.num(a.after, 3)} / 1M)`;
+    return `${a.label || a.target}: ${t('New official model price')} (${fmt.currency(a.after, 'USD', { precise: true })} / 1M)`;
   }
   const sign = isNum(a.pctChange) && a.pctChange > 0 ? '+' : '';
-  return `${a.label || a.target} (${a.field}): $${fmt.num(a.before, 3)} \u2192 $${fmt.num(a.after, 3)} / 1M (${sign}${fmt.num(a.pctChange, 1)}%)`;
+  return `${a.label || a.target} (${a.field}): ${fmt.currency(a.before, 'USD', { precise: true })} \u2192 ${fmt.currency(a.after, 'USD', { precise: true })} / 1M (${sign}${fmt.num(a.pctChange, 1)}%)`;
 }
 
 function renderBanners() {
@@ -383,11 +386,20 @@ function renderBanners() {
     }) : null;
     list.push(banner({
       tone: 'warning',
-      title: t('Public token pricing or USD/KRW rate changed ({n})', { n: pa.unacknowledgedCount }),
+      title: t('Official token prices or exchange rates changed ({n})', { n: pa.unacknowledgedCount }),
       text: items.join(' \u00b7 '),
       actions: h('div', { class: 'row' },
         button({ label: t('Cost & FinOps'), size: 'sm', variant: 'primary', onClick: () => { window.location.hash = '#/finops'; } }),
         ackBtn),
+    }));
+  }
+  const tr = store.boot.telemetryRouting;
+  if (tr && tr.paused > 0 && isModuleEnabled('telemetry')) {
+    list.push(banner({
+      tone: 'warning',
+      title: t('{n} telemetry BigQuery routes paused by budget control', { n: tr.paused }),
+      text: t('Daily volume budget reached. Paused sinks do not export more entries until resumed or the next local day.'),
+      actions: button({ label: t('Telemetry Extensions'), size: 'sm', variant: 'primary', onClick: () => { window.location.hash = '#/extensions'; } }),
     }));
   }
   const s = session();
@@ -602,7 +614,7 @@ function switchLocale(locale) {
 
 function paletteItems() {
   const items = visibleRoutes().map((r) => ({ label: t(r.label), group: r.group ? t(r.group) : t('Navigation'), iconName: r.icon, run: () => { window.location.hash = `#/${r.path}`; } }));
-  const settingsTabs = [['general', 'General'], ['access', 'Access control'], ['workspace', 'Workspace and data sources'], ['modules', 'Modules'], ['models', 'Model catalog'], ['ai', 'AI engine'], ['governance', 'Governance policy'], ['about', 'About']];
+  const settingsTabs = [['general', 'General'], ['access', 'Access control'], ['workspace', 'Workspace and data sources'], ['modules', 'Modules'], ['models', 'Model catalog'], ['ai', 'AI engine'], ['data-collection', 'Data collection and cost'], ['governance', 'Governance policy'], ['about', 'About']];
   settingsTabs.forEach(([id, label]) => items.push({ label: `${t('Settings')}: ${t(label)}`, group: t('Settings'), iconName: 'settings', run: () => { window.location.hash = `#/settings/${id}`; } }));
   if (isAdmin()) {
     items.push({ label: `${t('Add account')} (${t('Approved accounts')})`, group: t('Actions'), iconName: 'plus', run: () => openAccessDrawer() });

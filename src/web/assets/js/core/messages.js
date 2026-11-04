@@ -45,8 +45,15 @@ const TEMPLATES = [
   [/^The permissions of (\S+) could not be read\.$/, 'The permissions of {a} could not be read.'],
   [/^Created with (\d+) permissions \(businessaicode\.\* excluded\)\.$/, 'Created with {a} permissions (businessaicode.* excluded).'],
   [/^The role could not be created \((\w+)\)\.$/, 'The role could not be created ({a}).'],
-  // Automatic token prices
+  // Automatic token prices & telemetry routing
   [/^Billed prices are in (\w+) and could not be converted to (\w+), so the public price list is used instead\.$/, 'Billed prices are in {a} and could not be converted to {b}, so the public price list is used instead.'],
+  [/^No exchange rate for USD\/(\w+) is available yet, so estimates are shown in USD\.$/, 'No exchange rate for USD/{a} is available yet, so estimates are shown in USD.'],
+  [/^(\d+) model\(s\) have no official price yet \((.+)\); their tokens are counted at zero cost\. Add an alias or a price in Settings > Data collection and cost\.$/, '{a} model(s) have no official price yet ({b}); their tokens are counted at zero cost. Add an alias or a price in Settings > Data collection and cost.'],
+  [/^Only the first (\d+) log names per project are listed\.$/, 'Only the first {a} log names per project are listed.'],
+  [/^The maximum number of routes \((\d+)\) has been reached\.$/, 'The maximum number of routes ({a}) has been reached.'],
+  [/^A route can send at most (\d+) logs\.$/, 'A route can send at most {a} logs.'],
+  [/^Daily budget exceeded \(([\d.]+) GiB \/ ([\d.]+) GiB\)$/, 'Daily budget exceeded ({a} GiB / {b} GiB)'],
+  [/^Workspace daily budget exceeded \(([\d.]+) GiB \/ ([\d.]+) GiB\)$/, 'Workspace daily budget exceeded ({a} GiB / {b} GiB)'],
   // Request validation
   [/^Unknown settings key: (\S+)$/, 'Unknown settings key: {a}'],
   [/^Setting (\S+) cannot be reset from the UI\.$/, 'Setting {a} cannot be reset from the UI.'],

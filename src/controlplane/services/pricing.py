@@ -32,8 +32,6 @@ LOG = logging.getLogger("controlplane.pricing")
 
 CATALOG_V1 = "https://cloudbilling.googleapis.com/v1"
 CATALOG_LABEL = "api:cloudbilling.services.skus"
-# Cloud Billing Catalog service ids (stable public identifiers).
-CATALOG_SERVICES = (("C7E2-9256-1C43", "Agent Platform"), ("AEFD-7695-64FA", "Gemini API"))
 BILLING_DAYS = 30
 CACHE_SECONDS = 6 * 3600
 MAX_CATALOG_PAGES = 8
@@ -42,6 +40,7 @@ VARIANT_WORDS = {"batch", "flex", "priority", "offpeak", "peak", "caching", "cac
                  "tuning", "tuned", "audio", "image", "images", "video", "cyber", "bidi", "embedding", "embeddings",
                  "grounding", "search", "contributor", "deferred", "offline",
                  "lyria", "music", "song", "clip", "clips", "track", "tracks", "veo", "imagen", "chirp"}
+CACHED_VARIANT_WORDS = VARIANT_WORDS - {"caching", "cached", "cache"} | {"storage", "hour", "hours"}
 MAX_USD_PER_SINGLE_TOKEN = 0.0005  # $500 / 1M tokens ceiling rejects per-clip / per-image / per-call SKUs
 LONG_CONTEXT_RE = re.compile(r"(?i)(?:>|\u2265|over|above)\s*\d|long context|long input|long output")
 WORD_RE = re.compile(r"[a-z0-9.]+")
@@ -63,6 +62,19 @@ def token_sku(description, service=None, unit=None, pricing_unit=None):
     if measure == "output_tokens":
         return info["key"], "output", info["product"]
     return None
+
+
+def cached_token_sku(description, service=None, unit=None, pricing_unit=None):
+    """(model key, "cached", product) for a standard text cached-input token SKU (not cache storage), else None."""
+    if not description or not isinstance(description, str):
+        return None
+    low = description.lower()
+    if "cach" not in low or set(WORD_RE.findall(low)) & CACHED_VARIANT_WORDS or LONG_CONTEXT_RE.search(low):
+        return None
+    info = models.parse_sku(description, service)
+    if not info or models.classify_measure(description, unit, pricing_unit) != "cached_tokens":
+        return None
+    return info["key"], "cached", info["product"]
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +136,9 @@ def _money(unit):
     return int((unit or {}).get("units") or 0) + ((unit or {}).get("nanos") or 0) / 1e9
 
 
+money = _money
+
+
 def catalog_entries(skus):
     """Yields (key, direction, rank, price_per_token, conversion_rate, effective_time) for standard text
     token SKUs priced per token count. rank prefers own model SKUs and global endpoints."""
@@ -148,11 +163,23 @@ def catalog_entries(skus):
         yield key, direction, (1 if prod else 0, 0 if "global" in desc else 1), price, rate, info.get("effectiveTime")
 
 
-def catalog_prices(ctx, currency):
+def catalog_services(ctx):
+    """Billing Catalog services that bill model tokens: the list kept by the daily price sync, discovered live
+    (by display name, see pricing.catalog_services) when no sync has run yet."""
+    from . import pricing_sync
+    settings_mgr = getattr(getattr(ctx, "app", None), "settings", None)
+    synced = (settings_mgr.pricing_state().get("catalogServices") or []) if settings_mgr is not None else []
+    if synced:
+        return synced
+    return pricing_sync.select_model_services(pricing_sync.list_catalog_services(ctx), ctx.settings)
+
+
+def catalog_prices(ctx, currency, services=None):
     """({key: {"input": per_million, "output": per_million}}, usd_rate, effective_time) in `currency`."""
     candidates = {}
     usd_rate, effective = None, None
-    for service_id, _name in CATALOG_SERVICES:
+    for svc in (services if services is not None else catalog_services(ctx)):
+        service_id = svc["id"] if isinstance(svc, dict) else svc
         token = None
         for _ in range(MAX_CATALOG_PAGES):
             params = {"currencyCode": currency, "pageSize": 5000}
@@ -222,8 +249,29 @@ def combine(currency, billing, billing_currency, billing_usd_rate, catalog, usd_
     return PriceTable(currency, prices, fx, counts), warning
 
 
+def synced_prices(ctx, currency):
+    """(prices per 1M tokens in `currency`, usd_rate, as_of) from the daily official price sync, or None."""
+    settings_mgr = getattr(getattr(ctx, "app", None), "settings", None)
+    synced = settings_mgr.pricing_state() if settings_mgr is not None else {}
+    if not (synced.get("syncedAt") and synced.get("models")):
+        return None
+    if currency == "USD":
+        rate, as_of = 1.0, synced.get("syncedAt")
+    else:
+        item = ((synced.get("fx") or {}).get("rates") or {}).get(currency) or {}
+        rate, as_of = to_float(item.get("rate")), item.get("asOf")
+        if not rate:
+            return None
+    out = {}
+    for key, item in (synced.get("models") or {}).items():
+        entry = {d: float(item[d]) * rate for d in ("input", "output") if to_float(item.get(d)) is not None}
+        if entry:
+            out[key] = entry
+    return out, rate, as_of
+
+
 def build_price_table(ctx, currency):
-    """Billing and catalog prices in `currency` ("" = billing currency). Never raises for upstream
+    """Billing and official list prices in `currency` ("" = billing currency). Never raises for upstream
     failures; they become warnings and the affected models stay unpriced."""
     billing, billing_currency, billing_rate = {}, None, None
     src = ctx.billing_source()
@@ -235,27 +283,15 @@ def build_price_table(ctx, currency):
             ctx.warn_error(src.label, err, "Prices from the billing export")
     cap_currency = currency or billing_currency or "USD"
     catalog, usd_rate, effective = {}, None, None
-    try:
-        catalog, usd_rate, effective = catalog_prices(ctx, cap_currency)
-        ctx.add_source(CATALOG_LABEL)
-    except GcpError as err:
-        settings_mgr = getattr(getattr(ctx, "app", None), "settings", None)
-        synced = settings_mgr.pricing_state() if settings_mgr is not None else {}
-        if synced.get("syncedAt") and synced.get("models"):
-            fx_rate = to_float((synced.get("fx") or {}).get("usdKrw")) if cap_currency == "KRW" else 1.0
-            if cap_currency in ("USD", "KRW") and fx_rate:
-                usd_rate = fx_rate
-                effective = (synced.get("fx") or {}).get("asOf") or synced.get("syncedAt")
-                for key, item in (synced.get("models") or {}).items():
-                    entry = {}
-                    if to_float(item.get("input")) is not None:
-                        entry["input"] = float(item["input"]) * fx_rate
-                    if to_float(item.get("output")) is not None:
-                        entry["output"] = float(item["output"]) * fx_rate
-                    if entry:
-                        catalog[key] = entry
-                ctx.add_source("pricing:public_sync")
-        if not catalog:
+    synced = synced_prices(ctx, cap_currency)
+    if synced is not None:
+        catalog, usd_rate, effective = synced
+        ctx.add_source("pricing:official_sync")
+    else:
+        try:
+            catalog, usd_rate, effective = catalog_prices(ctx, cap_currency)
+            ctx.add_source(CATALOG_LABEL)
+        except GcpError as err:
             ctx.warn_error(CATALOG_LABEL, err, "The Google Cloud price list")
     table, warning = combine(cap_currency, billing, billing_currency, billing_rate, catalog, usd_rate, effective)
     if warning:

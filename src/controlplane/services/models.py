@@ -619,27 +619,21 @@ def build_usage(ctx, rng, data=None):
                               key=lambda s: -(s["cost"] or 0))
         elif estimate_mode:
             from . import pricing_sync
-            _, rate_info = pricing_sync.lookup_model_rate(rates_map, key)
+            _, rate_info = pricing_sync.lookup_model_rate(rates_map, key, pricing_sync.model_aliases(ctx))
             est_val, est_daily = _estimated_model_cost(entry, rate_info)
             est_daily_by_key[key] = est_daily
             cost = round(est_val, 6)
             skus_out = []
             if rate_info:
-                if tokens["input"]:
-                    skus_out.append({"sku": "%s — Input Tokens (Estimated)" % entry["name"],
-                                     "service": "Agent Platform", "measure": "input_tokens", "unit": "tokens",
-                                     "amount": tokens["input"],
-                                     "cost": money(tokens["input"] * rate_info["input"] / 1_000_000.0)})
-                if tokens["output"]:
-                    skus_out.append({"sku": "%s — Output Tokens (Estimated)" % entry["name"],
-                                     "service": "Agent Platform", "measure": "output_tokens", "unit": "tokens",
-                                     "amount": tokens["output"],
-                                     "cost": money(tokens["output"] * rate_info["output"] / 1_000_000.0)})
-                if tokens["cached"]:
-                    skus_out.append({"sku": "%s — Context Cache Tokens (Estimated)" % entry["name"],
-                                     "service": "Agent Platform", "measure": "cached_tokens", "unit": "tokens",
-                                     "amount": tokens["cached"],
-                                     "cost": money(tokens["cached"] * rate_info["cached"] / 1_000_000.0)})
+                for slot, measure, label in (("input", "input_tokens", "Input Tokens"),
+                                             ("output", "output_tokens", "Output Tokens"),
+                                             ("cached", "cached_tokens", "Context Cache Tokens")):
+                    if tokens[slot]:
+                        unit = rate_info.get(slot)
+                        skus_out.append({"sku": "%s — %s (Estimated)" % (entry["name"], label),
+                                         "service": "Agent Platform", "measure": measure, "unit": "tokens",
+                                         "amount": tokens[slot],
+                                         "cost": money(tokens[slot] * unit / 1_000_000.0) if unit is not None else None})
                 skus_out.sort(key=lambda s: -(s["cost"] or 0))
         else:
             cost = None

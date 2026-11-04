@@ -177,6 +177,50 @@ class SettingsUpdateTest(unittest.TestCase):
         out = self.update("governance", {"token_cap": 1000, "period": "weekly"})
         self.assertEqual(out, {"governance.antigravity.token_cap": 1000, "governance.antigravity.period": "weekly"})
 
+    def test_pricing_section(self):
+        out = self.update("pricing", {"currency": "eur", "sync_time": "00:00", "sync_timezone": "Asia/Seoul",
+                                      "model_aliases": ["My-Tuned = gemini-2.5-flash"],
+                                      "model_overrides": [{"model": "acme-llm", "input": 1, "output": 2.5}],
+                                      "public_sources": ["https://cloud.google.com/vertex-ai/generative-ai/pricing"]})
+        self.assertEqual(out["pricing.currency"], "EUR")
+        self.assertEqual(out["pricing.model_aliases"], ["my-tuned=gemini-2.5-flash"])
+        self.assertEqual(out["pricing.model_overrides"], [{"model": "acme-llm", "input": 1.0, "output": 2.5,
+                                                           "cached": None}])
+        self.assertBadRequest("pricing", {"sync_time": "24:00"})
+        self.assertBadRequest("pricing", {"sync_time": "7am"})
+        self.assertBadRequest("pricing", {"sync_timezone": "Mars/Base"})
+        self.assertBadRequest("pricing", {"currency": "WONS"})
+        self.assertBadRequest("pricing", {"currency": "K1"})
+        # Price pages must be official Google documentation; exchange-rate feeds any public https host.
+        self.assertBadRequest("pricing", {"public_sources": ["https://prices.example.com/gemini"]})
+        self.assertBadRequest("pricing", {"public_sources": ["http://cloud.google.com/pricing"]})
+        self.assertBadRequest("pricing", {"fx_sources": ["https://127.0.0.1/rates"]})
+        self.assertBadRequest("pricing", {"fx_sources": ["https://metadata.google.internal/x"]})
+        self.assertEqual(self.update("pricing", {"fx_sources": ["https://api.frankfurter.dev/v1/latest?base=USD"]}),
+                         {"pricing.fx_sources": ["https://api.frankfurter.dev/v1/latest?base=USD"]})
+        self.assertBadRequest("pricing", {"model_aliases": ["no equals sign"]})
+        self.assertBadRequest("pricing", {"model_overrides": [{"model": "a", "input": -1}]})
+        self.assertBadRequest("pricing", {"model_overrides": [{"model": "a"}, {"model": "a"}]})
+
+    def test_telemetry_section(self):
+        out = self.update("telemetry", {"discovery": {"activity_days": 14, "max_log_entries": 5000},
+                                        "ai": {"model": "gemini-4-argon", "batch_size": 20},
+                                        "routing": {"sample_percent": 10, "min_severity": "WARNING",
+                                                    "daily_budget_gb": 2.5, "over_budget_action": "alert"},
+                                        "display_renames": ["Vertex AI=Agent Platform"]})
+        self.assertEqual(out["telemetry.discovery.activity_days"], 14)
+        self.assertEqual(out["telemetry.routing.min_severity"], "WARNING")
+        self.assertEqual(out["telemetry.ai.model"], "gemini-4-argon")
+        self.assertEqual(self.update("telemetry", {"ai": {"model": ""}}), {"telemetry.ai.model": ""})
+        self.assertBadRequest("telemetry", {"routing": {"sample_percent": 0}})
+        self.assertBadRequest("telemetry", {"routing": {"min_severity": "LOUD"}})
+        self.assertBadRequest("telemetry", {"routing": {"dataset": "bad-dataset!"}})
+        self.assertBadRequest("telemetry", {"routing": {"notify_webhook_url": "https://evil.example.com/x"}})
+        self.assertBadRequest("telemetry", {"discovery": {"max_log_entries": 10}})
+        self.assertBadRequest("telemetry", {"inference": {"user_hints": ["Has Space"]}})
+        self.assertBadRequest("telemetry", {"connectors": []})  # connectors have their own endpoints
+        self.assertBadRequest("ai_engine", {"fallback_models": ["not a model"]})
+
     def test_ui_locked_keys(self):
         self.assertBadRequest("security", {"auth_mode": "iap"})
         out = self.update("security", {"auth_mode": "auto", "mask_pii_for_viewers": False})
