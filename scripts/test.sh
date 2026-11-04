@@ -102,6 +102,7 @@ if [[ "$LIVE" == "1" ]]; then
   ACP_TEST_ROOT="$ROOT" \
   ACP_TEST_PROJECT="$PROJECT_ID" \
   ACP_TEST_REGION="$REGION" \
+  ACP_TEST_SERVICE="$SERVICE_NAME" \
   ACP_TEST_URL="$BASE_URL" \
   ACP_TEST_ADMIN="$ADMIN_EMAIL" \
   ACP_TEST_MUTATE="$MUTATE" \
@@ -117,15 +118,31 @@ import urllib.request
 root = os.environ["ACP_TEST_ROOT"]
 sys.path.insert(0, os.path.join(root, "src"))
 
-from controlplane.auth import SignInBridge  # noqa: E402
+from controlplane.auth import Signer  # noqa: E402
 
 project = os.environ["ACP_TEST_PROJECT"]
+region = os.environ["ACP_TEST_REGION"]
+service = os.environ["ACP_TEST_SERVICE"]
 base_url = os.environ["ACP_TEST_URL"].rstrip("/")
 admin_email = os.environ["ACP_TEST_ADMIN"].strip()
 do_mutate = os.environ.get("ACP_TEST_MUTATE") == "1"
 
+svc_raw = subprocess.check_output(
+    ["gcloud", "run", "services", "describe", service, f"--project={project}", f"--region={region}", "--format=json"],
+    text=True,
+    stderr=subprocess.DEVNULL,
+)
+svc_json = json.loads(svc_raw[svc_raw.index("{"):])
+secret_name = f"{service}-session-secret"
+for item in (((svc_json.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers", [{}])[0].get("env", []):
+    if item.get("name") == "SESSION_SECRET":
+        ref = ((item.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name")
+        if ref:
+            secret_name = ref
+        break
+
 raw_secret = subprocess.check_output(
-    ["gcloud", "secrets", "versions", "access", "latest", "--secret=cp-session-secret", f"--project={project}"],
+    ["gcloud", "secrets", "versions", "access", "latest", f"--secret={secret_name}", f"--project={project}"],
     text=True,
     stderr=subprocess.DEVNULL,
 )
@@ -135,8 +152,10 @@ secret_lines = [
 ]
 secret = secret_lines[-1]
 
-bridge = SignInBridge(secret=secret)
-session_cookie = bridge.make_session(admin_email, ttl_seconds=3600)
+session_cookie = Signer(secret.encode("utf-8"), "session").sign(
+    {"email": admin_email, "name": admin_email, "picture": "", "sub": "e2e:" + admin_email, "ims": int(time.time() * 1000)},
+    3600,
+)
 csrf_token = ""
 
 
