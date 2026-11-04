@@ -207,7 +207,12 @@ def log_volumes(ctx, days=None):
     from . import monitoring
     days = int(days or ((ctx.settings.get("telemetry") or {}).get("discovery") or {}).get("activity_days") or 7)
     now = dt.datetime.now(dt.timezone.utc)
-    series = monitoring.time_series(ctx, LOG_BYTES_METRIC, ["metric.label.log"], now - dt.timedelta(days=days), now)
+    try:
+        series = monitoring.time_series(ctx, LOG_BYTES_METRIC, ["metric.label.log"], now - dt.timedelta(days=days), now)
+    except GcpError as err:
+        if err.kind in ("not_found", "invalid"):
+            return {}
+        raise
     out = {}
     for labels, points in series:
         name = urllib.parse.unquote(str(labels.get("metric.label.log") or "")).strip()

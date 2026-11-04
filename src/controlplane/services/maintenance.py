@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import threading
 
 from ..httpkit import now_iso
@@ -32,6 +33,26 @@ MONITOR_SECONDS = 300
 
 def _now():
     return dt.datetime.now(dt.timezone.utc)
+
+
+def cloud_run_scheduler_managed(app, environ=None):
+    """True on Cloud Run when Cloud Scheduler drives maintenance (non-IAP mode).
+    Cloud Run throttles CPU outside active HTTP requests, so daemon threads freeze mid-RPC and cause socket errors."""
+    env = os.environ if environ is None else environ
+    if not env.get("K_SERVICE"):
+        return False
+    configured = "auto"
+    if app is not None and getattr(app, "settings", None) is not None:
+        try:
+            settings, _ = app.settings.snapshot()
+            configured = ((settings.get("security") or {}).get("auth_mode") or "auto").strip().lower()
+        except Exception:  # pylint: disable=broad-except
+            configured = "auto"
+    from ..security import resolve_auth_mode
+    try:
+        return resolve_auth_mode(configured, env) != "iap"
+    except ValueError:
+        return False
 
 
 def _claim(app, task, due):
@@ -111,9 +132,16 @@ def tick(app, actor="system:maintenance", trigger="scheduled"):
         snap_doc, _ = aux_docs(app).load(telemetry.DISCOVERY_DOC)
         snap_project = snap_doc.get("project") if isinstance(snap_doc, dict) else None
         snap_updated = parse_rfc3339(snap_doc.get("updatedAt")) if isinstance(snap_doc, dict) else None
+        snap_pending = bool((((snap_doc or {}).get("data") or {}).get("aiGrouping") or {}).get("pending")) \
+            if isinstance(snap_doc, dict) else False
+        snap_cfg_changed = bool(snap_doc.get("configFp")
+                                and snap_doc.get("configFp") != telemetry._discovery_config_fp(settings)) \
+            if isinstance(snap_doc, dict) else False
 
         def discovery_due(_rec):
             if snap_project != settings["workspace"]["project_id"] or snap_updated is None:
+                return True
+            if snap_pending or snap_cfg_changed:
                 return True
             return (_now() - snap_updated).total_seconds() >= telemetry.DISCOVERY_REFRESH_SECONDS
 
@@ -176,8 +204,8 @@ def run(ctx):
 
 
 class MaintenanceMonitor:
-    """In-process fallback for the scheduler tick (local runs, or instances kept warm). Cloud Scheduler stays the
-    reliable path on Cloud Run, where idle instances get no CPU."""
+    """In-process fallback for the scheduler tick (local runs, or IAP instances where Cloud Scheduler cannot call in).
+    On standard Cloud Run deployments, Cloud Scheduler invokes POST /api/v1/system/maintenance with dedicated CPU."""
 
     def __init__(self, app, interval=MONITOR_SECONDS):
         self.app = app
@@ -186,9 +214,13 @@ class MaintenanceMonitor:
         self._thread = None
 
     def start(self):
+        if cloud_run_scheduler_managed(self.app):
+            LOG.info("Cloud Run scheduler mode: skipping in-process maintenance thread (driven by Cloud Scheduler)")
+            return False
         if self._thread is None:
             self._thread = threading.Thread(target=self._loop, name="maintenance-monitor", daemon=True)
             self._thread.start()
+        return True
 
     def stop(self):
         self._stop.set()

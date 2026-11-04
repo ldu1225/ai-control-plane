@@ -609,9 +609,9 @@ class GroupDashboardTest(unittest.TestCase):
 
 
 class DiscoverySnapshotAndOverlayTest(unittest.TestCase):
-    def _make_env(self):
+    def _make_env(self, **overrides):
         base_settings = support.make_settings(workspace={"project_id": "demo-project", "projects": ["sub-project"],
-                                                         "timezone": "UTC"})
+                                                         "timezone": "UTC"}, **overrides)
         mgr = settings_store.SettingsManager(base_settings, settings_store.MemoryStore())
         ctx = support.FakeCtx(settings=mgr.snapshot()[0])
         ctx.app.settings = mgr
@@ -738,7 +738,79 @@ class DiscoverySnapshotAndOverlayTest(unittest.TestCase):
         self.assertEqual(info["newlyProfiled"], 0)
         self.assertEqual(info["pending"], 1)
 
+    def test_partial_transient_failure_preserves_previous_logs_and_strips_transient_warnings(self):
+        ctx, _mgr = self._make_env()
+
+        def ok_compute(full_ctx, allow_uncached_ai=True):
+            full_ctx.add_source("api:logging.logs")
+            return self._fake_base()
+
+        with mock.patch.object(telemetry, "_compute_discover_base", side_effect=ok_compute):
+            first = telemetry.refresh_discovery_snapshot(ctx.app)
+        self.assertEqual(len(first["data"]["logs"]), 2)
+        self.assertEqual(first["warnings"], [])
+
+        def partial_fail_compute(full_ctx, allow_uncached_ai=True):
+            full_ctx.warn("api:logging.logs", "upstream_unavailable", "The Cloud Logging log list: service unavailable.")
+            full_ctx.warn("bigquery:demo-project.ops", "access_denied", "Permanent IAM warning")
+            degraded = self._fake_base()
+            degraded["logs"] = None
+            degraded["aiGrouping"] = {"enabled": False, "model": None, "profiled": 0, "newlyProfiled": 0}
+            return degraded
+
+        with mock.patch.object(telemetry, "_compute_discover_base", side_effect=partial_fail_compute):
+            second = telemetry.refresh_discovery_snapshot(ctx.app)
+        # Previous logs and AI grouping are preserved; transient logging warning is stripped while IAM warning stays.
+        self.assertEqual(len(second["data"]["logs"]), 2)
+        self.assertEqual(second["data"]["aiGrouping"]["profiled"], 3)
+        self.assertEqual([w["code"] for w in second["warnings"]], ["access_denied"])
+        self.assertIn("api:logging.logs", second["sources"])
+
+    def test_blank_project_missing_monitoring_metrics_and_transient_activity_emit_zero_warnings(self):
+        from controlplane.gcp import GcpError
+        from controlplane.services import telemetry_routing as routing
+
+        ctx = support.FakeCtx()
+        with mock.patch("controlplane.services.monitoring.time_series",
+                        side_effect=GcpError("not_found", status=404, message="Metric descriptor not found")):
+            self.assertEqual(telemetry._log_metric(ctx, telemetry.LOG_ENTRY_METRIC, 7), {})
+            self.assertEqual(routing.log_volumes(ctx, 7), {})
+        self.assertEqual(ctx.warnings, [])
+
+        with mock.patch.object(telemetry, "_discover_tables", return_value=[]), \
+                mock.patch.object(telemetry, "_list_logs", return_value=[]), \
+                mock.patch.object(telemetry, "_log_metric",
+                                  side_effect=GcpError("network", message="TLS handshake timed out")), \
+                mock.patch("controlplane.services.telemetry_routing.log_volumes", return_value={}):
+            base = telemetry._compute_discover_base(ctx, allow_uncached_ai=False)
+        self.assertEqual(base["tables"], [])
+        self.assertEqual(base["logs"], [])
+        self.assertEqual(ctx.warnings, [])
+
+    def test_cloud_run_scheduler_mode_skips_in_process_daemon_threads(self):
+        from controlplane.services import maintenance
+
+        ctx_google, _ = self._make_env(security={"auth_mode": "google"})
+        ctx_iap, _ = self._make_env(security={"auth_mode": "iap"})
+
+        with mock.patch.dict("os.environ", {"K_SERVICE": "ai-control-plane"}, clear=False):
+            self.assertTrue(maintenance.cloud_run_scheduler_managed(ctx_google.app))
+            self.assertFalse(maintenance.cloud_run_scheduler_managed(ctx_iap.app))
+
+            mon_google = maintenance.MaintenanceMonitor(ctx_google.app)
+            self.assertFalse(mon_google.start())
+            self.assertIsNone(mon_google._thread)
+            self.assertFalse(telemetry.ensure_background_discovery(ctx_google.app))
+
+            mon_iap = maintenance.MaintenanceMonitor(ctx_iap.app)
+            try:
+                self.assertTrue(mon_iap.start())
+                self.assertIsNotNone(mon_iap._thread)
+            finally:
+                mon_iap.stop()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

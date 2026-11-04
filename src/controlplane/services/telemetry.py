@@ -29,8 +29,8 @@ from ..httpkit import ApiError, now_iso
 from ..schema import SEGMENT_RE, build_expr, expr, quote_ident
 from ..security import uid_for
 from ..settings_store import aux_docs
-from .base import (BUILTIN_PAGES, CORE_TABLES, bucket_or_sentinel, bucket_values, iso, parse_rfc3339, period_sql,
-                   range_params, require_identity_admin, split_rollup, to_int)
+from .base import (BUILTIN_PAGES, CORE_TABLES, TRANSIENT_CODES, bucket_or_sentinel, bucket_values, iso, parse_rfc3339,
+                   period_sql, range_params, require_identity_admin, split_rollup, to_int)
 from . import agents, monitoring
 from . import telemetry_profile as profile
 from . import telemetry_routing as routing
@@ -319,7 +319,12 @@ def _log_metric(ctx, metric, days):
     now = dt.datetime.now(dt.timezone.utc)
     today = now.astimezone(tz).date()
     index = {today - dt.timedelta(days=days - 1 - i): i for i in range(days)}
-    series = monitoring.time_series(ctx, metric, ["metric.label.log"], now - dt.timedelta(days=days), now)
+    try:
+        series = monitoring.time_series(ctx, metric, ["metric.label.log"], now - dt.timedelta(days=days), now)
+    except GcpError as err:
+        if err.kind in ("not_found", "invalid"):
+            return {}
+        raise
     out = {}
     for labels, points in series:
         name = urllib.parse.unquote(str(labels.get("metric.label.log") or "")).strip()
@@ -972,7 +977,17 @@ def _compute_discover_base(ctx, allow_uncached_ai=True):
     })
     tables = _task_result(ctx, res["tables"], "telemetry:tables", "Table discovery")
     logs = _task_result(ctx, res["logs"], "api:logging.logs", "The Cloud Logging log list")
-    activity = _task_result(ctx, res["activity"], "api:monitoring.log_entry_count", "Log activity from Cloud Monitoring")
+    ok_a, act_val = res["activity"]
+    if ok_a:
+        activity = act_val
+    elif isinstance(act_val, GcpError) and act_val.kind in ("not_found", "invalid"):
+        activity = {}
+    elif isinstance(act_val, GcpError) and act_val.kind in ("network", "timeout", "unavailable", "rate_limit", "server"):
+        LOG.info("telemetry activity metric skipped (%s)", act_val.kind)
+        activity = None
+    else:
+        ctx.warn_error("api:monitoring.log_entry_count", act_val, "Log activity from Cloud Monitoring")
+        activity = None
     ok_v, volumes = res["volume"]
     volumes = volumes if ok_v else {}
     titles = res["titles"][1] if res["titles"][0] else {}
@@ -1207,33 +1222,59 @@ def refresh_discovery_snapshot(app, actor="system:maintenance", allow_uncached_a
     full_ctx = Ctx(app, settings, version, Identity(actor, "admin", "scheduler", "discovery:%s" % actor),
                    params={"project": "all"})
     base_data = _compute_discover_base(full_ctx, allow_uncached_ai=allow_uncached_ai)
+    existing, _ = aux_docs(app).load(DISCOVERY_DOC)
+    prev_ok = (isinstance(existing, dict) and existing.get("project") == full_ctx.project
+               and isinstance(existing.get("data"), dict))
+    has_data = base_data.get("tables") is not None or base_data.get("logs") is not None
+    if not has_data and prev_ok:
+        return existing
+
+    warnings = list(full_ctx.warnings)
+    sources = set(full_ctx.sources)
+    if prev_ok:
+        prev_data = existing["data"]
+        prev_sources = set(existing.get("sources") or [])
+        if base_data.get("tables") is None and prev_data.get("tables") is not None:
+            base_data["tables"] = prev_data["tables"]
+            warnings = [w for w in warnings if not (
+                w.get("code") in TRANSIENT_CODES
+                and (w.get("source") or "").startswith(("telemetry:tables", "bigquery:", "api:bigquery"))
+            )]
+            sources.update(s for s in prev_sources if s.startswith(("bigquery:", "api:bigquery")))
+        if base_data.get("logs") is None and prev_data.get("logs") is not None:
+            base_data["logs"] = prev_data["logs"]
+            if not ((base_data.get("aiGrouping") or {}).get("profiled")) \
+                    and ((prev_data.get("aiGrouping") or {}).get("profiled")):
+                base_data["aiGrouping"] = prev_data["aiGrouping"]
+            warnings = [w for w in warnings if not (
+                w.get("code") in TRANSIENT_CODES and (w.get("source") or "").startswith("api:logging")
+            )]
+            sources.update(s for s in prev_sources if s.startswith("api:logging"))
+
     snap = {
         "updatedAt": now_iso(),
         "project": full_ctx.project,
         "projects": list(getattr(full_ctx, "all_projects", None) or [full_ctx.project]),
         "configFp": _discovery_config_fp(settings),
         "data": base_data,
-        "warnings": list(full_ctx.warnings),
-        "sources": sorted(full_ctx.sources),
+        "warnings": warnings,
+        "sources": sorted(sources),
     }
-    existing, _ = aux_docs(app).load(DISCOVERY_DOC)
-    has_data = base_data.get("tables") is not None or base_data.get("logs") is not None
-    if has_data or not (isinstance(existing, dict) and existing.get("project") == full_ctx.project
-                        and isinstance(existing.get("data"), dict)):
-        try:
-            aux_docs(app).mutate(DISCOVERY_DOC, lambda doc: (doc.clear(), doc.update(snap), True)[-1])
-        except Exception as err:  # pylint: disable=broad-except
-            LOG.warning("telemetry discovery snapshot not saved: %s", type(err).__name__)
-        cache = getattr(app, "cache", None)
-        if cache is not None:
-            cache.set(("telemetry_discovery_snap", full_ctx.project), snap, DISCOVERY_REFRESH_SECONDS * 4)
-        return snap
-    return existing
+    try:
+        aux_docs(app).mutate(DISCOVERY_DOC, lambda doc: (doc.clear(), doc.update(snap), True)[-1])
+    except Exception as err:  # pylint: disable=broad-except
+        LOG.warning("telemetry discovery snapshot not saved: %s", type(err).__name__)
+    cache = getattr(app, "cache", None)
+    if cache is not None:
+        cache.set(("telemetry_discovery_snap", full_ctx.project), snap, DISCOVERY_REFRESH_SECONDS * 4)
+    return snap
 
 
 def ensure_background_discovery(app, actor="system:background", allow_uncached_ai=True):
-    """Starts at most one background thread per app instance to refresh `telemetry_discovery` asynchronously."""
-    if app is None:
+    """Starts at most one background thread per app instance to refresh `telemetry_discovery` asynchronously.
+    Skipped on Cloud Run when Cloud Scheduler drives `POST /api/v1/system/maintenance` with dedicated request CPU."""
+    from . import maintenance
+    if app is None or maintenance.cloud_run_scheduler_managed(app):
         return False
     key = id(app)
     with _BG_LOCK:

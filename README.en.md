@@ -896,7 +896,9 @@ If `deploy.<PROJECT_ID>.env` contains `SCAN_PROJECTS` (or you pass `--link-proje
 ### 16.1 Tests
 
 ```bash
-python3 -m unittest discover -s tests/unit -v
+./scripts/test.sh                                          # all offline suites (unit tests, bash -n, prepublish scan, AI Analyst validate)
+./scripts/test.sh --live --project PROJECT_ID --mutate     # live Cloud Run end-to-end verification (including connector & route mutations)
+python3 -m unittest discover -s tests/unit -v              # unit tests only
 ```
 
 The unit tests verify code behavior and do not connect to Google Cloud. Test inputs use only reserved domains (`example.com` and others), and the tests are not included in the container image. GitHub Actions (`.github/workflows/tests.yml`) runs them on every push and pull request, together with `bash -n` on the scripts, the prepublish scan and the offline validation of the AI Analyst golden dataset.

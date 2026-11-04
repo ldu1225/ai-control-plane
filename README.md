@@ -888,7 +888,9 @@ BigQuery 감사 로그 데이터셋, Artifact Registry 저장소, Data Access �
 ### 16.1 테스트
 
 ```bash
-python3 -m unittest discover -s tests/unit -v
+./scripts/test.sh                                          # 전체 오프라인 검증 (단위 테스트 + 셸 문법 + 배포 전 검사 + AI 애널리스트 검증)
+./scripts/test.sh --live --project PROJECT_ID --mutate     # 배포된 Cloud Run 서비스 라이브 엔드투엔드 검증 (커넥터·라우팅 생성/삭제 포함)
+python3 -m unittest discover -s tests/unit -v              # 단위 테스트만 단독 실행
 ```
 
 단위 테스트는 코드 동작을 검증하기 위한 것이며 Google Cloud에 접속하지 않습니다. 테스트 입력값은 예약 도메인(`example.com` 등)만 쓰고, 컨테이너 이미지에는 포함되지 않습니다. GitHub Actions(`.github/workflows/tests.yml`)가 푸시와 풀 리퀘스트마다 단위 테스트, 스크립트 `bash -n`, 배포 전 검사, AI 애널리스트 골든 데이터셋의 오프라인 검증을 실행합니다.

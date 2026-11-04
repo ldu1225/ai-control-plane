@@ -1061,6 +1061,11 @@ PYPROBE
   if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" || "$HTTP_CODE" == "401" ]]; then
     info "live readiness verified (${BASE_URL} responded HTTP ${HTTP_CODE})"
   fi
+  if [[ "$MAINTENANCE_SCHEDULE" != "off" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
+    if gcloud scheduler jobs run "$MAINT_JOB" --project "$PROJECT_ID" --location "$REGION" --quiet >/dev/null 2>&1; then
+      info "triggered initial maintenance (${MAINT_JOB}: official pricing sync + telemetry discovery)"
+    fi
+  fi
 fi
 
 log "Deployment complete: ${PROJECT_ID}"
