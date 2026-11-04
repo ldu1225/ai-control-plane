@@ -135,11 +135,12 @@ svc_raw = subprocess.check_output(
 svc_json = json.loads(svc_raw[svc_raw.index("{"):])
 secret_name = f"{service}-session-secret"
 for item in (((svc_json.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers", [{}])[0].get("env", []):
-    if item.get("name") == "SESSION_SECRET":
+    if item.get("name") == "PUBLIC_BASE_URL" and item.get("value"):
+        base_url = item["value"].rstrip("/")
+    elif item.get("name") == "SESSION_SECRET":
         ref = ((item.get("valueFrom") or {}).get("secretKeyRef") or {}).get("name")
         if ref:
             secret_name = ref
-        break
 
 raw_secret = subprocess.check_output(
     ["gcloud", "secrets", "versions", "access", "latest", f"--secret={secret_name}", f"--project={project}"],
@@ -188,10 +189,10 @@ def call_api(method, path, body=None, auth=True, timeout=60):
         return err.code, elapsed_ms, parsed
 
 
-# 1. Public healthz & auth state
-st, ms, _ = call_api("GET", "/healthz", auth=False)
-assert st == 200, f"/healthz failed: {st}"
-print(f"  [OK] GET /healthz -> {st} ({ms:.0f} ms)")
+# 1. Public liveness (/health) & auth state
+st, ms, _ = call_api("GET", "/health", auth=False)
+assert st == 200, f"/health failed: {st}"
+print(f"  [OK] GET /health -> {st} ({ms:.0f} ms) [{base_url}]")
 
 st, ms, auth_state = call_api("GET", "/api/v1/auth/state", auth=False)
 assert st == 200, f"/api/v1/auth/state failed: {st} {auth_state}"
@@ -256,8 +257,14 @@ print(
 )
 assert ms_disc < 2000.0, f"discover warm latency too high: {ms_disc:.1f} ms"
 
-# 5. Optional E2E mutation cycle (connector + managed BigQuery log route)
+# 5. Optional E2E mutation cycle (connector + live overlay + managed BigQuery log route + AI Analyst chat)
 if do_mutate:
+    # Clean up any leftover E2E Smoke Route from an interrupted run
+    _, _, existing_rt = call_api("GET", "/api/v1/telemetry/routing")
+    for rt in ((existing_rt.get("data") or {}).get("routes") or []):
+        if rt.get("title") == "E2E Smoke Route" and rt.get("id"):
+            call_api("POST", "/api/v1/telemetry/routing/routes/action", body={"id": rt["id"], "action": "delete"})
+
     st, _, saved = call_api("POST", "/api/v1/telemetry/connectors", body={
         "name": "E2E Smoke Connector",
         "enabled": True,
@@ -269,6 +276,14 @@ if do_mutate:
     conn_id = ((saved.get("data") or {}).get("connector") or {}).get("id")
     assert conn_id, f"missing connector id: {saved}"
     print(f"  [OK] Created connector {conn_id}")
+
+    st, _, disc_live = call_api("GET", "/api/v1/telemetry/discover")
+    assert st == 200
+    stdout_logs = [lg for lg in ((disc_live.get("data") or {}).get("logs") or [])
+                   if lg.get("shortName") == "run.googleapis.com/stdout" and lg.get("project") == project]
+    if stdout_logs:
+        assert stdout_logs[0].get("connectorId") == conn_id, f"live overlay missed connector: {stdout_logs[0]}"
+        print(f"  [OK] Verified instant live snapshot overlay for connector {conn_id}")
 
     st, _, deleted = call_api("POST", "/api/v1/telemetry/connectors/delete", body={"id": conn_id})
     assert st == 200, f"delete connector failed: {st} {deleted}"
@@ -286,15 +301,24 @@ if do_mutate:
     assert route_id, f"missing route id: {route_res}"
     print(f"  [OK] Created managed BigQuery log route {route_id}")
 
-    st, _, p_res = call_api("POST", "/api/v1/telemetry/routing/routes/pause", body={"id": route_id})
+    st, _, p_res = call_api("POST", "/api/v1/telemetry/routing/routes/action", body={"id": route_id, "action": "pause"})
     assert st == 200, f"pause route failed: {st} {p_res}"
-    st, _, r_res = call_api("POST", "/api/v1/telemetry/routing/routes/resume", body={"id": route_id})
+    st, _, r_res = call_api("POST", "/api/v1/telemetry/routing/routes/action", body={"id": route_id, "action": "resume"})
     assert st == 200, f"resume route failed: {st} {r_res}"
     print(f"  [OK] Paused & resumed route {route_id}")
 
-    st, _, d_res = call_api("POST", "/api/v1/telemetry/routing/routes/delete", body={"id": route_id})
+    st, _, d_res = call_api("POST", "/api/v1/telemetry/routing/routes/action", body={"id": route_id, "action": "delete"})
     assert st == 200, f"delete route failed: {st} {d_res}"
     print(f"  [OK] Deleted route {route_id}")
+
+    st, ms_chat, chat_res = call_api("POST", "/api/v1/analyst/chat", body={
+        "question": "최근 7일 동안 기록된 Gemini Enterprise 활동 건수는 몇 건인가요?",
+        "history": [],
+    }, timeout=90)
+    assert st == 200, f"AI Analyst chat failed: {st} {chat_res}"
+    ans = ((chat_res.get("data") or {}).get("answer") or "").strip()
+    assert ans, f"AI Analyst returned empty answer: {chat_res}"
+    print(f"  [OK] POST /api/v1/analyst/chat -> {st} ({ms_chat:.0f} ms, answer_chars={len(ans)})")
 
 print("==> [Live E2E] ALL CHECKS PASSED")
 PYLIVE
