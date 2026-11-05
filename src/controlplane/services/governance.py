@@ -32,10 +32,11 @@ from dataclasses import dataclass, field
 
 from .. import config, timeutil
 from ..gcp import GcpError
-from ..httpkit import ApiError, now_iso
+from ..httpkit import ApiError
 from ..schema import expr, quote_ident
 from ..security import is_human, uid_for
 from ..settings_store import EMPTY_GOVERNANCE
+from . import credit_ledger
 from .base import AGY_SINK, iso, parse_rfc3339, to_int
 from .pricing import price_table
 
@@ -100,6 +101,12 @@ class GovConfig:
     @property
     def markers(self):
         return {self.cap_marker, self.admin_marker, *self.legacy_markers}
+
+
+def utcnow():
+    """The current time (aware UTC). The caps drill (controlplane/caps_drill.py) replaces it to run a month of
+    scheduled enforcement in seconds; nothing else does."""
+    return dt.datetime.now(dt.timezone.utc)
 
 
 def marker_name(project, role_id):
@@ -234,10 +241,11 @@ def _manual_cached(ag):
     return tuple(out)
 
 
-def pricing_from(ag, table=None):
-    """Pricing for the saved policy. table is the automatic price table (services.pricing) or None."""
+def pricing_from(ag, table=None, currency=None):
+    """Pricing for the saved policy. table is the automatic price table (services.pricing) or None. currency overrides
+    the policy currency (credit caps are always in USD, like the credit itself)."""
     source = ag.get("pricing_source") or "auto"
-    currency = ag.get("currency") or ""
+    currency = currency or ag.get("currency") or ""
     if source == "auto" and table is not None:
         currency = table.currency
     return Pricing(currency=currency or "USD",
@@ -279,6 +287,85 @@ def estimate_cost(rec, pricing):
     if used_tokens > 0 and priced_tokens == 0:
         return None, True
     return round(total, 6), partial
+
+
+# ---------------------------------------------------------------------------
+# Credit caps: weekly free credit (Gemini models) and a monthly paid budget, in USD (services/credit_ledger.py)
+# ---------------------------------------------------------------------------
+
+CREDIT_MODEL = "credit_budget"
+
+
+PERIOD_CAP_KEYS = ("cost_cap", "token_cap", "request_cap")
+
+
+def credit_mode(ag):
+    """True when caps follow the Antigravity credit; cap_model "period" keeps the fixed period caps. When cap_model was
+    never chosen (empty), credit caps apply, except that an installation from before credit caps that already set a
+    fixed cap keeps the period model: an upgrade must never drop caps a customer relies on."""
+    model = ag.get("cap_model") or ""
+    if model:
+        return model == CREDIT_MODEL
+    for key in PERIOD_CAP_KEYS:
+        try:
+            if float(ag.get(key) or 0) > 0:
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
+def usd_budget(value):
+    """A USD budget from settings or a rule: None (no limit) for a negative or missing value, 0 = credits only."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if amount != amount or amount < 0 else amount
+
+
+def credit_cycle(settings):
+    anchor = period_anchor(settings)
+    return credit_ledger.Cycle(tz=anchor["tz"], weekday=int(anchor["weekday"] or 0), at=anchor["at"])
+
+
+def credit_prefixes(ag):
+    return tuple(p for p in (ag.get("credit_model_prefixes") or credit_ledger.CREDIT_MODEL_PREFIXES) if p)
+
+
+def credit_terms(ag, exc):
+    """(monthly credit, monthly paid budget or None) for one person: an individual limit rule replaces the defaults."""
+    credit = float(ag.get("credit_per_user_month") or 0)
+    budget = usd_budget(ag.get("paid_budget_month"))
+    if exc and exc.get("type") == "limit":
+        if exc.get("creditMonth") is not None:
+            credit = float(exc["creditMonth"])
+        if exc.get("paidBudget") is not None:
+            budget = usd_budget(exc["paidBudget"])
+    return max(0.0, credit), budget
+
+
+def split_cost(rec, pricing, prefixes=credit_ledger.CREDIT_MODEL_PREFIXES):
+    """(gemini_cost, other_cost, known, partial) of one usage record in the pricing currency. Gemini models draw on
+    the included credit; every other model (Claude) is paid. known is False when tokens were used but none of a part
+    could be priced (its cost then counts as 0 and the caps do not act on it)."""
+    gemini, other = {}, {}
+    for model, agg in (rec.get("byModel") or {}).items():
+        (gemini if credit_ledger.credit_eligible(model, prefixes) else other)[model] = agg
+    costs, known, partial = [], True, False
+    for part in (gemini, other):
+        if not part:
+            costs.append(0.0)
+            continue
+        cost, part_partial = estimate_cost({"byModel": part}, pricing)
+        partial = partial or part_partial
+        if cost is None:
+            known = False
+            cost = 0.0
+        costs.append(cost)
+    return costs[0], costs[1], known, partial
 
 
 class PolicyIndex:
@@ -412,7 +499,7 @@ def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_o
     - mode "manual": over-cap users go to the review queue instead of the block list.
     - telemetry_truncated: usage was read only partly (log read cap), so counts are lower bounds. Over-cap
       results stay valid, but usage-based restores are withheld (G3 warns)."""
-    now = now or dt.datetime.now(dt.timezone.utc)
+    now = now or utcnow()
     population = len(users)
     determinate = sum(1 for u in users if u["state"] != UNKNOWN)
     gates = []
@@ -460,18 +547,34 @@ def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_o
                 restore.append(uid)
             elif not g3_ok:
                 withheld = True
+    # The change budget limits how many people one run suspends: a circuit breaker against a telemetry or pricing
+    # glitch suspending everyone at once. Suspensions above it are deferred to the next run (block rules first, then
+    # the people furthest over their limits), so a real wave, such as an organization budget being spent or a new
+    # credits-only policy, is still applied within a few runs. Restores give access back and are never limited: at a
+    # weekly reset every suspended person is restored in the same run, however many there are.
     budget = max(cfg.change_budget_min, int(math.ceil(cfg.change_budget_ratio * population)))
-    planned = len(block) + len(restore) + len(disallow)
+    planned = len(block) + len(disallow)
     g4_ok = planned <= budget
-    gates.append({"id": "G4_CHANGE_BUDGET", "status": "pass" if g4_ok else "fail",
-                  "detail": "%d planned changes; budget is %d." % (planned, budget)})
+    deferred = []
+    if not g4_ok:
+        severity = {u["uid"]: u.get("capUsage") or 0 for u in users}
+        block.sort(key=lambda uid: -severity.get(uid, 0))   # stable: equal severity keeps the population order
+        keep = disallow[:budget]
+        room = budget - len(keep)
+        deferred = disallow[len(keep):] + block[room:]
+        disallow, block = keep, block[:room]
+    gates.append({"id": "G4_CHANGE_BUDGET", "status": "pass" if g4_ok else "warn",
+                  "detail": "%d planned suspensions; budget is %d per run." % (planned, budget) if g4_ok else
+                  "%d planned suspensions; budget is %d per run, so %d wait for the next run."
+                  % (planned, budget, len(deferred))})
     gates.append({"id": "G5_NON_USER_GRANT_ABSENT", "status": "pass" if not non_user_on_access else "warn",
                   "detail": "No group or domain grants on %s." % access_role if not non_user_on_access else
                   "%d group or domain grant(s) on %s; affected users are not enforceable."
                   % (len(non_user_on_access), access_role)})
     failed = [g for g in gates if g["status"] == "fail"]
     plan = {"block": block, "restore": restore, "disallow": disallow, "review": review, "manual": manual,
-            "withheldRestores": withheld, "aborted": bool(failed),
+            "withheldRestores": withheld, "deferredBlocks": deferred, "changeBudget": budget,
+            "aborted": bool(failed),
             "abortReason": "; ".join("%s: %s" % (g["id"], g["detail"]) for g in failed) if failed else None}
     return gates, plan, budget
 
@@ -1003,8 +1106,9 @@ def _add_logging_gaps(ctx, src, usage, start, end, email=None, rng=None, log_lab
     usage.merge(extra)
 
 
-def antigravity_usage(ctx, start, end, email=None, rng=None):
-    """Returns a Usage. Never raises for upstream failures (usage.ok=False + warning)."""
+def antigravity_usage(ctx, start, end, email=None, rng=None, fresh=False):
+    """Returns a Usage. Never raises for upstream failures (usage.ok=False + warning). fresh skips the 5-minute cache of
+    Cloud Logging reads (enforcement runs decide on the latest entries)."""
     ag = ctx.settings["governance"]["antigravity"]
     mode = ag.get("usage_source", "auto")
     src = None
@@ -1031,7 +1135,11 @@ def antigravity_usage(ctx, start, end, email=None, rng=None):
     def load():
         return _logging_usage(ctx, start, end, email=email, rng=rng)
     try:
-        usage, _ = ctx.app.cache.get_or_compute(cache_key, 300, load)
+        if fresh:
+            usage = load()
+            ctx.app.cache.set(cache_key, usage, 300)
+        else:
+            usage, _ = ctx.app.cache.get_or_compute(cache_key, 300, load)
     except GcpError as err:
         ctx.warn_error(log_label, err, "Cloud Logging inference logs")
         return Usage("logging")
@@ -1141,7 +1249,8 @@ def public_exception(item):
         return None
     return {"type": item["type"], "scope": "period" if item.get("until") else "permanent",
             "until": item.get("until"), "tokenCap": item.get("tokenCap"), "requestCap": item.get("requestCap"),
-            "costCap": item.get("costCap"), "note": item.get("note") or "",
+            "costCap": item.get("costCap"), "paidBudget": item.get("paidBudget"),
+            "creditMonth": item.get("creditMonth"), "note": item.get("note") or "",
             "createdBy": item.get("createdBy") or None, "createdAt": item.get("createdAt")}
 
 
@@ -1166,7 +1275,7 @@ def restore_at(state, suspension, over, next_reset, now):
     return None
 
 
-# The default schedule runs every 15 minutes; two hours without a scheduled run means it stopped, and suspended
+# The default schedule runs every 5 minutes; two hours without a scheduled run means it stopped, and suspended
 # users would then not be restored at the period reset.
 SCHEDULER_STALE_AFTER = dt.timedelta(hours=2)
 
@@ -1180,7 +1289,7 @@ def scheduler_status(ctx, state, now=None):
     configured = bool(invokers and base)
     last = state.get("lastScheduledRun")
     last_at = parse_rfc3339(last.get("at")) if isinstance(last, dict) else None
-    now = now or dt.datetime.now(dt.timezone.utc)
+    now = now or utcnow()
     stale = bool(configured and last_at is not None and now - last_at > SCHEDULER_STALE_AFTER)
     return {"configured": configured, "lastRun": last, "stale": stale}
 
@@ -1212,31 +1321,118 @@ _EMPTY_USAGE = {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens"
                 "clients": set(), "models": set(), "byModel": {}}
 
 
-def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, mode=None, now=None):
+def _usage_tasks(ctx, tasks, credit, segs, start, end, fresh, now=None):
+    if credit:
+        horizon = (now or utcnow()) - dt.timedelta(minutes=15)
+        for i, seg in enumerate(segs):
+            # Closed segments no longer change (log entries arrive within minutes): only the open one is read fresh
+            # during enforcement, the others may come from the 5-minute cache.
+            seg_fresh = bool(fresh and seg.end > horizon)
+            tasks[("usage", i)] = (lambda a=seg.start, b=seg.end, f=seg_fresh: antigravity_usage(ctx, a, b, fresh=f))
+    else:
+        tasks["usage"] = lambda: antigravity_usage(ctx, start, end, fresh=fresh)
+
+
+def _segment_usages(res, segs):
+    """(all usage, current-cycle usage, evaluated-month usage, per-segment usages) from the per-segment results. Any
+    failed segment makes usage unavailable: the ledger must never decide on part of the month."""
+    parts, healthy = [], True
+    for i in range(len(segs)):
+        ok, value = res[("usage", i)]
+        if not ok or not getattr(value, "ok", False):
+            healthy = False
+            value = value if ok else Usage("unavailable")
+        parts.append(value)
+    source = next((u.source for u in parts if u.ok), "unavailable") if healthy else "unavailable"
+    every, week, month = Usage(source), Usage(source), Usage(source)
+    if healthy:
+        every.ok = week.ok = month.ok = True
+        for seg, part in zip(segs, parts):
+            every.merge(part)
+            if seg.in_week:
+                week.merge(part)
+            if seg.in_month:
+                month.merge(part)
+    return every, week, month, parts
+
+
+def _credit_ledgers(ag, emails, exceptions, segs, parts, pricing):
+    """{email: (ledger, budget, known, partial, week_cost)} for every person in `emails`."""
+    prefixes = credit_prefixes(ag)
+    out = {}
+    for email in emails:
+        credit_month, budget = credit_terms(ag, exceptions.get(email))
+        costs, known, partial, week_cost = [], True, False, 0.0
+        for seg, part in zip(segs, parts):
+            rec = part.users.get(email)
+            if not rec:
+                costs.append((0.0, 0.0))
+                continue
+            gemini, other, ok, part_partial = split_cost(rec, pricing, prefixes)
+            known, partial = known and ok, partial or part_partial
+            costs.append((gemini, other))
+            if seg.in_week:
+                week_cost += gemini + other
+        led = credit_ledger.run(segs, costs, credit_month / 4.0)
+        out[email] = (led, budget, known and pricing.configured, partial, week_cost)
+    return out
+
+
+def _credit_row(led, budget, known, org_used_up):
+    used_up = credit_ledger.budget_used_up(led, budget, org_used_up)
+    return {"creditWeek": round(led.credit_week, 6), "freeUsedWeek": round(led.free_used_week, 6),
+            "freeLeftWeek": round(led.free_left_week, 6), "paidWeek": round(led.paid_week, 6),
+            "paidMonth": round(led.paid_month, 6), "freeMonth": round(led.free_month, 6),
+            "costMonth": round(led.cost_month, 6), "geminiMonth": round(led.gemini_month, 6),
+            "otherMonth": round(led.other_month, 6), "budget": budget,
+            "budgetLeft": None if budget is None else round(max(0.0, budget - led.paid_month), 6),
+            "budgetUsedUp": used_up, "costKnown": known}
+
+
+def _credit_ratio(led, budget):
+    if budget is not None and budget > 0:
+        return led.paid_month / budget
+    if budget == 0 and led.credit_week > 0:
+        return led.free_used_week / led.credit_week + (1.0 if led.paid_month > credit_ledger.EPS else 0.0)
+    return 0.0
+
+
+def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, mode=None, now=None, fresh=False):
     """Computes the full governance status. Returns (public_payload, internal).
 
     cost_cap and mode default to the saved policy. mode "auto" plans blocks for over-cap users;
-    "manual" puts them in the review queue."""
+    "manual" puts them in the review queue. With credit caps (cap_model credit_budget, the default) the usage of the
+    month so far is read per weekly cycle and each person's weekly free credit and monthly paid budget decide
+    (services/credit_ledger.py); token and request caps then apply per weekly cycle. fresh skips cached log reads."""
     cfg = gov_config(ctx.settings)
     ag = ctx.settings["governance"]["antigravity"]
+    credit = credit_mode(ag)
     cost_cap = float(ag.get("cost_cap") or 0) if cost_cap is None else float(cost_cap)
+    if credit:
+        cost_cap = 0.0
     mode = mode or ag.get("enforcement_mode") or "manual"
     anchor = period_anchor(ctx.settings)
     tz = anchor["tz"]
-    now = now or dt.datetime.now(dt.timezone.utc)
-    start, end = timeutil.governance_window(period, window, now=now, **anchor)
-    next_reset = timeutil.governance_next_reset(period, window, now=now, **anchor)
+    now = now or utcnow()
+    segs, month_start, month_end = None, None, None
+    if credit:
+        period, window = "weekly", "calendar"
+        segs, (month_start, month_end), (start, next_reset) = credit_ledger.segments(credit_cycle(ctx.settings), now)
+        end = now.astimezone(dt.timezone.utc).replace(second=0, microsecond=0)
+    else:
+        start, end = timeutil.governance_window(period, window, now=now, **anchor)
+        next_reset = timeutil.governance_next_reset(period, window, now=now, **anchor)
     gstate = governance_state(ctx)
     exceptions = active_exceptions(gstate, now)
     suspensions = {s["email"]: s for s in gstate.get("suspensions") or []}
     tasks = {
-        "usage": lambda: antigravity_usage(ctx, start, end),
         "policy": lambda: get_policy(ctx),
         "markers": lambda: marker_status(ctx, cfg),
         "perms": lambda: permission_status(ctx),
     }
+    _usage_tasks(ctx, tasks, credit, segs, start, end, fresh, now)
     if (ag.get("pricing_source") or "auto") == "auto":
-        tasks["prices"] = lambda: price_table(ctx, ag.get("currency") or "")
+        tasks["prices"] = lambda: price_table(ctx, "USD" if credit else (ag.get("currency") or ""))
     res = ctx.run(tasks)
     table = None
     if "prices" in res:
@@ -1247,10 +1443,15 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
             ctx.warn("pricing:auto", "pricing_unavailable", "Automatic token prices could not be loaded.")
         else:
             ctx.warn_error("pricing:auto", value, "Automatic token prices")
-    pricing = pricing_from(ag, table)
-    ok, usage = res["usage"]
-    if not ok:
-        usage = Usage("unavailable")
+    pricing = pricing_from(ag, table, currency="USD" if credit else None)
+    parts = []
+    if credit:
+        usage, window_usage, _month_usage, parts = _segment_usages(res, segs)
+    else:
+        ok, usage = res["usage"]
+        if not ok:
+            usage = Usage("unavailable")
+        window_usage = usage
     ok, policy = res["policy"]
     readable = ok
     if not ok:
@@ -1262,18 +1463,51 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
     ancestor = make_ancestor_check(ctx, cfg)
     population = {e for e in usage.users if is_human(e)}
     population |= idx.direct_users({cfg.access_role, *cfg.markers})
+    ledgers, org_paid, org_budget, org_used_up = {}, None, None, False
+    if credit and usage.ok:
+        ledgers = _credit_ledgers(ag, sorted(population), exceptions, segs, parts, pricing)
+        org_paid = round(sum(item[0].paid_month for item in ledgers.values()), 6)
+        org_budget = usd_budget(ag.get("org_paid_budget_month"))
+        org_used_up = org_budget is not None and org_paid >= org_budget - credit_ledger.EPS
     users = []
     for email in sorted(population):
-        u = usage.users.get(email) or _EMPTY_USAGE
-        has_usage = u["requests"] > 0
+        u = window_usage.users.get(email) or _EMPTY_USAGE
+        has_usage = (usage.users.get(email) or _EMPTY_USAGE)["requests"] > 0
         state, reason = classify(email, has_usage, idx, cfg, ancestor)
         exc = exceptions.get(email)
         tcap, rcap, ccap = effective_caps(exc, token_cap, request_cap, cost_cap)
+        if credit:
+            ccap = 0.0
         susp = suspensions.get(email) if state == CAPPED else None
         row = {"uid": uid_for(email), "email": email, "state": state, "reason": reason, "plannedAction": "none",
                "exception": public_exception(exc), "suspension": public_suspension(susp),
                "caps": {"tokenCap": tcap, "requestCap": rcap, "costCap": ccap}}
-        if usage.ok:
+        reset_at = next_reset
+        if usage.ok and credit:
+            led, budget, known, partial, week_cost = ledgers[email]
+            row["caps"]["paidBudget"] = budget
+            row["caps"]["creditWeek"] = round(led.credit_week, 6)
+            over_t, ratio_t, reasons_t = cap_check(u["tokens"], u["requests"], tcap, rcap)
+            limited = budget is not None or org_used_up
+            if known:
+                over_l, reasons_l = credit_ledger.decide(led, budget, org_used_up)
+            else:
+                over_l, reasons_l = (None if limited else False), []
+            over = True if over_t else over_l
+            reasons = reasons_l + reasons_t
+            times = []
+            if over_l:
+                times.append(credit_ledger.restore_time(led, budget, now, next_reset, month_end, org_used_up))
+            if over_t:
+                times.append(next_reset)
+            reset_at = None if (not times or None in times) else max(times)
+            row.update({"requests": u["requests"], "tokens": u["tokens"], "promptTokens": u["promptTokens"],
+                        "candidateTokens": u["candidateTokens"], "clients": sorted(u["clients"]),
+                        "models": sorted(u["models"]), "estimatedCost": round(week_cost, 6) if known else None,
+                        "costPartial": partial, "overCap": over,
+                        "capUsage": round(max(ratio_t or 0.0, _credit_ratio(led, budget)), 4) if known else ratio_t,
+                        "overCapReasons": reasons, "credit": _credit_row(led, budget, known, org_used_up)})
+        elif usage.ok:
             cost, partial = estimate_cost(u, pricing)
             over, cap_usage, reasons = cap_check(u["tokens"], u["requests"], tcap, rcap, cost, ccap)
             row.update({"requests": u["requests"], "tokens": u["tokens"], "promptTokens": u["promptTokens"],
@@ -1285,11 +1519,15 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
             row.update({"requests": None, "tokens": None, "promptTokens": None, "candidateTokens": None,
                         "clients": None, "models": None, "estimatedCost": None, "costPartial": False,
                         "overCap": None, "capUsage": None, "overCapReasons": None})
-        row["restoreAt"] = restore_at(state, susp, row["overCap"], next_reset, now)
+            if credit:
+                row["credit"] = None
+        # resetAt: when this person's caps lift without further usage (the suspension end of a block planned now).
+        row["resetAt"] = iso(reset_at) if (row["overCap"] and reset_at is not None) else None
+        row["restoreAt"] = restore_at(state, susp, row["overCap"], reset_at, now)
         users.append(row)
     non_user = idx.non_user_members(cfg.access_role) if readable else []
-    gates, plan, budget = evaluate(users, readable, usage.ok, usage.records, non_user, cfg, cfg.access_role,
-                                   mode=mode, now=now, telemetry_truncated=usage.truncated)
+    gates, plan, budget_n = evaluate(users, readable, usage.ok, usage.records, non_user, cfg, cfg.access_role,
+                                     mode=mode, now=now, telemetry_truncated=usage.truncated)
     planned = {}
     for action in ("block", "review", "restore", "disallow", "manual"):
         for uid in plan[action]:
@@ -1307,8 +1545,11 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
             review_queue.append({"uid": u["uid"], "email": u["email"], "requests": u["requests"],
                                  "tokens": u["tokens"], "estimatedCost": u["estimatedCost"],
                                  "capUsage": u["capUsage"], "overCapReasons": u["overCapReasons"],
-                                 "caps": u["caps"], "exception": u["exception"]})
-    users.sort(key=lambda u: (-(u["tokens"] or 0), -(u["requests"] or 0), u["email"]))
+                                 "caps": u["caps"], "exception": u["exception"], "credit": u.get("credit")})
+    if credit:
+        users.sort(key=lambda u: (-(((u.get("credit") or {}).get("costMonth")) or 0), -(u["tokens"] or 0), u["email"]))
+    else:
+        users.sort(key=lambda u: (-(u["tokens"] or 0), -(u["requests"] or 0), u["email"]))
     review_queue.sort(key=lambda r: (-(r["capUsage"] or 0), r["email"]))
     controllable = by_state[EA] + by_state[CAPPED] + by_state[BLOCKED]
     denominator = len(users) - by_state[NO_ACCESS]
@@ -1330,7 +1571,9 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
     if not ok:
         perms = {p: None for p in REQUIRED_PERMISSIONS}
     usage_source = usage.source if usage.ok else "unavailable"
-    if cost_cap > 0 and not pricing.configured:
+    paid_limits = credit and (usd_budget(ag.get("paid_budget_month")) is not None or org_budget is not None
+                              or any((e.get("paidBudget") is not None) for e in exceptions.values()))
+    if (cost_cap > 0 or paid_limits) and not pricing.configured:
         ctx.warn("policy:governance.antigravity.cost_cap", "pricing_not_configured",
                  "A cost cap is set but no token prices were found, so estimated cost is unavailable and the cost "
                  "cap is not applied." if pricing.source == "auto" else
@@ -1342,15 +1585,35 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
     costs = [u["estimatedCost"] for u in users if u.get("estimatedCost") is not None]
     used_models = {m for rec in usage.users.values() for m in (rec.get("byModel") or {})} if usage.ok else set()
     store = _state_store(ctx)
+    policy_out = {"tokenCap": token_cap, "requestCap": request_cap, "costCap": cost_cap,
+                  "currency": pricing.currency, "currencySetting": ag.get("currency") or "",
+                  "period": period, "window": window,
+                  "windowStart": iso(start), "windowEnd": iso(end), "nextReset": iso(next_reset),
+                  "resetTimezone": tz, "resetWeekday": anchor["weekday"], "resetTime": anchor["at"],
+                  "creditPerUserMonth": float(ag.get("credit_per_user_month") or 0),
+                  "changeBudget": budget_n, "enforcementMode": mode,
+                  "capModel": CREDIT_MODEL if credit else "period",
+                  "pricing": pricing.public(used_models)}
+    totals = {"requests": sum(u["requests"] or 0 for u in users) if usage.ok else None,
+              "tokens": sum(u["tokens"] or 0 for u in users) if usage.ok else None,
+              "estimatedCost": round(sum(costs), 6) if (usage.ok and pricing.configured) else None,
+              "overCap": sum(1 for u in users if u["overCap"]) if usage.ok else None,
+              "suspended": by_state[CAPPED] if readable else None,
+              "review": len(plan["review"]), "exceptions": len(exception_rows)}
+    if credit:
+        rows = [u.get("credit") for u in users if u.get("credit")]
+        policy_out.update({"creditPerWeek": round(float(ag.get("credit_per_user_month") or 0) / 4.0, 6),
+                           "paidBudgetMonth": usd_budget(ag.get("paid_budget_month")),
+                           "orgPaidBudgetMonth": org_budget if usage.ok else usd_budget(ag.get("org_paid_budget_month")),
+                           "orgPaidMonth": org_paid, "orgBudgetUsedUp": org_used_up,
+                           "monthStart": iso(month_start), "monthEnd": iso(month_end),
+                           "creditModels": list(credit_prefixes(ag))})
+        totals.update({"paidMonth": org_paid,
+                       "freeMonth": round(sum(r["freeMonth"] for r in rows), 6) if usage.ok else None,
+                       "costMonth": round(sum(r["costMonth"] for r in rows), 6) if usage.ok else None,
+                       "budgetUsedUp": sum(1 for r in rows if r["budgetUsedUp"]) if usage.ok else None})
     payload = {
-        "policy": {"tokenCap": token_cap, "requestCap": request_cap, "costCap": cost_cap,
-                   "currency": pricing.currency, "currencySetting": ag.get("currency") or "",
-                   "period": period, "window": window,
-                   "windowStart": iso(start), "windowEnd": iso(end), "nextReset": iso(next_reset),
-                   "resetTimezone": tz, "resetWeekday": anchor["weekday"], "resetTime": anchor["at"],
-                   "creditPerUserMonth": float(ag.get("credit_per_user_month") or 0),
-                   "changeBudget": budget, "enforcementMode": mode,
-                   "pricing": pricing.public(used_models)},
+        "policy": policy_out,
         "usageSource": usage_source, "gates": gates,
         "population": {"total": len(users) if population_known else None,
                        "byState": by_state if population_known else None,
@@ -1360,12 +1623,7 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
         "manualActions": manual if (readable and usage.ok) else None,
         "reviewQueue": review_queue if (readable and usage.ok) else None,
         "exceptions": exception_rows,
-        "totals": {"requests": sum(u["requests"] or 0 for u in users) if usage.ok else None,
-                   "tokens": sum(u["tokens"] or 0 for u in users) if usage.ok else None,
-                   "estimatedCost": round(sum(costs), 6) if (usage.ok and pricing.configured) else None,
-                   "overCap": sum(1 for u in users if u["overCap"]) if usage.ok else None,
-                   "suspended": by_state[CAPPED] if readable else None,
-                   "review": len(plan["review"]), "exceptions": len(exception_rows)},
+        "totals": totals,
         "enforcement": {"mode": mode, "lastRun": gstate.get("lastRun"),
                         "scheduler": scheduler_status(ctx, gstate, now),
                         "durable": store.governance_durable() if store is not None else None},
@@ -1375,8 +1633,17 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
     }
     internal = {"policy": policy, "readable": readable, "cfg": cfg, "usage": usage, "idx": idx, "now": now,
                 "nextReset": next_reset, "tz": tz, "mode": mode, "state": gstate,
-                "periodEnd": timeutil.governance_period_end(period, window, now=now, **anchor)}
+                "periodEnd": next_reset if credit else
+                timeutil.governance_period_end(period, window, now=now, **anchor)}
     return payload, internal
+
+
+def current_period_end(ctx, now=None):
+    """End of the current settlement period: the weekly credit cycle with credit caps, else the policy period."""
+    ag = ctx.settings["governance"]["antigravity"]
+    if credit_mode(ag):
+        return credit_cycle(ctx.settings).week(now or utcnow())[1]
+    return timeutil.governance_period_end(ag["period"], ag["window"], now=now, **period_anchor(ctx.settings))
 
 
 def status(ctx):
@@ -1426,6 +1693,95 @@ def _to_currency_from_usd(amount_usd, currency, table):
     return None
 
 
+def _token_columns(rec):
+    prompt = to_int(rec.get("promptTokens"))
+    return {"requests": to_int(rec.get("requests")), "tokens": to_int(rec.get("tokens")), "promptTokens": prompt,
+            "cachedTokens": to_int(rec.get("cachedTokens")),
+            "outputTokens": max(to_int(rec.get("tokens")) - prompt, to_int(rec.get("candidateTokens")), 0)}
+
+
+def _model_rows(rec, pricing, prefixes):
+    out = []
+    for model, agg in sorted((rec.get("byModel") or {}).items()):
+        mcost, mpartial = estimate_cost({"tokens": agg.get("tokens"), "byModel": {model: agg}}, pricing)
+        out.append(dict(_token_columns(agg), model=model, cost=mcost, costPartial=mpartial,
+                        credit=credit_ledger.credit_eligible(model, prefixes)))
+    return out
+
+
+def _credit_billing_report(ctx):
+    """billing_report with credit caps: the same ledger as enforcement. Per person, Gemini cost is first covered by
+    the weekly free share (monthly credit / 4, unused share does not roll over); Claude and the rest is the paid
+    amount to charge back. A weekly cycle that crosses the month start shares one free share across both months."""
+    ag = ctx.settings["governance"]["antigravity"]
+    anchor = period_anchor(ctx.settings)
+    tz = timeutil.get_zone(anchor["tz"])
+    now = utcnow()
+    start_local, end_local = _report_month(ctx, tz, now)
+    month_start = start_local.astimezone(dt.timezone.utc)
+    segs, (_ms, month_end), _ = credit_ledger.segments(credit_cycle(ctx.settings), now, month_start=month_start)
+    segs = [seg for seg in segs if seg.start < now]
+    tasks = {}
+    _usage_tasks(ctx, tasks, True, segs, None, None, False, now)
+    if (ag.get("pricing_source") or "auto") == "auto":
+        tasks["prices"] = lambda: price_table(ctx, "USD")
+    res = ctx.run(tasks)
+    table = None
+    if "prices" in res:
+        ok, value = res["prices"]
+        if ok:
+            table = value
+        else:
+            ctx.warn_error("pricing:auto", value, "Automatic token prices")
+    pricing = pricing_from(ag, table, currency="USD")
+    every, _week, month_usage, parts = _segment_usages(res, segs)
+    exceptions = active_exceptions(governance_state(ctx), now)
+    people = sorted(e for e in month_usage.users if is_human(e))
+    ledgers = _credit_ledgers(ag, people, exceptions, segs, parts, pricing) if every.ok else {}
+    prefixes = credit_prefixes(ag)
+    rows, models_used = [], set()
+    keys = ("requests", "tokens", "promptTokens", "cachedTokens", "outputTokens")
+    totals = dict({k: 0 for k in keys}, cost=0.0, gemini=0.0, other=0.0, credit=0.0, chargeable=0.0)
+    known_all = True
+    for email in people:
+        rec = month_usage.users[email]
+        led, budget, known, partial, _ = ledgers[email]
+        by_model = _model_rows(rec, pricing, prefixes)
+        models_used.update(m["model"] for m in by_model)
+        money = (lambda v: round(v, 6) if known else None)
+        row = dict(_token_columns(rec), uid=uid_for(email), email=email, cost=money(led.cost_month),
+                   costPartial=partial, gemini=money(led.gemini_month), other=money(led.other_month),
+                   credit=money(led.free_month), chargeable=money(led.paid_month), budget=budget,
+                   creditWeek=round(led.credit_week, 6), byModel=by_model, last=iso(rec.get("last")),
+                   weeks=[{"start": iso(w["start"]), "end": iso(w["end"]), "gemini": round(w["gemini"], 6),
+                           "other": round(w["other"], 6), "free": round(w["free"], 6), "paid": round(w["paid"], 6)}
+                          for w in led.weeks] if known else None)
+        rows.append(row)
+        for k in keys:
+            totals[k] += row[k]
+        if not known:
+            known_all = False
+            continue
+        totals["cost"] += led.cost_month
+        totals["gemini"] += led.gemini_month
+        totals["other"] += led.other_month
+        totals["credit"] += led.free_month
+        totals["chargeable"] += led.paid_month
+    for k in ("cost", "gemini", "other", "credit", "chargeable"):
+        totals[k] = round(totals[k], 6) if known_all else None
+    if every.truncated:
+        ctx.warn("logging:%s" % urllib.parse.unquote(ag["inference_log"]), "truncated",
+                 "Inference log entries were truncated at max_log_entries; the month is incomplete.")
+    credit_usd = float(ag.get("credit_per_user_month") or 0)
+    return {"month": start_local.strftime("%Y-%m"), "start": iso(month_start),
+            "end": iso(end_local.astimezone(dt.timezone.utc)), "complete": month_end <= now,
+            "timezone": anchor["tz"], "currency": "USD", "pricing": pricing.public(models_used),
+            "capModel": CREDIT_MODEL, "creditPerUserMonthUsd": credit_usd, "creditPerUser": credit_usd,
+            "creditPerWeek": round(credit_usd / 4.0, 6), "paidBudgetMonth": usd_budget(ag.get("paid_budget_month")),
+            "creditModels": list(prefixes), "usageSource": every.source if every.ok else "unavailable",
+            "users": rows, "totals": totals}
+
+
 def billing_report(ctx):
     """Per-person Antigravity usage and cost for one calendar month (month boundaries at local midnight in the reset
     time zone), for internal chargeback. Tokens are what the inference log recorded for each call; cost applies the
@@ -1433,9 +1789,11 @@ def billing_report(ctx):
     monthly Antigravity credit per licensed user can be deducted. Google bills per project, so this is the
     allocation of usage to people, not an invoice line."""
     ag = ctx.settings["governance"]["antigravity"]
+    if credit_mode(ag):
+        return _credit_billing_report(ctx)
     anchor = period_anchor(ctx.settings)
     tz = timeutil.get_zone(anchor["tz"])
-    now = dt.datetime.now(dt.timezone.utc)
+    now = utcnow()
     start_local, end_local = _report_month(ctx, tz, now)
     start = start_local.astimezone(dt.timezone.utc)
     end = min(end_local.astimezone(dt.timezone.utc), now)
@@ -1554,7 +1912,7 @@ def _marker_for(action, cfg):
 def _result_of(mode, plan, changes):
     if mode == "dry_run":
         return "dry_run"
-    if plan["aborted"]:
+    if plan["aborted"] or (plan.get("deferredBlocks") and not any(c["status"] == "applied" for c in changes)):
         return "aborted"
     if changes and all(c["status"] == "applied" for c in changes):
         return "success"
@@ -1580,6 +1938,8 @@ def _refresh_status_cache(ctx):
 
 
 def _suspension_record(ctx, user, until, trigger, now):
+    # resetAt is when this person's caps lift (credit caps: the weekly reset or the month start, whichever restores).
+    until = parse_rfc3339(user.get("resetAt")) or until
     return {"email": user["email"], "since": iso(now), "until": iso(until), "trigger": trigger,
             "by": ctx.identity.email, "reasons": list(user.get("overCapReasons") or []),
             "tokens": user.get("tokens"), "requests": user.get("requests"), "cost": user.get("estimatedCost")}
@@ -1644,11 +2004,17 @@ def _run(ctx, mode, period, window, token_cap, request_cap, eval_mode, trigger, 
     previous = (governance_state(ctx).get("lastRun") or {}).get("result")
     with _WRITE_LOCK:
         for attempt in (1, 2):
-            payload, internal = compute_status(ctx, period, window, token_cap, request_cap, mode=eval_mode)
+            payload, internal = compute_status(ctx, period, window, token_cap, request_cap, mode=eval_mode,
+                                               fresh=True)
             plan, gates = payload["plan"], payload["gates"]
             users = {u["uid"]: u for u in payload["users"] or []}
             cfg = internal["cfg"]
-            changes = []
+            changes = [{"uid": uid, "email": users[uid]["email"],
+                        "action": "disallow" if (users[uid].get("exception") or {}).get("type") == "block" else "block",
+                        "status": "skipped",
+                        "message": "Deferred to the next run: more suspensions than the change budget allows in one "
+                                   "run."}
+                       for uid in plan.get("deferredBlocks") or []]
             executed = False
             if mode == "dry_run" or plan["aborted"]:
                 message = "Dry run: no IAM change was made." if mode == "dry_run" else \
@@ -1714,9 +2080,13 @@ def _run(ctx, mode, period, window, token_cap, request_cap, eval_mode, trigger, 
                                                         len(plan["manual"]),
                                                         "; aborted by safety gates" if plan["aborted"] else ""))
         elif mode == "apply" and kind == "enforce" and (executed or new_review or
-                                                        (plan["aborted"] and previous != "aborted")):
+                                                        ((plan["aborted"] or plan.get("deferredBlocks"))
+                                                         and previous != "aborted")):
             parts = ["AI Control Plane %s enforcement (%s): %d suspended until the period reset, %d restored, "
                      "%d blocked by exception rules" % (eval_mode, result, counts[0], counts[1], counts[2])]
+            if plan.get("deferredBlocks"):
+                parts.append("%d suspension(s) deferred to the next run by the change budget (%d per run)"
+                             % (len(plan["deferredBlocks"]), plan.get("changeBudget") or 0))
             if new_review:
                 parts.append("%d user(s) over the cap await review: %s" % (len(new_review), ", ".join(new_review[:10])))
             if plan["aborted"]:
@@ -1785,7 +2155,8 @@ def _exception_item(ctx, email, kind, until, note, caps=None):
     caps = caps or {}
     return {"email": email, "type": kind, "until": iso(until) if until else None,
             "tokenCap": caps.get("tokenCap"), "requestCap": caps.get("requestCap"), "costCap": caps.get("costCap"),
-            "note": note, "createdBy": ctx.identity.email, "createdAt": now_iso()}
+            "paidBudget": caps.get("paidBudget"), "creditMonth": caps.get("creditMonth"),
+            "note": note, "createdBy": ctx.identity.email, "createdAt": iso(utcnow())}
 
 
 def _put_exception(state, item):
@@ -1939,7 +2310,10 @@ def exception_save(ctx):
     if kind == "limit":
         caps = {"tokenCap": _optional_cap(body, "tokenCap", True, 10 ** 12),
                 "requestCap": _optional_cap(body, "requestCap", True, 10 ** 9),
-                "costCap": _optional_cap(body, "costCap", False, 1e9)}
+                "costCap": _optional_cap(body, "costCap", False, 1e9),
+                # Credit caps (USD): an individual monthly paid budget (0 = credits only) and monthly credit.
+                "paidBudget": _optional_cap(body, "paidBudget", False, 1e9),
+                "creditMonth": _optional_cap(body, "creditMonth", False, 1e6)}
         if all(v is None for v in caps.values()):
             raise ApiError("bad_request", "Set at least one individual cap.")
     email, uid = _target_email(ctx)
@@ -1948,7 +2322,7 @@ def exception_save(ctx):
     ag = ctx.settings["governance"]["antigravity"]
     until = None
     if scope == "period":
-        until = timeutil.governance_period_end(ag["period"], ag["window"], **period_anchor(ctx.settings))
+        until = current_period_end(ctx)
     item = _exception_item(ctx, email, kind, until, note, caps)
 
     def apply(state):

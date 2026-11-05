@@ -299,7 +299,7 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `ENABLE_GOVERNANCE_ACTIONS` | `true` | IAM 쓰기 역할 부여(`--read-only` 지정 시 `false`). 한도 초과 사용자 정지, 복원, 개별 허용/차단, 마커 역할 생성에 필요 |
-| `ENFORCEMENT_SCHEDULE` | `*/15 * * * *` | Antigravity 한도 집행 일정(cron). 정지된 사용자는 집행 실행에서 복원되므로 기본으로 켜져 있습니다. `off`면 끕니다(그러면 기간이 초기화된 뒤 관리자가 집행을 실행해야 접근이 돌아옵니다). `--read-only`와 IAP 방식에서는 만들지 않습니다. |
+| `ENFORCEMENT_SCHEDULE` | `*/5 * * * *` | Antigravity 한도 집행 일정(cron). 한도를 넘은 사람을 5분 안에 정지하고 초기화되면 복원하므로 기본으로 켜져 있습니다. `off`면 끕니다(그러면 초기화된 뒤 관리자가 집행을 실행해야 접근이 돌아옵니다). `--read-only`와 IAP 방식에서는 만들지 않습니다. |
 | `MAINTENANCE_SCHEDULE` | `0 * * * *` | 공식 단가·다중 통화 환율 일일 동기화(`PRICING_SYNC_TIME`, 기본 `00:00`) 및 텔레메트리 BigQuery 라우팅 일일 GiB 한도 점검·다음 날 자동 재개를 수행하는 Cloud Scheduler 일정(`off` 지정 시 생략) |
 | `PRICING_SYNC_TIME`, `PRICING_CURRENCY` | `00:00`, `KRW` | 공식 단가·환율 일일 자동 동기화 시각(`WORKSPACE_TIMEZONE` 기준) 및 결제 내보내기 미연결 시 기본 표시 통화 |
 
@@ -570,69 +570,86 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ## 8. Antigravity 사용자별 한도와 정지
 
-사람별로 금액(예: 1인당 100만 원)이나 토큰, 요청 수 한도를 두고, 넘은 사용자의 Antigravity 접근을 정산 기간이 끝날 때까지 막습니다. 관리자는 **금액만 정하면 됩니다.** 토큰 단가와 환율은 시스템이 찾습니다.
+Gemini Enterprise 라이선스에는 Antigravity 크레딧(1인당 월 Standard $10, Plus $15)이 들어 있고, Google은 이 크레딧을 **7일마다 월 크레딧 ÷ 4씩** 공유 풀로 적용합니다. 크레딧은 **Gemini 모델에만** 쓰이고, **Claude 같은 타사 모델은 처음부터 종량제**입니다([공식 문서](https://cloud.google.com/gemini/enterprise/docs/quotas-and-pay-as-you-go-usage)). 이 대시보드는 사람마다 장부를 달러로 계산해, **무료 크레딧은 매주 다시 쓸 수 있게 두고 추가 결제만 월 한도로** 막습니다. 금액은 모두 **USD**입니다.
 
 ### 8.1 동작 개요
 
+사람마다 두 가지 금액을 관리합니다.
+
+| 항목 | 내용 |
+|---|---|
+| 이번 주 무료 몫 | 월 크레딧 ÷ 4 (Standard $2.50, Plus $3.75). Gemini 사용분에서만 차감되고, 남아도 다음 주로 넘어가지 않습니다. |
+| 월 추가 결제 한도 | Claude 사용액 전부 + 무료 몫을 넘은 Gemini 사용액. 예: `$100`. `크레딧만`($0)이나 `제한 없음`(설치 직후 기본값)도 고를 수 있습니다. |
+
+- **정지**: 월 추가 결제 한도를 다 썼고 **지금 무료로 쓸 수 있는 것이 없을 때**만 정지합니다. 즉 이번 주 무료 몫까지 다 썼거나, 한도를 다 쓴 뒤 이번 주에 또 유료로 썼을 때(예: Claude)입니다. 다음 집행 실행(기본 5분 이내)에 정지됩니다.
+- **복원**: **주간 초기화**(새 무료 몫)와 **매월 1일**(새 한도) 가운데 먼저 오면서 실제로 정지를 푸는 시각에 자동으로 복원됩니다. **영구 정지는 없습니다.**
+- 예시(월 한도 $100, Standard): 1주차에 무료 $2.50과 추가 $100을 쓰면 정지 → 2주차 초기화 때 자동 복원 → 무료 $2.50을 다 쓰거나 Claude를 쓰면 다음 실행에서 정지 → 3·4주차도 같음 → 다음 달 1일에 $100 한도가 다시 생깁니다.
+- IAM 권한은 모델을 구분하지 못합니다(`businessaicode.locations.generateContent` 하나). 그래서 정지는 Antigravity 전체에 걸리고, 한도를 다 쓴 사람이 Claude를 쓰면 그 주에 남은 무료 크레딧도 함께 막힙니다. 한도를 다 쓴 사람에게는 Gemini만 쓰도록 안내하세요.
+- **조직 전체 월 추가 결제 한도**(선택): 모두의 추가 결제 합계가 이 금액에 닿으면 다음 달 1일까지 전원이 `크레딧만`으로 바뀝니다.
+- Google 청구서는 프로젝트 단위이고 크레딧을 공유 풀로 적용하므로(덜 쓴 사람의 크레딧이 많이 쓴 사람을 덮음) 실제 청구액은 사람별 추가 결제 합계보다 적을 수 있습니다. 사람별 금액은 사내 정산(차지백) 기준입니다.
+
 ```mermaid
 flowchart TD
-  usage["사용자별 토큰 사용량 (inference_response 로그)"] --> cost["추정 비용 = 모델별 토큰 x 단가"]
-  prices["단가: 실제 청구 단가, 없으면 Google 공개 가격표"] --> cost
-  cost --> check{"한도 초과?"}
-  rules["예외 규칙: 항상 허용 / 항상 차단 / 개별 한도"] --> check
+  usage["사람별 토큰 사용량 (inference_response 로그)"] --> ledger["장부: 이번 주 무료 몫(Gemini만) + 이번 달 추가 결제"]
+  prices["단가: 실제 청구 단가, 없으면 Google 공개 가격표"] --> ledger
+  ledger --> check{"월 한도 소진 + 지금 무료로 쓸 것 없음?"}
+  rules["예외 규칙: 항상 허용 / 항상 차단 / 개별 한도·크레딧"] --> check
   check -- "아니요" --> keep["접근 유지"]
-  check -- "예, 자동 모드" --> suspend["정지: 접근 역할을 한도 마커 역할로 교체"]
+  check -- "예, 자동 모드" --> suspend["정지: 접근 역할을 한도 마커 역할로 교체 (5분 이내)"]
   check -- "예, 수동 모드" --> queue["검토 대기열: 관리자가 정지 또는 이번 기간 허용"]
   queue --> suspend
-  suspend --> reset["정산 기간 종료 시 자동 복원"]
+  suspend --> reset["주간 초기화 또는 매월 1일에 자동 복원"]
 ```
 
 ### 8.2 시작하기
 
 1. 기본 설치(`ENABLE_GOVERNANCE_ACTIONS="true"`)면 준비가 끝납니다. 설치가 다음을 자동으로 합니다.
    - **마커 역할 생성**: Gemini Enterprise User 역할에서 `businessaicode.*`만 뺀 `CustomAntigravityCapBlocked`, `CustomAntigravityAdminBlocked`([공식 문서의 AI developer tools 제한용 커스텀 역할](https://cloud.google.com/gemini/enterprise/docs/ai-developer-tools-creating-custom-roles)과 같은 방식). 정지된 사용자는 Gemini Enterprise 앱은 계속 쓰고 Antigravity만 막힙니다.
-   - **집행 스케줄러**: 15분마다 집행 실행(`ENFORCEMENT_SCHEDULE` 기본값 `*/15 * * * *`). 정산 기간이 초기화되면 정지된 사용자를 **자동으로 복원**합니다(수동 검토 모드에서도). 끄려면 `--no-enforcement-schedule`, 주기를 바꾸려면 `--enforcement-schedule "CRON"`. IAP 접근 모드와 `--read-only`에서는 만들지 않습니다.
+   - **집행 스케줄러**: 5분마다 집행 실행(`ENFORCEMENT_SCHEDULE` 기본값 `*/5 * * * *`). 한도를 넘은 사람을 5분 안에 정지하고, 초기화되면 정지된 사용자를 **자동으로 복원**합니다(수동 검토 모드에서도). 끄려면 `--no-enforcement-schedule`, 주기를 바꾸려면 `--enforcement-schedule "CRON"`. IAP 접근 모드와 `--read-only`에서는 만들지 않습니다.
    - 2시간 넘게 스케줄 실행이 없으면 화면에 **자동 집행이 멈췄습니다** 경고가 뜹니다.
 2. Gemini Enterprise 관리자가 **메타데이터 로깅**을 켭니다(6.5). 사용량은 그때부터 집계됩니다.
-3. **한도 정책 > 정책 편집**에서 정합니다. 설치 직후 한도는 모두 꺼져 있어(0) 누구도 한도를 넘지 않습니다.
-   - 1인당 비용 한도: 직접 입력 또는 **Antigravity 크레딧 기준으로 설정** 버튼(1인당 월 크레딧 ÷ 4: Standard 주 $2.50, Plus 주 $3.75. 모두 이 안에서 쓰면 크레딧 풀을 넘지 않아 초과 과금이 생기지 않습니다). 월 크레딧 금액은 설정 > 거버넌스 정책의 `1인당 월 Antigravity 크레딧`(기본 10)입니다.
-   - 통화: 기본은 결제 계정 통화. `KRW`를 고르면 원화로 표시하고 비교합니다.
-   - 정산 기간: 기본 **주별**. Gemini Enterprise는 Antigravity 크레딧을 프로젝트 첫 요청 시점부터 **7일 단위 공유 풀**로 집행하므로([공식 문서](https://cloud.google.com/gemini/enterprise/docs/quotas-and-pay-as-you-go-usage)) **주간 초기화 요일·초기화 시각**을 그 주기에 맞춥니다. 초기화 시간대는 비우면 워크스페이스 시간대입니다.
-   - 토큰 한도, 요청 한도(0이면 꺼짐)
-4. 사람마다 금액을 다르게 주려면 **한도 대비 사용량** 표의 **비용 한도** 열에서 연필 버튼을 누릅니다(`기본값 사용`, `비용 한도 없음`, 프리셋, 직접 입력).
+3. **한도 정책 > 정책 편집**에서 정합니다. 설치 직후에는 `제한 없음`이라 누구도 정지되지 않습니다.
+   - 한도 방식: **주간 무료 크레딧 + 월 추가 결제 한도**(권장, 기본). 예전 방식(기간별 고정 비용·토큰·요청 한도)도 고를 수 있습니다. 예전 버전에서 고정 한도를 이미 쓰던 설치는 업그레이드해도 그 한도가 그대로 유지되고, 이 선택을 바꿀 때 전환됩니다.
+   - 1인 월 크레딧(USD): `Standard $10` / `Plus $15` 버튼.
+   - 1인 월 추가 결제 한도: `제한 없음` / `크레딧만` / `월 한도`(예: 100).
+   - 조직 전체 월 추가 결제 한도(선택, 비우면 제한 없음).
+   - 주간 초기화 요일·시각·시간대: 프로젝트의 7일 크레딧 주기(프로젝트에서 Antigravity를 처음 쓴 시각부터 시작)에 맞춥니다. 월 한도는 같은 시간대의 매월 1일 00:00에 초기화됩니다.
+   - 주간 토큰·요청 한도(선택, 0이면 꺼짐).
+4. 사람마다 한도를 다르게 주려면 **사용자별 사용량과 한도** 표의 **추가 결제 한도** 열에서 연필 버튼을 누릅니다(`기본값`, `크레딧만`, `개별 한도`). Plus 라이선스처럼 크레딧이 다른 사람은 예외 규칙의 **개별 한도**에서 월 크레딧을 15로 줍니다.
 5. 상단 **집행** 카드에서 **자동 정지** 또는 **수동 검토**를 고릅니다. 기본은 수동 검토입니다.
 6. **시뮬레이션**으로 IAM을 바꾸지 않고 결과를 미리 본 뒤 **지금 집행 실행**을 누릅니다.
 
-### 8.3 추정 비용과 단가
+### 8.3 금액 계산과 단가
 
-- 사용자별 비용 = 모델별로 (입력 토큰 − 캐시 토큰) x 입력 단가 + 캐시 토큰(`cachedContentTokenCount`) x 캐시 단가 + 나머지 토큰(응답, thinking) x 출력 단가. Antigravity 세션은 입력 대부분이 프롬프트 캐시에서 나오므로(공식 예시: 입력 70,825 중 69,079), 캐시 단가를 쓰지 않으면 금액이 크게 부풀려집니다. 캐시 단가를 모르는 모델은 입력 단가로 계산해 낮게 잡히지 않게 합니다. 캐시 쓰기 토큰은 로그에 따로 없어 입력으로 계산합니다.
+- 사용자별 금액 = 모델별로 (입력 토큰 − 캐시 토큰) x 입력 단가 + 캐시 토큰(`cachedContentTokenCount`) x 캐시 단가 + 나머지 토큰(응답, thinking) x 출력 단가. Antigravity 세션은 입력 대부분이 프롬프트 캐시에서 나오므로(공식 예시: 입력 70,825 중 69,079), 캐시 단가를 쓰지 않으면 금액이 크게 부풀려집니다. 캐시 단가를 모르는 모델은 입력 단가로 계산해 낮게 잡히지 않게 합니다. 캐시 쓰기 토큰은 로그에 따로 없어 입력으로 계산합니다.
+- 무료 몫은 사용한 순서대로 Gemini 금액에 먼저 적용합니다(모델 ID가 `gemini`로 시작하는 모델, `credit_model_prefixes`). 한 주가 두 달에 걸치면(예: 월요일 초기화인데 1일이 수요일) 그 주의 무료 몫 하나를 두 달이 나눠 쓰고, 추가 결제는 사용한 날짜의 달로 계산합니다.
 - 단가는 모델과 방향(입력/출력)별로 다음 순서로 찾습니다.
   1. **실제 청구 단가**: 최근 30일 결제 내보내기에서 해당 모델 표준 텍스트 토큰 SKU의 `SUM(cost) / SUM(usage.amount)`. 협상 가격이 반영되며 크레딧은 빼지 않습니다. batch, flex, priority, 캐시, 장문 컨텍스트, 튜닝, 오디오/이미지/비디오 같은 변형 SKU는 제외합니다.
   2. **Google 공개 가격표**: 청구 기록이 없는 모델은 Cloud Billing Catalog API(Agent Platform, Gemini API)의 공개 가격을 씁니다.
-- 통화가 다르면 Google이 가격표에 게시하는 환율로 환산합니다. 화면에 `1 USD = ₩1,359 (Google 환율, 날짜)`처럼 근거를 표시합니다.
+- 크레딧 한도는 USD로 계산합니다. 청구 통화가 다르면 Google이 가격표에 게시하는 환율로 환산하고, 화면에 `1 USD = ₩1,359 (Google 환율, 날짜)`처럼 근거를 표시합니다.
 - 단가는 6시간 동안 캐시됩니다. 한도 정책 카드의 **이번 기간에 사용한 모델 단가** 표에 모델별 단가와 출처(청구 단가, Google 가격표, 단가 없음)가 표시됩니다.
-- 어느 쪽에서도 단가를 찾지 못한 모델은 "단가 없음"으로 표시되고 그 토큰은 비용에 들어가지 않습니다. 비용 한도만 켠 상태에서 비용을 계산할 수 없는 사용자는 한도 사용률이 0%가 아니라 `—`로 표시되고 정지되지 않습니다.
-- 결제 내보내기에는 사용자 정보가 없으므로 사람별 비용은 실제 청구액이 아니라 토큰 기반 추정치입니다. 화면에도 추정 비용으로 표시합니다. 토큰 수 자체는 Google이 호출마다 기록한 실측값입니다.
-- **월간 사용 리포트**(Antigravity 통제 화면): 달을 고르면 사람별 요청 수, 입력·캐시·출력 토큰, 금액, 크레딧, 청구 금액(크레딧 차감 또는 전액)을 보여 주고 CSV로 내려받습니다(`GET /api/v1/governance/antigravity/billing-report?month=YYYY-MM`). 사내 정산(차지백)에 그대로 쓰는 용도이며, Google 청구서는 프로젝트 단위라는 점을 리포트에 명시합니다.
+- 어느 쪽에서도 단가를 찾지 못한 모델은 "단가 없음"으로 표시되고, 그 사람의 금액을 계산할 수 없으면 한도 사용률이 `—`로 표시되고 정지되지 않습니다.
+- 결제 내보내기에는 사용자 정보가 없으므로 사람별 금액은 토큰 기반 계산입니다. 토큰 수 자체는 Google이 호출마다 기록한 실측값입니다.
+- **월간 사용 리포트**(Antigravity 통제 화면): 달을 고르면 사람별 요청 수, 토큰, Gemini 금액, Claude 등 타사 모델 금액, 적용된 무료 크레딧, **청구 금액**(= Claude + 주간 무료 몫을 넘은 Gemini), 추가 결제 한도를 보여 주고 CSV로 내려받습니다(`GET /api/v1/governance/antigravity/billing-report?month=YYYY-MM`). 정지 판단과 같은 장부를 쓰므로 화면의 숫자와 리포트가 일치합니다.
 - 계약 단가를 직접 넣고 싶은 조직은 설정 > 거버넌스 정책에서 토큰 단가를 `직접 입력`으로 바꾸거나 `config.yaml`의 `model_prices`를 씁니다(선택).
 
 ### 8.4 집행 모드
 
-| 모드 | 한도를 넘으면 | 복원 |
+| 모드 | 정지 조건을 만족하면 | 복원 |
 |---|---|---|
-| 수동 검토 (기본) | 검토 대기열에 올라갑니다. 관리자가 사용자별(또는 일괄)로 **정지**하거나 **이번 기간 허용**합니다. 새 대기 사용자가 생기면 웹훅으로 알립니다. | 정산 기간이 끝나면 자동 |
-| 자동 정지 | 집행 실행마다 정지됩니다. | 정산 기간이 끝나면 자동 |
+| 수동 검토 (기본) | 검토 대기열에 올라갑니다. 관리자가 사용자별(또는 일괄)로 **정지**하거나 **이번 기간 허용**합니다. 새 대기 사용자가 생기면 웹훅으로 알립니다. | 주간 초기화 또는 매월 1일에 자동 |
+| 자동 정지 | 집행 실행마다 정지됩니다. | 주간 초기화 또는 매월 1일에 자동 |
 
-- **집행 실행**은 **지금 집행 실행** 버튼 또는 Cloud Scheduler 작업(`ENFORCEMENT_SCHEDULE`)으로 일어납니다. 스케줄러 작업은 권한이 없는 전용 서비스 계정의 Google OIDC 토큰으로 `POST /api/v1/governance/antigravity/enforce`를 호출하고, 앱은 발급자, 대상(`PUBLIC_BASE_URL` + 경로), 이메일 검증, 허용 목록(`SCHEDULER_INVOKERS`)을 확인합니다. 인증 없는 호출과 다른 토큰은 401입니다.
-- 정지 = 접근 역할(`roles/discoveryengine.agentspaceUser`)을 한도 마커 역할(`CustomAntigravityCapBlocked`)로 바꾸는 하나의 etag 기반 `setIamPolicy`입니다. 정지 기록(시작, 종료 예정, 사유, 실행 주체)이 설정 버킷에 남고, 기간이 끝난 뒤 첫 집행 실행이 텔레메트리가 없어도 복원합니다. 기본 스케줄(15분)이면 초기화 후 15분 안에 복원되고, 스케줄을 끈 경우에만 초기화될 때마다 집행을 실행해야 합니다. 단, 새 기간 사용량이 이미 한도를 넘었으면 유지됩니다.
-- **영구 정지는 없습니다.** 한도 정지는 항상 다음 초기화에 풀리고, 계속 막는 것은 관리자가 건 **항상 차단** 규칙뿐입니다. 대시보드를 삭제할 때도 `teardown.sh`가 한도로 정지된 사용자를 먼저 복원합니다(15장).
+- **집행 실행**은 **지금 집행 실행** 버튼 또는 Cloud Scheduler 작업(`ENFORCEMENT_SCHEDULE`)으로 일어납니다. 스케줄러 작업은 권한이 없는 전용 서비스 계정의 Google OIDC 토큰으로 `POST /api/v1/governance/antigravity/enforce`를 호출하고, 앱은 발급자, 대상(`PUBLIC_BASE_URL` + 경로), 이메일 검증, 허용 목록(`SCHEDULER_INVOKERS`)을 확인합니다. 인증 없는 호출과 다른 토큰은 401입니다. 집행은 항상 캐시를 쓰지 않고 최신 로그를 읽습니다.
+- 정지 = 접근 역할(`roles/discoveryengine.agentspaceUser`)을 한도 마커 역할(`CustomAntigravityCapBlocked`)로 바꾸는 하나의 etag 기반 `setIamPolicy`입니다. 정지 기록(시작, 복원 예정 시각, 사유, 실행 주체)이 설정 버킷에 남고, 복원 시각이 지나면 첫 집행 실행이 텔레메트리가 없어도 복원합니다. 기본 스케줄(5분)이면 초기화 후 5분 안에 복원되고, 스케줄을 끈 경우에만 초기화될 때마다 집행을 실행해야 합니다.
+- **영구 정지는 없습니다.** 한도 정지는 항상 다음 주간 초기화나 매월 1일에 풀리고, 계속 막는 것은 관리자가 건 **항상 차단** 규칙뿐입니다. 대시보드를 삭제할 때도 `teardown.sh`가 한도로 정지된 사용자를 먼저 복원합니다(15장).
 
 ### 8.5 예외 규칙
 
 | 규칙 | 효과 | 기간 |
 |---|---|---|
 | 항상 허용 | 한도를 넘어도 정지하지 않습니다. 정지된 사용자는 바로 복원됩니다. | 이번 정산 기간만 / 만료 없음 |
-| 개별 한도 | 이 사용자에게만 다른 비용/토큰/요청 한도를 적용합니다. 비워 둔 항목은 기본 한도를 따릅니다. | 이번 정산 기간만 / 만료 없음 |
+| 개별 한도 | 이 사용자에게만 다른 월 추가 결제 한도(0 = 크레딧만), 월 크레딧(예: Plus 15), 주간 토큰/요청 한도를 적용합니다. 비워 둔 항목은 기본값을 따릅니다. 한도를 늘리면 다음 집행 실행에서 바로 복원됩니다. | 이번 정산 기간만 / 만료 없음 |
 | 항상 차단 | 관리자 차단 마커 역할(`CustomAntigravityAdminBlocked`)로 바로 차단하고, 규칙을 지울 때까지 유지합니다. | 만료 없음 |
 
 규칙은 두 집행 모드 모두에 적용되며, 추가/변경/삭제는 모두 감사 로그에 남습니다.
@@ -654,8 +671,8 @@ flowchart TD
 |---|---|---|
 | `G1_POLICY_READABLE` | 프로젝트 IAM 정책을 읽지 못함 | 적용 중단 |
 | `G2_ANY_DETERMINATE` | 판단 가능한 사용자가 없음 | 적용 중단 |
-| `G3_TELEMETRY_HEALTHY` | 사용량 조회 실패, 0건, 또는 Cloud Logging 읽기가 `max_log_entries`(기본 20,000건)에서 잘림 | 정지만 적용, 사용량 기반 복원 보류(기간 종료 복원은 진행). 잘린 집계는 하한값이므로 한도 초과 판정은 유효합니다. 사용자가 많으면 추론 로그를 BigQuery로 내보내세요. |
-| `G4_CHANGE_BUDGET` | 계획된 변경이 `max(change_budget_min, ceil(change_budget_ratio x 대상 인원))` 초과 | 적용 중단 |
+| `G3_TELEMETRY_HEALTHY` | 사용량 조회 실패, 0건, 또는 Cloud Logging 읽기가 `max_log_entries`(기본 20,000건)에서 잘림 | 정지만 적용, 사용량 기반 복원 보류(복원 예정 시각이 지난 정지는 그대로 복원). 잘린 집계는 하한값이므로 한도 초과 판정은 유효합니다. 사용자가 많으면 추론 로그를 BigQuery로 내보내세요. 사용량을 읽지 못한 달의 장부로는 아무도 정지하지 않습니다. |
+| `G4_CHANGE_BUDGET` | 한 번의 실행에서 정지할 인원이 `max(change_budget_min, ceil(change_budget_ratio x 대상 인원))`(기본 최소 10명, 20%)을 넘음 | 가장 많이 넘은 사람부터 그 인원만 정지하고 나머지는 다음 실행에서 정지합니다(복원은 인원 제한 없음). 조직 한도가 소진되는 순간처럼 여러 명이 한꺼번에 넘어도 몇 번의 실행(5분 간격) 안에 모두 정지되고, 잘못된 데이터 하나로 한 번에 많은 사람이 막히는 일은 막습니다. |
 | `G5_NON_USER_GRANT_ABSENT` | 접근 역할에 그룹 또는 도메인 바인딩 존재 | 경고 |
 
 동시 변경으로 etag가 충돌하면 계획을 다시 계산해 한 번 재시도합니다.
@@ -665,6 +682,27 @@ flowchart TD
 - 모든 집행 실행, 검토 결정, 예외 규칙, 허용/차단은 Cloud Logging 감사 로그(`projects/PROJECT_ID/logs/agy-admin%2Fadmin_actions`)에 기록되고 **관리 감사 로그** 카드에 표시됩니다. 이를 위해 서비스 계정에 `roles/logging.logWriter`가 항상 부여됩니다. 그래도 기록에 실패하면 변경은 유지되고 API 응답에 `auditLogged: false`로 표시됩니다. [agy-admin-cli](https://github.com/terrychahn/agy-admin-cli)와 같은 마커 역할과 감사 로그를 쓰므로 함께 운영할 수 있습니다. 함께 쓸 때는 두 도구의 실행 시각이 겹치지 않게 합니다.
 - `governance.antigravity.webhook_url`(Slack `hooks.slack.com` 또는 Google Chat `chat.googleapis.com`, HTTPS만)을 지정하면 새 검토 대기 사용자와 집행 결과를 보냅니다.
 - 예외 규칙과 정지 기록은 설정 버킷에 저장되어 재시작 후에도 남습니다. 설정 버킷 없이 Cloud Run에서 실행하면 메모리에만 저장되며 화면에 경고가 표시됩니다.
+
+### 8.8 자동 검증 (드릴)
+
+사람이 손으로 확인하지 않아도 되도록, **실제 집행 엔진을 그대로 돌리는 한 달 시뮬레이션**이 들어 있습니다. Google Cloud 접속 없이 몇 초 만에 끝납니다.
+
+```bash
+python3 scripts/caps_drill.py                                  # 월 한도 $100, Standard 크레딧 ($10)
+python3 scripts/caps_drill.py --budget 0                       # 크레딧만
+python3 scripts/caps_drill.py --org-budget 300 --crowd 30      # 조직 한도 + 30명이 한꺼번에 넘는 경우
+python3 scripts/caps_drill.py --weekday 2 --at 14:00 --tz America/Los_Angeles   # 프로젝트의 7일 주기
+```
+
+- 가짜 시계로 5분마다 스케줄 실행을 흉내 내고, 프로젝트 IAM 정책과 공식 스키마의 추론 로그(BigQuery 싱크 테이블)를 시뮬레이션합니다. 대시보드 코드는 운영과 똑같이 돕니다. 시뮬레이션 사용자는 접근 권한이 있을 때만 호출에 성공합니다.
+- 사람별 주차별 Gemini·Claude·무료 적용·추가 결제 금액, 모든 정지·복원 시각과 사유, 그리고 실행마다 검사한 규칙 결과(PASS/FAIL)가 나옵니다.
+  - R1 한도나 무료 크레딧이 남은 사람은 정지되지 않는다
+  - R2 한도를 넘은 사람은 다음 실행(5분 이내)에 정지된다 (변경 예산을 넘는 대량 정지는 몇 번의 실행에 나눠서)
+  - R3 모든 정지는 주간 초기화나 월 초에 풀린다 (영구 정지 0건)
+  - R4 한도 초과분은 복원 1회당 실행 간격(5분) 사용량 이내 (개인·조직 한도 모두)
+  - R5 항상 허용·그룹 권한 사용자는 정지되지 않는다
+  - R6 월간 리포트 금액 = 호출 단위 독립 계산 (센트 단위)
+- 같은 드릴이 단위 테스트(`tests/unit/test_caps_drill.py`)로 `scripts/test.sh`에서 매번 돕니다. 엔진을 일부러 망가뜨린 변형(무료 크레딧이 갱신되지 않음, 정지하지 않음, Claude를 크레딧으로 계산, 변경 예산을 넘으면 아무도 정지하지 않음)에서는 드릴이 반드시 FAIL해야 테스트가 통과합니다.
 
 ---
 
@@ -700,7 +738,7 @@ flowchart TD
 | `gateway` | `services` | Agent Gateway에서 관제할 서비스 |
 | `agent_lifecycle` | `idle_days`, `deprecation_days` | 휴면과 폐기 권고 기준 |
 | `finops` | `spike_threshold_pct`, `spike_min_delta` | 비용 급증 기준 |
-| `governance.antigravity` | `cost_cap`, `currency`, `pricing_source`, `token_cap`, `request_cap`, `period`, `window`, `reset_timezone`, `enforcement_mode`, 마커 역할, 변경 예산, `webhook_url` | Antigravity 한도 정책 |
+| `governance.antigravity` | `cap_model`(`credit_budget` 기본 / `period`), `credit_per_user_month`, `paid_budget_month`(-1 제한 없음, 0 크레딧만), `org_paid_budget_month`, `credit_model_prefixes`, `reset_timezone`, `reset_weekday`, `reset_time`, `token_cap`, `request_cap`, `enforcement_mode`, `pricing_source`, 기간 방식의 `cost_cap`·`currency`·`period`·`window`, 마커 역할, 변경 예산, `webhook_url` | Antigravity 한도 정책 |
 | `analyst` | `max_bytes_billed`, `max_rows`, `allow_viewers` | AI 애널리스트 쿼리 상한, 뷰어 사용 허용 여부(기본 `false`) |
 
 ### 9.3 환경 변수
@@ -962,6 +1000,7 @@ BigQuery 감사 로그 데이터셋, Artifact Registry 저장소, Data Access �
 ./scripts/test.sh                                          # 전체 오프라인 검증 (단위 테스트 + 셸 문법 + 배포 전 검사 + AI 애널리스트 검증)
 ./scripts/test.sh --live --project PROJECT_ID --mutate     # 배포된 Cloud Run 서비스 라이브 엔드투엔드 검증 (커넥터·라우팅 생성/삭제 포함)
 python3 -m unittest discover -s tests/unit -v              # 단위 테스트만 단독 실행
+python3 scripts/caps_drill.py                              # Antigravity 크레딧 한도 한 달 드릴 (8.8)
 ```
 
 단위 테스트는 코드 동작을 검증하기 위한 것이며 Google Cloud에 접속하지 않습니다. 테스트 입력값은 예약 도메인(`example.com` 등)만 쓰고, 컨테이너 이미지에는 포함되지 않습니다. GitHub Actions(`.github/workflows/tests.yml`)가 푸시와 풀 리퀘스트마다 단위 테스트, 스크립트 `bash -n`, 배포 전 검사, AI 애널리스트 골든 데이터셋의 오프라인 검증을 실행합니다.

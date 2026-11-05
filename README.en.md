@@ -303,7 +303,7 @@ You can also enter or update the billing values after deployment in **Settings >
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_GOVERNANCE_ACTIONS` | `false` | Grants IAM write roles. Required to suspend users over their cap, restore them, allow or disallow individual users and create marker roles |
-| `ENFORCEMENT_SCHEDULE` | `*/15 * * * *` | Antigravity cap enforcement schedule (cron). Suspended users are restored by enforcement runs, so it is on by default. `off` turns it off (then users get access back only when an administrator runs enforcement after the period resets). It is not created with `--read-only` or in IAP mode. |
+| `ENFORCEMENT_SCHEDULE` | `*/5 * * * *` | Antigravity cap enforcement schedule (cron). It suspends people over their limits within 5 minutes and restores them after each reset, so it is on by default. `off` turns it off (then users get access back only when an administrator runs enforcement after the reset). It is not created with `--read-only` or in IAP mode. |
 | `MAINTENANCE_SCHEDULE` | `0 * * * *` | Cloud Scheduler cron for `${SERVICE_NAME}-maintenance`: runs daily official pricing & multi-currency FX sync at `PRICING_SYNC_TIME` (default `00:00` in `WORKSPACE_TIMEZONE`) and enforces/resumes Telemetry BigQuery route daily GiB caps (`off` or `none` disables the job) |
 | `PRICING_SYNC_TIME`, `PRICING_CURRENCY` | `00:00`, `KRW` | Daily pricing/FX sync time (in `WORKSPACE_TIMEZONE`) and default display currency when no billing export is connected |
 
@@ -578,101 +578,140 @@ Query results can contain raw text columns such as prompts. Therefore, when view
 
 ## 8. Antigravity per-user caps and suspension
 
-Set a per-person cap on cost (for example, KRW 1,000,000 per person), tokens or number of requests. Users who go over it lose Antigravity access until the settlement period ends. Administrators **only need to set the amount.** The system finds the token prices and exchange rates.
+Gemini Enterprise licenses include Antigravity credit (Standard USD 10, Plus USD 15 per user and month), and Google applies it **every 7 days as a quarter of the monthly credit**, as a shared pool. The credit is used **only by Gemini models**; **third-party models such as Claude are always pay-as-you-go** ([official documentation](https://cloud.google.com/gemini/enterprise/docs/quotas-and-pay-as-you-go-usage)). The dashboard keeps a ledger in USD for every person: **the free credit stays usable every week, and only paid usage has a monthly budget**. All amounts are **USD**.
 
 ### 8.1 How it works
 
+Every person has two amounts.
+
+| Item | Meaning |
+|---|---|
+| This week's free share | Monthly credit / 4 (Standard USD 2.50, Plus USD 3.75). Only Gemini usage draws on it, and what is left does not carry over. |
+| Monthly paid budget | All Claude usage + Gemini usage beyond the free share. For example `USD 100`. `Credits only` (USD 0) and `No limit` (the default after installation) are also available. |
+
+- **Suspension**: only when the monthly paid budget is spent **and nothing is free right now**: this week's free share is used up too, or the person pays again this week after the budget is spent (for example with Claude). The next enforcement run (within 5 minutes by default) suspends the person.
+- **Restore**: automatically at the **weekly reset** (a new free share) or on the **1st of the month** (a new budget), whichever comes first and actually lifts the suspension. **Nobody is suspended permanently.**
+- Example (USD 100 budget, Standard): free USD 2.50 + paid USD 100 in week 1 → suspended → restored automatically at the week 2 reset → suspended by the next run once the free USD 2.50 is used up or Claude is used → the same in weeks 3 and 4 → the USD 100 budget is back on the 1st of the next month.
+- IAM cannot tell models apart (one permission, `businessaicode.locations.generateContent`). A suspension therefore stops all of Antigravity, and a person who uses Claude after spending the budget also loses the rest of that week's free credit. Ask people who have spent their budget to use Gemini only.
+- **Organization paid budget per month** (optional): when everyone's paid usage together reaches it, everyone is credits only until the 1st.
+- Google bills the project and applies the credit as a shared pool (unused credit of light users covers heavy users), so the invoice can be lower than the sum of per-person paid amounts. Per-person amounts are the basis for internal chargeback.
+
 ```mermaid
 flowchart TD
-  usage["Token usage per user (inference_response log)"] --> cost["Estimated cost = tokens per model x unit price"]
-  prices["Unit price: actual billed price, or the public Google price list if there is none"] --> cost
-  cost --> check{"Over the cap?"}
-  rules["Exception rules: Always allow / Always block / Individual cap"] --> check
-  check -- "No" --> keep["Access kept"]
-  check -- "Yes, automatic mode" --> suspend["Suspension: the access role is replaced with the cap marker role"]
-  check -- "Yes, manual mode" --> queue["Review queue: an administrator selects Suspend or Allow this period"]
+  usage["Per-person token usage (inference_response log)"] --> ledger["Ledger: this week's free share (Gemini only) + paid this month"]
+  prices["Prices: billed price per token, else the public Google price list"] --> ledger
+  ledger --> check{"Budget spent and nothing free right now?"}
+  rules["Exception rules: always allow / always block / individual budget and credit"] --> check
+  check -- "No" --> keep["Access stays"]
+  check -- "Yes, automatic mode" --> suspend["Suspend: access role replaced by the cap marker role (within 5 minutes)"]
+  check -- "Yes, manual mode" --> queue["Review queue: an administrator suspends or allows for this period"]
   queue --> suspend
-  suspend --> reset["Restored automatically when the settlement period ends"]
+  suspend --> reset["Restored automatically at the weekly reset or on the 1st"]
 ```
 
 ### 8.2 Getting started
 
-1. A default installation (`ENABLE_GOVERNANCE_ACTIONS="true"`) is ready. The installer does the following.
-   - **Creates the marker roles** `CustomAntigravityCapBlocked` and `CustomAntigravityAdminBlocked`: the Gemini Enterprise User role without `businessaicode.*`, the same custom role Google documents for [restricting AI developer tools](https://cloud.google.com/gemini/enterprise/docs/ai-developer-tools-creating-custom-roles). Suspended users keep the Gemini Enterprise app and lose only Antigravity.
-   - **Creates the enforcement schedule**: an enforcement run every 15 minutes (`ENFORCEMENT_SCHEDULE` defaults to `*/15 * * * *`), which **restores suspended users automatically** when the settlement period resets, in manual review mode too. Use `--no-enforcement-schedule` to turn it off or `--enforcement-schedule "CRON"` to change it. It is not created in IAP access mode or with `--read-only`.
-   - If no scheduled run happens for two hours, the page shows **Scheduled enforcement stopped**.
+1. The default installation (`ENABLE_GOVERNANCE_ACTIONS="true"`) prepares everything:
+   - **Marker roles**: `CustomAntigravityCapBlocked` and `CustomAntigravityAdminBlocked`, the Gemini Enterprise User role without `businessaicode.*` (the same approach as the [official custom roles that restrict AI developer tools](https://cloud.google.com/gemini/enterprise/docs/ai-developer-tools-creating-custom-roles)). Suspended users keep the Gemini Enterprise app; only Antigravity is blocked.
+   - **Enforcement schedule**: an enforcement run every 5 minutes (`ENFORCEMENT_SCHEDULE` defaults to `*/5 * * * *`), which suspends people over their limits within 5 minutes and **restores suspended users automatically** after each reset, in manual review mode too. Use `--no-enforcement-schedule` to turn it off or `--enforcement-schedule "CRON"` to change it. It is not created in IAP access mode or with `--read-only`.
+   - When no scheduled run has happened for two hours, the page shows **Automatic enforcement has stopped**.
 2. A Gemini Enterprise administrator turns on **Metadata logging** (6.5). Usage is counted from then on.
-3. Set the following in **Cap policy > Edit policy**. Right after installation every cap is off (0), so nobody is over a cap.
-   - Cost cap per person: a custom amount, or **Set from Antigravity credits** (the monthly credit per user / 4: Standard USD 2.50 and Plus USD 3.75 per week; if everyone stays inside it, the credit pool is never exceeded and nothing is billed above quota). The monthly credit is `Antigravity credit per user and month` in Settings > Governance policy (default 10).
-   - Currency: the billing account currency by default. If you choose `KRW`, amounts are shown and compared in Korean won.
-   - Settlement period: **Weekly** by default. Gemini Enterprise enforces Antigravity credits as a **shared pool per 7 days** from the project's first request ([official docs](https://cloud.google.com/gemini/enterprise/docs/quotas-and-pay-as-you-go-usage)), so set the **Weekly reset day** and **Reset time** to that cycle. An empty reset time zone means the workspace time zone.
-   - Token cap, Request cap (0 disables it)
-4. To give a person a different amount, select the pencil button in the **Cost cap** column of the **Usage against cap** table (`Use default`, `No cost cap`, presets, custom amount).
-5. In the **Enforcement** card at the top, choose **Automatic suspension** or **Manual review**. The default is manual review.
-6. Use **Dry run** to preview the result without changing IAM, then select **Run enforcement now**.
+3. Set the policy in **Cap policy > Edit policy**. Right after installation it is `No limit`, so nobody is suspended.
+   - Caps: **Weekly free credit + monthly paid budget** (recommended, default). The earlier fixed cost / token / request caps per period remain available. An installation that already used fixed caps keeps them after an upgrade until this choice is changed.
+   - Credit per person per month (USD): the `Standard $10` / `Plus $15` buttons.
+   - Paid budget per person per month: `No limit` / `Credits only` / `Monthly limit` (for example 100).
+   - Paid budget for everyone per month (optional, empty = no limit).
+   - Weekly reset day, time and time zone: match the project's 7-day credit cycle (it starts when the project first used Antigravity). The monthly budget resets on the 1st at 00:00 in the same time zone.
+   - Weekly token and request caps (optional, 0 = off).
+4. To give someone a different budget, select the pencil button in the **Paid budget** column of the **People and limits** table (`Default`, `Credits only`, `Individual limit`). For a person with a different credit, such as a Plus license, set the monthly credit to 15 in an **Individual limit** exception rule.
+5. In the **Enforcement** card, choose **Automatic** or **Manual review** (default).
+6. Preview with **Simulate** (no IAM change), then select **Run enforcement now**.
 
-### 8.3 Estimated cost and unit prices
+### 8.3 Amounts and prices
 
-- Cost per user = for each model, (input tokens − cached tokens) x input price + cached tokens (`cachedContentTokenCount`) x cached price + remaining tokens (response, thinking) x output price. Antigravity sessions serve most input from the prompt cache (official example: 69,079 of 70,825 input tokens), so ignoring the cached price would inflate the amount a lot. Models without a known cached price use the input price, so cost is never underestimated. Cache writes are not in the log and count as input.
-- Unit prices are looked up per model and per direction (input/output) in the following order.
-  1. **Actual billed price**: `SUM(cost) / SUM(usage.amount)` for the model's standard text token SKUs in the billing export over the last 30 days. Negotiated prices are reflected, and credits are not subtracted. Variant SKUs such as batch, flex, priority, cache, long context, tuning and audio/image/video are excluded.
-  2. **Public Google price list**: Models without billing records use the public prices from the Cloud Billing Catalog API (Agent Platform, Gemini API).
-- If the currency is different, amounts are converted with the exchange rate that Google publishes in its price list. The UI shows the basis, for example `1 USD = ₩1,359 (Google rate, date)`.
-- Unit prices are cached for 6 hours. The **Prices of models used in this period** table in the Cap policy card shows the price of each model and its source (Billed price, Google price list, No price).
-- Models with no price from either source are shown as "No price", and their tokens are not included in the cost. When only the cost cap is on, users whose cost cannot be calculated show `—` for cap usage instead of 0%, and they are not suspended.
-- The billing export has no user information, so per-person cost is a token-based estimate, not the actual billed amount. The UI also labels it as estimated cost. The token counts themselves are what Google logged for each call.
-- **Monthly usage report** (Antigravity Controls page): pick a month to see requests, input, cached and output tokens, cost, credit and the amount to charge (credit deducted or full amount) per person, and download it as CSV (`GET /api/v1/governance/antigravity/billing-report?month=YYYY-MM`). It is meant for internal chargeback and states that Google bills the project, not people.
-- Organizations that want to enter their contract prices can change Token prices to `Enter prices` in Settings > Governance policy, or use `model_prices` in `config.yaml` (optional).
+- Per-person amount = per model, (input tokens − cached tokens) x input price + cached tokens (`cachedContentTokenCount`) x cached price + other tokens (response, thinking) x output price. Most input in Antigravity sessions comes from the prompt cache (official example: 69,079 of 70,825 input tokens), so the amount would be inflated without the cached price. Models without a cached price use the input price so that amounts are never too low. Cache-write tokens are not logged separately and count as input.
+- The free share covers Gemini amounts first, in the order they were used (models whose id starts with `gemini`, `credit_model_prefixes`). When a week spans two months (for example a Monday reset and the 1st on a Wednesday), both months share that week's free share, and paid amounts count in the month they happened in.
+- Prices are found per model and direction (input/output), in this order:
+  1. **Billed price**: `SUM(cost) / SUM(usage.amount)` of the model's standard text-token SKUs in the last 30 days of the billing export. Negotiated prices are included and credits are not subtracted. Variant SKUs (batch, flex, priority, cache, long context, tuning, audio/image/video) are excluded.
+  2. **Public Google price list**: models without billed usage use the public prices of the Cloud Billing Catalog API (Agent Platform, Gemini API).
+- Credit caps are calculated in USD. Other billing currencies are converted with the exchange rate Google publishes in the price list, shown as `1 USD = ₩1,359 (Google rate, date)`.
+- Prices are cached for six hours. The **Prices of models used in this period** table of the policy card shows each model's price and source (billed price, Google price list, no price).
+- A model without any price is shown as "no price"; when a person's amount cannot be calculated, the cap usage is shown as `—` and the person is not suspended.
+- Billing exports carry no user information, so per-person amounts are calculated from tokens. The token counts themselves are what Google logged for every call.
+- **Monthly usage report** (Antigravity Controls page): pick a month to see per person the requests, tokens, the Gemini amount, the amount for Claude and other third-party models, the free credit applied, the **amount to charge** (= Claude + Gemini beyond the weekly free share) and the paid budget, with CSV download (`GET /api/v1/governance/antigravity/billing-report?month=YYYY-MM`). It uses the same ledger as the suspension decisions, so the page and the report agree.
+- Organizations that want to enter contract prices switch token prices to `Entered` in Settings > Governance policy or use `model_prices` in `config.yaml` (optional).
 
 ### 8.4 Enforcement modes
 
-| Mode | When a user goes over the cap | Restore |
+| Mode | When the suspension condition holds | Restore |
 |---|---|---|
-| Manual review (default) | The user is added to the review queue. An administrator selects **Suspend** or **Allow this period** for each user (or in bulk). A webhook notification is sent when new users are waiting. | Automatic when the settlement period ends |
-| Automatic suspension | The user is suspended by each enforcement run. | Automatic when the settlement period ends |
+| Manual review (default) | The user enters the review queue. An administrator **suspends** or **allows for this period**, per user or in bulk. New queue entries are sent to the webhook. | Automatic at the weekly reset or on the 1st |
+| Automatic | Every enforcement run suspends the user. | Automatic at the weekly reset or on the 1st |
 
-- An **enforcement run** is started by the **Run enforcement now** button or by the Cloud Scheduler job (`ENFORCEMENT_SCHEDULE`). The scheduler job calls `POST /api/v1/governance/antigravity/enforce` with a Google OIDC token from a dedicated service account that has no permissions. The app checks the issuer, the audience (`PUBLIC_BASE_URL` + path), email verification and the allowlist (`SCHEDULER_INVOKERS`). Calls without authentication and calls with other tokens get 401.
-- Suspension = one etag-based `setIamPolicy` call that replaces the access role (`roles/discoveryengine.agentspaceUser`) with the cap marker role (`CustomAntigravityCapBlocked`). A suspension record (start, scheduled end, reason, actor) is kept in the settings bucket, and the first enforcement run after the period ends restores the user, even without telemetry. With the default schedule (15 minutes) this happens within 15 minutes of the reset; only when the schedule is turned off do you need to run enforcement after each reset. However, the suspension stays if the user's usage in the new period is already over the cap.
-- **No suspension is permanent.** A cap suspension always ends at the next reset; only an administrator's **Always block** rule keeps blocking. `teardown.sh` also restores cap-suspended users before it removes the dashboard (section 15).
+- An **enforcement run** is started by the **Run enforcement now** button or by the Cloud Scheduler job (`ENFORCEMENT_SCHEDULE`). The scheduler job calls `POST /api/v1/governance/antigravity/enforce` with a Google OIDC token from a dedicated service account that has no permissions. The app checks the issuer, the audience (`PUBLIC_BASE_URL` + path), email verification and the allowlist (`SCHEDULER_INVOKERS`). Calls without authentication and calls with other tokens get 401. Enforcement always reads the latest logs, never cached ones.
+- Suspension = one etag-based `setIamPolicy` call that replaces the access role (`roles/discoveryengine.agentspaceUser`) with the cap marker role (`CustomAntigravityCapBlocked`). A suspension record (start, restore time, reason, actor) is kept in the settings bucket, and the first enforcement run after the restore time restores the user, even without telemetry. With the default schedule (5 minutes) this happens within 5 minutes of the reset; only when the schedule is turned off do you need to run enforcement after each reset.
+- **Nobody is suspended permanently.** A cap suspension always ends at the next weekly reset or on the 1st; only an **always block** rule set by an administrator keeps someone blocked. `teardown.sh` also restores cap-suspended users before it removes the dashboard (section 15).
 
 ### 8.5 Exception rules
 
 | Rule | Effect | Duration |
 |---|---|---|
-| Always allow | The user is not suspended, even above the cap. A suspended user is restored immediately. | This settlement period only / No expiry |
-| Individual cap | Applies different cost/token/request caps to this user only. Fields left empty keep the default cap. | This settlement period only / No expiry |
-| Always block | Blocks the user immediately with the administrative block marker role (`CustomAntigravityAdminBlocked`) and keeps the block until the rule is deleted. | No expiry |
+| Always allow | Never suspended for exceeding a cap. A suspended user is restored immediately. | This settlement period / no expiry |
+| Individual limit | A different monthly paid budget (0 = credits only), monthly credit (for example Plus 15) or weekly token / request caps for this user. Empty fields keep the default. A higher budget restores the person in the next enforcement run. | This settlement period / no expiry |
+| Always block | Blocked immediately with the admin block marker role (`CustomAntigravityAdminBlocked`) until the rule is deleted. | No expiry |
 
-Rules apply in both enforcement modes. Every addition, change and deletion is recorded in the audit log.
+Rules apply in both enforcement modes. Every add, change and delete is written to the audit log.
 
 ### 8.6 IAM states and safety gates
 
-| State | Meaning | Automatic suspension | Automatic restore |
+| State | Meaning | Auto suspend | Auto restore |
 |---|---|:---:|:---:|
-| `ENFORCEABLE_ALLOWED` | Has access only through direct `user:` bindings | Yes | - |
-| `CAPPED_BY_TOOL` | Suspended for exceeding the cap | - | Yes |
+| `ENFORCEABLE_ALLOWED` | Access only through a direct `user:` binding | Yes | - |
+| `CAPPED_BY_TOOL` | Suspended for exceeding a cap | - | Yes |
 | `BLOCKED_BY_ADMIN` | Blocked by an administrator | - | No |
-| `NOT_ENFORCEABLE` | Has access through a group, domain, inherited binding, privileged role or similar, so it cannot be controlled per user | No | No |
+| `NOT_ENFORCEABLE` | Access through a group, domain, inherited binding or broader role; cannot be controlled per user | No | No |
 | `NO_ACCESS` | No access path | No | No |
-| `UNKNOWN` | Cannot be determined because the policy could not be read | No | No |
+| `UNKNOWN` | Undeterminable because the policy could not be read | No | No |
 
-`NOT_ENFORCEABLE` and `UNKNOWN` users are never changed. They are shown in the "Manual action required" list with remediation steps for each reason.
+`NOT_ENFORCEABLE` and `UNKNOWN` users are never changed; they are listed under "Manual action required" with the remedy for each reason.
 
-| Gate | Condition | Action |
+| Gate | Condition | Behavior |
 |---|---|---|
-| `G1_POLICY_READABLE` | The project IAM policy cannot be read | Abort the run |
-| `G2_ANY_DETERMINATE` | No user can be classified | Abort the run |
-| `G3_TELEMETRY_HEALTHY` | The usage query fails, returns 0 records, or the Cloud Logging read was truncated at `max_log_entries` (default 20,000) | Apply suspensions only and withhold usage-based restores (restores at the end of the period still proceed). Truncated counts are lower bounds, so over-cap results stay valid. Export the inference log to BigQuery when there are many users. |
-| `G4_CHANGE_BUDGET` | Planned changes exceed `max(change_budget_min, ceil(change_budget_ratio x users in scope))` | Abort the run |
-| `G5_NON_USER_GRANT_ABSENT` | The access role has a group or domain binding | Warning |
+| `G1_POLICY_READABLE` | The project IAM policy cannot be read | Abort |
+| `G2_ANY_DETERMINATE` | No user has a determinate state | Abort |
+| `G3_TELEMETRY_HEALTHY` | The usage query failed, returned nothing, or Cloud Logging reads were truncated at `max_log_entries` (default 20,000) | Suspensions only; usage-based restores are withheld (suspensions past their restore time are still restored). Truncated counts are lower bounds, so over-cap results stay valid. Route the inference log to BigQuery for many users. Nobody is suspended from a month whose usage could not be read. |
+| `G4_CHANGE_BUDGET` | More people to suspend in one run than `max(change_budget_min, ceil(change_budget_ratio x population))` (default at least 10, 20%) | The people furthest over are suspended up to that number and the rest by the next runs (restores are never limited). Even when many people go over at once, such as when the organization budget runs out, all of them are suspended within a few runs (5 minutes apart), while one run with bad data cannot block many people at once. |
+| `G5_NON_USER_GRANT_ABSENT` | Group or domain bindings on the access role | Warning |
 
-If the etag conflicts because of a concurrent change, the plan is recalculated and retried once.
+On an etag conflict from a concurrent change, the plan is recomputed and retried once.
 
 ### 8.7 Audit, notifications and persistence
 
-- Every enforcement run, review decision, exception rule and allow/disallow action is written to the Cloud Logging audit log (`projects/PROJECT_ID/logs/agy-admin%2Fadmin_actions`) and shown in the **Administrative audit log** card. The service account always has `roles/logging.logWriter` for this. If a write still fails, the change is kept and the API response reports `auditLogged: false`. It uses the same marker roles and audit log as [agy-admin-cli](https://github.com/terrychahn/agy-admin-cli), so you can run both together. When you do, make sure the run times of the two tools do not overlap.
-- If you set `governance.antigravity.webhook_url` (Slack `hooks.slack.com` or Google Chat `chat.googleapis.com`, HTTPS only), new users awaiting review and enforcement results are sent to it.
-- Exception rules and suspension records are stored in the settings bucket and are kept after a restart. If you run on Cloud Run without a settings bucket, they are kept only in memory and the UI shows a warning.
+- Every enforcement run, review decision, exception rule and allow/block is written to the Cloud Logging audit log (`projects/PROJECT_ID/logs/agy-admin%2Fadmin_actions`) and shown in the **Administrative audit log** card. The service account therefore always gets `roles/logging.logWriter`. If writing still fails, the change stands and the API response says `auditLogged: false`. The marker roles and the audit log are the same as [agy-admin-cli](https://github.com/terrychahn/agy-admin-cli), so the two tools can be used together; make sure their runs do not overlap.
+- With `governance.antigravity.webhook_url` (Slack `hooks.slack.com` or Google Chat `chat.googleapis.com`, HTTPS only), new review queue entries and enforcement results are sent.
+- Exception rules and suspension records are stored in the settings bucket and survive restarts. On Cloud Run without a settings bucket they are kept in memory only, and the page shows a warning.
+
+### 8.8 Automatic verification (drill)
+
+So that nobody has to check by hand, the repository includes **a simulated month that runs the real enforcement engine**. It needs no Google Cloud access and finishes in seconds.
+
+```bash
+python3 scripts/caps_drill.py                                  # USD 100 paid budget, Standard credit (USD 10)
+python3 scripts/caps_drill.py --budget 0                       # credits only
+python3 scripts/caps_drill.py --org-budget 300 --crowd 30      # organization budget + 30 people going over at once
+python3 scripts/caps_drill.py --weekday 2 --at 14:00 --tz America/Los_Angeles   # the project's 7-day cycle
+python3 scripts/caps_drill.py --lang en                        # English report
+```
+
+- A simulated clock calls enforcement every 5 minutes, as Cloud Scheduler does, against a simulated project IAM policy and an inference log with the official schema (BigQuery sink table). The dashboard code runs exactly as in production. Simulated people's calls succeed only while they hold the access role.
+- The report shows each person's Gemini, Claude, free and paid amounts per week, every suspension and restore with its reason, and the rules checked after every run (PASS/FAIL):
+  - R1 nobody is suspended while budget or free credit is left
+  - R2 everybody who is over is suspended by the next run (a wave above the change budget within a few runs)
+  - R3 every suspension ends at the weekly reset or the month start (no permanent suspension)
+  - R4 spending beyond a budget stays within one interval (5 minutes) per restore, for people and the organization
+  - R5 people with an allow rule or group access are never suspended
+  - R6 the monthly report equals an independent call-by-call calculation (to the cent)
+- The same drill runs as unit tests (`tests/unit/test_caps_drill.py`) in `scripts/test.sh`. Engines broken on purpose (free credit never renewed, never suspending, Claude counted against the credit, nobody suspended above the change budget) must make the drill fail, or the tests fail.
 
 ---
 
@@ -708,7 +747,7 @@ Items changed in the UI are marked "Customized", and you can use **Reset to defa
 | `gateway` | `services` | Services to monitor in Agent Gateway |
 | `agent_lifecycle` | `idle_days`, `deprecation_days` | Thresholds for idle agents and deprecation candidates |
 | `finops` | `spike_threshold_pct`, `spike_min_delta` | Cost spike thresholds |
-| `governance.antigravity` | `cost_cap`, `currency`, `pricing_source`, `token_cap`, `request_cap`, `period`, `window`, `reset_timezone`, `enforcement_mode`, marker roles, change budget, `webhook_url` | Antigravity cap policy |
+| `governance.antigravity` | `cap_model` (`credit_budget` default / `period`), `credit_per_user_month`, `paid_budget_month` (-1 no limit, 0 credits only), `org_paid_budget_month`, `credit_model_prefixes`, `reset_timezone`, `reset_weekday`, `reset_time`, `token_cap`, `request_cap`, `enforcement_mode`, `pricing_source`, the period caps `cost_cap`, `currency`, `period`, `window`, marker roles, change budget, `webhook_url` | Antigravity cap policy |
 | `analyst` | `max_bytes_billed`, `max_rows`, `allow_viewers` | AI Analyst query limits, and whether viewers may use it (default `false`) |
 
 ### 9.3 Environment variables
@@ -970,6 +1009,7 @@ If `deploy.<PROJECT_ID>.env` contains `SCAN_PROJECTS` (or you pass `--link-proje
 ./scripts/test.sh                                          # all offline suites (unit tests, bash -n, prepublish scan, AI Analyst validate)
 ./scripts/test.sh --live --project PROJECT_ID --mutate     # live Cloud Run end-to-end verification (including connector & route mutations)
 python3 -m unittest discover -s tests/unit -v              # unit tests only
+python3 scripts/caps_drill.py --lang en                    # Antigravity credit caps drill, one month (8.8)
 ```
 
 The unit tests verify code behavior and do not connect to Google Cloud. Test inputs use only reserved domains (`example.com` and others), and the tests are not included in the container image. GitHub Actions (`.github/workflows/tests.yml`) runs them on every push and pull request, together with `bash -n` on the scripts, the prepublish scan and the offline validation of the AI Analyst golden dataset.

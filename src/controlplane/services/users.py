@@ -217,7 +217,7 @@ def iam_context(ctx):
 
 
 CAP_FIELDS = ("exception", "suspension", "restoreAt", "overCap", "overCapReasons", "capUsage", "estimatedCost",
-              "caps")
+              "caps", "credit")
 
 
 def iam_for(email, status_payload, internal):

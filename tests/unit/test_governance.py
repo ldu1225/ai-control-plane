@@ -93,6 +93,22 @@ class ClassifierTest(unittest.TestCase):
         self.assertEqual(gov.over_cap(10 ** 9, 10 ** 9, 0, 0), (False, 0.0))
 
 
+class CapModelTest(unittest.TestCase):
+    """cap_model empty (the default): credit caps for new installations, fixed caps kept on upgrades."""
+
+    def test_new_installations_use_credit_caps(self):
+        self.assertTrue(gov.credit_mode({}))
+        self.assertTrue(gov.credit_mode({"cap_model": "", "cost_cap": 0, "token_cap": 0, "request_cap": 0}))
+
+    def test_upgrades_with_fixed_caps_keep_them(self):
+        for key in gov.PERIOD_CAP_KEYS:
+            self.assertFalse(gov.credit_mode({"cap_model": "", key: 5}), key)
+
+    def test_an_explicit_choice_wins(self):
+        self.assertTrue(gov.credit_mode({"cap_model": "credit_budget", "cost_cap": 5}))
+        self.assertFalse(gov.credit_mode({"cap_model": "period"}))
+
+
 def user(uid, state, over):
     return {"uid": uid, "state": state, "overCap": over}
 
@@ -163,13 +179,43 @@ class GatesAndPlanTest(unittest.TestCase):
         tight = gov.GovConfig(**dict(CFG.__dict__, change_budget_min=1, change_budget_ratio=0.1))
         users = [user("a", "ENFORCEABLE_ALLOWED", True), user("b", "ENFORCEABLE_ALLOWED", True),
                  user("c", "NO_ACCESS", False)]
+        users[1]["capUsage"] = 1.6   # b is further over its limits than a
         gates, plan, budget = self.evaluate(users, cfg=tight)
         self.assertEqual(budget, 1)  # max(1, ceil(0.1 * 3))
-        self.assertEqual(self.gate(gates, "G4_CHANGE_BUDGET"), "fail")
-        self.assertTrue(plan["aborted"])
+        self.assertEqual(self.gate(gates, "G4_CHANGE_BUDGET"), "warn")
+        # More suspensions than one run may apply: the person furthest over goes first, the other waits for the
+        # next run (rate limit, not a stop), and the run itself is not aborted.
+        self.assertFalse(plan["aborted"])
+        self.assertEqual((plan["block"], plan["deferredBlocks"], plan["changeBudget"]), (["b"], ["a"], 1))
+        self.assertIn("1 wait for the next run", next(g["detail"] for g in gates if g["id"] == "G4_CHANGE_BUDGET"))
         ratio_cfg = gov.GovConfig(**dict(CFG.__dict__, change_budget_min=0, change_budget_ratio=0.5))
-        _, plan, budget = self.evaluate(users, cfg=ratio_cfg)
+        gates, plan, budget = self.evaluate(users, cfg=ratio_cfg)
         self.assertEqual(budget, 2)  # ceil(0.5 * 3)
+        self.assertEqual(self.gate(gates, "G4_CHANGE_BUDGET"), "pass")
+        self.assertFalse(plan["aborted"])
+        self.assertEqual((sorted(plan["block"]), plan["deferredBlocks"]), (["a", "b"], []))
+
+    def test_g4_block_rules_come_first(self):
+        tight = gov.GovConfig(**dict(CFG.__dict__, change_budget_min=1, change_budget_ratio=0.0))
+        users = [user("a", "ENFORCEABLE_ALLOWED", True), dict(user("z", "ENFORCEABLE_ALLOWED", False),
+                                                                exception={"type": "block"})]
+        _, plan, _ = self.evaluate(users, cfg=tight)
+        self.assertEqual((plan["disallow"], plan["block"], plan["deferredBlocks"]), (["z"], [], ["a"]))
+
+    def test_restores_are_never_limited_by_the_change_budget(self):
+        # A weekly reset restores everyone who was suspended in one run, however many people that is.
+        tight = gov.GovConfig(**dict(CFG.__dict__, change_budget_min=1, change_budget_ratio=0.0))
+        ended = {"until": "2026-11-02T00:00:00Z"}
+        users = [dict(user("c%02d" % i, "CAPPED_BY_TOOL", False), suspension=ended) for i in range(40)]
+        users.append(user("a", "ENFORCEABLE_ALLOWED", True))
+        gates, plan, _ = self.evaluate(users, cfg=tight)
+        self.assertEqual(self.gate(gates, "G4_CHANGE_BUDGET"), "pass")
+        self.assertEqual(len(plan["restore"]), 40)
+        self.assertEqual(plan["block"], ["a"])
+        users += [user("b", "ENFORCEABLE_ALLOWED", True)]
+        gates, plan, _ = self.evaluate(users, cfg=tight)
+        self.assertEqual(self.gate(gates, "G4_CHANGE_BUDGET"), "warn")
+        self.assertEqual((len(plan["restore"]), plan["block"], plan["deferredBlocks"]), (40, ["a"], ["b"]))
         self.assertFalse(plan["aborted"])
 
     def test_g5_group_grants_warn(self):

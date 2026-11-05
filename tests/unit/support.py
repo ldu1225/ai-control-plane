@@ -24,7 +24,9 @@ ADMIN_MARKER = "projects/%s/roles/CustomAntigravityAdminBlocked" % PROJECT
 LEGACY_MARKER = "projects/%s/roles/CustomAntigravityRestrictedUser" % PROJECT
 
 
-TEST_CAP_POLICY = {"period": "daily", "token_cap": 500000, "request_cap": 1000, "reset_timezone": "UTC"}
+# Fixed period caps (cap_model "period"); credit caps have their own tests (test_credit_caps*.py).
+TEST_CAP_POLICY = {"cap_model": "period", "period": "daily", "token_cap": 500000, "request_cap": 1000,
+                   "reset_timezone": "UTC"}
 
 
 def make_settings(**sections):

@@ -22,12 +22,15 @@ const GATE_TEXT = {
   G1_POLICY_READABLE: ['Policy readable', 'The project IAM policy can be read. Failure aborts the run.'],
   G2_ANY_DETERMINATE: ['Determinate classification', 'At least one user could be classified. Failure aborts the run.'],
   G3_TELEMETRY_HEALTHY: ['Telemetry healthy', 'Usage telemetry returned records. When degraded, automatic restores are withheld.'],
-  G4_CHANGE_BUDGET: ['Change budget', 'Planned changes stay within the circuit-breaker budget. Exceeding it aborts the run.'],
+  G4_CHANGE_BUDGET: ['Change budget', 'At most this many people are suspended in one run (circuit breaker); the rest follow in the next runs. Restores are never limited.'],
   G5_NON_USER_GRANT_ABSENT: ['No group or domain grants', 'Access is not granted through groups or domains. Affected users require manual action.'],
 };
 
 const PERIODS = [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['all', 'Last 90 days']];
-const REASON_LABELS = { tokens: 'Tokens', requests: 'Requests', cost: 'Estimated cost' };
+const REASON_LABELS = {
+  tokens: 'Tokens', requests: 'Requests', cost: 'Estimated cost',
+  budget: 'Paid budget spent', credit: 'Weekly free credit used up', paid: 'Paid usage this week',
+};
 const TRIGGER_LABELS = { auto: 'Automatic', review: 'Review approval', bulk: 'Bulk apply', admin: 'Administrator', scheduler: 'Scheduler' };
 const RULE_HINTS = {
   allow: 'The user is never suspended for exceeding a cap. A suspended user is restored now.',
@@ -79,6 +82,10 @@ export default async function render(ctx) {
     return null;
   }
 
+  if (isCredit(status.policy)) {
+    const desc = header.querySelector('.page-desc');
+    if (desc) desc.textContent = t('Everyone can use the weekly free Antigravity credit (Gemini models). Paid usage (Claude, and Gemini beyond the free share) has a monthly budget per person in USD. A person whose budget is spent is stopped only while nothing is free, and is restored automatically at the weekly reset and on the 1st of the month.');
+  }
   if (admin && status.plan && status.plan.aborted) {
     runBtn.disabled = true;
     runBtn.title = t('A safety gate failed. Resolve it before running enforcement.');
@@ -136,6 +143,50 @@ function money(v, ccy) {
   return fmt.currency(v, ccy, { precise: true });
 }
 
+/** Credit caps: weekly free credit (Gemini models) + monthly paid budget per person, in USD. */
+function isCredit(policy) {
+  return Boolean(policy) && policy.capModel === 'credit_budget';
+}
+
+function usd(v) {
+  return money(v, 'USD');
+}
+
+/** A paid budget: null = no limit, 0 = credits only. */
+function budgetText(b) {
+  if (!isNum(b)) return t('No limit');
+  return b === 0 ? t('Credits only') : usd(b);
+}
+
+function creditWeekCell(c) {
+  if (!c) return h('span', { class: 'text-muted' }, DASH);
+  const ratio = c.creditWeek > 0 ? c.freeUsedWeek / c.creditWeek : 0;
+  return h('div', { class: 'cell-stack' },
+    h('div', { class: 'share-cell' }, progress(Math.min(1, ratio), ratio >= 1 ? 'warning' : 'success'),
+      h('span', null, `${usd(c.freeUsedWeek)} / ${usd(c.creditWeek)}`)),
+    h('span', { class: 'cell-sub' }, t('{v} left', { v: usd(c.freeLeftWeek) })));
+}
+
+function paidMonthCell(c) {
+  if (!c) return h('span', { class: 'text-muted' }, DASH);
+  const b = c.budget;
+  let ratio = 0;
+  if (isNum(b) && b > 0) ratio = c.paidMonth / b;
+  else if (b === 0 && c.paidMonth > 0) ratio = 1;
+  const tone = ratio >= 1 ? 'danger' : ratio >= 0.8 ? 'warning' : 'success';
+  return h('div', { class: 'cell-stack' },
+    h('div', { class: 'share-cell' }, isNum(b) ? progress(Math.min(1, ratio), tone) : null,
+      h('span', { class: c.budgetUsedUp ? 'fw-600 text-danger' : 'fw-600' }, usd(c.paidMonth))),
+    h('span', { class: 'cell-sub' }, isNum(b) ? t('of {cap}', { cap: budgetText(b) }) : t('No limit')));
+}
+
+function weeklyCapsText(policy) {
+  return [
+    t('Tokens {v}', { v: policy.tokenCap ? fmt.compact(policy.tokenCap) : t('off') }),
+    t('Requests {v}', { v: policy.requestCap ? fmt.int(policy.requestCap) : t('off') }),
+  ].join(' \u00b7 ');
+}
+
 function costBasis(pricing) {
   if (!pricing || !pricing.configured) return pricing && pricing.source === 'manual' ? t('Token prices not entered') : t('No token prices found');
   if (pricing.source === 'manual') return t('Estimated with entered prices');
@@ -146,7 +197,8 @@ function costBasis(pricing) {
 
 function reasonBadges(reasons) {
   if (!reasons || !reasons.length) return h('span', { class: 'text-muted' }, DASH);
-  return h('div', { class: 'chips' }, reasons.map((r) => badge(t(REASON_LABELS[r] || r), r === 'cost' ? 'warning' : 'danger', { size: 'sm' })));
+  const tone = (r) => (r === 'cost' || r === 'budget' ? 'warning' : r === 'credit' ? 'info' : 'danger');
+  return h('div', { class: 'chips' }, reasons.map((r) => badge(t(REASON_LABELS[r] || r), tone(r), { size: 'sm' })));
 }
 
 function capUsageCell(ratio) {
@@ -174,6 +226,8 @@ function ruleDetail(rule, ccy) {
     if (isNum(rule.tokenCap)) parts.push(t('Tokens {v}', { v: fmt.compact(rule.tokenCap) }));
     if (isNum(rule.requestCap)) parts.push(t('Requests {v}', { v: fmt.int(rule.requestCap) }));
     if (isNum(rule.costCap)) parts.push(t('Cost {v}', { v: fmt.currency(rule.costCap, ccy) }));
+    if (isNum(rule.paidBudget)) parts.push(t('Paid budget {v}', { v: budgetText(rule.paidBudget) }));
+    if (isNum(rule.creditMonth)) parts.push(t('Credit {v} a month', { v: usd(rule.creditMonth) }));
     const caps = parts.join(' \u00b7 ');
     return rule.until ? `${caps} \u00b7 ${t('Until {time}', { time: fmt.dateTime(rule.until) })}` : caps;
   }
@@ -215,6 +269,10 @@ function renderStatus(ctx, body, s) {
   } else if (plan.withheldRestores) {
     body.append(banner({ tone: 'warning', title: t('Automatic restores withheld'), text: t('Usage telemetry is degraded (gate G3), so users capped earlier will not be restored automatically in this cycle. Suspensions whose settlement period has ended are still restored.') }));
   }
+  if ((plan.deferredBlocks || []).length) {
+    body.append(banner({ tone: 'warning', title: t('Suspensions spread over several runs'), text: t('{n} more people are over their limits than the change budget allows in one run ({m} per run). The people furthest over are suspended first and the rest in the next runs, every few minutes. Restores are never limited.', { n: fmt.int(plan.deferredBlocks.length), m: fmt.int(plan.changeBudget) }) }));
+  }
+  const credit = isCredit(policy);
   const usageUnavailable = s.usageSource === 'unavailable';
   const prereq = s.prerequisites || {};
   if (usageUnavailable) {
@@ -238,21 +296,34 @@ function renderStatus(ctx, body, s) {
   body.append(enforcementCard(ctx, s));
 
   const plannedBlocks = (plan.block || []).length;
-  body.append(h('div', { class: 'kpi-grid' },
+  const queueKpi = kpi({
+    label: mode === 'manual' ? t('Awaiting review') : t('Suspended at next run'),
+    value: fmt.int(mode === 'manual' ? totals.review : plannedBlocks),
+    meta: h('span', null, mode === 'manual' ? t('Administrator decision required') : t('Applied by the next enforcement run')),
+  });
+  const coverageKpi = kpi({ label: t('Enforceable coverage'), value: fmt.pct(pop.enforceableCoverage), meta: isNum(pop.enforceableCoverage) ? progress(pop.enforceableCoverage, pop.enforceableCoverage >= 0.8 ? 'success' : 'warning') : null });
+  if (credit) body.append(h('div', { class: 'kpi-grid' },
+    kpi({ label: t('People this month'), value: usageUnavailable ? DASH : fmt.int(pop.total), meta: h('span', null, t('This week: {range}', { range: windowText(policy) })) }),
+    kpi({
+      label: t('Paid this month'), value: isNum(totals.paidMonth) ? usd(totals.paidMonth) : DASH,
+      meta: h('span', null, isNum(policy.orgPaidBudgetMonth) ? t('Organization budget {v}', { v: budgetText(policy.orgPaidBudgetMonth) }) : t('Free credit applied {v}', { v: usd(totals.freeMonth) })),
+      tip: t('Claude usage and Gemini usage beyond each person\'s weekly free share, priced per token. Google bills the project and applies the credit as a shared pool, so the invoice can be lower than this sum.'),
+    }),
+    kpi({ label: t('Budget spent: credits only'), value: fmt.int(totals.budgetUsedUp), meta: h('span', null, t('They use the free credit again after each weekly reset')) }),
+    queueKpi,
+    kpi({ label: t('Suspended now'), value: fmt.int(totals.suspended), meta: h('span', null, policy.nextReset ? t('Weekly reset {time}', { time: fmt.dateTime(policy.nextReset) }) : DASH) }),
+    coverageKpi));
+  else body.append(h('div', { class: 'kpi-grid' },
     kpi({ label: t('Users in period'), value: usageUnavailable ? DASH : fmt.int(pop.total), meta: h('span', null, windowText(policy)) }),
     kpi({ label: t('Over cap'), value: fmt.int(totals.overCap), meta: h('span', null, capsText(policy)) }),
-    kpi({
-      label: mode === 'manual' ? t('Awaiting review') : t('Suspended at next run'),
-      value: fmt.int(mode === 'manual' ? totals.review : plannedBlocks),
-      meta: h('span', null, mode === 'manual' ? t('Administrator decision required') : t('Applied by the next enforcement run')),
-    }),
+    queueKpi,
     kpi({ label: t('Suspended now'), value: fmt.int(totals.suspended), meta: h('span', null, policy.nextReset ? t('Restored at {time}', { time: fmt.dateTime(policy.nextReset) }) : t('Restored when usage falls below the cap')) }),
     kpi({
       label: t('Estimated cost'), value: isNum(totals.estimatedCost) ? fmt.currency(totals.estimatedCost, ccy) : DASH,
       meta: h('span', null, costBasis(policy.pricing)),
       tip: t('Per-user cost is estimated from each person\'s tokens per model and the price per token: what your billing account actually paid, or the public Google price list. Billing exports do not break cost down by user.'),
     }),
-    kpi({ label: t('Enforceable coverage'), value: fmt.pct(pop.enforceableCoverage), meta: isNum(pop.enforceableCoverage) ? progress(pop.enforceableCoverage, pop.enforceableCoverage >= 0.8 ? 'success' : 'warning') : null })));
+    coverageKpi));
 
   body.append(queueCard(ctx, s));
   body.append(suspendedCard(ctx, s));
@@ -261,7 +332,7 @@ function renderStatus(ctx, body, s) {
   const row1 = h('div', { class: 'grid' });
   const pricing = policy.pricing || {};
   const policyCard = card({
-    title: t('Cap policy'), subtitle: t('Default caps per user and settlement period'),
+    title: t('Cap policy'), subtitle: credit ? t('Default limits per person, in USD') : t('Default caps per user and settlement period'),
     actions: button({
       label: t('Edit policy'), icon: 'edit', size: 'sm',
       onClick: () => {
@@ -269,14 +340,25 @@ function renderStatus(ctx, body, s) {
         editPolicy(ctx, policy);
       },
     }),
-    body: kv([
+    body: credit ? kv([
+      [t('Caps'), t('Weekly free credit + monthly paid budget')],
+      [t('Credit per person'), t('{m} a month ({w} a week, Gemini models only)', { m: usd(policy.creditPerUserMonth), w: usd(policy.creditPerWeek) })],
+      [t('Paid budget per person'), budgetText(policy.paidBudgetMonth)],
+      [t('Organization paid budget'), isNum(policy.orgPaidBudgetMonth) ? t('{v} ({used} used this month)', { v: usd(policy.orgPaidBudgetMonth), used: usd(policy.orgPaidMonth) }) : t('No limit')],
+      [t('Weekly reset'), resetText(policy)],
+      [t('Budget month'), t('From the 1st at 00:00 ({tz})', { tz: policy.resetTimezone || 'UTC' })],
+      policy.tokenCap || policy.requestCap ? [t('Weekly token and request caps'), weeklyCapsText(policy)] : null,
+      [t('Token prices'), pricingSummary(pricing, 'USD')],
+      [t('Change budget'), t('At most {n} suspensions per run', { n: fmt.int(policy.changeBudget) })],
+      [t('Usage source'), { bigquery: t('BigQuery log sink'), logging: t('Cloud Logging API'), unavailable: t('Unavailable') }[s.usageSource] || s.usageSource],
+    ]) : kv([
       [t('Token cap'), policy.tokenCap ? fmt.int(policy.tokenCap) : t('Disabled')],
       [t('Request cap'), policy.requestCap ? fmt.int(policy.requestCap) : t('Disabled')],
       [t('Cost cap per person'), policy.costCap ? h('span', null, fmt.currency(policy.costCap, ccy), pricing.configured ? null : h('span', { class: 'text-warning' }, ` \u00b7 ${t('no token prices')}`)) : t('Disabled')],
       [t('Token prices'), pricingSummary(pricing, ccy)],
       [t('Settlement period'), periodLabel(policy)],
       [t('Period reset'), resetText(policy)],
-      [t('Change budget'), t('{n} changes per cycle', { n: fmt.int(policy.changeBudget) })],
+      [t('Change budget'), t('At most {n} suspensions per run', { n: fmt.int(policy.changeBudget) })],
       [t('Usage source'), { bigquery: t('BigQuery log sink'), logging: t('Cloud Logging API'), unavailable: t('Unavailable') }[s.usageSource] || s.usageSource],
     ]),
   });
@@ -298,10 +380,30 @@ function renderStatus(ctx, body, s) {
     }))) : emptyState({ icon: 'alert-triangle', tone: 'warning', compact: true, title: t('Population unknown'), body: t('Usage and IAM data could not be read, so the user population is unknown.') }),
   }));
 
+  const budgetCell = (u) => {
+    const own = u.exception && u.exception.type === 'limit' && isNum(u.exception.paidBudget);
+    const b = u.credit ? u.credit.budget : (u.caps ? u.caps.paidBudget : null);
+    return h('div', { class: 'row nowrap cap-cell' },
+      h('div', { class: 'cell-stack' }, h('span', { class: own ? 'fw-600' : '' }, budgetText(b)), h('span', { class: 'cell-sub' }, own ? t('Individual') : t('Default'))),
+      button({ icon: 'edit', size: 'sm', title: t('Change paid budget'), onClick: () => { if (requireAdmin(t('Change paid budget'))) editPersonCap(ctx, s, u); } }));
+  };
+  const creditColumns = [
+    { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
+    { key: 'estimatedCost', label: t('This week'), align: 'num', value: (u) => u.estimatedCost, render: (u) => h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600', title: u.costPartial ? t('Some models have no unit price') : null }, usd(u.estimatedCost), u.costPartial ? ' *' : ''), h('span', { class: 'cell-sub' }, isNum(u.tokens) ? t('{n} tokens', { n: fmt.compact(u.tokens) }) : DASH)) },
+    { key: 'freeWeek', label: t('Free credit this week'), align: 'num', value: (u) => (u.credit ? u.credit.freeUsedWeek : null), render: (u) => creditWeekCell(u.credit), csv: (u) => (u.credit ? u.credit.freeUsedWeek : '') },
+    { key: 'paidMonth', label: t('Paid this month'), align: 'num', value: (u) => (u.credit ? u.credit.paidMonth : null), render: (u) => paidMonthCell(u.credit), csv: (u) => (u.credit ? u.credit.paidMonth : '') },
+    { key: 'budget', label: t('Paid budget'), align: 'num', value: (u) => (u.credit ? u.credit.budget : null), render: budgetCell, csv: (u) => (u.credit && isNum(u.credit.budget) ? u.credit.budget : '') },
+    { key: 'models', label: t('Models'), sortable: false, render: (u) => listCell(u.models, { mono: true }), csv: (u) => (u.models || []).join('|') },
+    { key: 'exception', label: t('Rule'), render: (u) => ruleBadge(u.exception), value: (u) => (u.exception ? u.exception.type : ''), csv: (u) => (u.exception ? u.exception.type : '') },
+    { key: 'state', label: t('Access state'), render: (u) => { const b = statusBadge(u.state, { size: 'sm' }); if (u.reason) b.title = reasonLabel(u.reason); else if (u.restoreAt) b.title = t('Restored at {time}', { time: fmt.dateTime(u.restoreAt) }); return h('div', { class: 'cell-stack' }, b, u.restoreAt ? h('span', { class: 'cell-sub' }, t('Back {time}', { time: fmt.dateTime(u.restoreAt) })) : null); } },
+    { key: 'plannedAction', label: t('Planned action'), render: (u) => statusBadge(u.plannedAction || 'none', { size: 'sm' }) },
+  ];
   body.append(card({
-    title: t('Usage against cap'), subtitle: windowText(policy), flush: true, source: prereq.inferenceLog || undefined,
+    title: credit ? t('People and limits') : t('Usage against cap'),
+    subtitle: credit ? t('This week {range} \u00b7 paid this month from the 1st', { range: windowText(policy) }) : windowText(policy),
+    flush: true, source: prereq.inferenceLog || undefined,
     body: dataTable({
-      columns: [
+      columns: credit ? creditColumns : [
         { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
         { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
         { key: 'tokens', label: t('Tokens'), align: 'num', render: (u) => (isNum(u.tokens) ? h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600' }, fmt.compact(u.tokens)), h('span', { class: 'cell-sub' }, t('{p} in \u00b7 {c} out', { p: fmt.compact(u.promptTokens), c: fmt.compact(u.candidateTokens) }))) : h('span', { class: 'text-muted' }, DASH)), value: (u) => u.tokens },
@@ -330,7 +432,7 @@ function renderStatus(ctx, body, s) {
         { key: 'state', label: t('Access state'), render: (u) => { const b = statusBadge(u.state, { size: 'sm' }); if (u.reason) b.title = reasonLabel(u.reason); else if (u.restoreAt) b.title = t('Restored at {time}', { time: fmt.dateTime(u.restoreAt) }); return b; } },
         { key: 'plannedAction', label: t('Planned action'), render: (u) => statusBadge(u.plannedAction || 'none', { size: 'sm' }) },
       ],
-      rows: s.users, pageSize: 15, exportName: 'antigravity-usage', initialSort: { key: 'capUsage', dir: 'desc' },
+      rows: s.users, pageSize: 15, exportName: 'antigravity-usage', initialSort: credit ? { key: 'paidMonth', dir: 'desc' } : { key: 'capUsage', dir: 'desc' },
       emptyText: t('No Antigravity usage was recorded in this window.'),
       unavailableText: t('Usage and IAM data could not be read, so the user population is unknown.'),
       onRowClick: (u) => u.uid && openUserDrawer(u.uid, { onChanged: () => ctx.rerender() }),
@@ -431,12 +533,23 @@ function billingReportCard(ctx) {
       const rows = r.users || [];
       const notice = warningsNotice(res.meta && res.meta.warnings);
       const amount = (u) => (state.credit ? u.chargeable : u.cost);
+      const creditCaps = r.capModel === 'credit_budget';
       let content;
       if (!rows.length) {
         content = emptyState({ icon: 'file-text', compact: true, title: t('No Antigravity usage in {month}', { month: r.month || state.month }), body: t('Usage appears when Antigravity for organizations writes its inference log with Metadata logging turned on.') });
       } else {
         content = dataTable({
-          columns: [
+          columns: creditCaps ? [
+            { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
+            { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
+            { key: 'tokens', label: t('Tokens'), align: 'num', format: fmt.compact, csv: (u) => u.tokens },
+            { key: 'gemini', label: t('Gemini'), align: 'num', render: (u) => usd(u.gemini), value: (u) => u.gemini },
+            { key: 'other', label: t('Claude and other models'), align: 'num', render: (u) => usd(u.other), value: (u) => u.other },
+            { key: 'credit', label: t('Free credit'), align: 'num', render: (u) => (state.credit ? usd(u.credit) : h('span', { class: 'text-muted' }, DASH)), value: (u) => (state.credit ? u.credit : null) },
+            { key: 'chargeable', label: state.credit ? t('Amount to charge') : t('Cost'), align: 'num', render: (u) => h('span', { class: 'fw-600', title: u.costPartial ? t('Some models have no unit price') : null }, usd(amount(u)), u.costPartial ? ' *' : ''), value: (u) => amount(u) },
+            { key: 'budget', label: t('Paid budget'), align: 'num', render: (u) => budgetText(u.budget), value: (u) => u.budget, csv: (u) => (isNum(u.budget) ? u.budget : '') },
+            { key: 'models', label: t('Models'), sortable: false, render: (u) => listCell((u.byModel || []).map((m) => m.model), { mono: true }), csv: (u) => (u.byModel || []).map((m) => `${m.model}:${m.tokens}`).join('|') },
+          ] : [
             { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
             { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
             { key: 'promptTokens', label: t('Input tokens'), align: 'num', format: fmt.compact, csv: (u) => u.promptTokens },
@@ -458,7 +571,9 @@ function billingReportCard(ctx) {
           h('span', { class: 'text-muted' }, t('{n} people \u00b7 {month} ({tz})', { n: fmt.int(rows.length), month: r.month || state.month, tz: r.timezone || '' })),
           r.complete === false ? badge(t('Month in progress'), 'warning', { size: 'sm' }) : null),
         h('p', { class: 'muted' }, t('Tokens are what Google logged for each call (businessaicode.googleapis.com/inference_response). Cost = tokens x unit price of each model; prompt tokens served from cache use the cache price. Google bills the project, not people, so this is how the project\'s usage is divided between people.')),
-        state.credit ? h('p', { class: 'muted' }, t('Credit: {v} per person per month (Gemini Enterprise Antigravity credit, Settings > Governance).', { v: money(r.creditPerUser, ccy) })) : null);
+        creditCaps
+          ? h('p', { class: 'muted' }, t('Free credit: {w} per person per week ({m} a month / 4), for Gemini models only; unused credit does not carry over. Claude is always paid. Amount to charge = Claude + Gemini beyond the weekly free share. Google bills the project and applies the credit as a shared pool, so the invoice can be lower than the sum.', { w: usd(r.creditPerWeek), m: usd(r.creditPerUserMonthUsd) }))
+          : (state.credit ? h('p', { class: 'muted' }, t('Credit: {v} per person per month (Gemini Enterprise Antigravity credit, Settings > Governance).', { v: money(r.creditPerUser, ccy) })) : null));
       append(host, [notice ? h('div', { class: 'card-body flush-top' }, notice) : null, content, foot]);
     }, { skeletonKind: 'table', signal: ctx.signal });
   }
@@ -504,12 +619,18 @@ function enforcementCard(ctx, s) {
   else schedSub = t('Runs only when an administrator selects Run enforcement now');
   return card({
     title: t('Enforcement'),
-    subtitle: mode === 'auto'
-      ? t('Automatic: users over their cap are suspended by each enforcement run and restored when the settlement period resets.')
-      : t('Manual: users over their cap wait in the review queue. An administrator suspends them until the period resets or allows them for the rest of the period.'),
+    subtitle: isCredit(policy)
+      ? (mode === 'auto'
+        ? t('Automatic: a person whose paid budget is spent is stopped by the next run once nothing is free (the week\'s free credit is used up or they pay again), and restored at the weekly reset or on the 1st of the month.')
+        : t('Manual: people whose paid budget is spent wait in the review queue. Suspensions end automatically at the weekly reset or on the 1st of the month.'))
+      : (mode === 'auto'
+        ? t('Automatic: users over their cap are suspended by each enforcement run and restored when the settlement period resets.')
+        : t('Manual: users over their cap wait in the review queue. An administrator suspends them until the period resets or allows them for the rest of the period.')),
     actions: control,
     body: h('div', { class: 'enf-grid' },
-      enfItem(t('Settlement period'), periodLabel(policy), resetText(policy)),
+      isCredit(policy)
+        ? enfItem(t('Free credit cycle'), t('{w} per person per week', { w: usd(policy.creditPerWeek) }), resetText(policy))
+        : enfItem(t('Settlement period'), periodLabel(policy), resetText(policy)),
       enfItem(t('Next reset'), policy.nextReset ? fmt.dateTime(policy.nextReset) : t('No fixed reset'), policy.nextReset ? fmt.relative(policy.nextReset) : t('Suspended users are restored when their usage falls below the cap')),
       enfItem(t('Last run'), last ? fmt.dateTime(last.at) : t('Not run yet'), last ? runSummary(last) : t('Select Run enforcement now or configure the scheduler')),
       enfItem(t('Scheduler'), sched.configured ? t('Configured') : t('Not configured'), schedSub)),
@@ -609,7 +730,13 @@ function queueCard(ctx, s) {
   } else if (!rows.length) {
     content = emptyState({ icon: 'check-circle', compact: true, title: manual ? t('No users awaiting review') : t('No suspensions planned'), body: t('No enforceable user is over the cap in this period.') });
   } else {
-    const columns = [
+    const columns = isCredit(policy) ? [
+      { key: 'email', label: t('User'), render: (r) => userCell(r.email, r.exception ? t('Individual cap') : null) },
+      { key: 'estimatedCost', label: t('This week'), align: 'num', render: (r) => usd(r.estimatedCost), value: (r) => r.estimatedCost },
+      { key: 'freeWeek', label: t('Free credit this week'), align: 'num', render: (r) => creditWeekCell(r.credit), value: (r) => (r.credit ? r.credit.freeUsedWeek : null) },
+      { key: 'paidMonth', label: t('Paid this month'), align: 'num', render: (r) => paidMonthCell(r.credit), value: (r) => (r.credit ? r.credit.paidMonth : null) },
+      { key: 'overCapReasons', label: t('Why'), sortable: false, render: (r) => reasonBadges(r.overCapReasons), csv: (r) => (r.overCapReasons || []).join('|') },
+    ] : [
       { key: 'email', label: t('User'), render: (r) => userCell(r.email, r.exception ? t('Individual cap') : null) },
       { key: 'tokens', label: t('Tokens'), align: 'num', render: (r) => capValue(r.tokens, r.caps && r.caps.tokenCap, fmt.compact), value: (r) => r.tokens },
       { key: 'requests', label: t('Requests'), align: 'num', render: (r) => capValue(r.requests, r.caps && r.caps.requestCap, fmt.int), value: (r) => r.requests },
@@ -636,9 +763,11 @@ function queueCard(ctx, s) {
     button({ label: t('Allow all this period'), size: 'sm', onClick: () => { if (requireAdmin(t('Allow this period'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, rows, 'allow'); } })) : null;
   return card({
     title: manual ? t('Review queue') : t('Suspended at the next run'),
-    subtitle: manual
-      ? t('Users over their cap in this period. A suspension ends automatically when the settlement period resets.')
-      : t('Automatic mode: these users are over their cap and will be suspended by the next enforcement run.'),
+    subtitle: isCredit(policy)
+      ? t('Paid budget spent and nothing free right now. A suspension ends automatically at the weekly reset or on the 1st of the month.')
+      : (manual
+        ? t('Users over their cap in this period. A suspension ends automatically when the settlement period resets.')
+        : t('Automatic mode: these users are over their cap and will be suspended by the next enforcement run.')),
     actions: bulk, flush: true, body: content,
   });
 }
@@ -757,14 +886,21 @@ async function editException(ctx, s, existing) {
   const datalist = h('datalist', { id: listId }, (s.users || []).map((u) => h('option', { value: u.email })));
   const tokenIn = textInput({ value: existing && isNum(existing.tokenCap) ? String(existing.tokenCap) : '', type: 'number', placeholder: t('Default'), attrs: { min: 0, step: 1000 } });
   const reqIn = textInput({ value: existing && isNum(existing.requestCap) ? String(existing.requestCap) : '', type: 'number', placeholder: t('Default'), attrs: { min: 0, step: 10 } });
+  const credit = isCredit(policy);
   const ownCost = existing && isNum(existing.costCap) ? existing.costCap : null;
   const costPick = amountPicker({ value: ownCost || 0, currency: ccy, pricing: policy.pricing, allowDefault: true, isDefault: ownCost === null, defaultLabel: defaultCostLabel(policy, ccy) });
+  const budgetIn = textInput({ value: existing && isNum(existing.paidBudget) ? String(existing.paidBudget) : '', type: 'number', placeholder: t('Default ({v})', { v: budgetText(policy.paidBudgetMonth) }), attrs: { min: 0, step: 10 } });
+  const creditIn = textInput({ value: existing && isNum(existing.creditMonth) ? String(existing.creditMonth) : '', type: 'number', placeholder: t('Default ({v})', { v: usd(policy.creditPerUserMonth) }), attrs: { min: 0, step: 1 } });
   const noteIn = textInput({ value: existing ? existing.note || '' : '', placeholder: t('Reason (optional)'), attrs: { maxlength: 200 } });
   const capsRow = h('div', { class: 'stack' },
-    field({ label: t('Cost cap ({ccy})', { ccy }), help: t('Use default keeps the cost cap of the cap policy.'), control: costPick }),
+    credit
+      ? h('div', { class: 'field-row' },
+        field({ label: t('Paid budget per month (USD)'), help: t('Empty keeps the default. 0 = credits only.'), control: budgetIn }),
+        field({ label: t('Credit per month (USD)'), help: t('Empty keeps the default, for example 15 for a Plus license.'), control: creditIn }))
+      : field({ label: t('Cost cap ({ccy})', { ccy }), help: t('Use default keeps the cost cap of the cap policy.'), control: costPick }),
     h('div', { class: 'field-row' },
-      field({ label: t('Token cap'), control: tokenIn }),
-      field({ label: t('Request cap'), control: reqIn })));
+      field({ label: credit ? t('Token cap per week') : t('Token cap'), control: tokenIn }),
+      field({ label: credit ? t('Request cap per week') : t('Request cap'), control: reqIn })));
   const scopeField = field({
     label: t('Duration'),
     control: selectInput([{ value: 'permanent', label: t('No expiry') }, { value: 'period', label: t('This settlement period only') }], state.scope, (v) => { state.scope = v; }),
@@ -800,7 +936,9 @@ async function editException(ctx, s, existing) {
     if (!EMAIL_RE.test(email)) { err.textContent = t('Enter a valid email address.'); return; }
     const payload = { email, type: state.type, scope: state.type === 'block' ? 'permanent' : state.scope, note: noteIn.value.trim() };
     if (state.type === 'limit') {
-      const caps = { tokenCap: numberOrNull(tokenIn, true), requestCap: numberOrNull(reqIn, true), costCap: costPick.valid() ? costPick.read() : NaN };
+      const caps = credit
+        ? { tokenCap: numberOrNull(tokenIn, true), requestCap: numberOrNull(reqIn, true), paidBudget: numberOrNull(budgetIn, false), creditMonth: numberOrNull(creditIn, false) }
+        : { tokenCap: numberOrNull(tokenIn, true), requestCap: numberOrNull(reqIn, true), costCap: costPick.valid() ? costPick.read() : NaN };
       if (Object.values(caps).some((v) => Number.isNaN(v))) { err.textContent = t('Caps must be numbers of zero or more (token and request caps are whole numbers).'); return; }
       if (Object.values(caps).every((v) => v === null)) { err.textContent = t('Set at least one individual cap.'); return; }
       Object.assign(payload, caps);
@@ -1018,14 +1156,131 @@ function usedPriceTable(pricing, ccy) {
   });
 }
 
+function capModelSelect(value, onChange) {
+  return selectInput([
+    { value: 'credit_budget', label: t('Weekly free credit + monthly paid budget (recommended)') },
+    { value: 'period', label: t('Fixed caps per period') },
+  ], value, onChange, { 'aria-label': t('Caps') });
+}
+
+function tzChoices(workspaceTz, current) {
+  return [...new Set([workspaceTz, current, 'UTC', ...intlValues('timeZone')].filter(Boolean))].map((z) => ({ value: z, label: z === workspaceTz ? `${z} (${t('workspace')})` : z }));
+}
+
+function priceInfoBlock(pricing, ccy) {
+  return h('div', { class: 'stack-sm' },
+    h('div', { class: pricing.configured ? 'fw-600' : 'fw-600 text-warning' }, pricingSummary(pricing, ccy)),
+    h('p', { class: 'muted' }, pricing.source === 'manual'
+      ? t('Entered token prices from Settings > Governance policy are used.')
+      : t('Prices are found automatically: what your billing account actually paid per token in the last 30 days, and the public Google Cloud price list for models without billed usage. Amounts are converted with the Google exchange rate.')));
+}
+
+/** Credit caps: monthly credit (weekly free share for Gemini), a monthly paid budget per person and optionally one for
+ * everyone, all in USD; the weekly reset follows the project's 7-day Antigravity credit cycle. */
+async function editCreditPolicy(ctx, policy) {
+  const workspaceTz = (store.boot && store.boot.workspace && store.boot.workspace.timezone) || 'UTC';
+  const state = {
+    model: 'credit_budget', tz: policy.resetTimezone || workspaceTz,
+    weekday: isNum(policy.resetWeekday) ? policy.resetWeekday : 0, at: policy.resetTime || '00:00',
+    budgetMode: !isNum(policy.paidBudgetMonth) ? 'none' : (policy.paidBudgetMonth === 0 ? 'credits' : 'limit'),
+  };
+  const numIn = (v, step, placeholder) => textInput({ value: isNum(v) ? String(v) : '', type: 'number', placeholder: placeholder || '', attrs: { min: 0, step } });
+  const creditIn = numIn(isNum(policy.creditPerUserMonth) ? policy.creditPerUserMonth : 10, 1);
+  const weeklyNote = h('span', { class: 'cell-sub' });
+  const syncWeekly = () => {
+    const v = Number(creditIn.value);
+    weeklyNote.textContent = creditIn.value.trim() !== '' && Number.isFinite(v) && v >= 0 ? t('{w} free per person per week (Gemini models only)', { w: usd(v / 4) }) : '';
+  };
+  creditIn.addEventListener('input', syncWeekly);
+  const preset = (label, v) => button({ label, size: 'sm', onClick: () => { creditIn.value = String(v); syncWeekly(); } });
+  const budgetIn = numIn(state.budgetMode === 'limit' ? policy.paidBudgetMonth : 100, 10);
+  budgetIn.hidden = state.budgetMode !== 'limit';
+  const budgetSeg = segmented([
+    { value: 'none', label: t('No limit') }, { value: 'credits', label: t('Credits only') }, { value: 'limit', label: t('Monthly limit') },
+  ], state.budgetMode, (v) => { state.budgetMode = v; budgetIn.hidden = v !== 'limit'; });
+  const orgIn = numIn(policy.orgPaidBudgetMonth, 10, t('No limit'));
+  const weekdaySel = selectInput(WEEKDAYS.map((d, i) => ({ value: String(i), label: t(d) })), String(state.weekday), (v) => { state.weekday = Number(v); });
+  const timeIn = textInput({ value: state.at, attrs: { placeholder: '00:00', maxlength: 5, inputmode: 'numeric' } });
+  const tokenIn = textInput({ value: isNum(policy.tokenCap) ? String(policy.tokenCap) : '0', type: 'number', attrs: { min: 0, step: 1000 } });
+  const reqIn = textInput({ value: isNum(policy.requestCap) ? String(policy.requestCap) : '0', type: 'number', attrs: { min: 0, step: 10 } });
+  const how = h('ul', { class: 'muted stack-sm' },
+    h('li', null, t('Each person can use the weekly free credit for Gemini models. Claude is always paid.')),
+    h('li', null, t('Paid usage counts against the monthly paid budget. While budget is left, nobody is stopped.')),
+    h('li', null, t('When the budget is spent, the person is stopped once nothing is free: the week\'s free credit is used up, or they pay again.')),
+    h('li', null, t('They are restored automatically at the weekly reset (new free credit) and on the 1st of the month (new budget). Nobody is stopped permanently.')));
+  const err = h('div', { class: 'field-error' });
+  const save = button({ label: t('Save policy'), variant: 'primary' });
+  syncWeekly();
+  const m = openModal({
+    title: t('Edit cap policy'),
+    subtitle: t('Amounts are in USD, like the Antigravity credit. Give specific people a different budget from the Paid budget column or with exception rules.'),
+    wide: true,
+    body: (el) => append(el, [
+      field({ label: t('Caps'), control: capModelSelect(state.model, (v) => { state.model = v; }) }),
+      h('div', { class: 'field-row' },
+        field({ label: t('Credit per person per month (USD)'), help: t('Gemini Enterprise Standard 10, Plus 15. Google applies a quarter of it every 7 days.'), control: h('div', { class: 'stack-sm' }, creditIn, h('div', { class: 'row' }, preset(t('Standard {v}', { v: '$10' }), 10), preset(t('Plus {v}', { v: '$15' }), 15)), weeklyNote) }),
+        field({ label: t('Paid budget per person per month (USD)'), help: t('Claude and Gemini beyond the free credit. Credits only = no paid usage.'), control: h('div', { class: 'stack-sm' }, budgetSeg, budgetIn) })),
+      h('div', { class: 'field-row' },
+        field({ label: t('Paid budget for everyone per month (USD)'), help: t('Optional. When everyone together has spent it, everyone is credits only until the 1st. Empty = no limit.'), control: orgIn }),
+        field({ label: t('Reset time zone'), control: selectInput(tzChoices(workspaceTz, state.tz), state.tz, (v) => { state.tz = v; }) })),
+      h('div', { class: 'field-row' },
+        field({ label: t('Weekly reset day'), help: t('The project\'s 7-day Antigravity credit cycle starts at its first request; use the same day and time.'), control: weekdaySel }),
+        field({ label: t('Reset time'), help: t('HH:MM in the reset time zone'), control: timeIn })),
+      h('div', { class: 'field-row' },
+        field({ label: t('Token cap per user per week'), help: t('Optional. 0 disables it.'), control: tokenIn }),
+        field({ label: t('Request cap per user per week'), help: t('Optional. 0 disables it.'), control: reqIn })),
+      field({ label: t('How it works'), control: how }),
+      field({ label: t('Token prices'), control: priceInfoBlock(policy.pricing || {}, 'USD') }),
+      err]),
+    footer: (el) => append(el, [button({ label: t('Cancel'), onClick: () => m.close() }), save]),
+  });
+  save.addEventListener('click', async () => {
+    err.textContent = '';
+    const amount = (input) => (input.value.trim() === '' ? NaN : Number(input.value));
+    const creditVal = amount(creditIn);
+    if (!Number.isFinite(creditVal) || creditVal < 0) { err.textContent = t('Enter the credit as a number of zero or more.'); return; }
+    let budget = -1;
+    if (state.budgetMode === 'credits') budget = 0;
+    if (state.budgetMode === 'limit') {
+      budget = amount(budgetIn);
+      if (!Number.isFinite(budget) || budget < 0) { err.textContent = t('Enter the paid budget as a number of zero or more.'); return; }
+    }
+    let org = -1;
+    if (orgIn.value.trim() !== '') {
+      org = amount(orgIn);
+      if (!Number.isFinite(org) || org < 0) { err.textContent = t('Enter the paid budget as a number of zero or more.'); return; }
+    }
+    const tc = Number(tokenIn.value);
+    const rc = Number(reqIn.value);
+    if (!Number.isInteger(tc) || tc < 0 || !Number.isInteger(rc) || rc < 0) { err.textContent = t('Caps must be whole numbers of zero or more.'); return; }
+    const at = String(timeIn.value || '').trim();
+    if (!/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(at)) { err.textContent = t('Enter the reset time as HH:MM, for example 09:00.'); return; }
+    const values = {
+      cap_model: state.model, credit_per_user_month: creditVal, paid_budget_month: budget, org_paid_budget_month: org,
+      reset_timezone: state.tz, reset_weekday: state.weekday, reset_time: at, token_cap: tc, request_cap: rc,
+    };
+    setBusy(save, true, t('Saving'));
+    try {
+      await api.post('/api/v1/settings', { section: 'governance', values });
+      toast({ title: t('Cap policy saved'), tone: 'success' });
+      m.close();
+      ctx.rerender();
+    } catch (e) {
+      setBusy(save, false);
+      err.textContent = errorText(e);
+    }
+  });
+}
+
 /** Default caps. The administrator sets amounts only; token prices are found automatically. */
 async function editPolicy(ctx, policy) {
+  if (isCredit(policy)) { editCreditPolicy(ctx, policy); return; }
   const pricing = policy.pricing || {};
   const workspaceTz = (store.boot && store.boot.workspace && store.boot.workspace.timezone) || 'UTC';
   const saved = typeof policy.currencySetting === 'string' ? policy.currencySetting : ccyOf(policy);
   const state = {
     period: policy.period || 'weekly', window: policy.window || 'calendar', tz: policy.resetTimezone || workspaceTz, currency: saved,
-    weekday: isNum(policy.resetWeekday) ? policy.resetWeekday : 0, at: policy.resetTime || '00:00',
+    weekday: isNum(policy.resetWeekday) ? policy.resetWeekday : 0, at: policy.resetTime || '00:00', model: 'period',
   };
   const shownCcy = () => state.currency || (saved ? 'USD' : ccyOf(policy));
   const num = (v, step, min = 0) => textInput({ value: isNum(v) ? String(v) : '0', type: 'number', attrs: { min, step } });
@@ -1084,6 +1339,7 @@ async function editPolicy(ctx, policy) {
     subtitle: t('Caps apply to each person within the settlement period. Give specific people a different amount from the Cost cap column of the usage table or with exception rules.'),
     wide: true,
     body: (el) => append(el, [
+      field({ label: t('Caps'), help: t('Choose the credit caps to give everyone the weekly free credit and a monthly paid budget in USD.'), control: capModelSelect(state.model, (v) => { state.model = v; }) }),
       h('div', { class: 'field-row' },
         field({ label: t('Cost cap per person'), help: t('Users above this estimated cost are suspended (automatic mode) or queued for review.'), control: h('div', { class: 'stack-sm' }, costHost, creditBtn) }),
         field({ label: t('Currency'), help: t('Cost caps and estimates are shown in this currency'), control: currencySel })),
@@ -1112,6 +1368,7 @@ async function editPolicy(ctx, policy) {
     const values = {
       token_cap: tc, request_cap: rc, cost_cap: cost.read() || 0, currency: state.currency,
       period: state.period, window: state.window, reset_timezone: state.tz, reset_weekday: state.weekday, reset_time: at,
+      cap_model: state.model,
     };
     setBusy(save, true, t('Saving'));
     try {
@@ -1132,7 +1389,66 @@ function defaultCostLabel(policy, ccy) {
   return t('Default ({v})', { v: policy.costCap ? fmt.currency(policy.costCap, ccy) : t('no cost cap') });
 }
 
+async function editPersonBudget(ctx, s, user) {
+  const policy = s.policy || {};
+  const rule = user.exception;
+  const isLimit = rule && rule.type === 'limit';
+  const own = isLimit && isNum(rule.paidBudget) ? rule.paidBudget : null;
+  const state = { mode: own === null ? 'default' : (own === 0 ? 'credits' : 'limit') };
+  const fallback = isNum(policy.paidBudgetMonth) && policy.paidBudgetMonth > 0 ? policy.paidBudgetMonth : 100;
+  const amountIn = textInput({ value: String(own || fallback), type: 'number', attrs: { min: 0, step: 10 } });
+  amountIn.hidden = state.mode !== 'limit';
+  const seg = segmented([
+    { value: 'default', label: t('Default ({v})', { v: budgetText(policy.paidBudgetMonth) }) },
+    { value: 'credits', label: t('Credits only') },
+    { value: 'limit', label: t('Individual limit') },
+  ], state.mode, (v) => { state.mode = v; amountIn.hidden = v !== 'limit'; });
+  const c = user.credit;
+  const usage = c ? t('Paid this month {p} \u00b7 free credit this week {f} of {w}', { p: usd(c.paidMonth), f: usd(c.freeUsedWeek), w: usd(c.creditWeek) }) : null;
+  const err = h('div', { class: 'field-error' });
+  const save = button({ label: t('Save'), variant: 'primary' });
+  const m = openModal({
+    title: t('Paid budget for {email}', { email: user.email }),
+    subtitle: t('Default for everyone: {v}', { v: budgetText(policy.paidBudgetMonth) }),
+    body: (el) => append(el, [
+      rule && !isLimit ? banner({ tone: 'info', text: t('This person has an exception rule ({rule}). Saving an individual budget replaces it.', { rule: ruleBadge(rule).textContent }) }) : null,
+      field({ label: t('Paid budget per month (USD)'), help: usage, control: h('div', { class: 'stack-sm' }, seg, amountIn) }),
+      err]),
+    footer: (el) => append(el, [button({ label: t('Cancel'), onClick: () => m.close() }), save]),
+  });
+  save.addEventListener('click', async () => {
+    err.textContent = '';
+    let amount = null;
+    if (state.mode === 'credits') amount = 0;
+    if (state.mode === 'limit') {
+      amount = amountIn.value.trim() === '' ? NaN : Number(amountIn.value);
+      if (!Number.isFinite(amount) || amount < 0) { err.textContent = t('Enter the paid budget as a number of zero or more.'); return; }
+    }
+    setBusy(save, true, t('Saving'));
+    try {
+      const keepOther = isLimit && (isNum(rule.tokenCap) || isNum(rule.requestCap) || isNum(rule.creditMonth) || isNum(rule.costCap));
+      if (amount === null && !keepOther) {
+        if (isLimit) await api.post('/api/v1/governance/antigravity/exceptions/delete', { email: user.email });
+      } else {
+        await api.post('/api/v1/governance/antigravity/exceptions', {
+          email: user.email, type: 'limit', scope: isLimit && rule.scope === 'period' ? 'period' : 'permanent',
+          tokenCap: isLimit ? rule.tokenCap : null, requestCap: isLimit ? rule.requestCap : null,
+          costCap: isLimit ? rule.costCap : null, creditMonth: isLimit ? rule.creditMonth : null, paidBudget: amount,
+          note: isLimit && rule.note ? rule.note : t('Individual paid budget'),
+        });
+      }
+      toast({ title: t('Paid budget saved'), text: amount === null ? t('{email} uses the default budget.', { email: user.email }) : t('{email}: {v}', { email: user.email, v: budgetText(amount) }), tone: 'success' });
+      m.close();
+      ctx.rerender();
+    } catch (e) {
+      setBusy(save, false);
+      err.textContent = errorText(e);
+    }
+  });
+}
+
 async function editPersonCap(ctx, s, user) {
+  if (isCredit(s.policy)) { editPersonBudget(ctx, s, user); return; }
   const policy = s.policy || {};
   const ccy = ccyOf(policy);
   const rule = user.exception;

@@ -35,7 +35,8 @@ const TEMPLATES = [
   // Safety gates
   [/^(\d+) of (\d+) users have a determinate state\.$/, '{a} of {b} users have a determinate state.'],
   [/^(\d+) inference log records in the window\.$/, '{a} inference log records in the window.'],
-  [/^(\d+) planned changes; budget is (\d+)\.$/, '{a} planned changes; budget is {b}.'],
+  [/^(\d+) planned suspensions; budget is (\d+) per run\.$/, '{a} planned suspensions; budget is {b} per run.'],
+  [/^(\d+) planned suspensions; budget is (\d+) per run, so (\d+) wait for the next run\.$/, '{a} planned suspensions; budget is {b} per run, so {c} wait for the next run.'],
   [/^No group or domain grants on (\S+)\.$/, 'No group or domain grants on {a}.'],
   [/^(\d+) group or domain grant\(s\) on (\S+); affected users are not enforceable\.$/, '{a} group or domain grant(s) on {b}; affected users are not enforceable.'],
   // Governance results

@@ -290,7 +290,20 @@ function renderUserDetail(drawer, d, meta, onChanged) {
   if (d.iam) body.append(iamCard(drawer, d, onChanged));
 }
 
-const CAP_REASON_LABELS = { tokens: 'Tokens', requests: 'Requests', cost: 'Estimated cost' };
+const CAP_REASON_LABELS = {
+  tokens: 'Tokens', requests: 'Requests', cost: 'Estimated cost',
+  budget: 'Paid budget spent', credit: 'Weekly free credit used up', paid: 'Paid usage this week',
+};
+
+function usdText(v) {
+  return fmt.currency(v, 'USD', { precise: true });
+}
+
+/** Credit caps: a paid budget, null = no limit, 0 = credits only. */
+function budgetLabel(b) {
+  if (!isNum(b)) return t('No limit');
+  return b === 0 ? t('Credits only') : usdText(b);
+}
 
 function capRuleText(rule) {
   if (!rule) return null;
@@ -317,8 +330,10 @@ function iamCard(drawer, d, onChanged) {
       kv([
         [t('State'), iamBadge(iam)],
         iam.reason ? [t('Reason'), reasonLabel(iam.reason)] : null,
-        isNum(iam.capUsage) ? [t('Cap usage'), `${fmt.pct(iam.capUsage, 0)}${reasons ? ` \u00b7 ${t('cap reached: {r}', { r: reasons })}` : ''}`] : null,
-        isNum(iam.estimatedCost) ? [t('Estimated cost'), fmt.currency(iam.estimatedCost, ccy, { precise: true })] : null,
+        iam.credit ? [t('Free credit this week'), `${usdText(iam.credit.freeUsedWeek)} / ${usdText(iam.credit.creditWeek)}`] : null,
+        iam.credit ? [t('Paid this month'), `${usdText(iam.credit.paidMonth)} / ${budgetLabel(iam.credit.budget)}${reasons ? ` \u00b7 ${reasons}` : ''}`] : null,
+        !iam.credit && isNum(iam.capUsage) ? [t('Cap usage'), `${fmt.pct(iam.capUsage, 0)}${reasons ? ` \u00b7 ${t('cap reached: {r}', { r: reasons })}` : ''}`] : null,
+        !iam.credit && isNum(iam.estimatedCost) ? [t('Estimated cost'), fmt.currency(iam.estimatedCost, ccy, { precise: true })] : null,
         iam.exception ? [t('Exception rule'), `${capRuleText(iam.exception)}${iam.exception.until ? ` \u00b7 ${t('Until {time}', { time: fmt.dateTime(iam.exception.until) })}` : ''}`] : null,
         iam.restoreAt ? [t('Access returns'), `${fmt.dateTime(iam.restoreAt)} (${fmt.relative(iam.restoreAt)})`] : null,
       ]),

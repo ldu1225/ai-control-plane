@@ -163,6 +163,17 @@ DEFAULTS = {
             # 10, Plus 15; enforced weekly as a shared pool of credit / 4 x seats). Used by the
             # credit-based cap preset and the monthly billing report.
             "credit_per_user_month": 10.0,
+            # How caps work. credit_budget: each person has a weekly free share of that credit for Gemini models
+            # (third-party models such as Claude are always paid) and a monthly paid budget in USD; a person whose
+            # paid budget is spent is stopped only while nothing is free (the week's share is used up or they pay
+            # again) and is restored at the next weekly reset or month start. period: the fixed token, request and
+            # cost caps per settlement period above. Empty (default) = credit_budget, except that an installation
+            # from before credit caps with fixed caps already set keeps period until an administrator chooses.
+            "cap_model": "",
+            "paid_budget_month": -1.0,       # USD per person and month beyond the free credit; -1 = no limit,
+                                             # 0 = credits only
+            "org_paid_budget_month": -1.0,   # USD for everyone together; when spent, everyone is credits only
+            "credit_model_prefixes": ["gemini"],   # model ids that draw on the included credit
             # Service accounts allowed to call the enforcement endpoint with a Google OIDC token
             # (Cloud Scheduler). Configured in config.yaml or SCHEDULER_INVOKERS only.
             "scheduler_invokers": [],
@@ -389,6 +400,9 @@ def _text(max_len, allow_empty=True):
             raise Invalid("must not contain control characters")
         return value
     return check
+
+
+MODEL_PREFIX_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 def _int(lo, hi):
@@ -737,6 +751,10 @@ VALIDATORS = {
     "governance.antigravity.reset_weekday": _int(0, 6),
     "governance.antigravity.reset_time": _pred(lambda v: bool(TIME_OF_DAY_RE.match(str(v or ""))), "time as HH:MM"),
     "governance.antigravity.credit_per_user_month": _float(0, 1e6),
+    "governance.antigravity.cap_model": _enum("", "credit_budget", "period"),
+    "governance.antigravity.paid_budget_month": _float(-1, 1e9),
+    "governance.antigravity.org_paid_budget_month": _float(-1, 1e9),
+    "governance.antigravity.credit_model_prefixes": _list(_regex(MODEL_PREFIX_RE, "model id prefix", lower=True), 20),
     "governance.antigravity.scheduler_invokers": _list(_regex(EMAIL_RE, "service account email", lower=True), 10),
     "analyst.max_bytes_billed": _int(10000000, 10 ** 13),
     "analyst.max_rows": _int(1, 5000),

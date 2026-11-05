@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Unified test runner for AI Control Plane:
-#   ./scripts/test.sh                                         # all offline suites (unit, bash -n, prepublish, analyst validate)
+#   ./scripts/test.sh                                         # all offline suites (unit, bash -n, prepublish, analyst validate,
+#                                                             # Antigravity credit caps drill)
 #   ./scripts/test.sh --live --project PROJECT_ID [--mutate]  # plus full live Cloud Run E2E & exception verification
 
 set -euo pipefail
@@ -25,6 +26,7 @@ Default (no flags):
     2. Shell syntax checks (bash -n scripts/*.sh scripts/lib/*.sh)
     3. Prepublish security/leak scan (python3 scripts/prepublish_scan.py)
     4. AI Analyst golden dataset validation (python3 eval/analyst/run_eval.py validate)
+    5. Antigravity credit caps drill: a simulated month of scheduled enforcement (python3 scripts/caps_drill.py)
 
 Live E2E options:
   --live                 Verify a deployed Cloud Run service end-to-end
@@ -59,20 +61,27 @@ done
 cd "$ROOT"
 
 if [[ "$SKIP_OFFLINE" != "1" ]]; then
-  echo "==> [1/4] Unit tests"
+  echo "==> [1/5] Unit tests"
   python3 -m unittest discover -s tests/unit -v
 
-  echo "==> [2/4] Shell script syntax (bash -n)"
+  echo "==> [2/5] Shell script syntax (bash -n)"
   for f in scripts/install.sh scripts/deploy.sh scripts/prepare.sh scripts/teardown.sh scripts/test.sh scripts/lib/common.sh; do
     bash -n "$f"
   done
   echo "    OK: all shell scripts parsed cleanly"
 
-  echo "==> [3/4] Prepublish security scan"
+  echo "==> [3/5] Prepublish security scan"
   python3 scripts/prepublish_scan.py
 
-  echo "==> [4/4] AI Analyst golden dataset validation"
+  echo "==> [4/5] AI Analyst golden dataset validation"
   python3 eval/analyst/run_eval.py validate
+
+  echo "==> [5/5] Antigravity credit caps drill (a month of scheduled enforcement, rules R1-R6)"
+  DRILL_OUT="$(mktemp)"
+  python3 scripts/caps_drill.py --start 2026-11-01 --days 38 --fast --lang en > "$DRILL_OUT" || {
+    cat "$DRILL_OUT"; rm -f "$DRILL_OUT"; exit 1; }
+  tail -9 "$DRILL_OUT"
+  rm -f "$DRILL_OUT"
 fi
 
 if [[ "$LIVE" == "1" ]]; then

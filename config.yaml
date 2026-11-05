@@ -154,7 +154,15 @@ governance:
     token_cap: 0                  # 0 = disabled (all caps are off until an administrator sets one)
     request_cap: 0                # 0 = disabled
     credit_per_user_month: 10     # Antigravity credit per licensed user and month in USD (Standard 10, Plus 15);
-                                  # used by the credit-based cap preset and the monthly usage report
+                                  # Gemini Enterprise enforces it per 7 days as credit / 4 per person
+    cap_model: ""                 # credit_budget = weekly free credit (Gemini models) + monthly paid budget per
+                                  # person in USD; period = the fixed token / request / cost caps per period;
+                                  # empty = credit_budget, except installations from before credit caps that already
+                                  # set fixed caps keep period until an administrator chooses (upgrades drop no caps)
+    paid_budget_month: -1         # USD per person and month beyond the free credit (Claude is always paid);
+                                  # -1 = no limit, 0 = credits only. A person whose budget is spent is stopped only
+                                  # while nothing is free and is restored at the next weekly reset or month start
+    org_paid_budget_month: -1     # USD for everyone together; when spent, everyone is credits only; -1 = no limit
     cost_cap: 0                   # amount per person and period in `currency`, e.g. 1000000 (KRW); 0 = disabled
     currency: ""                  # ISO code of cost caps, e.g. KRW; empty = billing account currency
     pricing_source: "auto"        # auto = price per token the billing account paid (last 30 days), then the

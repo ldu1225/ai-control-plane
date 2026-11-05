@@ -75,6 +75,38 @@ class FrontendHygieneTest(unittest.TestCase):
                     missing.append((js_file.name, key))
         self.assertEqual(missing, [], f"Missing Korean translations in ko.js: {missing[:15]}")
 
+    def test_labels_in_constant_maps_and_server_templates_are_translated(self):
+        """Labels reach t() through constant maps (t(REASON_LABELS[r])) and server text through the templates of
+        core/messages.js; the t('literal') scan above cannot see either."""
+        keys = set(_extract_ko_keys(KO_PATH.read_text(encoding="utf-8")))
+        str_re = re.compile(r"(['\"])((?:\\.|(?!\1)[^\n])*)\1")
+        maps = {
+            "pages/antigravity.js": ("GATE_TEXT", "REASON_LABELS", "TRIGGER_LABELS", "RULE_HINTS", "PERIODS", "WEEKDAYS"),
+            "pages/_shared.js": ("CAP_REASON_LABELS",),
+        }
+        missing = []
+        for rel, names in maps.items():
+            src = (JS_ROOT / rel).read_text(encoding="utf-8")
+            for name in names:
+                m = re.search(r"^const %s = (.*?);$" % name, src, re.MULTILINE | re.DOTALL)
+                self.assertIsNotNone(m, f"{name} not found in {rel}")
+                for sm in str_re.finditer(m.group(1)):
+                    text = _unescape_js(sm.group(2))
+                    # Identifiers (period ids, gate ids) are not shown; labels start upper-case or contain a space.
+                    if (text[:1].isupper() and not re.fullmatch(r"[A-Z0-9_]+", text)) or " " in text:
+                        if text not in keys:
+                            missing.append((rel, name, text))
+        messages = (JS_ROOT / "core" / "messages.js").read_text(encoding="utf-8")
+        for m in re.finditer(r",\s*(['\"])((?:\\.|(?!\1)[^\n])*)\1\],\s*$", messages, re.MULTILINE):
+            text = _unescape_js(m.group(2))
+            if text not in keys:
+                missing.append(("core/messages.js", "TEMPLATES", text))
+        for m in re.finditer(r"^\s+\w+: (['\"])((?:\\.|(?!\1)[^\n])*)\1,\s*$", messages, re.MULTILINE):
+            text = _unescape_js(m.group(2))
+            if text not in keys:
+                missing.append(("core/messages.js", "CODES", text))
+        self.assertEqual(missing, [], f"Missing Korean translations in ko.js: {missing[:15]}")
+
 
 if __name__ == "__main__":
     unittest.main()

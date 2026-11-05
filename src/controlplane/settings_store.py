@@ -44,7 +44,7 @@ MAX_GOVERNANCE_ENTRIES = 5000
 REVOCATION_RETENTION_MS = 8 * 24 * 3600 * 1000  # longer than the maximum session lifetime (7 days)
 EXCEPTION_TYPES = ("allow", "block", "limit")
 SUSPENSION_TRIGGERS = ("auto", "review", "admin", "bulk")
-CAP_REASONS = ("tokens", "requests", "cost")
+CAP_REASONS = ("tokens", "requests", "cost", "budget", "credit", "paid")
 
 
 def _valid_account_key(key):
@@ -133,6 +133,8 @@ def sanitize_governance(state):
             "tokenCap": _opt_num(item.get("tokenCap"), 0, 10 ** 12, integer=True) if kind == "limit" else None,
             "requestCap": _opt_num(item.get("requestCap"), 0, 10 ** 9, integer=True) if kind == "limit" else None,
             "costCap": _opt_num(item.get("costCap"), 0, 1e9) if kind == "limit" else None,
+            "paidBudget": _opt_num(item.get("paidBudget"), 0, 1e9) if kind == "limit" else None,
+            "creditMonth": _opt_num(item.get("creditMonth"), 0, 1e6) if kind == "limit" else None,
             "note": str(item.get("note") or "")[:200], "createdBy": str(item.get("createdBy") or "")[:200],
             "createdAt": _opt_str(item.get("createdAt"))})
     suspensions = []
@@ -148,7 +150,7 @@ def sanitize_governance(state):
         suspensions.append({
             "email": email, "since": _opt_str(item.get("since")), "until": _opt_str(item.get("until")),
             "trigger": trigger, "by": str(item.get("by") or "")[:200],
-            "reasons": [r for r in item.get("reasons") or [] if r in CAP_REASONS][:3],
+            "reasons": [r for r in item.get("reasons") or [] if r in CAP_REASONS][:6],
             "tokens": _opt_num(item.get("tokens"), 0, 10 ** 15, integer=True),
             "requests": _opt_num(item.get("requests"), 0, 10 ** 12, integer=True),
             "cost": _opt_num(item.get("cost"), 0, 1e12)})

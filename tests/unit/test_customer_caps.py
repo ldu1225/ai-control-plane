@@ -296,7 +296,8 @@ class DeployDefaultsTest(unittest.TestCase):
 
     def test_enforcement_schedule_and_marker_roles_by_default(self):
         res = self.deploy("--project", "demo-hub-proj")
-        self.assertIn("Antigravity caps: enforcement runs */15 * * * *", res.stdout)
+        # Every 5 minutes: a person over the limits is stopped within 5 minutes and restored soon after each reset.
+        self.assertIn("Antigravity caps: enforcement runs */5 * * * *", res.stdout)
         self.assertIn("scheduler jobs create http ai-control-plane-enforce", res.stderr)
         self.assertIn("[dry-run] Antigravity marker roles CustomAntigravityCapBlocked and "
                       "CustomAntigravityAdminBlocked in demo-hub-proj", res.stdout)
@@ -305,13 +306,13 @@ class DeployDefaultsTest(unittest.TestCase):
         res = self.deploy("--project", "demo-hub-proj", "--no-enforcement-schedule")
         self.assertIn("Antigravity caps: no enforcement schedule", res.stdout)
         self.assertNotIn("ai-control-plane-enforce", res.stderr)
-        res = self.deploy("--project", "demo-hub-proj", "--enforcement-schedule", "*/5 * * * *")
-        self.assertIn("enforcement runs */5 * * * *", res.stdout)
+        res = self.deploy("--project", "demo-hub-proj", "--enforcement-schedule", "*/15 * * * *")
+        self.assertIn("enforcement runs */15 * * * *", res.stdout)
         res = self.deploy(config_text='ENFORCEMENT_SCHEDULE="off"\n')
         self.assertIn("no enforcement schedule", res.stdout)
         # Older deploy.env files carried ENFORCEMENT_SCHEDULE="": that keeps the default instead of turning it off.
         res = self.deploy(config_text='ENFORCEMENT_SCHEDULE=""\n')
-        self.assertIn("enforcement runs */15 * * * *", res.stdout)
+        self.assertIn("enforcement runs */5 * * * *", res.stdout)
 
     def test_read_only_and_iap_installs_skip_the_default_schedule_without_failing(self):
         res = self.deploy("--project", "demo-hub-proj", "--read-only")

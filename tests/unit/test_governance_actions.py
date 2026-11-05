@@ -153,14 +153,48 @@ class CapTest(unittest.TestCase):
         self.assertTrue(all(c["status"] == "failed" for c in out["changes"]))
         self.assertEqual(h.write_audit.call_args.args[2]["result"], "failed")
 
-    def test_change_budget_gate_aborts(self):
+    def test_change_budget_gate_defers_suspensions_but_restores(self):
         with Harness() as h:
-            out = gov.cap(self.ctx(change_budget_min=0, change_budget_ratio=0.1))
-        h.set_policy.assert_not_called()
-        self.assertTrue(out["plan"]["aborted"])
-        self.assertIn("G4_CHANGE_BUDGET", out["plan"]["abortReason"])
-        self.assertTrue(all(c["status"] == "skipped" for c in out["changes"]))
-        self.assertEqual(h.write_audit.call_args.args[2]["result"], "aborted")
+            out = gov.cap(self.ctx(change_budget_min=0, change_budget_ratio=0.0))
+        self.assertFalse(out["plan"]["aborted"])
+        self.assertTrue(out["plan"]["deferredBlocks"])
+        g4 = next(g for g in out["gates"] if g["id"] == "G4_CHANGE_BUDGET")
+        self.assertEqual(g4["status"], "warn")
+        deferred = [c for c in out["changes"] if c["status"] == "skipped"]
+        self.assertTrue(deferred)
+        self.assertTrue(all(c["action"] == "block" and c["message"].startswith("Deferred") for c in deferred))
+        # The suspended user below the caps is still restored in the same run.
+        applied = [(c["email"], c["action"]) for c in out["changes"] if c["status"] == "applied"]
+        self.assertEqual(applied, [("capped@example.com", "restore")])
+        written = h.written_policies()[0]
+        self.assertIn("user:capped@example.com", members(written, ACCESS_ROLE))
+        self.assertNotIn("user:capped@example.com", members(written, CAP_MARKER))
+        for c in deferred:   # deferred suspensions leave access untouched in this run
+            self.assertNotIn("user:%s" % c["email"], members(written, CAP_MARKER))
+        self.assertEqual(h.write_audit.call_args.args[2]["result"], "partial")
+
+    def test_change_budget_suspends_the_furthest_over_first_and_the_rest_next_run(self):
+        pol = {"version": 3, "etag": "BwX1", "bindings": [
+            {"role": ACCESS_ROLE, "members": ["user:a@example.com", "user:b@example.com", "user:c@example.com"]}]}
+        usage = make_usage([("c@example.com", 600000, 5), ("a@example.com", 900000, 5), ("b@example.com", 700000, 5)])
+        with Harness(policies=[pol], usage=usage) as h:
+            out = gov.cap(self.ctx(change_budget_min=2, change_budget_ratio=0.0))
+        g4 = next(g for g in out["gates"] if g["id"] == "G4_CHANGE_BUDGET")
+        self.assertEqual(g4["status"], "warn")
+        self.assertFalse(out["plan"]["aborted"])
+        self.assertEqual(sorted(c["email"] for c in out["changes"] if c["status"] == "applied"),
+                         ["a@example.com", "b@example.com"])   # token cap 500000: a 1.8x, b 1.4x, c 1.2x
+        self.assertEqual([c["email"] for c in out["changes"] if c["status"] == "skipped"], ["c@example.com"])
+        written = h.written_policies()[0]
+        self.assertEqual(members(written, CAP_MARKER), {"user:a@example.com", "user:b@example.com"})
+        # The next run (the scheduler calls every few minutes) suspends the one that waited.
+        with Harness(policies=[written], usage=usage) as h2:
+            out2 = gov.cap(self.ctx(change_budget_min=2, change_budget_ratio=0.0))
+        self.assertEqual([(c["email"], c["action"], c["status"]) for c in out2["changes"]],
+                         [("c@example.com", "block", "applied")])
+        self.assertEqual(next(g for g in out2["gates"] if g["id"] == "G4_CHANGE_BUDGET")["status"], "pass")
+        self.assertEqual(members(h2.written_policies()[0], CAP_MARKER),
+                         {"user:a@example.com", "user:b@example.com", "user:c@example.com"})
 
     def test_unreadable_policy_aborts(self):
         with Harness(policies=[GcpError("denied", status=403)]) as h:

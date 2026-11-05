@@ -24,8 +24,8 @@
 #   --service-name NAME     Cloud Run service name (default: ai-control-plane)
 #   --billing-account ID    Cloud Billing account ID to link if the project is unbilled
 #   --read-only             Skip IAM governance write roles (ENABLE_GOVERNANCE_ACTIONS=false)
-#   --enforcement-schedule CRON  Antigravity cap enforcement runs (default */15 * * * *: restores suspended
-#                           users at each period reset; suspends over-cap users only in automatic mode)
+#   --enforcement-schedule CRON  Antigravity cap enforcement runs (default */5 * * * *: restores suspended
+#                           users at each reset; suspends over-cap users only in automatic mode)
 #   --no-enforcement-schedule    No scheduled runs (enforce from the dashboard after every period reset)
 #   --no-data-access-logs   Skip enabling Data Access audit logs
 #   --no-log-prompts        Turn on Gemini Enterprise usage logs without prompt/response logging (sensitiveLoggingEnabled)
@@ -233,7 +233,7 @@ ENABLE_GOVERNANCE_ACTIONS="${ENABLE_GOVERNANCE_ACTIONS:-true}"
 ENFORCEMENT_SCHEDULE_EXPLICIT=0
 [[ -n "$(trim_ws "${ENFORCEMENT_SCHEDULE:-}")" ]] && ENFORCEMENT_SCHEDULE_EXPLICIT=1
 ENFORCEMENT_SCHEDULE="$(trim_ws "${ENFORCEMENT_SCHEDULE:-}")"
-[[ -n "$ENFORCEMENT_SCHEDULE" ]] || ENFORCEMENT_SCHEDULE="*/15 * * * *"
+[[ -n "$ENFORCEMENT_SCHEDULE" ]] || ENFORCEMENT_SCHEDULE="*/5 * * * *"
 case "$ENFORCEMENT_SCHEDULE" in off|none) ENFORCEMENT_SCHEDULE="" ;; esac
 # Scheduler tick for scheduled work: the daily official price and exchange-rate check (at pricing.sync_time, default
 # 00:00 in the workspace timezone; a setting, not a cron here) and the telemetry route budget guard. "off" disables it.
@@ -309,7 +309,7 @@ if [[ "$MAINTENANCE_SCHEDULE" != "off" ]]; then
 fi
 if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
   read -r -a _cron_fields <<<"$ENFORCEMENT_SCHEDULE"
-  [[ "${#_cron_fields[@]}" -eq 5 ]] || die "ENFORCEMENT_SCHEDULE must be a 5-field cron expression (for example */15 * * * *) or off"
+  [[ "${#_cron_fields[@]}" -eq 5 ]] || die "ENFORCEMENT_SCHEDULE must be a 5-field cron expression (for example */5 * * * *) or off"
   if [[ "$ENABLE_GOVERNANCE_ACTIONS" != "true" ]]; then
     [[ "$ENFORCEMENT_SCHEDULE_EXPLICIT" == "1" ]] && die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
     ENFORCEMENT_SCHEDULE=""  # read-only install: nothing is ever suspended, so there is nothing to restore
