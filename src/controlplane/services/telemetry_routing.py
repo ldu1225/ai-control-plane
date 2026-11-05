@@ -257,8 +257,17 @@ def exported_bytes_today(ctx, project, tz_name, now=None):
 # ---------------------------------------------------------------------------
 
 def _dataset_location(ctx, pol):
+    """Location for a new routing dataset: the setting, else the audit dataset's own location (read from the dataset
+    itself, so it works while the dataset is still empty on a new project), else a table-based guess, else US.
+    Organizations that restrict resource locations reject a dataset created outside the allowed region."""
     if pol["datasetLocation"]:
         return pol["datasetLocation"]
+    try:
+        meta = ctx.rest("GET", "%s/projects/%s/datasets/%s" % (BQ_V2, ctx.project, ctx.audit_dataset))
+        if isinstance(meta, dict) and meta.get("location"):
+            return meta["location"]
+    except Exception:  # pylint: disable=broad-except
+        pass
     try:
         loc = ctx.registry.dataset_location(ctx.project, ctx.audit_dataset, ctx.quota_project)
     except Exception:  # pylint: disable=broad-except

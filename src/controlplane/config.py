@@ -956,6 +956,7 @@ ENV_MAP = {
     "PRICING_SYNC_TIME": "pricing.sync_time",
     "TELEMETRY_AI_MODEL": "telemetry.ai.model",
     "TELEMETRY_DATASET": "telemetry.routing.dataset",
+    "TELEMETRY_DATASET_LOCATION": "telemetry.routing.dataset_location",
     "HOST": "server.host",
     "PORT": "server.port",
 }

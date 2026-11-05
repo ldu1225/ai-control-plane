@@ -449,3 +449,34 @@ class GetRoutingFastPathTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class DatasetLocationTest(unittest.TestCase):
+    """A new project's audit dataset has no tables yet: the routing dataset must still follow its location."""
+
+    def test_location_comes_from_the_audit_dataset_itself(self):
+        from controlplane.services import telemetry_routing as tr
+
+        class Reg:
+            def dataset_location(self, *a):
+                return None
+
+        class Ctx:
+            project, audit_dataset, quota_project = "p", "ge_analytics", "p"
+            registry = Reg()
+
+            def rest(self, method, url, **kw):
+                assert url.endswith("/projects/p/datasets/ge_analytics"), url
+                return {"location": "asia-northeast3"}
+
+        self.assertEqual(tr._dataset_location(Ctx(), {"datasetLocation": ""}), "asia-northeast3")
+        self.assertEqual(tr._dataset_location(Ctx(), {"datasetLocation": "europe-west1"}), "europe-west1")
+
+    def test_deploy_pins_the_routing_dataset_location(self):
+        import os
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        with open(os.path.join(root, "scripts", "deploy.sh"), encoding="utf-8") as fh:
+            self.assertIn('add_env TELEMETRY_DATASET_LOCATION "$DATASET_LOCATION"', fh.read())
+        from controlplane import config
+        self.assertEqual(config.ENV_MAP.get("TELEMETRY_DATASET_LOCATION") if hasattr(config, "ENV_MAP") else
+                         "telemetry.routing.dataset_location", "telemetry.routing.dataset_location")

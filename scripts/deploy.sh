@@ -842,6 +842,7 @@ add_env PRICING_SYNC_TIME "$PRICING_SYNC_TIME"
 add_env PRICING_CURRENCY "$PRICING_CURRENCY"
 add_env TELEMETRY_AI_MODEL "$TELEMETRY_AI_MODEL"
 add_env TELEMETRY_DATASET "$TELEMETRY_DATASET"
+add_env TELEMETRY_DATASET_LOCATION "$DATASET_LOCATION"   # routed telemetry stays in the allowed region
 COMMON=(--image "$IMAGE" --project "$PROJECT_ID" --region "$REGION" --cpu-boost --quiet)
 [[ -n "$ORGPOL_BINAUTHZ" ]] && COMMON+=(--binary-authorization "$ORGPOL_BINAUTHZ")
 [[ -n "$VPC_NETWORK" ]] && COMMON+=(--network "$VPC_NETWORK" --subnet "$VPC_SUBNET" --vpc-egress all-traffic)
