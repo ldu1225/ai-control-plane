@@ -104,6 +104,20 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("대시보드 리소스는 아직 하나도 만들지 않았습니다", err)
         self.assertNotIn("RESULT", out)
 
+    def test_expanded_effective_location_values_are_resolved(self):
+        # What the effective-policy API really returns for "in:us-locations" (members expanded, no "in:" prefix).
+        expanded = ["us-west3-locations", "us-locations", "us-west3-b", "us", "us-west2-b", "us-central6-locations",
+                    "us-west4-b", "nam3"]
+        rc, out, err = self.run_preflight({"gcp.resourceLocations": {"listPolicy": {"allowedValues": expanded}}})
+        self.assertEqual(rc, 1)
+        self.assertIn("[중단] gcp.resourceLocations", err)
+        self.assertNotIn("asia-northeast3 허용", out)
+        seoul = ["asia-northeast3-locations", "asia-northeast3-a", "asia-northeast3", "asia1"]
+        rc, out, err = self.run_preflight({"gcp.resourceLocations": {"listPolicy": {"allowedValues": seoul}}})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("asia-northeast3 허용", out)
+        self.assertNotIn("[주의] gcp.resourceLocations", err)
+
     def test_continent_group_allows_region(self):
         policies = {"gcp.resourceLocations": {"listPolicy": {"allowedValues": ["in:asia-locations"]}}}
         rc, out, err = self.run_preflight(policies, region="asia-northeast3")

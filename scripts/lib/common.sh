@@ -878,6 +878,8 @@ KNOWN_GROUPS = set().union(*GROUPS.values())
 
 
 def loc_match(loc, value):
+    """True / False, or None for a value group this check cannot resolve. Effective policies list expanded members
+    (us-west3-locations, us-west3-b, us, nam3, ...), so any concrete location that is not ours is False."""
     name = value[3:] if value.startswith("in:") else value
     cont = loc.split("-")[0]
     if name in (loc, loc + "-locations") or name.startswith(loc + "-"):
@@ -886,12 +888,10 @@ def loc_match(loc, value):
         group = name[:-len("-locations")]
         if group in GROUPS.get(cont, set()) or group == loc:
             return True
-        if group in KNOWN_GROUPS or re.match(r"^[a-z]+-[a-z]+\d+$", group):
+        if group in KNOWN_GROUPS or re.match(r"^[a-z]+-[a-z]+\d+$", group) or re.match(r"^[a-z]+\d*$", group) is None:
             return False
-        return None
-    if re.match(r"^[a-z]+-[a-z]+\d+(-[a-z])?$", name) or name in ("us", "eu", "asia", "global"):
-        return name == loc
-    return None
+        return None if len(group) == 2 else False
+    return False
 
 
 def loc_verdict(loc, policy):
@@ -920,7 +920,7 @@ if pol:
         elif v is None:
             lines.append("WARN|gcp.resourceLocations: %s '%s' 허용 여부를 확정할 수 없습니다 (허용: %s). 실패하면 허용 리전으로 다시 실행하세요."
                          % (what, loc, allowed_txt))
-    if not loc_block:
+    if not loc_block and all(loc_verdict(l, pol) is True for l in (region, dsloc)):
         lines.append("OK|gcp.resourceLocations: %s 허용 (Secret Manager·버킷·BigQuery·Artifact Registry 를 %s 에 생성)" % (region, region))
 else:
     lines.append("OK|gcp.resourceLocations: 제한 없음")
