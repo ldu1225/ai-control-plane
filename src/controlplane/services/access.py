@@ -95,7 +95,8 @@ def summary(ctx):
         "source": "builtin",
         "pattern": False,
         "hasPassword": True,
-        "defaultPassword": not bool(admin_meta.get("passwordHash")),
+        "defaultPassword": bool(getattr(ctx.app, "auth", None) is not None and
+                                ctx.app.auth.default_admin_password_active()),
         "lastLogin": last.get("admin"),
         "self": actor == "admin",
         "canRemove": False,

@@ -275,6 +275,8 @@ enable_project_apis() {
         case "$api" in
           cloudbilling.googleapis.com|cloudbuild.googleapis.com|iap.googleapis.com|cloudscheduler.googleapis.com|cloudtrace.googleapis.com|clouderrorreporting.googleapis.com|sts.googleapis.com)
             warn "could not enable ${api} on ${project} (continuing with built-in fallback)" ;;
+          discoveryengine.googleapis.com|aiplatform.googleapis.com|monitoring.googleapis.com)
+            warn "could not enable ${api} on ${project} (organization policy or quota); the related dashboard pages show no data until it is enabled" ;;
           *)
             gcloud services enable "$api" --project "$project" \
               || die "could not enable required API ${api} on ${project}" ;;
@@ -756,6 +758,304 @@ preflight_caller_permissions() {
   [한국어 안내] 현재 로그인된 계정(${account})에 '${project}' 프로젝트 배포 권한(IAM 정책 설정/API 활성화)이 없습니다.
    1) 다른 Google 계정으로 잘못 로그인된 경우: gcloud auth login 실행 후 소유자 계정으로 다시 로그인하세요.
    2) 프로젝트 관리자에게 위 명령어로 '${account}' 계정에 소유자(roles/owner) 또는 편집자+프로젝트 IAM 관리자(roles/editor + roles/resourcemanager.projectIamAdmin) 권한 부여를 요청하신 뒤 동일 명령어를 다시 실행해 주세요."
+}
+
+# preflight_org_policies PROJECT REGION DATASET_LOCATION
+# Reads the effective organization policies that decide whether this deployment can work (resource locations, domain
+# restricted sharing, Cloud Run ingress / VPC egress / Binary Authorization / invoker IAM, CMEK, restricted services,
+# Cloud Build worker pools) and probes for VPC Service Controls, before anything is created. Prints one line per
+# finding and sets ORGPOL_* variables that later steps use to adapt automatically:
+#   ORGPOL_DRS=1                  domain restricted sharing: no allUsers / allAuthenticatedUsers bindings
+#   ORGPOL_REQUIRE_INVOKER_IAM=1  Cloud Run must keep the invoker IAM check (no --no-invoker-iam-check)
+#   ORGPOL_BINAUTHZ=<policy>      Cloud Run revisions must name a Binary Authorization policy
+#   ORGPOL_VPC_EGRESS=1           Cloud Run revisions must send all egress through a VPC (needs VPC_NETWORK/VPC_SUBNET)
+#   ORGPOL_NO_DEFAULT_POOL=1      Cloud Build default pool not allowed: build locally with Docker
+# Real blockers (location not allowed, no public ingress, CMEK required, required API denied, VPC-SC perimeter, VPC
+# egress without a VPC) stop the run with remediation unless PREFLIGHT_STRICT=false.
+preflight_org_policies() {
+  local project="$1" region="$2" dslocation="${3:-$2}" out rc=0
+  ORGPOL_DRS=0; ORGPOL_REQUIRE_INVOKER_IAM=0; ORGPOL_BINAUTHZ=""; ORGPOL_VPC_EGRESS=0; ORGPOL_NO_DEFAULT_POOL=0
+  log "0/8 Organization policy preflight (조직 정책 사전 점검: ${project})"
+  [[ "${DRY_RUN:-0}" == "1" ]] || gcloud services enable cloudresourcemanager.googleapis.com orgpolicy.googleapis.com \
+    --project "$project" --quiet >/dev/null 2>&1 || true
+  out="$(ACP_PF_PROJECT="$project" ACP_PF_REGION="$region" ACP_PF_DSLOC="$dslocation" \
+    ACP_PF_VPC_NETWORK="${VPC_NETWORK:-}" ACP_PF_VPC_SUBNET="${VPC_SUBNET:-}" ACP_PF_IMAGE="${IMAGE:-}" \
+    python3 - <<'PYORG'
+import concurrent.futures as cf
+import json
+import os
+import re
+import shutil
+import subprocess
+
+project = os.environ["ACP_PF_PROJECT"]
+region = os.environ["ACP_PF_REGION"].lower()
+dsloc = (os.environ.get("ACP_PF_DSLOC") or region).lower()
+has_vpc = bool(os.environ.get("ACP_PF_VPC_NETWORK") and os.environ.get("ACP_PF_VPC_SUBNET"))
+prebuilt = bool(os.environ.get("ACP_PF_IMAGE"))
+LEGACY = ["gcp.resourceLocations", "iam.allowedPolicyMemberDomains", "run.allowedIngress", "run.allowedVPCEgress",
+          "run.allowedBinaryAuthorizationPolicies", "gcp.restrictNonCmekServices", "serviceuser.services",
+          "cloudbuild.allowedWorkerPools", "storage.publicAccessPrevention", "storage.uniformBucketLevelAccess",
+          "iam.disableServiceAccountKeyCreation", "iam.automaticIamGrantsForDefaultServiceAccounts"]
+MANAGED = ["run.managed.requireInvokerIam", "iam.managed.allowedPolicyMembers"]
+REQUIRED_APIS = {"run.googleapis.com", "artifactregistry.googleapis.com", "storage.googleapis.com",
+                 "secretmanager.googleapis.com", "bigquery.googleapis.com", "logging.googleapis.com",
+                 "iam.googleapis.com", "iamcredentials.googleapis.com", "cloudresourcemanager.googleapis.com",
+                 "serviceusage.googleapis.com"}
+OPTIONAL_APIS = {"cloudbuild.googleapis.com": "Cloud Build (로컬 Docker 빌드로 대체)",
+                 "iap.googleapis.com": "IAP 로그인 브리지 (ID/비밀번호 로그인으로 대체)",
+                 "cloudscheduler.googleapis.com": "정기 작업 스케줄러 (인스턴스 내 실행으로 대체)",
+                 "aiplatform.googleapis.com": "AI 애널리스트·Agent Engine 화면",
+                 "discoveryengine.googleapis.com": "Gemini Enterprise·NotebookLM 화면",
+                 "monitoring.googleapis.com": "모델 사용량 지표", "modelarmor.googleapis.com": "Model Armor 화면"}
+CMEK_SERVICES = {"storage.googleapis.com", "bigquery.googleapis.com", "secretmanager.googleapis.com",
+                 "artifactregistry.googleapis.com", "run.googleapis.com", "logging.googleapis.com",
+                 "cloudbuild.googleapis.com"}
+
+
+def gcloud(args):
+    try:
+        r = subprocess.run(["gcloud"] + args, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except Exception as err:  # pylint: disable=broad-except
+        return 1, "", str(err)
+    return r.returncode, r.stdout, r.stderr
+
+
+def fetch(kind, name):
+    base = ["resource-manager", "org-policies"] if kind == "legacy" else ["org-policies"]
+    rc, so, se = gcloud(base + ["describe", "constraints/" + name, "--project", project, "--effective", "--format=json"])
+    if rc != 0:
+        return name, None, se
+    try:
+        return name, json.loads(so[so.index("{"):]), ""
+    except ValueError:
+        return name, None, so
+
+
+with cf.ThreadPoolExecutor(max_workers=8) as pool:
+    lres = {n: (p, e) for n, p, e in pool.map(lambda n: fetch("legacy", n), LEGACY)}
+    mres = {n: (p, e) for n, p, e in pool.map(lambda n: fetch("managed", n), MANAGED)}
+
+lines, blockers, sets = [], [], {}
+if all(p is None for p, _ in lres.values()):
+    err = "\n".join(e or "" for _, e in lres.values())
+    reason = ((lres[LEGACY[0]][1] or "").strip().splitlines() or [""])[-1]
+    if re.search(r"SERVICE_DISABLED|has not been used|is disabled", err):
+        hint = ("Cloud Resource Manager API 가 꺼져 있습니다. 먼저 실행: gcloud services enable cloudresourcemanager.googleapis.com "
+                "orgpolicy.googleapis.com --project %s" % project)
+    elif re.search(r"PERMISSION_DENIED|403|does not have", err):
+        hint = "정책 조회 권한이 없습니다. 조직 관리자에게 roles/orgpolicy.policyViewer 를 요청하면 정확히 점검할 수 있습니다"
+    else:
+        hint = reason[:160]
+    lines.append("SKIP|조직 정책을 읽지 못해 사전 점검을 건너뜁니다 (%s). 배포 중 자동 대응 경로로 진행합니다." % hint)
+
+
+def lp(name):
+    pol = lres.get(name, (None, ""))[0] or {}
+    return pol.get("listPolicy") or {}
+
+
+def enforced(name):
+    pol = lres.get(name, (None, ""))[0] or {}
+    return bool((pol.get("booleanPolicy") or {}).get("enforced"))
+
+
+def listed(policy):
+    return ([str(v).lower() for v in policy.get("allowedValues") or []],
+            [str(v).lower() for v in policy.get("deniedValues") or []],
+            str(policy.get("allValues") or "").upper())
+
+
+def managed_on(name):
+    pol = mres.get(name, (None, ""))[0] or {}
+    return any(r.get("enforce") for r in ((pol.get("spec") or {}).get("rules") or []))
+
+
+GROUPS = {"asia": {"asia"}, "europe": {"eu", "europe"}, "us": {"us", "northamerica"},
+          "northamerica": {"northamerica"}, "southamerica": {"southamerica"}, "australia": {"australia"},
+          "me": {"me"}, "africa": {"africa"}}
+KNOWN_GROUPS = set().union(*GROUPS.values())
+
+
+def loc_match(loc, value):
+    name = value[3:] if value.startswith("in:") else value
+    cont = loc.split("-")[0]
+    if name in (loc, loc + "-locations") or name.startswith(loc + "-"):
+        return True
+    if name.endswith("-locations"):
+        group = name[:-len("-locations")]
+        if group in GROUPS.get(cont, set()) or group == loc:
+            return True
+        if group in KNOWN_GROUPS or re.match(r"^[a-z]+-[a-z]+\d+$", group):
+            return False
+        return None
+    if re.match(r"^[a-z]+-[a-z]+\d+(-[a-z])?$", name) or name in ("us", "eu", "asia", "global"):
+        return name == loc
+    return None
+
+
+def loc_verdict(loc, policy):
+    allowed, denied, allv = listed(policy)
+    if allv == "DENY" or any(loc_match(loc, v) is True for v in denied):
+        return False
+    if not allowed:
+        return True
+    hits = [loc_match(loc, v) for v in allowed]
+    if any(h is True for h in hits):
+        return True
+    return None if any(h is None for h in hits) else False
+
+
+# 1. Resource locations
+pol = lp("gcp.resourceLocations")
+if pol:
+    allowed_txt = ", ".join((pol.get("allowedValues") or [])[:8]) or "-"
+    loc_block = False
+    for what, loc in (("리전", region), ("BigQuery 위치", dsloc)):
+        v = loc_verdict(loc, pol)
+        if v is False:
+            loc_block = True
+            blockers.append("gcp.resourceLocations: %s '%s' 가 허용되지 않습니다 (허용: %s). 허용된 리전으로 다시 실행하세요: "
+                            "--region <허용 리전>" % (what, loc, allowed_txt))
+        elif v is None:
+            lines.append("WARN|gcp.resourceLocations: %s '%s' 허용 여부를 확정할 수 없습니다 (허용: %s). 실패하면 허용 리전으로 다시 실행하세요."
+                         % (what, loc, allowed_txt))
+    if not loc_block:
+        lines.append("OK|gcp.resourceLocations: %s 허용 (Secret Manager·버킷·BigQuery·Artifact Registry 를 %s 에 생성)" % (region, region))
+else:
+    lines.append("OK|gcp.resourceLocations: 제한 없음")
+
+# 2. Domain restricted sharing (legacy and managed)
+allowed, denied, allv = listed(lp("iam.allowedPolicyMemberDomains"))
+if allowed or allv == "DENY" or managed_on("iam.managed.allowedPolicyMembers"):
+    sets["ORGPOL_DRS"] = "1"
+    lines.append("AUTO|도메인 제한 공유(iam.allowedPolicyMemberDomains) 사용 중: allUsers/allAuthenticatedUsers 바인딩을 건너뛰고 "
+                 "대시보드는 자체 로그인(--no-invoker-iam-check)으로 공개합니다. 고객사 도메인 밖 계정(예: 협력사 계정)은 IAP "
+                 "로그인 브리지가 거부할 수 있으니 그때는 'admin' 계정 + Secret Manager 비밀번호로 로그인하세요.")
+else:
+    lines.append("OK|도메인 제한 공유: 없음")
+
+# 3. Cloud Run invoker IAM (managed)
+if managed_on("run.managed.requireInvokerIam"):
+    sets["ORGPOL_REQUIRE_INVOKER_IAM"] = "1"
+    if sets.get("ORGPOL_DRS") == "1":
+        lines.append("AUTO|run.managed.requireInvokerIam + 도메인 제한 공유: 공개 진입이 불가하므로 대시보드를 Cloud Run IAP(Google "
+                     "로그인)로 바로 배포합니다. 이 경우 Cloud Scheduler 대신 인스턴스 내부에서 정기 작업을 실행합니다.")
+    else:
+        lines.append("AUTO|run.managed.requireInvokerIam: --no-invoker-iam-check 대신 allUsers invoker 로 공개합니다.")
+
+# 4. Cloud Run ingress
+allowed, denied, allv = listed(lp("run.allowedIngress"))
+if (allowed and "all" not in allowed) or "all" in denied or allv == "DENY":
+    blockers.append("run.allowedIngress: Cloud Run 외부 접속(ingress=all)이 금지되어 브라우저로 대시보드에 접속할 수 없습니다 (허용: %s). "
+                    "조직 관리자에게 이 프로젝트만 예외(run.allowedIngress 에 all 허용)를 요청하거나, 외부 HTTPS 부하 분산기+IAP 뒤에 "
+                    "배치해야 합니다." % (", ".join(allowed) or "-"))
+else:
+    lines.append("OK|run.allowedIngress: 외부 접속 허용")
+
+# 5. Cloud Run VPC egress
+allowed, denied, allv = listed(lp("run.allowedVPCEgress"))
+if allowed and "private-ranges-only" not in allowed:
+    sets["ORGPOL_VPC_EGRESS"] = "1"
+    if has_vpc:
+        lines.append("AUTO|run.allowedVPCEgress=%s: VPC_NETWORK/VPC_SUBNET 으로 모든 송신을 VPC 경유(all-traffic)로 배포합니다. "
+                     "서브넷에 비공개 Google 액세스(Private Google Access)가 켜져 있어야 합니다." % ",".join(allowed))
+    else:
+        blockers.append("run.allowedVPCEgress=%s: Cloud Run 이 VPC 를 통해서만 송신해야 합니다. 비공개 Google 액세스가 켜진 서브넷을 "
+                        "지정해 다시 실행하세요: --vpc-network <네트워크> --vpc-subnet <서브넷>" % ",".join(allowed))
+
+# 6. Binary Authorization
+allowed, denied, allv = listed(lp("run.allowedBinaryAuthorizationPolicies"))
+if allowed:
+    sets["ORGPOL_BINAUTHZ"] = (lp("run.allowedBinaryAuthorizationPolicies").get("allowedValues") or ["default"])[0]
+    lines.append("AUTO|run.allowedBinaryAuthorizationPolicies: Cloud Run 을 --binary-authorization=%s 로 배포합니다 "
+                 "(정책이 이 이미지를 허용하지 않으면 보안 담당자에게 예외/증명 요청)." % sets["ORGPOL_BINAUTHZ"])
+
+# 7. CMEK required
+allowed, denied, allv = listed(lp("gcp.restrictNonCmekServices"))
+need = sorted(CMEK_SERVICES if allv == "DENY" else (set(denied) & CMEK_SERVICES))
+if need:
+    blockers.append("gcp.restrictNonCmekServices: %s 리소스를 고객 관리 암호화 키(CMEK) 없이 만들 수 없습니다. 이 설치 스크립트는 CMEK 를 "
+                    "지원하지 않으므로 조직 관리자에게 이 프로젝트만 예외를 요청하세요." % ", ".join(need))
+
+# 8. Restricted services
+allowed, denied, allv = listed(lp("serviceuser.services"))
+if allowed or denied:
+    blocked = set(denied)
+    if allowed:
+        blocked |= {a for a in REQUIRED_APIS | set(OPTIONAL_APIS) if a not in allowed}
+    req = sorted(blocked & REQUIRED_APIS)
+    if req:
+        blockers.append("serviceuser.services: 필수 API 사용이 금지되어 있습니다: %s. 조직 관리자에게 허용을 요청하세요." % ", ".join(req))
+    for api in sorted(blocked & set(OPTIONAL_APIS)):
+        lines.append("WARN|serviceuser.services: %s 금지 -> %s 기능 제한" % (api, OPTIONAL_APIS[api]))
+
+# 9. Cloud Build worker pools
+allowed, denied, allv = listed(lp("cloudbuild.allowedWorkerPools"))
+if (allowed or allv == "DENY") and not prebuilt:
+    sets["ORGPOL_NO_DEFAULT_POOL"] = "1"
+    docker = shutil.which("docker") is not None and \
+        subprocess.run(["docker", "info"], capture_output=True, check=False).returncode == 0
+    if docker:
+        lines.append("AUTO|cloudbuild.allowedWorkerPools: 기본 빌드 풀 금지 -> Cloud Build 대신 이 환경의 Docker 로 빌드합니다.")
+    else:
+        blockers.append("cloudbuild.allowedWorkerPools: 기본 Cloud Build 풀이 금지되어 있고 이 환경에 Docker 가 없습니다. "
+                        "Google Cloud Shell(Docker 내장)에서 다시 실행하세요.")
+
+# 10. Constraints this deployment already satisfies
+for name, text in (("storage.publicAccessPrevention", "버킷 공개 차단"), ("storage.uniformBucketLevelAccess", "균일 버킷 접근"),
+                   ("iam.disableServiceAccountKeyCreation", "서비스 계정 키 생성 금지"),
+                   ("iam.automaticIamGrantsForDefaultServiceAccounts", "기본 서비스 계정 자동 권한 부여 금지")):
+    if enforced(name):
+        lines.append("OK|%s(%s) 적용됨: 이 배포는 그대로 준수합니다." % (name, text))
+
+# 11. VPC Service Controls probe
+rc, so, se = gcloud(["storage", "buckets", "list", "--project", project, "--limit", "1", "--format=value(name)"])
+if rc != 0 and re.search(r"VPC Service Controls|vpcServiceControls|SECURITY_POLICY_VIOLATED|prohibited by organization", se or "", re.I):
+    blockers.append("VPC Service Controls: 이 프로젝트가 서비스 경계 안에 있고 현재 실행 환경은 경계 밖입니다. 보안 담당자에게 이 계정의 "
+                    "인그레스 규칙(또는 액세스 수준) 추가를 요청하거나 경계 안의 환경에서 실행하세요.")
+
+for line in lines:
+    print("LINE|" + line)
+for b in blockers:
+    print("BLOCK|" + b)
+for k, v in sets.items():
+    print("SET|%s=%s" % (k, re.sub(r"[^A-Za-z0-9_.:/-]", "", v)))
+PYORG
+)" || rc=$?
+  local tag kind body var line blockers=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    tag="${line%%|*}"; line="${line#*|}"
+    case "$tag" in
+      LINE)
+        kind="${line%%|*}"; body="${line#*|}"
+        case "$kind" in
+          OK) info "[OK]   ${body}" ;;
+          AUTO) info "[자동] ${body}" ;;
+          WARN) warn "[주의] ${body}" ;;
+          SKIP) warn "[건너뜀] ${body}" ;;
+          *) info "${body}" ;;
+        esac ;;
+      BLOCK) blockers+=("$line"); printf '    [중단] %s\n' "$line" >&2 ;;
+      SET)
+        var="${line%%=*}"
+        case "$var" in
+          ORGPOL_DRS|ORGPOL_REQUIRE_INVOKER_IAM|ORGPOL_BINAUTHZ|ORGPOL_VPC_EGRESS|ORGPOL_NO_DEFAULT_POOL)
+            printf -v "$var" '%s' "${line#*=}" ;;
+        esac ;;
+    esac
+  done <<<"$out"
+  [[ "$rc" == "0" ]] || warn "organization policy preflight did not finish (exit ${rc}); continuing with runtime fallbacks"
+  if [[ ${#blockers[@]} -gt 0 ]]; then
+    if [[ "${PREFLIGHT_STRICT:-true}" == "false" ]]; then
+      warn "PREFLIGHT_STRICT=false: continuing despite ${#blockers[@]} blocking organization policy finding(s)"
+    else
+      die "조직 정책 때문에 이 프로젝트에는 지금 배포할 수 없습니다 (${#blockers[@]}건). 대시보드 리소스는 아직 하나도 만들지 않았습니다.
+   위 [중단] 항목을 조치한 뒤 같은 명령을 다시 실행하세요. 판단이 틀렸다고 확신하면 --skip-preflight-blockers 를 붙여 계속할 수 있습니다.
+   (Organization policies block this deployment; no dashboard resources were created. Fix the [중단] items and re-run.)"
+    fi
+  fi
 }
 
 # ensure_service_identities PROJECT PROJECT_NUMBER SERVICE [SERVICE ...]

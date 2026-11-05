@@ -256,10 +256,16 @@ class GoogleSignIn:
             return {}
         return (self.settings.auth_state() or {}).get("accounts") or {}
 
+    def initial_admin_password(self):
+        """Initial password of the built-in 'admin' account: ADMIN_INITIAL_PASSWORD (scripts/deploy.sh generates a
+        random one per deployment in Secret Manager). There is no built-in default password: without it the 'admin'
+        account cannot sign in with a password until an administrator sets one in Settings > Access control."""
+        return str(self.environ.get("ADMIN_INITIAL_PASSWORD") or "").strip()
+
     def default_admin_password_active(self):
-        accounts = self._accounts()
-        admin_meta = accounts.get("admin") or {}
-        return not bool(admin_meta.get("passwordHash"))
+        """True while the built-in 'admin' account still uses the deployment's initial password."""
+        admin_meta = self._accounts().get("admin") or {}
+        return not bool(admin_meta.get("passwordHash")) and bool(self.initial_admin_password())
 
     def password_login(self, username, password, next_path, headers, settings):
         """Authenticates an ID/Email + Password login and returns (user_dict, redirect_path, cookies)."""
@@ -279,8 +285,8 @@ class GoogleSignIn:
                                is_admin_email(username, sec.get("admins"))) else "viewer"
             name = meta.get("name") or username
         elif username == "admin":
-            default_pw = (self.environ.get("ADMIN_INITIAL_PASSWORD") or "admin")
-            verified = hmac.compare_digest(password.encode("utf-8"), default_pw.encode("utf-8"))
+            initial = self.initial_admin_password()
+            verified = bool(initial) and hmac.compare_digest(password.encode("utf-8"), initial.encode("utf-8"))
             role = "admin"
             name = "Administrator"
         if not verified:

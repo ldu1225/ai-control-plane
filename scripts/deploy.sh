@@ -25,6 +25,9 @@
 #   --billing-account ID    Cloud Billing account ID to link if the project is unbilled
 #   --read-only             Skip IAM governance write roles (ENABLE_GOVERNANCE_ACTIONS=false)
 #   --no-data-access-logs   Skip enabling Data Access audit logs
+#   --vpc-network NAME      Send Cloud Run egress through this VPC (needed when run.allowedVPCEgress forces it)
+#   --vpc-subnet NAME       Subnet for --vpc-network (enable Private Google Access on it)
+#   --skip-preflight-blockers  Continue even when the organization policy preflight finds blockers
 #   --config FILE           Read settings from FILE (CLI flags override FILE values)
 #   --dry-run               Print commands that would run without changing anything
 set -euo pipefail
@@ -52,7 +55,7 @@ CLI_DATA_ACCESS_LOGS=""
 CLI_PREPARE_LINKED=""
 CLI_SCAN_ALL=""
 
-usage() { sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
 normalize_cli_args "$@"
@@ -76,6 +79,9 @@ while [[ $# -gt 0 ]]; do
     --no-data-access-logs) CLI_DATA_ACCESS_LOGS="false"; shift ;;
     --prepare-linked-projects) CLI_PREPARE_LINKED="true"; shift ;;
     --no-prepare-linked-projects) CLI_PREPARE_LINKED="false"; shift ;;
+    --vpc-network) need_arg "$@"; VPC_NETWORK="$2"; shift 2 ;;
+    --vpc-subnet) need_arg "$@"; VPC_SUBNET="$2"; shift 2 ;;
+    --skip-preflight-blockers) PREFLIGHT_STRICT="false"; shift ;;
     --auto-discover-projects) CLI_SCAN_ALL="true"; shift ;;
     --no-auto-discover-projects) CLI_SCAN_ALL="false"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -214,6 +220,7 @@ SERVICE_ACCOUNT_ID="$(trim_ws "${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}")"
 SETTINGS_BUCKET="$(trim_ws "${SETTINGS_BUCKET:-}")"
 SESSION_SECRET_NAME="$(trim_ws "${SESSION_SECRET_NAME:-${SERVICE_NAME}-session-secret}")"
 OAUTH_SECRET_NAME="$(trim_ws "${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}")"
+ADMIN_SECRET_NAME="$(trim_ws "${ADMIN_SECRET_NAME:-${SERVICE_NAME}-admin-password}")"
 MEMORY="${MEMORY:-1Gi}"
 CPU="${CPU:-1}"
 MIN_INSTANCES="${MIN_INSTANCES:-0}"
@@ -349,6 +356,19 @@ DETECTED_BA="$(ensure_project_billing "$PROJECT_ID" "$BILLING_ACCOUNT_ID")"
 if [[ -z "$BILLING_ACCOUNT_ID" && -n "$DETECTED_BA" ]]; then
   BILLING_ACCOUNT_ID="$DETECTED_BA"
   info "detected Cloud Billing account: ${BILLING_ACCOUNT_ID}"
+fi
+
+# Organization policies, VPC Service Controls and restricted services: adapt automatically or stop before creating
+# anything, with remediation (customer projects often enforce these; see README 14).
+VPC_NETWORK="$(trim_ws "${VPC_NETWORK:-}")"; VPC_SUBNET="$(trim_ws "${VPC_SUBNET:-}")"
+[[ -z "$VPC_NETWORK" || -n "$VPC_SUBNET" ]] || die "--vpc-network needs --vpc-subnet"
+preflight_org_policies "$PROJECT_ID" "$REGION" "$DATASET_LOCATION"
+if [[ "$ORGPOL_DRS" == "1" ]]; then
+  BRIDGE_MEMBERS="$(printf '%s' "$BRIDGE_MEMBERS" | tr ',' '\n' | grep -viE '^ *(allusers|allauthenticatedusers) *$' | paste -sd, - || true)"
+fi
+if [[ -n "$ORGPOL_BINAUTHZ" ]]; then
+  run gcloud services enable binaryauthorization.googleapis.com --project "$PROJECT_ID" --quiet >/dev/null 2>&1 \
+    || warn "could not enable binaryauthorization.googleapis.com (Cloud Run deploys may be rejected)"
 fi
 
 # ------------------------------------------------------------------------------- 1. APIs & Service Agents
@@ -605,7 +625,9 @@ options:
   logging: CLOUD_LOGGING_ONLY
 EOF
     BUILD_OK=0
+    [[ "$ORGPOL_NO_DEFAULT_POOL" == "1" ]] && : >"$BUILD_LOG"
     for build_attempt in 1 2 3; do
+      [[ "$ORGPOL_NO_DEFAULT_POOL" == "1" ]] && break
       if gcloud builds submit "$ROOT" \
           --project "$PROJECT_ID" \
           --region "$REGION" \
@@ -624,7 +646,7 @@ EOF
     done
 
     # Tier 2 fallback: if regional worker pool quota is 0 or unavailable (and not restricted by resourceLocations), try global Cloud Build.
-    if [[ "$BUILD_OK" != "1" ]] && ! grep -Eiq 'resourceLocations' "$BUILD_LOG"; then
+    if [[ "$BUILD_OK" != "1" && "$ORGPOL_NO_DEFAULT_POOL" != "1" ]] && ! grep -Eiq 'resourceLocations' "$BUILD_LOG"; then
       warn "regional Cloud Build (${REGION}) did not succeed; retrying with global Cloud Build..."
       if gcloud builds submit "$ROOT" \
           --project "$PROJECT_ID" \
@@ -717,6 +739,24 @@ elif [[ -n "$GOOGLE_OAUTH_CLIENT_ID" ]] && gcloud secrets describe "$OAUTH_SECRE
   SECRETS="${SECRETS},GOOGLE_OAUTH_CLIENT_SECRET=${OAUTH_SECRET_NAME}:latest"
 fi
 
+# Built-in 'admin' account: a random initial password per deployment (there is no shared default such as admin/admin).
+# It is the way in when Google sign-in is unavailable (password-only fallback) and break-glass access otherwise; only
+# the dashboard service reads it (the sign-in bridge does not). Change it in Settings > Access control.
+ensure_secret_created "$ADMIN_SECRET_NAME" "$PROJECT_ID" "$REGION"
+if [[ "$DRY_RUN" == "1" ]]; then
+  info "[dry-run] ensure ${ADMIN_SECRET_NAME} holds a random initial admin password"
+else
+  if [[ -z "$(gcloud secrets versions list "$ADMIN_SECRET_NAME" --project "$PROJECT_ID" --filter='state=ENABLED' --limit 1 --format='value(name)' 2>/dev/null || true)" ]]; then
+    python3 -c 'import secrets,string,sys; a=string.ascii_letters+string.digits; sys.stdout.write("".join(secrets.choice(a) for _ in range(20)))' \
+      | gcloud secrets versions add "$ADMIN_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+    info "created a random initial password for the built-in admin account (${ADMIN_SECRET_NAME})"
+  fi
+fi
+run retry gcloud secrets add-iam-policy-binding "$ADMIN_SECRET_NAME" --project "$PROJECT_ID" \
+  --member "serviceAccount:${SA_EMAIL}" --role roles/secretmanager.secretAccessor --condition=None >/dev/null
+MAIN_SECRETS="${SECRETS},ADMIN_INITIAL_PASSWORD=${ADMIN_SECRET_NAME}:latest"
+ADMIN_PW_CMD="gcloud secrets versions access latest --secret=${ADMIN_SECRET_NAME} --project=${PROJECT_ID}"
+
 # ------------------------------------------------------------------------------- 6. data sources & auto-detection
 log "6/8 Data sources: audit log routing, Data Access logs, Gemini Enterprise & Agent Platform"
 if [[ -z "$ORGANIZATION_NAME" || "$ORGANIZATION_NAME" == "Your Organization" ]]; then
@@ -803,6 +843,8 @@ add_env PRICING_CURRENCY "$PRICING_CURRENCY"
 add_env TELEMETRY_AI_MODEL "$TELEMETRY_AI_MODEL"
 add_env TELEMETRY_DATASET "$TELEMETRY_DATASET"
 COMMON=(--image "$IMAGE" --project "$PROJECT_ID" --region "$REGION" --cpu-boost --quiet)
+[[ -n "$ORGPOL_BINAUTHZ" ]] && COMMON+=(--binary-authorization "$ORGPOL_BINAUTHZ")
+[[ -n "$VPC_NETWORK" ]] && COMMON+=(--network "$VPC_NETWORK" --subnet "$VPC_SUBNET" --vpc-egress all-traffic)
 MAIN=("${COMMON[@]}" --service-account "$SA_EMAIL")
 
 RUN_DEPLOY_HELP="$(gcloud run deploy --help 2>&1 || true)"
@@ -853,27 +895,29 @@ deploy_main_resilient() {
   if [[ "$DRY_RUN" == "1" ]]; then
     run gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --no-invoker-iam-check \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-      --set-env-vars "$public_env" --set-secrets "$SECRETS"
+      --set-env-vars "$public_env" --set-secrets "$MAIN_SECRETS"
     return 0
   fi
-  if [[ "$RUN_DEPLOY_HELP" == *"--no-invoker-iam-check"* ]]; then
+  if [[ "$RUN_DEPLOY_HELP" == *"--no-invoker-iam-check"* && "$ORGPOL_REQUIRE_INVOKER_IAM" != "1" ]]; then
     if gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --no-invoker-iam-check \
         --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-        --set-env-vars "$public_env" --set-secrets "$SECRETS"; then
+        --set-env-vars "$public_env" --set-secrets "$MAIN_SECRETS"; then
       return 0
     fi
     warn "--no-invoker-iam-check was rejected; retrying with --allow-unauthenticated..."
   fi
-  if gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --allow-unauthenticated \
+  if [[ "$ORGPOL_DRS" == "1" && "$ORGPOL_REQUIRE_INVOKER_IAM" == "1" ]]; then
+    info "organization policies allow neither --no-invoker-iam-check nor allUsers; deploying with Cloud Run IAP"
+  elif gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --allow-unauthenticated \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-      --set-env-vars "$public_env" --set-secrets "$SECRETS"; then
+      --set-env-vars "$public_env" --set-secrets "$MAIN_SECRETS"; then
     return 0
   fi
   warn "organization policy blocks unauthenticated Cloud Run entry; automatically switching ${SERVICE_NAME} to Direct Cloud Run IAP..."
   local iap_env="${ENV_VARS}##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
   retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
     --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-    --set-env-vars "$iap_env" --set-secrets "$SECRETS" \
+    --set-env-vars "$iap_env" --set-secrets "$MAIN_SECRETS" \
     || die "Cloud Run deployment failed under all access modes for ${PROJECT_ID}"
   retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
     --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
@@ -918,7 +962,7 @@ case "$ACCESS_MODE" in
       run retry gcloud run services add-iam-policy-binding "$BRIDGE_NAME" --project "$PROJECT_ID" --region "$REGION" \
         --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
       IFS=',' read -r -a members <<<"$BRIDGE_MEMBERS"
-      for member in "${members[@]}"; do
+      for member in ${members[@]+"${members[@]}"}; do
         member="$(normalize_iam_member "$member")"
         [[ -n "$member" ]] || continue
         run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$BRIDGE_NAME" --region="$REGION" \
@@ -972,11 +1016,11 @@ PY
     IAP_ENV="${ENV_VARS}##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
     run retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
-      --set-env-vars "$IAP_ENV" --set-secrets "$SECRETS"
+      --set-env-vars "$IAP_ENV" --set-secrets "$MAIN_SECRETS"
     run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
       --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
     IFS=',' read -r -a members <<<"$IAP_MEMBERS"
-    for member in "${members[@]}"; do
+    for member in ${members[@]+"${members[@]}"}; do
       member="$(normalize_iam_member "$member")"
       [[ -n "$member" ]] || continue
       run gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service="$SERVICE_NAME" --region="$REGION" \
@@ -1071,15 +1115,19 @@ fi
 log "Deployment complete: ${PROJECT_ID}"
 case "$EFFECTIVE_ACCESS_MODE" in
   iap) info "Dashboard URL : ${BASE_URL} (Google IAP sign-in)" ;;
-  password) info "Dashboard URL : ${BASE_URL}/login (ID/Password: initial account admin / admin)" ;;
+  password) info "Dashboard URL : ${BASE_URL}/login (ID/Password sign-in: account 'admin')" ;;
   google)
     if [[ "$BRIDGE_READY" == "1" ]]; then
       info "Dashboard URL : ${BASE_URL}/login (Google sign-in: ${ADMIN_EMAILS}${ALLOWED_USERS:+, viewers: $ALLOWED_USERS})"
     else
-      info "Dashboard URL : ${BASE_URL}/login (ID/Password: initial account admin / admin)"
+      EFFECTIVE_ACCESS_MODE="password"
+      info "Dashboard URL : ${BASE_URL}/login (ID/Password sign-in: account 'admin'; Google sign-in bridge unavailable)"
     fi ;;
   *) info "Dashboard URL : ${BASE_URL}/login (${ADMIN_EMAILS})" ;;
 esac
+if [[ "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
+  info "Admin password: ${ADMIN_PW_CMD}   (built-in 'admin' account; change it in Settings > Access control)"
+fi
 info "Audit dataset : ${PROJECT_ID}:${AUDIT_DATASET} (${DATASET_LOCATION}, Data Access=${ENABLE_DATA_ACCESS_LOGS}, GE Prompt Logging=${GE_PROMPT_LOGGING})"
 [[ -n "$NORMALIZED_SCAN_PROJECTS" ]] && info "Linked scan   : ${NORMALIZED_SCAN_PROJECTS}"
 info "Settings store: gs://${SETTINGS_BUCKET}"

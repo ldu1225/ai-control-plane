@@ -209,6 +209,7 @@ What the script automates end-to-end on a brand-new project:
 1. Open `/login` at the printed URL and select **Sign in with Google** (or sign in directly through Google IAP when Direct Cloud Run IAP was selected automatically).
 2. Accounts in `--admins` (`ADMIN_EMAILS`) sign in as administrators immediately; accounts in `--viewers` (`ALLOWED_USERS`) sign in as viewers immediately.
 3. Additional users or domains can be added anytime in **Settings > Access control**.
+4. The built-in `admin` account has no shared default password. Every deployment generates a random initial password in Secret Manager (`SERVICE_NAME-admin-password`); the last line of the deployment prints the command to read it (`gcloud secrets versions access latest --secret=ai-control-plane-admin-password --project=PROJECT_ID`). In organizations where Google sign-in is unavailable (automatic fallback to ID/password sign-in), sign in with it and change it in **Settings > Access control**. The sign-in page never shows account or password hints.
 
 ### 3.4 Post-deployment checks
 
@@ -879,6 +880,30 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 Run the one-liner again (`bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --project PROJECT_ID`) or `git pull && scripts/deploy.sh --project PROJECT_ID`. Saved `deploy.<PROJECT_ID>.env` files (including `SCAN_PROJECTS`) and all UI settings, exception rules, suspension records and widget layouts in the settings bucket are preserved automatically.
 
 ---
+
+
+### 14.4 Customer project preflight (organization policies, VPC Service Controls)
+
+Before creating anything (step 0/8), `deploy.sh` and `install.sh` read the project's effective organization policies. They adapt automatically, or, when the deployment cannot work as is, stop without creating any dashboard resources and print the fix.
+
+- Check only, change nothing: `scripts/deploy.sh --project PROJECT_ID --dry-run`
+- If a blank project cannot read its policies, run the printed `gcloud services enable cloudresourcemanager.googleapis.com orgpolicy.googleapis.com --project PROJECT_ID` and check again; without permission to read policies, ask for `roles/orgpolicy.policyViewer`.
+
+| Organization policy | What the script does | Fix |
+|---|---|---|
+| `gcp.resourceLocations` | Allowed region: Secret Manager, bucket, BigQuery, Artifact Registry and Cloud Run are all created there. Not allowed: **stops** | Re-run with `--region <allowed region>` |
+| `iam.allowedPolicyMemberDomains` (domain restricted sharing) | Automatic: skips `allUsers`/`allAuthenticatedUsers` bindings and publishes the dashboard with its own sign-in (`--no-invoker-iam-check`) | Accounts outside the customer domains may be refused by the IAP sign-in bridge; sign in as `admin` with the Secret Manager password |
+| `run.managed.requireInvokerIam` | Automatic: `allUsers` invoker, or Cloud Run IAP directly when combined with domain restricted sharing | With IAP, scheduled work runs inside the instance instead of Cloud Scheduler |
+| `run.allowedIngress` (internal only) | **Stops** (no browser access) | Ask for an `all` exception for this project, or put it behind an external HTTPS load balancer + IAP |
+| `run.allowedVPCEgress` (all-traffic) | Automatic with `--vpc-network`/`--vpc-subnet`, otherwise **stops** | Pass a subnet with Private Google Access |
+| `run.allowedBinaryAuthorizationPolicies` | Automatic: deploys with `--binary-authorization=<policy>` | If the policy rejects the image, ask security for an exception |
+| `gcp.restrictNonCmekServices` | **Stops** (CMEK is not supported) | Ask for an exception for this project |
+| `serviceuser.services` | Required APIs (Run, Artifact Registry, Storage, Secret Manager, BigQuery, Logging, IAM) denied: **stops**; other APIs: warns and only those pages lose data | Ask for the APIs to be allowed |
+| `cloudbuild.allowedWorkerPools` | Automatic: builds with Docker in Cloud Shell instead of Cloud Build (**stops** without Docker) | Run from Cloud Shell |
+| `storage.publicAccessPrevention`, `storage.uniformBucketLevelAccess`, `iam.disableServiceAccountKeyCreation`, `iam.automaticIamGrantsForDefaultServiceAccounts` | Already compliant | None |
+| VPC Service Controls perimeter | **Stops** | Add an ingress rule (or access level) for the deploying account, or run inside the perimeter |
+
+Use `--skip-preflight-blockers` only when you are sure a finding is wrong.
 
 ## 15. Removal
 

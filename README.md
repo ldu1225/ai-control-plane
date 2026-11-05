@@ -204,6 +204,7 @@ scripts/deploy.sh --project my-project-id --link-projects project-b,project-c
 1. 출력된 주소의 `/login`으로 접속해 **Google 계정으로 로그인**을 누릅니다(Direct IAP로 자동 전환된 조직 환경에서는 주소 접속 즉시 Google IAP 로그인이 실행됩니다).
 2. `--admins`(`ADMIN_EMAILS`)로 지정한 계정은 즉시 관리자로, `--viewers`(`ALLOWED_USERS`)로 지정한 계정은 즉시 뷰어로 접속됩니다.
 3. 추가 사용자는 **설정 > 액세스 제어** 화면에서 이메일 또는 도메인을 바로 등록·승인할 수 있습니다.
+4. 기본 관리자 계정 `admin`에는 공용 기본 비밀번호가 없습니다. 배포할 때마다 무작위 초기 비밀번호를 만들어 Secret Manager(`SERVICE_NAME-admin-password`)에 저장하고, 배포 마지막 줄의 `Admin password:` 명령(`gcloud secrets versions access latest --secret=ai-control-plane-admin-password --project=PROJECT_ID`)으로 확인합니다. Google 로그인을 쓸 수 없는 조직(ID/비밀번호 로그인으로 자동 전환)에서는 이 계정으로 들어온 뒤 **설정 > 액세스 제어**에서 비밀번호를 바꾸세요. 로그인 화면에는 계정이나 비밀번호 안내가 표시되지 않습니다.
 
 ### 3.4 배포 후 확인
 
@@ -871,6 +872,30 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 Cloud Shell에서 설치 명령 한 줄(`bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) --project PROJECT_ID`)을 다시 실행하거나, 저장소를 최신으로 받은 뒤 `scripts/deploy.sh --project PROJECT_ID`를 실행합니다. 화면 설정, 예외 규칙, 정지 기록, 위젯 배치는 설정 버킷에 있고 프로젝트별 `deploy.<PROJECT_ID>.env`(`SCAN_PROJECTS` 포함)도 그대로 유지됩니다.
 
 ---
+
+
+### 14.4 고객 프로젝트 사전 점검 (조직 정책·VPC Service Controls)
+
+`deploy.sh`와 `install.sh`는 리소스를 만들기 전에(0/8 단계) 프로젝트의 유효 조직 정책을 읽어 자동으로 맞추거나, 그대로는 배포할 수 없으면 아무 대시보드 리소스도 만들지 않고 바로 멈춘 뒤 조치를 안내합니다.
+
+- 변경 없이 점검만 하려면: `scripts/deploy.sh --project PROJECT_ID --dry-run`
+- 빈 프로젝트에서 정책을 읽지 못하면 안내대로 `gcloud services enable cloudresourcemanager.googleapis.com orgpolicy.googleapis.com --project PROJECT_ID`를 실행한 뒤 다시 점검합니다. 정책 조회 권한이 없으면 `roles/orgpolicy.policyViewer`를 요청합니다.
+
+| 조직 정책 | 스크립트 동작 | 조치 |
+|---|---|---|
+| `gcp.resourceLocations` | 허용 리전이면 Secret Manager·버킷·BigQuery·Artifact Registry·Cloud Run을 모두 그 리전에 만듭니다. 허용되지 않으면 **중단** | `--region <허용 리전>`으로 다시 실행 |
+| `iam.allowedPolicyMemberDomains` (도메인 제한 공유) | 자동: `allUsers`/`allAuthenticatedUsers` 바인딩을 생략하고 대시보드는 자체 로그인(`--no-invoker-iam-check`)으로 공개 | 고객사 도메인 밖 계정은 IAP 로그인 브리지가 거부할 수 있으니 `admin` 계정 + Secret Manager 비밀번호로 로그인 |
+| `run.managed.requireInvokerIam` | 자동: `allUsers` invoker로 공개, 도메인 제한 공유와 함께면 Cloud Run IAP로 바로 배포 | IAP 방식에서는 정기 작업이 Cloud Scheduler 대신 인스턴스 안에서 실행 |
+| `run.allowedIngress` (internal만 허용) | **중단** (브라우저로 접속할 수 없음) | 이 프로젝트만 `all` 예외 요청, 또는 외부 HTTPS 부하 분산기 + IAP 뒤에 배치 |
+| `run.allowedVPCEgress` (all-traffic 강제) | `--vpc-network`/`--vpc-subnet`을 주면 자동, 없으면 **중단** | 비공개 Google 액세스가 켜진 서브넷 지정 |
+| `run.allowedBinaryAuthorizationPolicies` | 자동: `--binary-authorization=<정책>`으로 배포 | 정책이 이미지를 막으면 보안 담당자에게 예외 요청 |
+| `gcp.restrictNonCmekServices` | **중단** (CMEK 미지원) | 이 프로젝트만 예외 요청 |
+| `serviceuser.services` | 필수 API(Run, Artifact Registry, Storage, Secret Manager, BigQuery, Logging, IAM)가 금지면 **중단**, 그 밖의 API는 경고 후 해당 화면만 제한 | 허용 요청 |
+| `cloudbuild.allowedWorkerPools` | 자동: Cloud Build 대신 Cloud Shell의 Docker로 빌드 (Docker가 없으면 **중단**) | Cloud Shell에서 실행 |
+| `storage.publicAccessPrevention`, `storage.uniformBucketLevelAccess`, `iam.disableServiceAccountKeyCreation`, `iam.automaticIamGrantsForDefaultServiceAccounts` | 그대로 준수 | 없음 |
+| VPC Service Controls 경계 | **중단** | 실행 계정의 인그레스 규칙(또는 액세스 수준) 추가, 또는 경계 안의 환경에서 실행 |
+
+판단이 틀렸다고 확신할 때만 `--skip-preflight-blockers`로 계속합니다.
 
 ## 15. 삭제
 

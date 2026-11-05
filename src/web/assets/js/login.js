@@ -305,16 +305,10 @@ function passwordFormView() {
 function signInView() {
   const guest = Boolean(state && state.guestAccess);
   const google = Boolean(state && state.googleEnabled !== false);
-  const defaultAdmin = Boolean(state && state.defaultAdminPassword);
   const hasAltActions = google || guest;
   return [
     heading(t('Sign in'), t('Sign in with your account ID and password to continue to {product}.', { product: productName() })),
     noticeAlert(),
-    defaultAdmin ? alertBox({
-      tone: 'info',
-      title: t('Initial administrator account'),
-      text: t('Default login: ID "admin" / Password "admin". You can change this password and create customer accounts in Settings > Access control.'),
-    }) : null,
     passwordFormView(),
     hasAltActions ? h('div', { class: 'login-divider' }, h('span', null, t('or'))) : null,
     hasAltActions ? h('div', { class: 'login-actions' },

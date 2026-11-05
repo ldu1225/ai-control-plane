@@ -1767,6 +1767,7 @@ const KO = {
   "Google OAuth sign-in": "Google OAuth 로그인",
   "Auth / Source": "인증 방식 / 구분",
   "Default (admin/admin)": "기본 계정 (admin/admin)",
+  "Initial password (Secret Manager)": "초기 비밀번호 (Secret Manager)",
   "Built-in Admin": "기본 관리자 (admin)",
   "ID / Password": "아이디 / 비밀번호",
   "Google OAuth": "Google 계정",

@@ -373,20 +373,26 @@ class GoogleSignInFlowTest(unittest.TestCase):
         self.assertEqual(res.status, 403)
 
     def test_password_login_and_account_management(self):
-        # 1. Initial auth state advertises passwordEnabled and defaultAdminPassword
+        # 1. The public sign-in state never reveals whether the built-in admin still uses its initial password
         state = self.request("GET", "/api/v1/auth/state").json()["data"]
         self.assertTrue(state.get("passwordEnabled"))
-        self.assertTrue(state.get("defaultAdminPassword"))
+        self.assertNotIn("defaultAdminPassword", state)
         csrf = state["csrfToken"]
 
-        # 2. Default admin/admin login succeeds and grants administrator access
-        bad = self.request("POST", "/api/v1/auth/login",
-                           cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
-                           body={"username": "admin", "password": "wrong"})
-        self.assertEqual(bad.status, 401)
-        ok = self.request("POST", "/api/v1/auth/login",
-                          cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
-                          body={"username": "admin", "password": "admin", "next": "/"})
+        def login(user, password):
+            return self.request("POST", "/api/v1/auth/login", cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
+                                body={"username": user, "password": password, "next": "/"})
+
+        # 2. No built-in default password: admin/admin is rejected when no initial password is configured
+        self.assertEqual(login("admin", "admin").status, 401)
+
+        # 3. The deployment's initial password (Secret Manager -> ADMIN_INITIAL_PASSWORD) signs the built-in admin in
+        initial = {"ADMIN_INITIAL_PASSWORD": "Init-Pass-2026-x9"}
+        with mock.patch.dict(self.app.auth.environ, initial):
+            self.assertEqual(login("admin", "wrong").status, 401)
+            self.assertEqual(login("admin", "admin").status, 401)
+            self.assertTrue(self.app.auth.default_admin_password_active())
+            ok = login("admin", initial["ADMIN_INITIAL_PASSWORD"])
         self.assertEqual(ok.status, 200)
         self.assertEqual(ok.json()["data"]["user"]["email"], "admin")
         self.assertEqual(ok.json()["data"]["user"]["role"], "admin")
@@ -415,18 +421,17 @@ class GoogleSignInFlowTest(unittest.TestCase):
         self.assertEqual(self.post("/api/v1/settings", v_sess, {"section": "product", "values": {"name": "X"}}).status,
                          403)
 
-        # 5. Update built-in admin password; default "admin" password stops working, new password works
+        # 5. Update built-in admin password; the initial password stops working, the new password works
         r3 = self.post("/api/v1/access/users", admin_sess,
                        {"email": "admin", "role": "admin", "password": "new-admin-pw"})
         self.assertEqual(r3.status, 200)
         state2 = self.request("GET", "/api/v1/auth/state").json()["data"]
-        self.assertFalse(state2.get("defaultAdminPassword"))
-        self.assertEqual(self.request("POST", "/api/v1/auth/login",
-                                      cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
-                                      body={"username": "admin", "password": "admin"}).status, 401)
-        self.assertEqual(self.request("POST", "/api/v1/auth/login",
-                                      cookies={"cp_csrf": csrf}, headers={"X-CSRF-Token": csrf},
-                                      body={"username": "admin", "password": "new-admin-pw"}).status, 200)
+        self.assertNotIn("defaultAdminPassword", state2)
+        with mock.patch.dict(self.app.auth.environ, initial):
+            self.assertFalse(self.app.auth.default_admin_password_active())
+            self.assertEqual(login("admin", initial["ADMIN_INITIAL_PASSWORD"]).status, 401)
+        self.assertEqual(login("admin", "admin").status, 401)
+        self.assertEqual(login("admin", "new-admin-pw").status, 200)
 
         # 6. Built-in admin cannot be deleted or demoted
         self.assertEqual(self.post("/api/v1/access/users/delete", admin_sess, {"email": "admin"}).status, 409)
@@ -488,6 +493,7 @@ class GoogleModeConfigTest(unittest.TestCase):
                 "SESSION_SECRET": "s" * 48,
                 "K_SERVICE": "ai-control-plane",
                 "PUBLIC_BASE_URL": "https://dash.example.com",
+                "ADMIN_INITIAL_PASSWORD": "fallback-Init-77",
             }
             with mock.patch.dict(os.environ, {"CONFIG_PATH": cfg}):
                 pw_app = app_module.App(environ=environ)
@@ -503,6 +509,7 @@ class GoogleModeConfigTest(unittest.TestCase):
                 self.assertEqual(state["authMode"], "google")
                 self.assertFalse(state["googleEnabled"])
                 self.assertTrue(state["passwordEnabled"])
+                self.assertNotIn("defaultAdminPassword", state)
                 csrf = state["csrfToken"]
 
                 conn.request("GET", "/auth/google/start", headers={"Host": "dash.example.com"})
@@ -511,15 +518,19 @@ class GoogleModeConfigTest(unittest.TestCase):
                 self.assertEqual(start_resp.status, 302)
                 self.assertEqual(start_resp.getheader("Location"), "/login?error=unavailable")
 
-                conn.request(
-                    "POST", "/api/v1/auth/login",
-                    body=json.dumps({"username": "admin", "password": "admin"}).encode("utf-8"),
-                    headers={"Host": "dash.example.com", "Content-Type": "application/json",
-                             "Cookie": "cp_csrf=%s" % csrf, "X-CSRF-Token": csrf},
-                )
-                login_resp = conn.getresponse()
-                login_body = json.loads(login_resp.read().decode("utf-8"))
-                self.assertEqual(login_resp.status, 200)
+                def login(password):
+                    conn.request(
+                        "POST", "/api/v1/auth/login",
+                        body=json.dumps({"username": "admin", "password": password}).encode("utf-8"),
+                        headers={"Host": "dash.example.com", "Content-Type": "application/json",
+                                 "Cookie": "cp_csrf=%s" % csrf, "X-CSRF-Token": csrf},
+                    )
+                    r = conn.getresponse()
+                    return r.status, json.loads(r.read().decode("utf-8"))
+
+                self.assertEqual(login("admin")[0], 401)
+                status, login_body = login("fallback-Init-77")
+                self.assertEqual(status, 200)
                 self.assertEqual(login_body["data"]["user"]["role"], "admin")
                 conn.close()
             finally:

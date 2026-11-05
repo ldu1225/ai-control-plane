@@ -97,8 +97,6 @@ def auth_state(ctx, handler):
         "authMode": mode,
         "googleEnabled": bool(mode == "google" and sign_in is not None and sign_in.google_enabled),
         "passwordEnabled": bool(mode == "google" and sign_in is not None),
-        "defaultAdminPassword": bool(mode == "google" and sign_in is not None and
-                                     sign_in.default_admin_password_active()),
         "guestAccess": bool(mode == "google" and s["security"].get("guest_access")),
         "switchAccountUrl": sign_in.switch_account_url() if mode == "google" and sign_in is not None else None,
         "user": user,

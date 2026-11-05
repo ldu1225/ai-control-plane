@@ -1229,7 +1229,7 @@ export function accessMembers(ctx = {}, editable = true) {
           key: 'source', label: t('Auth / Source'), width: '140px',
           render: (u) => {
             if (u.source === 'builtin') {
-              return badge(u.defaultPassword ? t('Default (admin/admin)') : t('Built-in Admin'), u.defaultPassword ? 'warning' : 'accent', { size: 'sm' });
+              return badge(u.defaultPassword ? t('Initial password (Secret Manager)') : t('Built-in Admin'), u.defaultPassword ? 'warning' : 'accent', { size: 'sm' });
             }
             if (u.hasPassword) {
               return badge(t('ID / Password'), 'success', { size: 'sm' });

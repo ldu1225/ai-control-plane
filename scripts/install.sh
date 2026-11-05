@@ -130,9 +130,9 @@ while [[ $# -gt 0 ]]; do
     --region) need_val "$@"; CLI_REGION="$2"; shift 2 ;;
     --admins|--admin) need_val "$@"; CLI_ADMINS="$2"; shift 2 ;;
     --viewers|--viewer|--allowed-users) need_val "$@"; CLI_VIEWERS="$2"; shift 2 ;;
-    --org-name|--access-mode|--service-name|--billing-account|--config|--dataset|--dataset-location|--ge-locations)
+    --org-name|--access-mode|--service-name|--billing-account|--config|--dataset|--dataset-location|--ge-locations|--vpc-network|--vpc-subnet)
       need_val "$@"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
-    --read-only|--data-access-logs|--no-data-access-logs|--prepare-linked-projects|--no-prepare-linked-projects|--auto-discover-projects|--no-auto-discover-projects|--log-prompts|--no-log-prompts)
+    --read-only|--data-access-logs|--no-data-access-logs|--prepare-linked-projects|--no-prepare-linked-projects|--auto-discover-projects|--no-auto-discover-projects|--log-prompts|--no-log-prompts|--skip-preflight-blockers)
       EXTRA_ARGS+=("$1"); shift ;;
     -h|--help) show_install_help 0 ;;
     *) echo "unknown argument: $1" >&2; show_install_help 2 ;;
