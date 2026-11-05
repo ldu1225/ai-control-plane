@@ -99,12 +99,22 @@ function periodLabel(policy) {
   return `${label} \u00b7 ${policy.window === 'rolling' ? t('Rolling') : t('Calendar')}`;
 }
 
+const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
+
 function resetText(policy) {
   if (policy.period === 'all' || policy.window === 'rolling') return t('Rolling window: usage leaves the window continuously');
   const tz = policy.resetTimezone || 'UTC';
-  if (policy.period === 'daily') return t('Resets every day at 00:00 ({tz})', { tz });
-  if (policy.period === 'weekly') return t('Resets every Monday at 00:00 ({tz})', { tz });
-  return t('Resets on the 1st of every month at 00:00 ({tz})', { tz });
+  const time = policy.resetTime || '00:00';
+  if (policy.period === 'daily') return t('Resets every day at {time} ({tz})', { time, tz });
+  if (policy.period === 'weekly') return t('Resets every {day} at {time} ({tz})', { day: t(WEEKDAYS[policy.resetWeekday || 0] || 'Monday'), time, tz });
+  return t('Resets on the 1st of every month at {time} ({tz})', { time, tz });
+}
+
+/** Weekly per-person cap that keeps everyone inside the Antigravity credit pool: the monthly credit per licensed
+ * user (Gemini Enterprise Standard USD 10, Plus USD 15) divided by 4, the pool Google enforces every 7 days. */
+function weeklyCreditUsd(policy) {
+  const monthly = isNum(policy.creditPerUserMonth) && policy.creditPerUserMonth > 0 ? policy.creditPerUserMonth : 10;
+  return Math.round((monthly / 4) * 100) / 100;
 }
 
 function capsText(policy) {
@@ -210,10 +220,15 @@ function renderStatus(ctx, body, s) {
   if (usageUnavailable) {
     body.append(banner({ tone: 'warning', title: t('Antigravity usage could not be read'), text: t('The inference log query failed. Grant the service identity roles/logging.viewer (or read access to the BigQuery sink table) and check the data source notices above.') }));
   } else if (prereq.telemetryDetected === false) {
-    body.append(banner({ tone: 'info', title: t('No Antigravity token usage logs in this project'), text: t('Token usage appears here when Antigravity for organizations writes its inference log ({log}) to this project.', { log: prereq.inferenceLog || t('set in Settings') }) }));
+    body.append(banner({ tone: 'info', title: t('No Antigravity token usage logs in this project'), text: t('Turn on Metadata logging in Gemini Enterprise > Settings > AI developer tools > Compliance (off by default). From then on every Antigravity call writes {log} with the user and token counts, and usage, cost and caps appear here.', { log: prereq.inferenceLog || t('set in Settings') }) }));
   }
   if (enforcement.durable === false) {
     body.append(banner({ tone: 'warning', title: t('Exception rules are not stored durably'), text: t('Settings are kept in memory on this deployment, so exception rules and suspension records are lost when the service restarts. Configure a settings bucket (SETTINGS_BUCKET).') }));
+  }
+  // Restores happen only inside an enforcement run: a schedule that stopped leaves suspended users waiting.
+  if ((enforcement.scheduler || {}).stale) {
+    const lastAt = ((enforcement.scheduler || {}).lastRun || {}).at;
+    body.append(banner({ tone: 'danger', title: t('Scheduled enforcement stopped'), text: t('The enforcement schedule last ran {when}. Suspended users are not restored at the period reset until it runs again. Check the Cloud Scheduler job {job} or select Run enforcement now.', { when: lastAt ? fmt.relative(lastAt) : DASH, job: 'ai-control-plane-enforce' }) }));
   }
   // Restores happen only inside an enforcement run, so suspended users without a schedule wait for an administrator.
   if (isNum(totals.suspended) && totals.suspended > 0 && (enforcement.scheduler || {}).configured === false) {
@@ -344,6 +359,7 @@ function renderStatus(ctx, body, s) {
     body: manualBody,
   }));
 
+  body.append(billingReportCard(ctx));
   body.append(agentActivityCard(ctx));
 
   const row3 = h('div', { class: 'grid' });
@@ -378,6 +394,76 @@ function renderStatus(ctx, body, s) {
     }
     append(auditHost, [auditWarnings && raw ? h('div', { class: 'card-body flush-top' }, auditWarnings) : null, content]);
   }, { skeletonKind: 'table', signal: ctx.signal });
+}
+
+/* ------------------------------------------------------------------ monthly usage report (chargeback) */
+
+function monthOptions(count = 6) {
+  const out = [];
+  const d = new Date();
+  for (let i = 0; i < count; i += 1) {
+    const y = d.getFullYear();
+    const m = d.getMonth() + 1;
+    out.push(`${y}-${String(m).padStart(2, '0')}`);
+    d.setDate(1);
+    d.setMonth(d.getMonth() - 1);
+  }
+  return out;
+}
+
+function billingReportCard(ctx) {
+  const months = monthOptions();
+  const state = { month: months[0], credit: true };
+  const host = h('div');
+  const monthSel = selectInput(months.map((m) => ({ value: m, label: m })), state.month, (v) => { state.month = v; refresh(); }, { 'aria-label': t('Month') });
+  const creditSeg = segmented([{ value: 'yes', label: t('Deduct credit') }, { value: 'no', label: t('Full amount') }], 'yes', (v) => { state.credit = v === 'yes'; refresh(); });
+  const out = card({
+    title: t('Monthly usage report'),
+    subtitle: t('Per-person Antigravity tokens and cost for chargeback'),
+    actions: h('div', { class: 'row' }, monthSel, creditSeg),
+    flush: true,
+    body: host,
+  });
+  function refresh() {
+    load(host, () => api.get('/api/v1/governance/antigravity/billing-report', { month: state.month }, { signal: ctx.signal }), (res) => {
+      const r = res.data || {};
+      const ccy = r.currency || 'USD';
+      const rows = r.users || [];
+      const notice = warningsNotice(res.meta && res.meta.warnings);
+      const amount = (u) => (state.credit ? u.chargeable : u.cost);
+      let content;
+      if (!rows.length) {
+        content = emptyState({ icon: 'file-text', compact: true, title: t('No Antigravity usage in {month}', { month: r.month || state.month }), body: t('Usage appears when Antigravity for organizations writes its inference log with Metadata logging turned on.') });
+      } else {
+        content = dataTable({
+          columns: [
+            { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
+            { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
+            { key: 'promptTokens', label: t('Input tokens'), align: 'num', format: fmt.compact, csv: (u) => u.promptTokens },
+            { key: 'cachedTokens', label: t('From cache'), align: 'num', format: fmt.compact, csv: (u) => u.cachedTokens },
+            { key: 'outputTokens', label: t('Output tokens'), align: 'num', format: fmt.compact, csv: (u) => u.outputTokens },
+            { key: 'cost', label: t('Cost'), align: 'num', render: (u) => h('span', { title: u.costPartial ? t('Some models have no unit price') : null }, money(u.cost, ccy), u.costPartial ? ' *' : ''), value: (u) => u.cost },
+            { key: 'credit', label: t('Credit'), align: 'num', render: (u) => (state.credit ? money(u.credit, ccy) : h('span', { class: 'text-muted' }, DASH)), value: (u) => (state.credit ? u.credit : null) },
+            { key: 'chargeable', label: state.credit ? t('Amount to charge') : t('Cost'), align: 'num', render: (u) => h('span', { class: 'fw-600' }, money(amount(u), ccy)), value: (u) => amount(u) },
+            { key: 'models', label: t('Models'), sortable: false, render: (u) => listCell((u.byModel || []).map((m) => m.model), { mono: true }), csv: (u) => (u.byModel || []).map((m) => `${m.model}:${m.tokens}`).join('|') },
+          ],
+          rows, pageSize: 10, searchable: rows.length > 10, exportName: `antigravity-usage-${r.month || state.month}`,
+          initialSort: { key: 'chargeable', dir: 'desc' },
+        });
+      }
+      const totals = r.totals || {};
+      const foot = h('div', { class: 'card-body stack-sm' },
+        h('div', { class: 'row wrap' },
+          h('span', { class: 'fw-600' }, t('Total {v}', { v: money(state.credit ? totals.chargeable : totals.cost, ccy) })),
+          h('span', { class: 'text-muted' }, t('{n} people \u00b7 {month} ({tz})', { n: fmt.int(rows.length), month: r.month || state.month, tz: r.timezone || '' })),
+          r.complete === false ? badge(t('Month in progress'), 'warning', { size: 'sm' }) : null),
+        h('p', { class: 'muted' }, t('Tokens are what Google logged for each call (businessaicode.googleapis.com/inference_response). Cost = tokens x unit price of each model; prompt tokens served from cache use the cache price. Google bills the project, not people, so this is how the project\'s usage is divided between people.')),
+        state.credit ? h('p', { class: 'muted' }, t('Credit: {v} per person per month (Gemini Enterprise Antigravity credit, Settings > Governance).', { v: money(r.creditPerUser, ccy) })) : null);
+      append(host, [notice ? h('div', { class: 'card-body flush-top' }, notice) : null, content, foot]);
+    }, { skeletonKind: 'table', signal: ctx.signal });
+  }
+  refresh();
+  return out;
 }
 
 /* ------------------------------------------------------------------ enforcement mode and runs */
@@ -639,7 +725,7 @@ function exceptionsCard(ctx, s) {
       { key: 'email', label: t('User'), render: (r) => userCell(r.email) },
       { key: 'type', label: t('Rule'), render: (r) => ruleBadge(r) },
       { key: 'detail', label: t('Detail'), sortable: false, wrap: true, render: (r) => h('span', { class: 'cell-sub' }, ruleDetail(r, ccy)), csv: (r) => ruleDetail(r, ccy) },
-      { key: 'note', label: t('Note'), sortable: false, wrap: true, render: (r) => h('span', { class: 'cell-sub' }, r.note || DASH) },
+      { key: 'note', label: t('Note'), sortable: false, wrap: true, render: (r) => h('span', { class: 'cell-sub' }, r.note ? serverText(r.note) : DASH), csv: (r) => r.note || '' },
       { key: 'createdAt', label: t('Added'), render: (r) => h('div', { class: 'cell-stack' }, h('span', null, r.createdAt ? fmt.dateTime(r.createdAt) : DASH), r.createdBy ? h('span', { class: 'cell-sub truncate' }, r.createdBy) : null), value: (r) => r.createdAt },
       { key: 'state', label: t('Access state'), render: (r) => statusBadge(r.state, { size: 'sm' }) },
       {
@@ -768,7 +854,8 @@ function prerequisites(ctx, p) {
   const items = [];
   (p.markerRoles || []).forEach((r) => items.push([r.exists, t('Marker role {role}', { role: r.role }), r.exists ? t('Present in project') : t('Missing')]));
   Object.entries(p.permissions || {}).forEach(([perm, ok]) => items.push([ok, perm, ok ? t('Granted') : t('Not granted to the control plane identity')]));
-  items.push([p.telemetryDetected, t('Antigravity inference telemetry'), p.telemetryDetected ? t('Detected') : t('Not detected')]);
+  items.push([p.telemetryDetected, t('Antigravity inference telemetry'), p.telemetryDetected ? t('Detected') : t('Not detected'),
+    p.telemetryDetected ? null : t('Counted only when Antigravity for organizations writes businessaicode.googleapis.com/inference_response logs in a scanned project. Antigravity used with a personal account writes no such log.')]);
   const missingRoles = (p.markerRoles || []).some((r) => !r.exists);
   const btn = missingRoles ? button({ label: t('Create marker roles'), icon: 'key', size: 'sm' }) : null;
   if (btn) {
@@ -793,9 +880,10 @@ function prerequisites(ctx, p) {
     });
   }
   return h('div', { class: 'stack' },
-    h('div', { class: 'checklist' }, items.map(([ok, label, sub]) => h('div', { class: 'check-item' },
+    h('div', { class: 'checklist' }, items.map(([ok, label, sub, hint]) => h('div', { class: 'check-item' },
       h('span', { class: ['ci-icon', ok ? 'ok' : 'no'] }, icon(ok ? 'check-circle' : 'x-circle', { size: 15 })),
-      h('div', { class: 'ci-text' }, h('div', { class: 'cell-mono' }, label), h('div', { class: 'ci-sub' }, sub))))),
+      h('div', { class: 'ci-text' }, h('div', { class: 'cell-mono' }, label), h('div', { class: 'ci-sub' }, sub),
+        hint ? h('div', { class: 'ci-sub' }, hint) : null)))),
     btn);
 }
 
@@ -886,9 +974,14 @@ function pricingSummary(pricing, ccy) {
     if (pricing.fx && pricing.fx.rate) parts.push(t('1 USD = {rate} (Google rate, {date})', { rate: fmt.currency(pricing.fx.rate, ccy), date: pricing.fx.asOf ? fmt.date(String(pricing.fx.asOf).slice(0, 10), 'long') : DASH }));
     return parts.join(' \u00b7 ');
   }
-  return pricing.configured
-    ? t('Entered prices: {inp} input \u00b7 {out} output per 1M tokens', { inp: money(pricing.inputPerMillion, ccy), out: money(pricing.outputPerMillion, ccy) })
-    : t('Entered prices: not set');
+  if (!pricing.configured) return t('Entered prices: not set');
+  // Per-model prices win; the single default price applies only to models without one (0 = not set).
+  const models = (pricing.models || []).length;
+  const fallback = (pricing.inputPerMillion || 0) > 0 || (pricing.outputPerMillion || 0) > 0;
+  if (!models) return t('Entered prices: {inp} input \u00b7 {out} output per 1M tokens', { inp: money(pricing.inputPerMillion, ccy), out: money(pricing.outputPerMillion, ccy) });
+  const parts = [t('Entered prices for {n} models', { n: fmt.int(models) })];
+  if (fallback) parts.push(t('other models: {inp} input \u00b7 {out} output per 1M tokens', { inp: money(pricing.inputPerMillion, ccy), out: money(pricing.outputPerMillion, ccy) }));
+  return parts.join(' \u00b7 ');
 }
 
 function usedPriceTable(pricing, ccy) {
@@ -907,7 +1000,18 @@ function usedPriceTable(pricing, ccy) {
         render: (r) => h('div', { class: 'cell-stack' }, h('span', { class: 'cell-mono' }, r.model), h('div', null, sourceBadge(r.price))),
         csv: (r) => r.model,
       },
-      { key: 'input', label: t('Input'), align: 'num', render: (r) => (r.price ? money(r.price.input, ccy) : DASH), value: (r) => (r.price ? r.price.input : null) },
+      {
+        // Cached prompt tokens are billed at their own price (second line); without one they count at the input price.
+        key: 'input', label: t('Input'), align: 'num',
+        render: (r) => (r.price
+          ? h('div', { class: 'cell-stack' }, h('span', null, money(r.price.input, ccy)),
+            isNum(r.price.cached)
+              ? h('span', { class: 'cell-sub' }, t('cached {v}', { v: money(r.price.cached, ccy) }))
+              : h('span', { class: 'cell-sub', title: t('No cached-token price: cached tokens count at the input price') }, t('cached = input')))
+          : DASH),
+        value: (r) => (r.price ? r.price.input : null),
+        csv: (r) => (r.price ? r.price.input : ''),
+      },
       { key: 'output', label: t('Output'), align: 'num', render: (r) => (r.price ? money(r.price.output, ccy) : DASH), value: (r) => (r.price ? r.price.output : null) },
     ],
     rows,
@@ -919,21 +1023,53 @@ async function editPolicy(ctx, policy) {
   const pricing = policy.pricing || {};
   const workspaceTz = (store.boot && store.boot.workspace && store.boot.workspace.timezone) || 'UTC';
   const saved = typeof policy.currencySetting === 'string' ? policy.currencySetting : ccyOf(policy);
-  const state = { period: policy.period || 'daily', window: policy.window || 'calendar', tz: policy.resetTimezone || 'UTC', currency: saved };
+  const state = {
+    period: policy.period || 'weekly', window: policy.window || 'calendar', tz: policy.resetTimezone || workspaceTz, currency: saved,
+    weekday: isNum(policy.resetWeekday) ? policy.resetWeekday : 0, at: policy.resetTime || '00:00',
+  };
   const shownCcy = () => state.currency || (saved ? 'USD' : ccyOf(policy));
   const num = (v, step, min = 0) => textInput({ value: isNum(v) ? String(v) : '0', type: 'number', attrs: { min, step } });
   const tokenIn = num(policy.tokenCap, 1000);
   const reqIn = num(policy.requestCap, 10);
   const costHost = h('div');
   let cost = null;
-  const renderCost = () => {
-    const prev = cost ? cost.read() : (policy.costCap || 0);
+  const renderCost = (value) => {
+    const prev = value !== undefined ? value : (cost ? cost.read() : (policy.costCap || 0));
     cost = amountPicker({ value: prev || 0, currency: shownCcy(), pricing });
     mount(costHost, cost);
   };
   const billingLabel = saved ? t('Billing account currency') : t('Billing account currency ({ccy})', { ccy: ccyOf(policy) });
   const currencyOptions = [{ value: '', label: billingLabel }, ...currencyCodes(saved).map((c) => ({ value: c, label: c }))];
   const currencySel = selectInput(currencyOptions, state.currency, (v) => { state.currency = v; renderCost(); }, { 'aria-label': t('Currency') });
+  const periodSel = selectInput(PERIODS.map(([v, l]) => ({ value: v, label: t(l) })), state.period, (v) => { state.period = v; });
+  const windowSel = selectInput([{ value: 'calendar', label: t('Calendar (fixed reset)') }, { value: 'rolling', label: t('Rolling') }], state.window, (v) => { state.window = v; });
+  const weekdaySel = selectInput(WEEKDAYS.map((d, i) => ({ value: String(i), label: t(d) })), String(state.weekday), (v) => { state.weekday = Number(v); });
+  const timeIn = textInput({ value: state.at, attrs: { placeholder: '00:00', maxlength: 5, inputmode: 'numeric' } });
+  // Credit-based cap: each person may use their share of the weekly Antigravity credit pool, so the pool is never
+  // exceeded and nothing is billed as pay-as-you-go above quota.
+  const creditUsd = weeklyCreditUsd(policy);
+  const creditBtn = button({
+    label: t('Set from Antigravity credits ({v} per week)', { v: fmt.currency(creditUsd, 'USD', { precise: true }) }), icon: 'dollar', size: 'sm',
+    onClick: () => {
+      let ccy = shownCcy();
+      let amount = creditUsd;
+      if (ccy !== 'USD') {
+        const fx = pricing.fx;
+        if (fx && fx.from === 'USD' && fx.to === ccy && isNum(fx.rate)) {
+          amount = Math.round(creditUsd * fx.rate * 100) / 100;
+        } else {
+          state.currency = 'USD';
+          currencySel.querySelector('select').value = 'USD';
+          ccy = 'USD';
+        }
+      }
+      state.period = 'weekly';
+      state.window = 'calendar';
+      periodSel.querySelector('select').value = 'weekly';
+      windowSel.querySelector('select').value = 'calendar';
+      renderCost(amount);
+    },
+  });
   const priceInfo = h('div', { class: 'stack-sm' },
     h('div', { class: pricing.configured ? 'fw-600' : 'fw-600 text-warning' }, pricingSummary(pricing, ccyOf(policy))),
     h('p', { class: 'muted' }, pricing.source === 'manual'
@@ -949,15 +1085,18 @@ async function editPolicy(ctx, policy) {
     wide: true,
     body: (el) => append(el, [
       h('div', { class: 'field-row' },
-        field({ label: t('Cost cap per person'), help: t('Users above this estimated cost are suspended (automatic mode) or queued for review.'), control: costHost }),
+        field({ label: t('Cost cap per person'), help: t('Users above this estimated cost are suspended (automatic mode) or queued for review.'), control: h('div', { class: 'stack-sm' }, costHost, creditBtn) }),
         field({ label: t('Currency'), help: t('Cost caps and estimates are shown in this currency'), control: currencySel })),
       h('div', { class: 'field-row' },
         field({ label: t('Token cap per user'), help: t('Total tokens within the period. 0 disables it.'), control: tokenIn }),
         field({ label: t('Request cap per user'), help: t('Inference requests within the period. 0 disables it.'), control: reqIn })),
       h('div', { class: 'field-row' },
-        field({ label: t('Settlement period'), control: selectInput(PERIODS.map(([v, l]) => ({ value: v, label: t(l) })), state.period, (v) => { state.period = v; }) }),
-        field({ label: t('Window'), control: selectInput([{ value: 'calendar', label: t('Calendar (fixed reset)') }, { value: 'rolling', label: t('Rolling') }], state.window, (v) => { state.window = v; }) }),
-        field({ label: t('Reset time zone'), help: t('Calendar periods reset at local midnight'), control: selectInput(tzOptions, state.tz, (v) => { state.tz = v; }) })),
+        field({ label: t('Settlement period'), control: periodSel }),
+        field({ label: t('Window'), control: windowSel }),
+        field({ label: t('Reset time zone'), control: selectInput(tzOptions, state.tz, (v) => { state.tz = v; }) })),
+      h('div', { class: 'field-row' },
+        field({ label: t('Weekly reset day'), help: t('Match the day Gemini Enterprise resets the Antigravity credit pool (every 7 days from the first request in the project).'), control: weekdaySel }),
+        field({ label: t('Reset time'), help: t('HH:MM in the reset time zone'), control: timeIn })),
       field({ label: t('Token prices'), control: priceInfo }),
       err]),
     footer: (el) => append(el, [button({ label: t('Cancel'), onClick: () => m.close() }), save]),
@@ -968,9 +1107,11 @@ async function editPolicy(ctx, policy) {
     const rc = Number(reqIn.value);
     if (!Number.isInteger(tc) || tc < 0 || !Number.isInteger(rc) || rc < 0) { err.textContent = t('Caps must be whole numbers of zero or more.'); return; }
     if (!cost.valid()) { err.textContent = t('The cost cap must be a number of zero or more.'); return; }
+    const at = String(timeIn.value || '').trim();
+    if (!/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(at)) { err.textContent = t('Enter the reset time as HH:MM, for example 09:00.'); return; }
     const values = {
       token_cap: tc, request_cap: rc, cost_cap: cost.read() || 0, currency: state.currency,
-      period: state.period, window: state.window, reset_timezone: state.tz,
+      period: state.period, window: state.window, reset_timezone: state.tz, reset_weekday: state.weekday, reset_time: at,
     };
     setBusy(save, true, t('Saving'));
     try {

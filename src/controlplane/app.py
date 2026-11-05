@@ -84,6 +84,8 @@ _route("GET", "/api/v1/users", users.list_users, module="users", range=True, cac
 _route("GET", "/api/v1/users/detail", users.detail, module="users", range=True, cache=True,
        mask={"restrict": ("text", "fileName", "fileId")})
 _route("GET", "/api/v1/governance/antigravity/status", governance.status, module="antigravity", cache=True, ttl=60)
+_route("GET", "/api/v1/governance/antigravity/billing-report", governance.billing_report, module="antigravity",
+       cache=True, ttl=300)
 _route("POST", "/api/v1/governance/antigravity/cap", governance.cap, module="antigravity", admin=True,
        rate="governance")
 _route("POST", "/api/v1/governance/antigravity/user-action", governance.user_action, module="antigravity",

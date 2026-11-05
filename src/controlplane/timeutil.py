@@ -197,6 +197,7 @@ def fold(rng, pairs, cast=float):
 
 PERIODS = ("daily", "weekly", "monthly", "all")
 WINDOWS = ("calendar", "rolling")
+RESET_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 
 def _check_period(period, window):
@@ -206,21 +207,43 @@ def _check_period(period, window):
         raise ApiError("bad_request", "Parameter 'window' must be 'calendar' or 'rolling'.")
 
 
-def _calendar_start(period, local_now):
-    """Start of the calendar period containing local_now (wall clock in its own zone)."""
-    midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+def reset_hour_minute(at):
+    """(hour, minute) of a 'HH:MM' reset time; empty or invalid values mean midnight."""
+    m = RESET_TIME_RE.match(str(at or "").strip())
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
+def _reset_weekday(weekday):
+    try:
+        value = int(weekday)
+    except (TypeError, ValueError):
+        return 0
+    return value if 0 <= value <= 6 else 0
+
+
+def _calendar_start(period, local_now, weekday=0, at="00:00"):
+    """Start of the calendar period containing local_now (wall clock in its own zone).
+
+    Periods begin at the reset time `at` (HH:MM, default midnight); weekly periods begin on `weekday`
+    (0 = Monday ... 6 = Sunday, default Monday) and monthly periods on the 1st."""
+    hour, minute = reset_hour_minute(at)
+    boundary = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if period == "daily":
-        return midnight
+        return boundary if local_now >= boundary else boundary - dt.timedelta(days=1)
     if period == "weekly":
-        return midnight - dt.timedelta(days=local_now.weekday())
-    return midnight.replace(day=1)
+        start = boundary - dt.timedelta(days=(local_now.weekday() - _reset_weekday(weekday)) % 7)
+        return start if local_now >= start else start - dt.timedelta(days=7)
+    start = boundary.replace(day=1)
+    if local_now >= start:
+        return start
+    return (start - dt.timedelta(days=1)).replace(day=1)
 
 
-def governance_window(period, window, now=None, tz=None):
+def governance_window(period, window, now=None, tz=None, weekday=0, at="00:00"):
     """Returns (start, end) aware UTC datetimes.
 
-    calendar: period boundaries at local midnight in `tz` (default UTC; daily: today 00:00,
-    weekly: Monday 00:00, monthly: the 1st 00:00), all: now - 90 days.
+    calendar: period boundaries at the reset time `at` (default 00:00) in `tz` (default UTC; daily:
+    today, weekly: the last `weekday` (default Monday), monthly: the 1st), all: now - 90 days.
     rolling: now - 24h / 7d / 30d / 90d."""
     now = (now or dt.datetime.now(UTC)).astimezone(UTC).replace(second=0, microsecond=0)
     _check_period(period, window)
@@ -230,11 +253,11 @@ def governance_window(period, window, now=None, tz=None):
         span = {"daily": 1, "weekly": 7, "monthly": 30}[period]
         return now - dt.timedelta(days=span), now
     zone = get_zone(tz) if tz else UTC
-    start = _calendar_start(period, now.astimezone(zone))
+    start = _calendar_start(period, now.astimezone(zone), weekday, at)
     return start.astimezone(UTC), now
 
 
-def governance_next_reset(period, window, now=None, tz=None):
+def governance_next_reset(period, window, now=None, tz=None, weekday=0, at="00:00"):
     """Next calendar period boundary (aware UTC), when usage counters restart; None for rolling
     windows and 'all', which have no fixed reset."""
     _check_period(period, window)
@@ -242,22 +265,22 @@ def governance_next_reset(period, window, now=None, tz=None):
         return None
     now = (now or dt.datetime.now(UTC)).astimezone(UTC)
     zone = get_zone(tz) if tz else UTC
-    start = _calendar_start(period, now.astimezone(zone))
+    start = _calendar_start(period, now.astimezone(zone), weekday, at)
     if period == "daily":
         nxt = start + dt.timedelta(days=1)
     elif period == "weekly":
         nxt = start + dt.timedelta(days=7)
     else:
         nxt = (start + dt.timedelta(days=32)).replace(day=1)
-    # Aware-datetime arithmetic with zoneinfo is wall-clock based: nxt is local midnight even
+    # Aware-datetime arithmetic with zoneinfo is wall-clock based: nxt is the local reset time even
     # across daylight-saving changes.
     return nxt.astimezone(UTC)
 
 
-def governance_period_end(period, window, now=None, tz=None):
+def governance_period_end(period, window, now=None, tz=None, weekday=0, at="00:00"):
     """End of the current evaluation period: the next calendar reset, or for rolling windows the
     moment the current usage has fully left the window (now + window span)."""
-    nxt = governance_next_reset(period, window, now, tz)
+    nxt = governance_next_reset(period, window, now, tz, weekday, at)
     if nxt is not None:
         return nxt
     now = (now or dt.datetime.now(UTC)).astimezone(UTC).replace(second=0, microsecond=0)

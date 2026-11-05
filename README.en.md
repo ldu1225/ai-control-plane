@@ -288,7 +288,7 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 | `DATASET_LOCATION` | `REGION` | Location of newly created BigQuery audit datasets (aligned across hub and linked projects so `UNION ALL` queries succeed) |
 | `ENABLE_DATA_ACCESS_LOGS` | `true` | Turns on Data Access audit logs across AI services (`--no-data-access-logs` sets `false`) |
 | `ENABLE_GE_OBSERVABILITY` | `true` | Turns on usage logs (observability) for every Gemini Enterprise app in `DISCOVERY_ENGINE_LOCATIONS`. Needs Owner or Gemini Enterprise Admin; without it, only a warning is printed. |
-| `GE_PROMPT_LOGGING` | `true` | Turns on `sensitiveLoggingEnabled` so user identities (`userIamPrincipal`), prompt/response text and uploaded file names are recorded instead of `<elided>`. |
+| `GE_PROMPT_LOGGING` | `true` | Turns on `sensitiveLoggingEnabled` so user identities (`userIamPrincipal`), prompt/response text and uploaded file names are recorded instead of `<elided>` (`--no-log-prompts` sets `false`). |
 | `BILLING_PROJECT_ID` | Empty | Project that holds the billing export (if empty, auto-detected or `PROJECT_ID`) |
 | `BILLING_DATASET` | Empty | Billing export dataset. Example: `billing_detailed_usage` |
 | `BILLING_TABLE` | Empty | `gcp_billing_export_resource_v1_XXXXXX_XXXXXX_XXXXXX` |
@@ -303,7 +303,7 @@ You can also enter or update the billing values after deployment in **Settings >
 | Variable | Default | Description |
 |---|---|---|
 | `ENABLE_GOVERNANCE_ACTIONS` | `false` | Grants IAM write roles. Required to suspend users over their cap, restore them, allow or disallow individual users and create marker roles |
-| `ENFORCEMENT_SCHEDULE` | Empty | Automatic enforcement schedule (cron). Example: `*/15 * * * *`. Requires `ENABLE_GOVERNANCE_ACTIONS=true`. Suspended users are restored by enforcement runs, so without a schedule they get access back only when an administrator runs enforcement after the period resets. |
+| `ENFORCEMENT_SCHEDULE` | `*/15 * * * *` | Antigravity cap enforcement schedule (cron). Suspended users are restored by enforcement runs, so it is on by default. `off` turns it off (then users get access back only when an administrator runs enforcement after the period resets). It is not created with `--read-only` or in IAP mode. |
 | `MAINTENANCE_SCHEDULE` | `0 * * * *` | Cloud Scheduler cron for `${SERVICE_NAME}-maintenance`: runs daily official pricing & multi-currency FX sync at `PRICING_SYNC_TIME` (default `00:00` in `WORKSPACE_TIMEZONE`) and enforces/resumes Telemetry BigQuery route daily GiB caps (`off` or `none` disables the job) |
 | `PRICING_SYNC_TIME`, `PRICING_CURRENCY` | `00:00`, `KRW` | Daily pricing/FX sync time (in `WORKSPACE_TIMEZONE`) and default display currency when no billing export is connected |
 
@@ -470,7 +470,7 @@ When a billing export is configured, Cost & FinOps, cost per model, agent runtim
 
 ### 6.5 Antigravity inference logs
 
-Antigravity token usage per user is read from the `businessaicode.googleapis.com/inference_response` log that Antigravity for organizations writes to the project. If a BigQuery sink table exists, BigQuery is used. Otherwise, the Cloud Logging API is used (`usage_source: auto`). Google Cloud API calls that coding agents make with user credentials are shown under **Agent activity in your cloud** on the Antigravity Controls page, based on audit logs.
+Antigravity token usage per user is read from the `businessaicode.googleapis.com/inference_response` log that Antigravity for organizations writes to the project. **This log is written only when Metadata logging is on in Gemini Enterprise > Settings > AI developer tools > Compliance, which is off by default** ([official docs](https://cloud.google.com/gemini/enterprise/docs/ai-developer-tools-track-token-usage)). Prompts and responses logging is not needed. The deployment summary checks whether the log exists. Entries written after the log sink exists are kept in BigQuery (no expiry); earlier entries stay in Cloud Logging for 30 days by default. Usage is read from the BigQuery sink table. The time before the table existed (for example when Metadata logging was turned on before installation) and projects without a sink table are read from Cloud Logging and added (`usage_source: auto`; no entry is counted twice), so the first week's caps and the first month's report miss no calls. Entries from before installation that are older than the Cloud Logging retention (30 days by default) cannot be read. Without a sink table, only the Cloud Logging API is used. Users are counted by the email in the log's `labels.user_id` (an IAM principal such as `user:alice@example.com`, with `user:` removed), so they match the project's `user:` IAM bindings; service accounts and other non-user principals are left out of the user list and the caps. Google Cloud API calls that coding agents make with user credentials are shown under **Agent activity in your cloud** on the Antigravity Controls page, based on audit logs.
 
 ### 6.6 Runtime service account permissions
 
@@ -542,7 +542,7 @@ Shows verdicts over time, matched filters (prompt injection, sensitive data and 
 
 ### 7.7 Models & Tokens
 
-- Models are discovered automatically from billing SKUs, Cloud Monitoring `model_user_id` and Antigravity `model_id`. The SKU description is searched for a model family word (Gemini, Claude, Llama and others), and qualifiers such as region, modality, input/output and context tier are removed to group the SKUs under one key (for example, `gemini-3.8-flash`). The Agent Platform format (`Gemini 3.8 Flash Global Text Input`), the Gemini API format and the Monitoring model ID are merged into the same model.
+- Models are discovered automatically from billing SKUs, Cloud Monitoring `model_user_id` and the `model` label of Antigravity inference logs (`model_id` in older entries). The SKU description is searched for a model family word (Gemini, Claude, Llama and others), and qualifiers such as region, modality, input/output and context tier are removed to group the SKUs under one key (for example, `gemini-3.8-flash`). The Agent Platform format (`Gemini 3.8 Flash Global Text Input`), the Gemini API format and the Monitoring model ID are merged into the same model.
 - Tokens per model are based on Cloud Monitoring `publisher/online_serving/token_count` (Agent Platform), plus billed Gemini API tokens that Monitoring does not capture. For models without Monitoring metrics, token usage from billing SKUs is used. Invocations and error rate are calculated from `model_invocation_count`.
 - When a product re-bills model usage under its own SKUs, that usage is shown separately in the "Usage by product" card. The same tokens are also billed to the underlying model, so they are not added to the model token total.
 - When a new model such as Gemini 4 Carbon or Gemini 4 Argon is discovered for the first time, a "new models detected" notice appears. With `auto_enable_new_models: true`, the model is tracked immediately. With `false`, it is left out of totals until an administrator turns it on.
@@ -597,12 +597,15 @@ flowchart TD
 
 ### 8.2 Getting started
 
-1. Deploy with `ENABLE_GOVERNANCE_ACTIONS="true"`. To use automatic suspension and automatic restores at the end of each period, also set `ENFORCEMENT_SCHEDULE="*/15 * * * *"`.
-2. In **Antigravity Controls > Enforcement prerequisites**, check the marker roles and permissions. If the marker roles are missing, select **Create marker roles**.
-3. Set the following in **Cap policy > Edit policy**.
-   - Cost cap per person: the `₩1M`, `₩2M` or `₩3M` preset (shown as `₩100만`, `₩200만`, `₩300만` in Korean), or a custom amount
+1. A default installation (`ENABLE_GOVERNANCE_ACTIONS="true"`) is ready. The installer does the following.
+   - **Creates the marker roles** `CustomAntigravityCapBlocked` and `CustomAntigravityAdminBlocked`: the Gemini Enterprise User role without `businessaicode.*`, the same custom role Google documents for [restricting AI developer tools](https://cloud.google.com/gemini/enterprise/docs/ai-developer-tools-creating-custom-roles). Suspended users keep the Gemini Enterprise app and lose only Antigravity.
+   - **Creates the enforcement schedule**: an enforcement run every 15 minutes (`ENFORCEMENT_SCHEDULE` defaults to `*/15 * * * *`), which **restores suspended users automatically** when the settlement period resets, in manual review mode too. Use `--no-enforcement-schedule` to turn it off or `--enforcement-schedule "CRON"` to change it. It is not created in IAP access mode or with `--read-only`.
+   - If no scheduled run happens for two hours, the page shows **Scheduled enforcement stopped**.
+2. A Gemini Enterprise administrator turns on **Metadata logging** (6.5). Usage is counted from then on.
+3. Set the following in **Cap policy > Edit policy**. Right after installation every cap is off (0), so nobody is over a cap.
+   - Cost cap per person: a custom amount, or **Set from Antigravity credits** (the monthly credit per user / 4: Standard USD 2.50 and Plus USD 3.75 per week; if everyone stays inside it, the credit pool is never exceeded and nothing is billed above quota). The monthly credit is `Antigravity credit per user and month` in Settings > Governance policy (default 10).
    - Currency: the billing account currency by default. If you choose `KRW`, amounts are shown and compared in Korean won.
-   - Settlement period: Daily, Weekly, Monthly, Last 90 days / Window: Calendar (fixed reset) or Rolling / Reset time zone (for example, the 1st of every month at 00:00 Asia/Seoul)
+   - Settlement period: **Weekly** by default. Gemini Enterprise enforces Antigravity credits as a **shared pool per 7 days** from the project's first request ([official docs](https://cloud.google.com/gemini/enterprise/docs/quotas-and-pay-as-you-go-usage)), so set the **Weekly reset day** and **Reset time** to that cycle. An empty reset time zone means the workspace time zone.
    - Token cap, Request cap (0 disables it)
 4. To give a person a different amount, select the pencil button in the **Cost cap** column of the **Usage against cap** table (`Use default`, `No cost cap`, presets, custom amount).
 5. In the **Enforcement** card at the top, choose **Automatic suspension** or **Manual review**. The default is manual review.
@@ -610,14 +613,15 @@ flowchart TD
 
 ### 8.3 Estimated cost and unit prices
 
-- Cost per user = for each model, input (prompt) tokens x input price + remaining tokens (response, thinking) x output price.
+- Cost per user = for each model, (input tokens − cached tokens) x input price + cached tokens (`cachedContentTokenCount`) x cached price + remaining tokens (response, thinking) x output price. Antigravity sessions serve most input from the prompt cache (official example: 69,079 of 70,825 input tokens), so ignoring the cached price would inflate the amount a lot. Models without a known cached price use the input price, so cost is never underestimated. Cache writes are not in the log and count as input.
 - Unit prices are looked up per model and per direction (input/output) in the following order.
   1. **Actual billed price**: `SUM(cost) / SUM(usage.amount)` for the model's standard text token SKUs in the billing export over the last 30 days. Negotiated prices are reflected, and credits are not subtracted. Variant SKUs such as batch, flex, priority, cache, long context, tuning and audio/image/video are excluded.
   2. **Public Google price list**: Models without billing records use the public prices from the Cloud Billing Catalog API (Agent Platform, Gemini API).
 - If the currency is different, amounts are converted with the exchange rate that Google publishes in its price list. The UI shows the basis, for example `1 USD = ₩1,359 (Google rate, date)`.
 - Unit prices are cached for 6 hours. The **Prices of models used in this period** table in the Cap policy card shows the price of each model and its source (Billed price, Google price list, No price).
 - Models with no price from either source are shown as "No price", and their tokens are not included in the cost. When only the cost cap is on, users whose cost cannot be calculated show `—` for cap usage instead of 0%, and they are not suspended.
-- The billing export has no user information, so per-person cost is a token-based estimate, not the actual billed amount. The UI also labels it as estimated cost.
+- The billing export has no user information, so per-person cost is a token-based estimate, not the actual billed amount. The UI also labels it as estimated cost. The token counts themselves are what Google logged for each call.
+- **Monthly usage report** (Antigravity Controls page): pick a month to see requests, input, cached and output tokens, cost, credit and the amount to charge (credit deducted or full amount) per person, and download it as CSV (`GET /api/v1/governance/antigravity/billing-report?month=YYYY-MM`). It is meant for internal chargeback and states that Google bills the project, not people.
 - Organizations that want to enter their contract prices can change Token prices to `Enter prices` in Settings > Governance policy, or use `model_prices` in `config.yaml` (optional).
 
 ### 8.4 Enforcement modes
@@ -628,7 +632,8 @@ flowchart TD
 | Automatic suspension | The user is suspended by each enforcement run. | Automatic when the settlement period ends |
 
 - An **enforcement run** is started by the **Run enforcement now** button or by the Cloud Scheduler job (`ENFORCEMENT_SCHEDULE`). The scheduler job calls `POST /api/v1/governance/antigravity/enforce` with a Google OIDC token from a dedicated service account that has no permissions. The app checks the issuer, the audience (`PUBLIC_BASE_URL` + path), email verification and the allowlist (`SCHEDULER_INVOKERS`). Calls without authentication and calls with other tokens get 401.
-- Suspension = one etag-based `setIamPolicy` call that replaces the access role (`roles/discoveryengine.agentspaceUser`) with the cap marker role (`CustomAntigravityCapBlocked`). A suspension record (start, scheduled end, reason, actor) is kept in the settings bucket, and the first enforcement run after the period ends restores the user, even without telemetry. With `ENFORCEMENT_SCHEDULE` this happens within one interval; without it, run enforcement after each reset. However, the suspension stays if the user's usage in the new period is already over the cap.
+- Suspension = one etag-based `setIamPolicy` call that replaces the access role (`roles/discoveryengine.agentspaceUser`) with the cap marker role (`CustomAntigravityCapBlocked`). A suspension record (start, scheduled end, reason, actor) is kept in the settings bucket, and the first enforcement run after the period ends restores the user, even without telemetry. With the default schedule (15 minutes) this happens within 15 minutes of the reset; only when the schedule is turned off do you need to run enforcement after each reset. However, the suspension stays if the user's usage in the new period is already over the cap.
+- **No suspension is permanent.** A cap suspension always ends at the next reset; only an administrator's **Always block** rule keeps blocking. `teardown.sh` also restores cap-suspended users before it removes the dashboard (section 15).
 
 ### 8.5 Exception rules
 
@@ -868,7 +873,8 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 | Only the Gemini Enterprise and Model Armor pages are empty | The filter of a sink created by `deploy.sh` before v2.1.0 ([6.1](#61-audit-log-sink-bigquery)). Run `deploy.sh` again with `CREATE_LOG_SINK=true`, or run `scripts/prepare.sh`; the logs arrive from then on. |
 | Warning that Gemini Enterprise usage logs could not be turned on | The running account needs Owner or Gemini Enterprise Admin (`roles/discoveryengine.agentspaceAdmin`). You can also turn them on in the console ([6.3](#63-gemini-enterprise-logs)). |
 | Tokens by model are empty | `roles/monitoring.viewer`, and whether token SKUs exist in the billing export |
-| License seats are empty or too low | `roles/discoveryengine.viewer`, and whether every location your subscriptions are distributed to is in `DISCOVERY_ENGINE_LOCATIONS` (leave it empty in `deploy.env` and run `scripts/deploy.sh` again to detect them) |
+| License seats are empty or too low | `roles/discoveryengine.viewer` and the license reader custom role `CustomAiControlPlaneLicenseReader` (in the primary and every linked project), and whether every location your subscriptions are distributed to is in `DISCOVERY_ENGINE_LOCATIONS` (leave it empty in `deploy.env` and run `scripts/deploy.sh` again to detect them) |
+| Access denied on `discoveryengine.*` (licenseConfigs, userLicenses, engines) or on the `user_activity` table | The runtime service account has no access to the project where Gemini Enterprise runs, usually because the dashboard was installed into another project. Install into the Gemini Enterprise project or link it with `--link-projects`; for a dashboard that is already installed, run the grant commands in [14.5](#145-when-gemini-enterprise-lives-in-another-project). |
 | 0 Antigravity users | Whether the `inference_response` log exists in the project (Antigravity for organizations). Agents in a personal setup do not write this log. |
 | All Antigravity states are `UNKNOWN` | The `resourcemanager.projects.getIamPolicy` permission (`roles/iam.securityReviewer`) |
 | Suspend/restore buttons are refused | Whether you redeployed with `ENABLE_GOVERNANCE_ACTIONS=true`, whether the marker roles exist, and the gate results |
@@ -905,6 +911,46 @@ Before creating anything (step 0/8), `deploy.sh` and `install.sh` read the proje
 
 Use `--skip-preflight-blockers` only when you are sure a finding is wrong.
 
+### 14.5 When Gemini Enterprise lives in another project
+
+If the dashboard was installed into a new project while Gemini Enterprise runs in an existing one, the runtime service account has no access to that project: the Gemini Enterprise pages stay empty and show access-denied notices for `discoveryengine.*` and `user_activity`. The final deployment summary then warns `No Gemini Enterprise app or seats found`.
+
+- **Recommended: install into the Gemini Enterprise project itself.** Antigravity governance (suspending and restoring over-cap users, individual allow and block), the marker roles and all IAM actions act on the primary project's IAM policy, and the Antigravity users' access role (`roles/discoveryengine.agentspaceUser`) lives in the Gemini Enterprise project.
+
+  ```bash
+  scripts/deploy.sh --project GE_PROJECT_ID
+  ```
+
+- **Alternative: link it read-only.** Keep the current project as the primary project and link the Gemini Enterprise project with `--link-projects` to see its usage, license seats and logs. Controls still act on the primary project only. The deploying account needs Owner on the Gemini Enterprise project.
+
+  ```bash
+  scripts/deploy.sh --project HUB_PROJECT_ID --link-projects GE_PROJECT_ID
+  ```
+
+> [!IMPORTANT]
+> By default the installer turns on observability (usage logs) **and prompt/response logging** (`sensitiveLoggingEnabled`) for every Gemini Enterprise app in the primary and linked projects, and enables Data Access audit logs. For a Gemini Enterprise project in production, get the customer's consent first, or run with `--no-log-prompts` and `--no-data-access-logs`.
+
+To add only the permissions to a dashboard that is already installed, an Owner of the Gemini Enterprise project runs the following (the runtime service account defaults to `ai-control-plane-sa`):
+
+```bash
+GE=GE_PROJECT_ID; HUB=HUB_PROJECT_ID
+SA="serviceAccount:ai-control-plane-sa@${HUB}.iam.gserviceaccount.com"
+# Read-only license seat reader (roles/discoveryengine.viewer has neither licenseConfigs.list nor listUserLicenses).
+# If the role already exists, use update instead of create.
+gcloud iam roles create CustomAiControlPlaneLicenseReader --project "$GE" \
+  --title "AI Control Plane License Reader" --stage GA \
+  --permissions discoveryengine.licenseConfigs.get,discoveryengine.licenseConfigs.list,discoveryengine.userStores.get,discoveryengine.userStores.listUserLicenses
+gcloud projects add-iam-policy-binding "$GE" --member "$SA" \
+  --role "projects/${GE}/roles/CustomAiControlPlaneLicenseReader" --condition=None
+for role in roles/discoveryengine.viewer roles/bigquery.dataViewer roles/bigquery.jobUser roles/bigquery.user \
+    roles/logging.viewer roles/logging.privateLogViewer roles/logging.configWriter roles/monitoring.viewer \
+    roles/aiplatform.viewer roles/iam.securityReviewer roles/modelarmor.viewer roles/serviceusage.serviceUsageConsumer; do
+  gcloud projects add-iam-policy-binding "$GE" --member "$SA" --role "$role" --condition=None
+done
+```
+
+Then add the Gemini Enterprise project under **Settings > Workspace and data sources > Additional projects to scan**. If that project has no audit log sink (`ge_analytics`) yet, create it with `scripts/prepare.sh --project GE_PROJECT_ID` (it takes the same `--no-log-prompts` and `--no-data-access-logs` options).
+
 ## 15. Removal
 
 ```bash
@@ -912,7 +958,7 @@ scripts/teardown.sh --project PROJECT_ID                 # deletes Cloud Run ser
 scripts/teardown.sh --project PROJECT_ID --delete-data   # also deletes the settings bucket and the Log Router sink (add --dry-run to preview first)
 ```
 
-If `deploy.<PROJECT_ID>.env` contains `SCAN_PROJECTS` (or you pass `--link-projects PROJ_B,PROJ_C`), `teardown.sh` also removes the runtime service account's cross-project IAM bindings from those linked projects. The BigQuery audit log dataset, the Artifact Registry repository and the Data Access audit log settings are not deleted automatically; the script prints the exact commands to delete them if desired. The observability setting of Gemini Enterprise apps and any Antigravity marker roles are also kept so suspended users are not orphaned; restore any suspended users on the Antigravity Controls page before removal.
+If `deploy.<PROJECT_ID>.env` contains `SCAN_PROJECTS` (or you pass `--link-projects PROJ_B,PROJ_C`), `teardown.sh` also removes the runtime service account's cross-project IAM bindings from those linked projects. The BigQuery audit log dataset, the Artifact Registry repository and the Data Access audit log settings are not deleted automatically; the script prints the exact commands to delete them if desired. **Users suspended by caps are restored automatically before removal** (the access role is given back first, then the marker role is removed). Administrator blocks are kept and listed; add `--restore-blocked-users` to restore them too. The observability setting of Gemini Enterprise apps and the Antigravity marker roles are kept, because blocked users may still hold the marker roles. The license reader custom role (`CustomAiControlPlaneLicenseReader`) loses its bindings in the primary and linked projects but the role itself is kept, because another dashboard in the same project may use it; the script prints the delete commands.
 
 ---
 

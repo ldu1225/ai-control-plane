@@ -289,7 +289,7 @@ def expr(alias, schema, *candidates, cast=None):
 class Source:
     """A resolved table (plain or date-sharded) with its schema."""
 
-    def __init__(self, project, dataset, logical, kind, table, schema, latest=None, location=None):
+    def __init__(self, project, dataset, logical, kind, table, schema, latest=None, location=None, created=None):
         self.project = project
         self.dataset = dataset
         self.logical = logical
@@ -298,6 +298,9 @@ class Source:
         self.schema = schema
         self.latest = latest
         self.location = location
+        # When the table was created (timezone-aware datetime, plain tables only). Log Router creates a sink table on the
+        # first routed entry, so log entries older than this exist only in Cloud Logging.
+        self.created = created
 
     @property
     def label(self):
@@ -549,7 +552,8 @@ class SchemaRegistry:
             return {"schema": TableSchema(tbl.schema, partition_field=getattr(partitioning, "field", None),
                                           ingestion_partitioned=ingestion),
                     "rows": getattr(tbl, "num_rows", None), "bytes": getattr(tbl, "num_bytes", None),
-                    "modified": getattr(tbl, "modified", None), "location": loc}
+                    "modified": getattr(tbl, "modified", None), "created": getattr(tbl, "created", None),
+                    "location": loc}
 
         value, _ = self._schemas.get_or_compute(("schema", project, dataset, table), SCHEMA_TTL, load)
         return value
@@ -561,8 +565,10 @@ class SchemaRegistry:
             return None
         meta = self.schema(project, dataset, res["latest"], quota_project)
         loc = meta.get("location") if isinstance(meta, dict) else None
+        # A sharded table's metadata is its latest shard's, so its creation time says nothing about the first entry.
+        created = meta.get("created") if (isinstance(meta, dict) and res["kind"] == "table") else None
         return Source(project, dataset, logical, res["kind"], res["table"], meta["schema"],
-                      latest=res["latest"], location=loc)
+                      latest=res["latest"], location=loc, created=created)
 
     def table_source(self, project, dataset, table, quota_project):
         """Source for an exact (non-discovered) table such as the billing export table."""

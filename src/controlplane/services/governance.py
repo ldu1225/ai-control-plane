@@ -10,7 +10,8 @@ Safety rules (from agy-admin):
 Per-user caps over a settlement period:
 - A user is over the cap when tokens, requests or the estimated cost (tokens x configured unit
   prices) reach the cap within the period (daily / weekly / monthly calendar periods reset at
-  local midnight in governance.antigravity.reset_timezone).
+  governance.antigravity.reset_time (weekly periods on reset_weekday) in reset_timezone, which
+  defaults to the workspace time zone).
 - enforcement_mode=auto: the scheduled enforcement run suspends over-cap users until the period
   resets. enforcement_mode=manual: over-cap users wait in a review queue; an administrator
   suspends them or allows them for the rest of the period.
@@ -120,6 +121,14 @@ def gov_config(settings):
         change_budget_ratio=float(ag.get("change_budget_ratio", 0.2)))
 
 
+def period_anchor(settings):
+    """Keyword arguments that locate calendar period boundaries: the reset time zone (empty = the
+    workspace time zone), the weekly reset weekday and the reset time."""
+    ag = settings["governance"]["antigravity"]
+    tz = ag.get("reset_timezone") or (settings.get("workspace") or {}).get("timezone") or "UTC"
+    return {"tz": tz, "weekday": ag.get("reset_weekday", 0) or 0, "at": ag.get("reset_time") or "00:00"}
+
+
 @dataclass(frozen=True)
 class Pricing:
     """Prices per million tokens used to estimate per-user cost (billing exports have no user
@@ -134,6 +143,7 @@ class Pricing:
     models: tuple = ()  # ((model id or prefix, input, output), ...), longest first
     source: str = "manual"
     table: object = None  # services.pricing.PriceTable when source == "auto"
+    cached_models: tuple = ()  # ((model id or prefix, cached-token price), ...), longest first
 
     @property
     def has_default(self):
@@ -162,6 +172,22 @@ class Pricing:
             return pin or 0.0, pout or 0.0, bool(pin and pout)
         return self.input_per_million, self.output_per_million, self.has_default
 
+    def cached_price(self, model, input_price):
+        """(price, known) per million prompt tokens served from the prompt cache. Entered cached prices
+        first, then the automatic price table. Without one the input price applies (known False), so
+        cached tokens are never estimated below what they can cost."""
+        key = str(model or "").lower()
+        for prefix, pcached in self.cached_models:
+            if key and (key == prefix or key.startswith(prefix)):
+                return pcached, True
+        if any(key and (key == prefix or key.startswith(prefix)) for prefix, _, _ in self.models):
+            return input_price, False
+        if self.source == "auto" and self.table is not None and model:
+            hit = self.table.lookup(model) or {}
+            if hit.get("cached") is not None:
+                return float(hit["cached"]), True
+        return input_price, False
+
     def lookup(self, model):
         """Public price entry for one model id, or None when unpriced."""
         pin, pout, priced = self.price(model)
@@ -171,7 +197,11 @@ class Pricing:
         source = "manual"
         if self.source == "auto" and not any(key and (key == p or key.startswith(p)) for p, _, _ in self.models):
             source = (self.table.lookup(model) or {}).get("source", "catalog")
-        return {"input": round(pin, 6), "output": round(pout, 6), "source": source, "complete": priced}
+        out = {"input": round(pin, 6), "output": round(pout, 6), "source": source, "complete": priced}
+        pcached, known = self.cached_price(model, pin)
+        if known:
+            out["cached"] = round(pcached, 6)
+        return out
 
     def public(self, used_models=()):
         out = {"configured": self.configured, "currency": self.currency, "source": self.source,
@@ -195,6 +225,15 @@ def _manual_models(ag):
     return tuple(models)
 
 
+def _manual_cached(ag):
+    out = []
+    for item in ag.get("model_prices") or []:
+        if isinstance(item, dict) and item.get("model") and item.get("cached") not in (None, ""):
+            out.append((str(item["model"]).lower(), float(item["cached"])))
+    out.sort(key=lambda m: (-len(m[0]), m[0]))
+    return tuple(out)
+
+
 def pricing_from(ag, table=None):
     """Pricing for the saved policy. table is the automatic price table (services.pricing) or None."""
     source = ag.get("pricing_source") or "auto"
@@ -204,13 +243,15 @@ def pricing_from(ag, table=None):
     return Pricing(currency=currency or "USD",
                    input_per_million=float(ag.get("input_price_per_million") or 0),
                    output_per_million=float(ag.get("output_price_per_million") or 0), models=_manual_models(ag),
-                   source=source, table=table if source == "auto" else None)
+                   source=source, table=table if source == "auto" else None, cached_models=_manual_cached(ag))
 
 
 def estimate_cost(rec, pricing):
-    """(cost, partial) of one user's usage in the pricing currency: prompt tokens at the input
-    price and every other token (candidates and thinking) at the output price, per model.
-    cost is None when no price is available (or none of the user's tokens could be priced);
+    """(cost, partial) of one user's usage in the pricing currency, per model: prompt tokens served from
+    the prompt cache (cachedContentTokenCount, a subset of promptTokenCount) at the cached-token price,
+    the other prompt tokens at the input price, and every other token (candidates and thinking) at the
+    output price. This follows how the calls are billed; cache writes are not in the log and count as
+    input. cost is None when no price is available (or none of the user's tokens could be priced);
     partial is True when some tokens belong to a model without a price (those tokens add nothing)."""
     if not pricing.configured:
         return None, False
@@ -225,14 +266,16 @@ def estimate_cost(rec, pricing):
         if model and models_service.is_non_token_model(model):
             continue
         prompt = max(0, to_int(agg.get("promptTokens")))
+        cached = min(max(0, to_int(agg.get("cachedTokens"))), prompt)
         output = max(tokens - prompt, to_int(agg.get("candidateTokens")), 0)
         pin, pout, priced = pricing.price(model)
+        pcached, _known = pricing.cached_price(model, pin)
         used_tokens += tokens
         if pin or pout:
             priced_tokens += tokens
         if not priced and tokens > 0:
             partial = True
-        total += prompt * pin / 1e6 + output * pout / 1e6
+        total += (prompt - cached) * pin / 1e6 + cached * pcached / 1e6 + output * pout / 1e6
     if used_tokens > 0 and priced_tokens == 0:
         return None, True
     return round(total, 6), partial
@@ -583,17 +626,68 @@ def permission_status(ctx):
 # Usage (BigQuery sink or Cloud Logging)
 # ---------------------------------------------------------------------------
 
+# Antigravity inference logs name the caller in labels.user_id as an IAM principal: "user:alice@example.com" (the
+# documented format; older entries carried the bare email). Usage is keyed by the plain lowercase email, the same key
+# as the direct "user:" bindings of the IAM policy (PolicyIndex.direct_users), so caps, the user list and IAM states
+# line up instead of showing "user:..." duplicates that never match a binding.
+USER_PRINCIPAL_PREFIX_RE = r"(?i)^user:"
+
+
+def agy_user_sql(user_expr):
+    """BigQuery expression: the plain lowercase email behind labels.user_id (a leading "user:" removed)."""
+    return "LOWER(REGEXP_REPLACE(TRIM(%s), r'%s', ''))" % (user_expr, USER_PRINCIPAL_PREFIX_RE)
+
+
+def usage_user(principal):
+    """The person behind labels.user_id as a plain lowercase email, or None. As in direct_users only users count:
+    service accounts ("serviceAccount:..." or a .gserviceaccount.com email), workforce identities ("principal://...")
+    and other principal types get no per-user usage or caps."""
+    if not isinstance(principal, str):
+        return None
+    value = principal.strip().lower()
+    if value.startswith("user:"):
+        value = value[5:].strip()
+    if ":" in value.partition("@")[0] or not is_human(value):
+        return None
+    return value
+
+
+AGY_PAYLOAD_COLUMN = "jsonpayload_v1_inferenceresponselog"
+
+
+def payload_paths(schema, path):
+    """`path` under every payload column of a Log Router table.
+
+    Log Router names the payload column of an entry whose jsonPayload carries an @type after that type, and lower-cases
+    the field names: Antigravity's InferenceResponseLog lands in jsonpayload_v1_inferenceresponselog.metadata.
+    prompttokencount, not jsonPayload.metadata.promptTokenCount (seen in a real sink table). Lookups are
+    case-insensitive, so the documented camelCase path finds the lower-cased columns."""
+    typed = sorted(node.name for name, node in ((schema.tree or {}).items() if schema else ())
+                   if name.startswith("jsonpayload_"))
+    typed.sort(key=lambda n: n.lower() != AGY_PAYLOAD_COLUMN)
+    return ["%s.%s" % (col, path) for col in typed] + ["jsonPayload.%s" % path]
+
+
 def agy_fields(src, alias="t"):
     s = src.schema
+    user = expr(alias, s, "labels.user_id", cast="STRING")
+
+    def tokens(name):
+        return expr(alias, s, *payload_paths(s, "metadata.%s" % name), cast="INT64")
     return {
-        "user": expr(alias, s, "labels.user_id", cast="STRING"),
+        "user": agy_user_sql(user) if user else None,
         "client": expr(alias, s, "labels.client_name", cast="STRING"),
         "model": expr(alias, s, "labels.model_id", "labels.model", cast="STRING"),
-        "total": expr(alias, s, "jsonPayload.metadata.totalTokenCount", cast="INT64"),
-        "prompt": expr(alias, s, "jsonPayload.metadata.promptTokenCount", cast="INT64"),
-        "candidates": expr(alias, s, "jsonPayload.metadata.candidatesTokenCount", cast="INT64"),
+        "total": tokens("totalTokenCount"),
+        "prompt": tokens("promptTokenCount"),
+        "candidates": tokens("candidatesTokenCount"),
+        # Optional: the column exists only after the first call served from the prompt cache.
+        "cached": tokens("cachedContentTokenCount"),
         "ts": "%s.%s" % (alias, quote_ident(src.time_column())),
     }
+
+
+USAGE_COUNTERS = ("requests", "tokens", "promptTokens", "candidateTokens", "cachedTokens")
 
 
 class Usage:
@@ -609,16 +703,45 @@ class Usage:
 
     def user(self, email):
         return self.users.setdefault(email, {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0,
-                                             "clients": set(), "models": set(), "last": None, "byModel": {}})
+                                             "cachedTokens": 0, "clients": set(), "models": set(), "last": None,
+                                             "byModel": {}})
 
     @staticmethod
-    def add_model(rec, model, requests, tokens, prompt, cand):
+    def add_model(rec, model, requests, tokens, prompt, cand, cached=0):
         agg = rec["byModel"].setdefault(model or "unknown", {"requests": 0, "tokens": 0, "promptTokens": 0,
-                                                             "candidateTokens": 0})
+                                                             "candidateTokens": 0, "cachedTokens": 0})
         agg["requests"] += requests
         agg["tokens"] += tokens
         agg["promptTokens"] += prompt
         agg["candidateTokens"] += cand
+        agg["cachedTokens"] = agg.get("cachedTokens", 0) + cached
+
+    def merge(self, other):
+        """Adds `other`, which must hold different log entries (Cloud Logging entries the sink table never received)."""
+        self.records += other.records
+        self.truncated = self.truncated or other.truncated
+        for email, rec in other.users.items():
+            u = self.user(email)
+            for key in USAGE_COUNTERS:
+                u[key] += rec.get(key) or 0
+            u["clients"] |= set(rec.get("clients") or ())
+            u["models"] |= set(rec.get("models") or ())
+            if rec.get("last") is not None and (u["last"] is None or rec["last"] > u["last"]):
+                u["last"] = rec["last"]
+            for model, agg in (rec.get("byModel") or {}).items():
+                Usage.add_model(u, model, agg.get("requests") or 0, agg.get("tokens") or 0,
+                                agg.get("promptTokens") or 0, agg.get("candidateTokens") or 0,
+                                agg.get("cachedTokens") or 0)
+        for mine, theirs in ((self.by_model, other.by_model), (self.by_client, other.by_client)):
+            for key, agg in theirs.items():
+                cur = mine.setdefault(key, {k: 0 for k in USAGE_COUNTERS})
+                for k in USAGE_COUNTERS:
+                    cur[k] = (cur.get(k) or 0) + (agg.get(k) or 0)
+        for (person, bucket), (req, tok) in other.daily.items():
+            if isinstance(bucket, str):
+                bucket = dt.date.fromisoformat(bucket[:10])
+            r0, t0 = self.daily.get((person, bucket), (0, 0))
+            self.daily[(person, bucket)] = (r0 + req, t0 + tok)
 
 
 def _bq_usage(ctx, src, start, end, email=None, rng=None):
@@ -632,52 +755,70 @@ def _bq_usage(ctx, src, start, end, email=None, rng=None):
     hi = (end + dt.timedelta(days=1)).strftime("%Y%m%d")
     params.update({"sfx_start": lo, "sfx_end": hi})
     if email:
-        where += " AND LOWER(%s) = @email" % f["user"]
+        where += " AND %s = @email" % f["user"]  # matches "user:<email>" and the bare email alike
         params["email"] = email
-    base = ("WITH %s,\nu AS (SELECT %s AS ts, LOWER(%s) AS email, %s AS client, %s AS model, IFNULL(%s, 0) AS total, "
-            "IFNULL(%s, 0) AS prompt, IFNULL(%s, 0) AS cand FROM s t WHERE %s)"
+    base = ("WITH %s,\nu AS (SELECT %s AS ts, %s AS email, %s AS client, %s AS model, IFNULL(%s, 0) AS total, "
+            "IFNULL(%s, 0) AS prompt, IFNULL(%s, 0) AS cand, IFNULL(%s, 0) AS cached FROM s t WHERE %s)"
             % (src.cte("s", start="w_start", end="w_end"), f["ts"], f["user"], f["client"] or null,
-               f["model"] or null, f["total"] or "0", f["prompt"] or "0", f["candidates"] or "0", where))
+               f["model"] or null, f["total"] or "0", f["prompt"] or "0", f["candidates"] or "0",
+               f["cached"] or "0", where))
     usage = Usage("bigquery")
     rows = ctx.query(base + "\nSELECT email, model, COUNT(*) AS requests, SUM(total) AS tokens, SUM(prompt) AS prompt_tokens, "
-                     "SUM(cand) AS candidate_tokens, ARRAY_AGG(DISTINCT client IGNORE NULLS LIMIT 20) AS clients, "
+                     "SUM(cand) AS candidate_tokens, SUM(cached) AS cached_tokens, "
+                     "ARRAY_AGG(DISTINCT client IGNORE NULLS LIMIT 20) AS clients, "
                      "MAX(ts) AS last_ts\nFROM u GROUP BY email, model", params, "antigravity")
     for row in rows:
         if not row.get("email"):
             continue
-        u = usage.user(row["email"])
         requests, tokens = to_int(row.get("requests")), to_int(row.get("tokens"))
         prompt, cand = to_int(row.get("prompt_tokens")), to_int(row.get("candidate_tokens"))
+        cached = to_int(row.get("cached_tokens"))
+        usage.records += requests
+        person = usage_user(row["email"])
+        if person is None:
+            continue  # a service account or another non-user principal: telemetry, but no per-user usage
+        u = usage.user(person)
         u["requests"] += requests
         u["tokens"] += tokens
         u["promptTokens"] += prompt
         u["candidateTokens"] += cand
+        u["cachedTokens"] += cached
         u["clients"] |= set(row.get("clients") or [])
         if row.get("model"):
             u["models"].add(row["model"])
-        Usage.add_model(u, row.get("model"), requests, tokens, prompt, cand)
+        Usage.add_model(u, row.get("model"), requests, tokens, prompt, cand, cached)
         last = row.get("last_ts")
         if last is not None and (u["last"] is None or last > u["last"]):
             u["last"] = last
-        usage.records += requests
     if email:
         for dim, target in (("model", usage.by_model), ("client", usage.by_client)):
             sub = ctx.query(base + "\nSELECT %s AS k, COUNT(*) AS requests, SUM(total) AS tokens, SUM(prompt) AS p, "
-                            "SUM(cand) AS c FROM u GROUP BY k" % dim, params, "antigravity")
+                            "SUM(cand) AS c, SUM(cached) AS ca FROM u GROUP BY k" % dim, params, "antigravity")
             for row in sub:
                 target[row.get("k") or "unknown"] = {"requests": to_int(row.get("requests")),
                                                      "tokens": to_int(row.get("tokens")),
                                                      "promptTokens": to_int(row.get("p")),
-                                                     "candidateTokens": to_int(row.get("c"))}
+                                                     "candidateTokens": to_int(row.get("c")),
+                                                     "cachedTokens": to_int(row.get("ca"))}
     if rng is not None:
         params.update({"tz": rng.tz_name, "start_date": rng.start, "bucket_days": rng.bucket_days})
         from .base import bucket_sql
         sub = ctx.query(base + "\nSELECT %s AS bucket, email, COUNT(*) AS requests, SUM(total) AS tokens "
                         "FROM u GROUP BY bucket, email" % bucket_sql("ts"), params, "antigravity")
         for row in sub:
-            usage.daily[(row.get("email"), row.get("bucket"))] = (to_int(row.get("requests")), to_int(row.get("tokens")))
+            person = usage_user(row.get("email"))
+            if person is not None:
+                usage.daily[(person, row.get("bucket"))] = (to_int(row.get("requests")), to_int(row.get("tokens")))
     usage.ok = True
     return usage
+
+
+def _user_label_regex(email):
+    """RE2 pattern for labels.user_id of one person: optional "user:" prefix, case-insensitive, exact email."""
+    parts = []
+    for ch in email.lower():
+        parts.append(ch if (ch.isalnum() or ch in "@_") else "[%s]" % ch)
+    return "(?i)^(user:)?%s$" % "".join(parts)
 
 
 def _logging_usage_project(ctx, project, log_id, start, end, email=None, rng=None):
@@ -686,7 +827,9 @@ def _logging_usage_project(ctx, project, log_id, start, end, email=None, rng=Non
     if email:
         if not config.EMAIL_RE.match(email):
             raise GcpError("invalid", message="invalid email")
-        flt += ' AND labels.user_id="%s"' % email
+        # labels.user_id is "user:<email>" (documented format); older entries carried the bare email. The match is
+        # case-insensitive like IAM principals; dots and other symbols become character classes (no escapes).
+        flt += ' AND labels.user_id=~"%s"' % _user_label_regex(email)
     ag = ctx.settings["governance"]["antigravity"]
     limit = int(ag.get("max_log_entries") or 20000)
     tz = timeutil.get_zone(ctx.tz_name)
@@ -712,22 +855,32 @@ def _logging_usage_project(ctx, project, log_id, start, end, email=None, rng=Non
     return entries_out, truncated, tz
 
 
-def _logging_usage(ctx, start, end, email=None, rng=None):
+def _logging_usage(ctx, start, end, email=None, rng=None, ranges=None):
+    """Usage from Cloud Logging. `ranges` ({project: (from, to)}) limits the read to those projects and time ranges."""
     ag = ctx.settings["governance"]["antigravity"]
     log_id = ag["inference_log"]
     if not config.LOG_NAME_RE.match(log_id):
         raise GcpError("invalid", message="invalid log id")
     projects = list(getattr(ctx, "projects", None) or [ctx.project])
+    if ranges is not None:
+        projects = [p for p in projects if p in ranges]
+    else:
+        ranges = {p: (start, end) for p in projects}
     usage = Usage("logging")
     tz = timeutil.get_zone(ctx.tz_name)
     all_entries = []
+    if not projects:
+        usage.ok = True
+        return usage
     if len(projects) <= 1:
-        proj = projects[0] if projects else ctx.project
-        entries, truncated, tz = _logging_usage_project(ctx, proj, log_id, start, end, email=email, rng=rng)
+        proj = projects[0]
+        lo, hi = ranges[proj]
+        entries, truncated, tz = _logging_usage_project(ctx, proj, log_id, lo, hi, email=email, rng=rng)
         all_entries.extend(entries)
         usage.truncated = truncated
     else:
-        tasks = {p: (lambda pr=p: _logging_usage_project(ctx, pr, log_id, start, end, email=email, rng=rng))
+        tasks = {p: (lambda pr=p: _logging_usage_project(ctx, pr, log_id, ranges[pr][0], ranges[pr][1],
+                                                         email=email, rng=rng))
                  for p in projects}
         res = ctx.run(tasks)
         for p in projects:
@@ -742,13 +895,18 @@ def _logging_usage(ctx, start, end, email=None, rng=None):
                 usage.truncated = True
     for entry in all_entries:
         labels = entry.get("labels") or {}
-        user = (labels.get("user_id") or "").strip().lower()
-        if not user:
+        principal = labels.get("user_id")
+        if not isinstance(principal, str) or not principal.strip():
             continue
+        usage.records += 1
+        user = usage_user(principal)  # "user:alice@example.com" -> "alice@example.com"
+        if user is None:
+            continue  # a service account or another non-user principal: telemetry, but no per-user usage
         meta = ((entry.get("jsonPayload") or {}).get("metadata") or {})
         total = to_int(meta.get("totalTokenCount"))
         prompt = to_int(meta.get("promptTokenCount"))
         cand = to_int(meta.get("candidatesTokenCount"))
+        cached = to_int(meta.get("cachedContentTokenCount"))
         client = labels.get("client_name")
         model = labels.get("model_id") or labels.get("model")
         ts = parse_rfc3339(entry.get("timestamp"))
@@ -757,21 +915,23 @@ def _logging_usage(ctx, start, end, email=None, rng=None):
         u["tokens"] += total
         u["promptTokens"] += prompt
         u["candidateTokens"] += cand
+        u["cachedTokens"] += cached
         if client:
             u["clients"].add(client)
         if model:
             u["models"].add(model)
-        Usage.add_model(u, model, 1, total, prompt, cand)
+        Usage.add_model(u, model, 1, total, prompt, cand, cached)
         if ts and (u["last"] is None or ts > u["last"]):
             u["last"] = ts
-        usage.records += 1
         if email:
             for key, target in ((model or "unknown", usage.by_model), (client or "unknown", usage.by_client)):
-                agg = target.setdefault(key, {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0})
+                agg = target.setdefault(key, {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0,
+                                              "cachedTokens": 0})
                 agg["requests"] += 1
                 agg["tokens"] += total
                 agg["promptTokens"] += prompt
                 agg["candidateTokens"] += cand
+                agg["cachedTokens"] += cached
         if rng is not None and ts is not None:
             bucket_idx = rng.bucket_index(ts.astimezone(tz).date())
             if bucket_idx is not None:
@@ -780,6 +940,67 @@ def _logging_usage(ctx, start, end, email=None, rng=None):
                 usage.daily[(user, bucket)] = (req + 1, tok + total)
     usage.ok = True
     return usage
+
+
+def _bq_first_seen(ctx, src, start, end):
+    """{project: earliest inference log entry in [start, end)} in the sink table(s), from logName."""
+    lname = expr("t", src.schema, "logName", cast="STRING")
+    if not lname:
+        return {}
+    params = {"w_start": start, "w_end": end,
+              "sfx_start": (start - dt.timedelta(days=1)).strftime("%Y%m%d"),
+              "sfx_end": (end + dt.timedelta(days=1)).strftime("%Y%m%d")}
+    sql = ("WITH %s\nSELECT REGEXP_EXTRACT(%s, r'^projects/([^/]+)/') AS project, MIN(%s) AS first_ts FROM s t "
+           "GROUP BY project" % (src.cte("s", start="w_start", end="w_end"), lname, agy_fields(src)["ts"]))
+    return {r["project"]: r["first_ts"] for r in ctx.query(sql, params, "antigravity")
+            if r.get("project") and r.get("first_ts") is not None}
+
+
+def logging_gaps(ctx, src, start, end):
+    """{project: (from, to)}: the parts of [start, end) whose inference logs exist only in Cloud Logging.
+
+    Log Router copies only entries received after a sink was created, and creates the table with the first one. So a
+    project whose sink table was created after `start` has its earlier entries only in Cloud Logging (for example
+    Metadata logging was turned on before the dashboard was installed), and a scanned project without a sink table
+    has all of them there. Empty when every sink table predates `start` (the normal case after the first period)."""
+    projects = list(getattr(ctx, "projects", None) or [ctx.project])
+    created = {s.project: getattr(s, "created", None) for s in (getattr(src, "sources", None) or [src])}
+    gaps, late = {}, []
+    for p in projects:
+        if p not in created:
+            gaps[p] = (start, end)
+        elif created[p] is not None and created[p] > start:
+            late.append(p)
+    if late:
+        first = _bq_first_seen(ctx, src, start, end)
+        for p in late:
+            stop = min(x for x in (first.get(p), created[p], end) if x is not None)
+            if stop > start:
+                gaps[p] = (start, stop)
+    return gaps
+
+
+def _add_logging_gaps(ctx, src, usage, start, end, email=None, rng=None, log_label=None):
+    """Adds Cloud Logging entries the sink table never received (see logging_gaps). Never raises."""
+    try:
+        gaps = logging_gaps(ctx, src, start, end)
+    except GcpError as err:
+        ctx.warn_error(src.label, err, "The first entries of the Antigravity inference log table")
+        return
+    if not gaps:
+        return
+    key = ("agy_logging_gap", tuple(sorted((p, iso(a), iso(b)) for p, (a, b) in gaps.items())), email or "", rng)
+    try:
+        extra, _ = ctx.app.cache.get_or_compute(
+            key, 300, lambda: _logging_usage(ctx, start, end, email=email, rng=rng, ranges=gaps))
+    except GcpError as err:
+        ctx.warn_error(log_label, err, "Cloud Logging inference logs older than the sink table")
+        return
+    if extra.records:
+        ctx.add_source(log_label)
+    if extra.truncated:
+        ctx.warn(log_label, "truncated", "Inference log entries were truncated at max_log_entries.")
+    usage.merge(extra)
 
 
 def antigravity_usage(ctx, start, end, email=None, rng=None):
@@ -795,11 +1016,13 @@ def antigravity_usage(ctx, start, end, email=None, rng=None):
         try:
             usage = _bq_usage(ctx, src, start, end, email=email, rng=rng)
             ctx.add_source(label)
-            return usage
         except GcpError as err:
             ctx.warn_error(label, err, "The Antigravity inference log table")
             usage = Usage("bigquery")
             return usage
+        if mode == "auto":
+            _add_logging_gaps(ctx, src, usage, start, end, email=email, rng=rng, log_label=log_label)
+        return usage
     if mode == "bigquery":
         return Usage("unavailable")
     projects = tuple(getattr(ctx, "projects", None) or [ctx.project])
@@ -816,6 +1039,55 @@ def antigravity_usage(ctx, start, end, email=None, rng=None):
     if usage.truncated:
         ctx.warn(log_label, "truncated", "Inference log entries were truncated at max_log_entries.")
     return usage
+
+
+TELEMETRY_LOOKBACK = dt.timedelta(days=30)  # Cloud Logging keeps _Default entries for 30 days by default
+
+
+def telemetry_seen(ctx, usage, now):
+    """True when an Antigravity inference log entry exists in the last 30 days.
+
+    The cap window alone is not enough: right after every reset it is empty although Metadata logging is on, and the
+    page would tell the administrator to turn on a setting that is already on."""
+    if not usage.ok:
+        return False
+    if usage.records > 0:
+        return True
+    ag = ctx.settings["governance"]["antigravity"]
+    mode = ag.get("usage_source", "auto")
+    log_id = ag["inference_log"]
+    projects = tuple(getattr(ctx, "projects", None) or [ctx.project])
+
+    def probe():
+        start, end = now - TELEMETRY_LOOKBACK, now + dt.timedelta(minutes=5)
+        if mode in ("auto", "bigquery"):
+            src = ctx.audit_source(AGY_SINK, optional=True)
+            if src is not None:
+                params = {"w_start": start, "w_end": end,
+                          "sfx_start": (start - dt.timedelta(days=1)).strftime("%Y%m%d"),
+                          "sfx_end": (end + dt.timedelta(days=1)).strftime("%Y%m%d")}
+                rows = ctx.query("WITH %s\nSELECT COUNT(*) AS n FROM (SELECT 1 FROM s LIMIT 1)"
+                                 % src.cte("s", start="w_start", end="w_end"), params, "antigravity")
+                if rows and to_int(rows[0].get("n")):
+                    return True
+        if mode == "bigquery" or not config.LOG_NAME_RE.match(log_id):
+            return False
+        for proj in projects:
+            body = {"resourceNames": ["projects/%s" % proj], "orderBy": "timestamp desc", "pageSize": 1,
+                    "filter": 'logName="projects/%s/logs/%s" AND timestamp>="%s"' % (proj, log_id, iso(start))}
+            try:
+                data = ctx.rest("POST", "%s/entries:list" % LOGGING_V2, json_body=body, timeout=30)
+            except (GcpError, ValueError):
+                continue
+            if (data or {}).get("entries"):
+                return True
+        return False
+
+    try:
+        seen, _ = ctx.app.cache.get_or_compute(("agy_telemetry_seen", projects, mode), 600, probe)
+    except (GcpError, ValueError):
+        return False  # a failed probe must not break the status page; the usage notices already say what failed
+    return bool(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -894,11 +1166,23 @@ def restore_at(state, suspension, over, next_reset, now):
     return None
 
 
-def scheduler_status(ctx, state):
+# The default schedule runs every 15 minutes; two hours without a scheduled run means it stopped, and suspended
+# users would then not be restored at the period reset.
+SCHEDULER_STALE_AFTER = dt.timedelta(hours=2)
+
+
+def scheduler_status(ctx, state, now=None):
+    """Scheduled enforcement: configured (Cloud Scheduler can call the enforcement endpoint), the last scheduled run
+    and stale (configured, has run before, but not within SCHEDULER_STALE_AFTER)."""
     ag = ctx.settings["governance"]["antigravity"]
     invokers = list(ag.get("scheduler_invokers") or [])
     base = (ctx.settings.get("security") or {}).get("public_base_url") or ""
-    return {"configured": bool(invokers and base), "lastRun": state.get("lastScheduledRun")}
+    configured = bool(invokers and base)
+    last = state.get("lastScheduledRun")
+    last_at = parse_rfc3339(last.get("at")) if isinstance(last, dict) else None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    stale = bool(configured and last_at is not None and now - last_at > SCHEDULER_STALE_AFTER)
+    return {"configured": configured, "lastRun": last, "stale": stale}
 
 
 # ---------------------------------------------------------------------------
@@ -924,8 +1208,8 @@ def policy_params(ctx, source):
     return period, window, caps[0], caps[1]
 
 
-_EMPTY_USAGE = {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0, "clients": set(),
-                "models": set(), "byModel": {}}
+_EMPTY_USAGE = {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0, "cachedTokens": 0,
+                "clients": set(), "models": set(), "byModel": {}}
 
 
 def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, mode=None, now=None):
@@ -937,10 +1221,11 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
     ag = ctx.settings["governance"]["antigravity"]
     cost_cap = float(ag.get("cost_cap") or 0) if cost_cap is None else float(cost_cap)
     mode = mode or ag.get("enforcement_mode") or "manual"
-    tz = ag.get("reset_timezone") or "UTC"
+    anchor = period_anchor(ctx.settings)
+    tz = anchor["tz"]
     now = now or dt.datetime.now(dt.timezone.utc)
-    start, end = timeutil.governance_window(period, window, now=now, tz=tz)
-    next_reset = timeutil.governance_next_reset(period, window, now=now, tz=tz)
+    start, end = timeutil.governance_window(period, window, now=now, **anchor)
+    next_reset = timeutil.governance_next_reset(period, window, now=now, **anchor)
     gstate = governance_state(ctx)
     exceptions = active_exceptions(gstate, now)
     suspensions = {s["email"]: s for s in gstate.get("suspensions") or []}
@@ -1062,7 +1347,9 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
                    "currency": pricing.currency, "currencySetting": ag.get("currency") or "",
                    "period": period, "window": window,
                    "windowStart": iso(start), "windowEnd": iso(end), "nextReset": iso(next_reset),
-                   "resetTimezone": tz, "changeBudget": budget, "enforcementMode": mode,
+                   "resetTimezone": tz, "resetWeekday": anchor["weekday"], "resetTime": anchor["at"],
+                   "creditPerUserMonth": float(ag.get("credit_per_user_month") or 0),
+                   "changeBudget": budget, "enforcementMode": mode,
                    "pricing": pricing.public(used_models)},
         "usageSource": usage_source, "gates": gates,
         "population": {"total": len(users) if population_known else None,
@@ -1080,15 +1367,15 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
                    "suspended": by_state[CAPPED] if readable else None,
                    "review": len(plan["review"]), "exceptions": len(exception_rows)},
         "enforcement": {"mode": mode, "lastRun": gstate.get("lastRun"),
-                        "scheduler": scheduler_status(ctx, gstate),
+                        "scheduler": scheduler_status(ctx, gstate, now),
                         "durable": store.governance_durable() if store is not None else None},
         "prerequisites": {"markerRoles": markers, "permissions": perms,
-                          "telemetryDetected": bool(usage.ok and usage.records > 0),
+                          "telemetryDetected": telemetry_seen(ctx, usage, now),
                           "inferenceLog": urllib.parse.unquote(ag.get("inference_log") or "")},
     }
     internal = {"policy": policy, "readable": readable, "cfg": cfg, "usage": usage, "idx": idx, "now": now,
                 "nextReset": next_reset, "tz": tz, "mode": mode, "state": gstate,
-                "periodEnd": timeutil.governance_period_end(period, window, now=now, tz=tz)}
+                "periodEnd": timeutil.governance_period_end(period, window, now=now, **anchor)}
     return payload, internal
 
 
@@ -1102,6 +1389,120 @@ def default_status(ctx):
     ag = ctx.settings["governance"]["antigravity"]
     payload, internal = compute_status(ctx, ag["period"], ag["window"], ag["token_cap"], ag["request_cap"])
     return payload, internal
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/governance/antigravity/billing-report?month=YYYY-MM
+# ---------------------------------------------------------------------------
+
+def _report_month(ctx, tz, now):
+    """(start, end) aware local datetimes of the requested calendar month (default: the current month)."""
+    raw = str(ctx.params.get("month") or "").strip()
+    local_now = now.astimezone(tz)
+    if raw:
+        parts = raw.split("-")
+        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()) or len(parts[0]) != 4:
+            raise ApiError("bad_request", "Parameter 'month' must be YYYY-MM.")
+        year, month = int(parts[0]), int(parts[1])
+        if not 1 <= month <= 12 or year < 2020:
+            raise ApiError("bad_request", "Parameter 'month' must be YYYY-MM.")
+        start = local_now.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if start > local_now:
+        raise ApiError("bad_request", "Parameter 'month' must not be in the future.")
+    end = (start + dt.timedelta(days=32)).replace(day=1)
+    return start, end
+
+
+def _to_currency_from_usd(amount_usd, currency, table):
+    if amount_usd is None:
+        return None
+    if currency == "USD":
+        return float(amount_usd)
+    fx = getattr(table, "fx", None) or {}
+    if fx.get("from") == "USD" and fx.get("to") == currency and fx.get("rate"):
+        return float(amount_usd) * float(fx["rate"])
+    return None
+
+
+def billing_report(ctx):
+    """Per-person Antigravity usage and cost for one calendar month (month boundaries at local midnight in the reset
+    time zone), for internal chargeback. Tokens are what the inference log recorded for each call; cost applies the
+    unit price of each model (cached prompt tokens at the cached-token price, thinking tokens as output). The
+    monthly Antigravity credit per licensed user can be deducted. Google bills per project, so this is the
+    allocation of usage to people, not an invoice line."""
+    ag = ctx.settings["governance"]["antigravity"]
+    anchor = period_anchor(ctx.settings)
+    tz = timeutil.get_zone(anchor["tz"])
+    now = dt.datetime.now(dt.timezone.utc)
+    start_local, end_local = _report_month(ctx, tz, now)
+    start = start_local.astimezone(dt.timezone.utc)
+    end = min(end_local.astimezone(dt.timezone.utc), now)
+    tasks = {"usage": lambda: antigravity_usage(ctx, start, end)}
+    if (ag.get("pricing_source") or "auto") == "auto":
+        tasks["prices"] = lambda: price_table(ctx, ag.get("currency") or "")
+    res = ctx.run(tasks)
+    table = None
+    if "prices" in res:
+        ok, value = res["prices"]
+        if ok:
+            table = value
+        else:
+            ctx.warn_error("pricing:auto", value, "Automatic token prices")
+    pricing = pricing_from(ag, table)
+    ok, usage = res["usage"]
+    if not ok:
+        usage = Usage("unavailable")
+    credit_usd = float(ag.get("credit_per_user_month") or 0)
+    credit = _to_currency_from_usd(credit_usd, pricing.currency, table) if credit_usd > 0 else 0.0
+    rows, models_used = [], set()
+    totals = {"requests": 0, "tokens": 0, "promptTokens": 0, "cachedTokens": 0, "outputTokens": 0,
+              "cost": 0.0, "chargeable": 0.0}
+    cost_known = charge_known = True
+    for email in sorted(usage.users):
+        rec = usage.users[email]
+        cost, partial = estimate_cost(rec, pricing)
+        by_model = []
+        for model, agg in sorted((rec.get("byModel") or {}).items()):
+            models_used.add(model)
+            mcost, mpartial = estimate_cost({"tokens": agg.get("tokens"), "byModel": {model: agg}}, pricing)
+            prompt = to_int(agg.get("promptTokens"))
+            by_model.append({"model": model, "requests": to_int(agg.get("requests")), "tokens": to_int(agg.get("tokens")),
+                             "promptTokens": prompt, "cachedTokens": to_int(agg.get("cachedTokens")),
+                             "outputTokens": max(to_int(agg.get("tokens")) - prompt, to_int(agg.get("candidateTokens")), 0),
+                             "cost": mcost, "costPartial": mpartial})
+        prompt = to_int(rec.get("promptTokens"))
+        output = max(to_int(rec.get("tokens")) - prompt, to_int(rec.get("candidateTokens")), 0)
+        chargeable = None
+        if cost is not None and credit is not None:
+            chargeable = round(max(0.0, cost - credit), 6)
+        row = {"uid": uid_for(email), "email": email, "requests": to_int(rec.get("requests")),
+               "tokens": to_int(rec.get("tokens")), "promptTokens": prompt,
+               "cachedTokens": to_int(rec.get("cachedTokens")), "outputTokens": output,
+               "cost": cost, "costPartial": partial, "credit": credit, "chargeable": chargeable,
+               "byModel": by_model, "last": iso(rec.get("last"))}
+        rows.append(row)
+        for key in ("requests", "tokens", "promptTokens", "cachedTokens", "outputTokens"):
+            totals[key] += row[key]
+        if cost is None:
+            cost_known = False
+        else:
+            totals["cost"] += cost
+        if chargeable is None:
+            charge_known = False
+        else:
+            totals["chargeable"] += chargeable
+    totals["cost"] = round(totals["cost"], 6) if cost_known else None
+    totals["chargeable"] = round(totals["chargeable"], 6) if charge_known else None
+    if usage.truncated:
+        ctx.warn("logging:%s" % urllib.parse.unquote(ag["inference_log"]), "truncated",
+                 "Inference log entries were truncated at max_log_entries; the month is incomplete.")
+    return {"month": start_local.strftime("%Y-%m"), "start": iso(start), "end": iso(end_local.astimezone(dt.timezone.utc)),
+            "complete": end_local.astimezone(dt.timezone.utc) <= now, "timezone": anchor["tz"],
+            "currency": pricing.currency, "pricing": pricing.public(models_used),
+            "creditPerUserMonthUsd": credit_usd, "creditPerUser": credit, "usageSource": usage.source,
+            "users": rows, "totals": totals}
 
 
 # ---------------------------------------------------------------------------
@@ -1466,7 +1867,7 @@ def review(ctx):
                 for email in allowed:
                     _put_exception(state, _exception_item(
                         ctx, email, "allow", internal["periodEnd"],
-                        note or "Allowed for the rest of the period in the review queue."))
+                        note or "Allowed for the rest of the period by an administrator."))
             mutate_state(ctx, apply, required=bool(allowed))
         for uid, email in allow_only:
             results.append({"uid": uid, "email": email, "status": "applied",
@@ -1547,7 +1948,7 @@ def exception_save(ctx):
     ag = ctx.settings["governance"]["antigravity"]
     until = None
     if scope == "period":
-        until = timeutil.governance_period_end(ag["period"], ag["window"], tz=ag.get("reset_timezone") or "UTC")
+        until = timeutil.governance_period_end(ag["period"], ag["window"], **period_anchor(ctx.settings))
     item = _exception_item(ctx, email, kind, until, note, caps)
 
     def apply(state):
@@ -1621,7 +2022,7 @@ def _change_user(ctx, decide, uid=None, email=None):
     new_state, action); action None means that no change was needed."""
     cfg = gov_config(ctx.settings)
     ag = ctx.settings["governance"]["antigravity"]
-    start, end = timeutil.governance_window(ag["period"], ag["window"], tz=ag.get("reset_timezone") or "UTC")
+    start, end = timeutil.governance_window(ag["period"], ag["window"], **period_anchor(ctx.settings))
     with _WRITE_LOCK:
         usage = antigravity_usage(ctx, start, end)
         for attempt in (1, 2):
@@ -1673,7 +2074,7 @@ def _sync_after_action(ctx, email, previous, action):
     if action == "disallow":
         item = _exception_item(ctx, email, "block", None, "Disallowed by an administrator.")
     elif action == "allow" and previous == CAPPED:
-        until = timeutil.governance_period_end(ag["period"], ag["window"], tz=ag.get("reset_timezone") or "UTC")
+        until = timeutil.governance_period_end(ag["period"], ag["window"], **period_anchor(ctx.settings))
         item = _exception_item(ctx, email, "allow", until, "Restored early by an administrator.")
 
     def apply(state):

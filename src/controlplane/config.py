@@ -129,10 +129,11 @@ DEFAULTS = {
             "legacy_marker_roles": ["CustomAntigravityRestrictedUser"],
             "privileged_roles": ["roles/owner", "roles/editor", "roles/discoveryengine.admin"],
             "extra_access_roles": [],
-            "period": "daily",
+            "period": "weekly",
             "window": "calendar",
-            "token_cap": 500000,
-            "request_cap": 1000,
+            # Caps of 0 are disabled: nothing is over a cap until an administrator sets one.
+            "token_cap": 0,
+            "request_cap": 0,
             "change_budget_min": 10,
             "change_budget_ratio": 0.2,
             "max_log_entries": 20000,
@@ -150,8 +151,18 @@ DEFAULTS = {
             "input_price_per_million": 0.0,
             "output_price_per_million": 0.0,
             "model_prices": [],
-            # Time zone of calendar period boundaries (daily / weekly / monthly settlement resets).
-            "reset_timezone": "UTC",
+            # Time zone of calendar period boundaries (daily / weekly / monthly settlement resets);
+            # empty = the workspace time zone.
+            "reset_timezone": "",
+            # Calendar periods start at reset_time (HH:MM); weekly periods on reset_weekday (0 = Monday).
+            # Gemini Enterprise enforces Antigravity credits per 7 days from the project's first request,
+            # so set these to that cycle to make weekly caps line up with the credit pool.
+            "reset_weekday": 0,
+            "reset_time": "00:00",
+            # Antigravity credit included per licensed user and month in USD (Gemini Enterprise Standard
+            # 10, Plus 15; enforced weekly as a shared pool of credit / 4 x seats). Used by the
+            # credit-based cap preset and the monthly billing report.
+            "credit_per_user_month": 10.0,
             # Service accounts allowed to call the enforcement endpoint with a Google OIDC token
             # (Cloud Scheduler). Configured in config.yaml or SCHEDULER_INVOKERS only.
             "scheduler_invokers": [],
@@ -505,7 +516,8 @@ CURRENCY_RE = re.compile(r"^([A-Z]{3})?$")
 
 
 def _model_prices(value):
-    """[{model, input, output}] unit prices per million tokens; model is an exact id or a prefix."""
+    """[{model, input, output, cached?}] unit prices per million tokens; model is an exact id or a prefix.
+    cached is the price of prompt tokens served from the prompt cache (omitted = automatic price)."""
     if not isinstance(value, list):
         raise Invalid("must be a list")
     if len(value) > 50:
@@ -514,8 +526,8 @@ def _model_prices(value):
     seen = set()
     price = _float(0, 1e6)
     for idx, item in enumerate(value):
-        if not isinstance(item, dict) or set(item) - {"model", "input", "output"}:
-            raise Invalid("item %d must be an object with model, input and output" % (idx + 1))
+        if not isinstance(item, dict) or set(item) - {"model", "input", "output", "cached"}:
+            raise Invalid("item %d must be an object with model, input, output and optional cached" % (idx + 1))
         model = str(item.get("model") or "").strip().lower()
         if not MODEL_KEY_RE.match(model):
             raise Invalid("item %d has an invalid model id" % (idx + 1))
@@ -523,7 +535,10 @@ def _model_prices(value):
             raise Invalid("model %s is listed twice" % model)
         seen.add(model)
         try:
-            out.append({"model": model, "input": price(item.get("input", 0)), "output": price(item.get("output", 0))})
+            entry = {"model": model, "input": price(item.get("input", 0)), "output": price(item.get("output", 0))}
+            if item.get("cached") not in (None, ""):
+                entry["cached"] = price(item.get("cached"))
+            out.append(entry)
         except Invalid as err:
             raise Invalid("item %d price %s" % (idx + 1, err))
     return out
@@ -718,7 +733,10 @@ VALIDATORS = {
     "governance.antigravity.input_price_per_million": _float(0, 1e6),
     "governance.antigravity.output_price_per_million": _float(0, 1e6),
     "governance.antigravity.model_prices": _model_prices,
-    "governance.antigravity.reset_timezone": _timezone,
+    "governance.antigravity.reset_timezone": _timezone_or_empty,
+    "governance.antigravity.reset_weekday": _int(0, 6),
+    "governance.antigravity.reset_time": _pred(lambda v: bool(TIME_OF_DAY_RE.match(str(v or ""))), "time as HH:MM"),
+    "governance.antigravity.credit_per_user_month": _float(0, 1e6),
     "governance.antigravity.scheduler_invokers": _list(_regex(EMAIL_RE, "service account email", lower=True), 10),
     "analyst.max_bytes_billed": _int(10000000, 10 ** 13),
     "analyst.max_rows": _int(1, 5000),

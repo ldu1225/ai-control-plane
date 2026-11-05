@@ -57,8 +57,15 @@ _BG_LOCK = threading.Lock()
 _BG_RUNNING = set()
 # Labels that only locate a resource and never name a workload.
 LOCATION_LABELS = {"project_id", "location", "zone", "region"}
+# IAM-style user principals ("user:alice@example.com", the documented labels.user_id format of Antigravity inference
+# logs) are shown and counted as the plain email, the key the rest of the dashboard uses for a person.
+USER_PRINCIPAL_PREFIX = r"(?i)^user:"
 
 sanitize_log_name = profile.sanitize_log_name
+
+
+def _connector_user(value):
+    return None if value is None else re.sub(USER_PRINCIPAL_PREFIX, "", str(value).strip())
 
 
 def _tcfg(settings, section):
@@ -1796,6 +1803,8 @@ def _bq_data(ctx, conn, rng, out):
     ts = "t.%s" % quote_ident(time_col)
     null = "CAST(NULL AS STRING)"
     user = expr("t", s, mapping["user"], cast="STRING") if mapping.get("user") else None
+    if user:
+        user = "REGEXP_REPLACE(%s, r'%s', '')" % (user, USER_PRINCIPAL_PREFIX)  # "user:<email>" is the email
     model = expr("t", s, mapping["model"], cast="STRING") if mapping.get("model") else None
     tokens = expr("t", s, mapping["tokens"], cast="INT64") if mapping.get("tokens") else None
     op = expr("t", s, mapping["operation"], cast="STRING") if mapping.get("operation") else None
@@ -1929,7 +1938,7 @@ def _logging_data(ctx, conn, rng, out):
         ts = parse_rfc3339(_get_path(entry, time_path) if time_path != "timestamp" else entry.get("timestamp"))
         if ts is None:
             continue
-        user = _get_path(entry, mapping["user"]) if mapping.get("user") else None
+        user = _connector_user(_get_path(entry, mapping["user"])) if mapping.get("user") else None
         model = _get_path(entry, mapping["model"]) if mapping.get("model") else None
         tok_raw = _get_path(entry, mapping["tokens"]) if mapping.get("tokens") else None
         tok = to_int(tok_raw) if tok_raw is not None else None

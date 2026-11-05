@@ -371,7 +371,8 @@ def synced_prices(ctx, currency):
     for key, item in (synced.get("models") or {}).items():
         if not pricing_sync.valid_token_entry(key, item):
             continue
-        entry = {d: float(item[d]) * rate for d in ("input", "output") if to_float(item.get(d)) is not None}
+        # cached: prompt tokens served from the prompt cache (priced separately, for example Antigravity sessions).
+        entry = {d: float(item[d]) * rate for d in ("input", "output", "cached") if to_float(item.get(d)) is not None}
         if entry:
             out[key] = entry
     return out, rate, as_of
@@ -409,7 +410,8 @@ def build_price_table(ctx, currency):
         for item in p_cfg.get("model_overrides") or []:
             mkey = models.normalize_model_id(item.get("model"))
             if mkey:
-                entry = {d: float(item[d]) * ovr_factor for d in ("input", "output") if to_float(item.get(d)) is not None}
+                entry = {d: float(item[d]) * ovr_factor for d in ("input", "output", "cached")
+                         if to_float(item.get(d)) is not None}
                 if entry:
                     table.prices[mkey] = dict(entry, source="override")
     if warning:

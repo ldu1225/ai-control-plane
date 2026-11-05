@@ -56,13 +56,15 @@ def long_ctes(ctx, start_param="start_ts"):
         c, caps_a = act_ctes(asrc, start_param)
         ctes += c
         labels.append(asrc.label)
-        act_ok = caps_a["token"] and caps_a["user"]
+        act_ok = caps_a["user"]
         parts.append("SELECT email AS email, 'geActivity' AS metric, 1 AS value, ts AS ts FROM act WHERE NOT is_auto")
         available.add("geActivity")
         if caps_a["agent"]:
             # Scheduled runs are the owner's agent calls but not activity of the person (AUTO_METRIC, see pivot_sql).
             parts.append("SELECT email AS email, IF(is_auto, '%s', 'agentCalls') AS metric, 1 AS value, ts AS ts "
                          "FROM act WHERE agent_id IS NOT NULL" % AUTO_METRIC)
+        if caps_a["method"]:
+            # Without the agent id column (no agent call logged yet, see act_ctes) agent calls are 0, not unknown.
             available.add("agentCalls")
     has_prompts, has_uploads = prompt_caps(caps_m, caps_a)
     if has_prompts or has_uploads:
@@ -91,12 +93,14 @@ def long_ctes(ctx, start_param="start_ts"):
     if osrc and act_ok:
         c, caps = armor_ctes(osrc, start_param)
         if caps["verdict"] and caps["corr"]:
-            ctes += c
-            ctes.append("act_tok AS (SELECT token, ANY_VALUE(email) AS email FROM act WHERE token IS NOT NULL "
-                        "AND email IS NOT NULL GROUP BY token)")
-            labels.append(osrc.label)
-            parts.append("SELECT t.email AS email, 'armorBlocks' AS metric, 1 AS value, o.ts AS ts "
-                         "FROM ops o JOIN act_tok t ON t.token = o.token WHERE o.blocked")
+            if caps_a["token"]:
+                ctes += c
+                ctes.append("act_tok AS (SELECT token, ANY_VALUE(email) AS email FROM act WHERE token IS NOT NULL "
+                            "AND email IS NOT NULL GROUP BY token)")
+                labels.append(osrc.label)
+                parts.append("SELECT t.email AS email, 'armorBlocks' AS metric, 1 AS value, o.ts AS ts "
+                             "FROM ops o JOIN act_tok t ON t.token = o.token WHERE o.blocked")
+            # Without the assist token column (no assist response logged yet) no block can be attributed: 0 per user.
             available.add("armorBlocks")
     agy_in_sql = False
     if agy_src is not None:
@@ -309,6 +313,7 @@ def detail(ctx):
     if parts:
         tasks["buckets"] = lambda: ctx.query(pivot_sql(ctes, parts, email_filter=True, per_bucket=True), params,
                                              "users")
+    no_agent_column = False
     if asrc:
         a_ctes, caps = act_ctes(asrc, "start_ts")
         if caps["agent"]:
@@ -317,6 +322,7 @@ def detail(ctx):
                    "WHERE c.email = @email AND c.agent_id IS NOT NULL GROUP BY c.agent_id ORDER BY calls DESC LIMIT 50"
                    % (",\n".join(a_ctes), AGENT_NAMES_CTE))
             tasks["agents"] = lambda: ctx.query(sql, params, "users")
+        no_agent_column = caps["method"] and not caps["agent"]
     if msrc:
         fsql = file_items_sql(msrc, asrc, email_filter=True, limit=200)
         if fsql:
@@ -388,6 +394,8 @@ def detail(ctx):
                        "calls": to_int(r.get("calls")), "lastUsed": iso(r.get("last_used"))} for r in rows]
         else:
             ctx.warn_error(asrc.label, rows, "Gemini Enterprise activity logs")
+    elif no_agent_column and sql_ok:
+        agents = []  # no agent call logged yet: the agent id column appears with the first one
     files = None
     if "files" in res:
         ok, rows = res["files"]

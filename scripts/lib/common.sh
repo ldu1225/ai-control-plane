@@ -1166,6 +1166,40 @@ PYCODE
   return $rc
 }
 
+# grant_license_reader PROJECT SA_EMAIL ROLE_ID PERMISSIONS
+# Best effort, for linked projects: creates (or updates) the read-only custom role ROLE_ID with PERMISSIONS in
+# PROJECT and binds it to SA_EMAIL. The predefined roles/discoveryengine.viewer has neither
+# discoveryengine.licenseConfigs.list nor discoveryengine.userStores.listUserLicenses, so without this role the
+# Gemini Enterprise seats of PROJECT stay hidden. Never fails the caller: when the deploying account cannot do
+# it, the warning carries the exact commands for an Owner of PROJECT. With DRY_RUN=1 it only prints the plan.
+grant_license_reader() {
+  local project="$1" sa="$2" role_id="$3" perms="$4" role create_cmd bind_cmd
+  role="projects/${project}/roles/${role_id}"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    info "[dry-run] custom role ${role} (${perms}) -> ${sa}"
+    return 0
+  fi
+  create_cmd="gcloud iam roles create ${role_id} --project ${project} --title \"AI Control Plane License Reader\" --permissions ${perms} --stage GA"
+  bind_cmd="gcloud projects add-iam-policy-binding ${project} --member serviceAccount:${sa} --role ${role} --condition=None"
+  gcloud iam roles undelete "$role_id" --project "$project" --quiet >/dev/null 2>&1 || true
+  if gcloud iam roles describe "$role_id" --project "$project" >/dev/null 2>&1; then
+    gcloud iam roles update "$role_id" --project "$project" --permissions "$perms" --quiet >/dev/null 2>&1 || true
+  elif ! gcloud iam roles create "$role_id" --project "$project" \
+      --title "AI Control Plane License Reader" \
+      --description "Read-only Gemini Enterprise license config and user seat reader" \
+      --permissions "$perms" --stage GA --quiet >/dev/null 2>&1; then
+    warn "could not create the license reader role ${role}, so Gemini Enterprise seats in ${project} stay hidden. As an Owner of ${project}, run: ${create_cmd} && ${bind_cmd}"
+    return 0
+  fi
+  if gcloud projects add-iam-policy-binding "$project" --member "serviceAccount:${sa}" --role "$role" \
+      --condition=None --quiet >/dev/null 2>&1; then
+    info "linked project ${project}: granted ${role} (Gemini Enterprise seats) to ${sa}"
+  else
+    warn "could not grant ${role} to ${sa}, so Gemini Enterprise seats in ${project} stay hidden. As an Owner of ${project}, run: ${bind_cmd}"
+  fi
+  return 0
+}
+
 # Log Router filter for the AI logs the dashboard reads (README 6.1 shows the same text).
 # Cloud Logging binds OR more tightly than AND, so the audit-log clause sits in its own parentheses.
 # Without them the Gemini Enterprise, Model Armor and Antigravity logs would also have to be audit logs,
@@ -1463,3 +1497,138 @@ ensure_ge_observability() { _ge_apps enable "$1" "$2" "${3:-true}"; }
 # Prints the locations (of GE_LOCATIONS_ALL) that have a Gemini Enterprise app or license configuration,
 # comma separated; prints nothing when there are none or they cannot be read.
 ge_locations() { _ge_apps detect "$1" "$GE_LOCATIONS_ALL" false 2>/dev/null; }
+
+# ensure_antigravity_marker_roles PROJECT [ACCESS_ROLE]
+# Creates (or refreshes) the two marker roles per-user Antigravity caps assign instead of the access role:
+# CustomAntigravityCapBlocked (suspended by a cap) and CustomAntigravityAdminBlocked (blocked by an administrator).
+# Both are the access role (default Gemini Enterprise User) without businessaicode.* permissions, which is the
+# custom role Google documents for restricting AI developer tools: users keep the Gemini Enterprise app and only
+# lose Antigravity. Permissions that custom roles do not support are dropped and retried. Never fails the deploy.
+ensure_antigravity_marker_roles() {
+  local project="$1" access_role="${2:-roles/discoveryengine.agentspaceUser}"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    info "[dry-run] Antigravity marker roles CustomAntigravityCapBlocked and CustomAntigravityAdminBlocked in ${project} (${access_role} without businessaicode.*)"
+    return 0
+  fi
+  python3 - "$project" "$access_role" <<'PY' || warn "Antigravity marker roles are not ready in ${project}: open Antigravity controls and select Create marker roles"
+import json, subprocess, sys
+project, base = sys.argv[1], sys.argv[2]
+
+def gc(*args):
+    return subprocess.run(["gcloud", *args, "--quiet"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+got = gc("iam", "roles", "describe", base, "--format=json")
+if got.returncode != 0:
+    print("    warning: cannot read %s" % base, file=sys.stderr)
+    sys.exit(1)
+perms = [p for p in json.loads(got.stdout).get("includedPermissions") or [] if not p.startswith("businessaicode.")]
+if not perms:
+    print("    warning: %s has no permissions besides businessaicode.*" % base, file=sys.stderr)
+    sys.exit(1)
+roles = {
+    "CustomAntigravityCapBlocked": ("Antigravity Cap Blocked",
+        "Assigned by AI Control Plane when a user exceeds the Antigravity cap. Same as the access role without "
+        "businessaicode permissions."),
+    "CustomAntigravityAdminBlocked": ("Antigravity Admin Blocked",
+        "Assigned by an administrator to disallow Antigravity. Same as the access role without businessaicode "
+        "permissions."),
+}
+ok = True
+for role_id, (title, description) in roles.items():
+    gc("iam", "roles", "undelete", role_id, "--project", project)
+    exists = gc("iam", "roles", "describe", role_id, "--project", project, "--format=value(name)").returncode == 0
+    use = list(perms)
+    done = False
+    for _ in range(5):
+        if exists:
+            res = gc("iam", "roles", "update", role_id, "--project", project, "--permissions", ",".join(use))
+        else:
+            res = gc("iam", "roles", "create", role_id, "--project", project, "--title", title,
+                     "--description", description, "--stage", "GA", "--permissions", ",".join(use))
+        if res.returncode == 0:
+            print("    marker role %s %s (%d permissions, businessaicode.* excluded)"
+                  % (role_id, "refreshed" if exists else "created", len(use)))
+            done = True
+            break
+        bad = [p for p in use if p in (res.stderr or "")]
+        if not bad:
+            tail = (res.stderr or "").strip().splitlines()
+            print("    warning: marker role %s: %s" % (role_id, tail[-1] if tail else "failed"), file=sys.stderr)
+            break
+        use = [p for p in use if p not in bad]
+    ok = ok and done
+sys.exit(0 if ok else 1)
+PY
+}
+
+# antigravity_readiness PROJECT
+# Prints whether per-user Antigravity usage can be measured in PROJECT: AI developer tools must be on
+# (businessaicode.googleapis.com) and Metadata logging must be on so that every call writes a
+# businessaicode.googleapis.com/inference_response entry with the user and token counts. Both are Gemini
+# Enterprise console settings (Metadata logging is off by default); this only reports, it changes nothing.
+antigravity_readiness() {
+  local project="$1"
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  if ! gcloud services list --enabled --project "$project" --filter="config.name=businessaicode.googleapis.com" \
+      --format="value(config.name)" 2>/dev/null | grep -q .; then
+    warn "Antigravity (AI developer tools) is not turned on in ${project}. Per-user Antigravity caps need it: Google Cloud console > Gemini Enterprise > Settings > AI developer tools."
+    return 0
+  fi
+  if gcloud logging read 'log_id("businessaicode.googleapis.com/inference_response")' --project "$project" \
+      --freshness=7d --limit=1 --format="value(timestamp)" 2>/dev/null | grep -q .; then
+    info "Antigravity usage logs found in ${project}: per-user tokens, cost and caps are measured from them."
+  else
+    warn "No Antigravity usage log in ${project} for 7 days. Turn on Gemini Enterprise > Settings > AI developer tools > Compliance > Metadata logging (off by default; prompts and responses logging is not needed). Per-user usage is counted from then on."
+  fi
+}
+
+# restore_capped_users PROJECT [ACCESS_ROLE] [INCLUDE_ADMIN_BLOCKED]
+# Gives users suspended by Antigravity caps their access role back before the control plane is removed: for every
+# direct, unconditional user: binding of the cap marker roles it first adds the access role, then removes the marker
+# role, so the user never loses the Gemini Enterprise app. Administrator blocks are kept (and listed) unless
+# INCLUDE_ADMIN_BLOCKED is true.
+restore_capped_users() {
+  local project="$1" access_role="${2:-roles/discoveryengine.agentspaceUser}" include_admin="${3:-false}"
+  python3 - "$project" "$access_role" "$include_admin" "${DRY_RUN:-0}" <<'PY'
+import json, subprocess, sys
+project, access, include_admin, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "true", sys.argv[4] == "1"
+cap = ["projects/%s/roles/%s" % (project, r) for r in ("CustomAntigravityCapBlocked", "CustomAntigravityRestrictedUser")]
+admin = "projects/%s/roles/CustomAntigravityAdminBlocked" % project
+
+def gc(*args):
+    return subprocess.run(["gcloud", *args, "--quiet"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+
+got = gc("projects", "get-iam-policy", project, "--format=json")
+if got.returncode != 0:
+    print("    warning: cannot read the IAM policy of %s; restore suspended users on the Antigravity controls page" % project,
+          file=sys.stderr)
+    sys.exit(0)
+targets, kept = {}, []
+for b in json.loads(got.stdout).get("bindings") or []:
+    if b.get("condition"):
+        continue
+    role = b.get("role")
+    for m in b.get("members") or []:
+        if not str(m).startswith("user:"):
+            continue
+        if role in cap or (include_admin and role == admin):
+            targets.setdefault(m, []).append(role)
+        elif role == admin:
+            kept.append(m)
+if not targets:
+    print("    no users suspended by Antigravity caps")
+for member, roles in sorted(targets.items()):
+    if dry:
+        print("    [dry-run] restore %s: add %s, remove %s" % (member, access, ", ".join(roles)))
+        continue
+    add = gc("projects", "add-iam-policy-binding", project, "--member", member, "--role", access, "--condition=None")
+    if add.returncode != 0:
+        print("    warning: could not give %s back to %s; marker role kept" % (access, member), file=sys.stderr)
+        continue
+    for role in roles:
+        gc("projects", "remove-iam-policy-binding", project, "--member", member, "--role", role, "--condition=None")
+    print("    restored %s (%s)" % (member, access))
+for member in sorted(set(kept)):
+    print("    kept administrator block: %s (restore with --restore-blocked-users)" % member)
+PY
+}

@@ -144,11 +144,17 @@ governance:
     legacy_marker_roles: ["CustomAntigravityRestrictedUser"]
     privileged_roles: ["roles/owner", "roles/editor", "roles/discoveryengine.admin"]
     extra_access_roles: []
-    period: "daily"               # settlement period: daily | weekly | monthly | all (all = 90 days)
-    window: "calendar"            # calendar (resets at local midnight in reset_timezone) | rolling
-    reset_timezone: "UTC"         # IANA zone of calendar period boundaries, for example Asia/Seoul
-    token_cap: 500000             # 0 = disabled
-    request_cap: 1000             # 0 = disabled
+    period: "weekly"              # settlement period: daily | weekly | monthly | all (all = 90 days). Weekly matches
+                                  # how Gemini Enterprise enforces Antigravity credits (a shared pool per 7 days)
+    window: "calendar"            # calendar (resets at reset_time in reset_timezone) | rolling
+    reset_timezone: ""            # IANA zone of calendar period boundaries; empty = the workspace time zone
+    reset_weekday: 0              # weekly periods start on this day: 0 = Monday ... 6 = Sunday (set it to the
+                                  # day the project's Antigravity credit pool resets)
+    reset_time: "00:00"           # HH:MM at which daily / weekly / monthly periods start
+    token_cap: 0                  # 0 = disabled (all caps are off until an administrator sets one)
+    request_cap: 0                # 0 = disabled
+    credit_per_user_month: 10     # Antigravity credit per licensed user and month in USD (Standard 10, Plus 15);
+                                  # used by the credit-based cap preset and the monthly usage report
     cost_cap: 0                   # amount per person and period in `currency`, e.g. 1000000 (KRW); 0 = disabled
     currency: ""                  # ISO code of cost caps, e.g. KRW; empty = billing account currency
     pricing_source: "auto"        # auto = price per token the billing account paid (last 30 days), then the
@@ -156,7 +162,8 @@ governance:
                                   # manual = the prices below
     input_price_per_million: 0    # manual prices only; model_prices also override automatic prices
     output_price_per_million: 0   # applies to candidate and thinking tokens
-    model_prices: []              # [{model: "gemini-3.8-pro", input: 0, output: 0}] (exact id or prefix)
+    model_prices: []              # [{model: "gemini-3.8-pro", input: 0, output: 0, cached: 0}] (exact id or prefix;
+                                  # cached = prompt tokens served from the prompt cache, optional)
     enforcement_mode: "manual"    # manual = review queue | auto = scheduled runs suspend over-cap users
     scheduler_invokers: []        # SCHEDULER_INVOKERS: service accounts allowed to call the enforce endpoint
                                   # with a Google OIDC token (Cloud Scheduler); requires security.public_base_url

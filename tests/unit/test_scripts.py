@@ -860,6 +860,11 @@ class MultiProjectHubAndTeardownTest(unittest.TestCase):
             self.assertIn("[dry-run] grant multi-project read roles on demo-spoke-b", res.stdout)
             self.assertIn("[dry-run] linked project demo-spoke-a: best-effort APIs, demo-spoke-a:ge_analytics", res.stdout)
             self.assertIn("[dry-run] linked project demo-spoke-b: best-effort APIs, demo-spoke-b:ge_analytics", res.stdout)
+            # Gemini Enterprise seats of linked projects need the license reader custom role there too.
+            for spoke in ("demo-spoke-a", "demo-spoke-b"):
+                self.assertIn("[dry-run] custom role projects/%s/roles/CustomAiControlPlaneLicenseReader (" % spoke,
+                              res.stdout)
+            self.assertNotIn("No Gemini Enterprise app or seats found", res.stderr)
             self.assertIn("SCAN_PROJECTS=demo-spoke-a,demo-spoke-b", res.stderr)
 
             saved_env_path = os.path.join(ws, "deploy.demo-hub.env")
@@ -1002,6 +1007,228 @@ class MultiProjectHubAndTeardownTest(unittest.TestCase):
         )
         self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
         self.assertIn("Unified Multi-Project Hub", res.stdout)
+
+
+LICENSE_ROLE_ID = "CustomAiControlPlaneLicenseReader"
+HUB_SA = "ai-control-plane-sa@demo-hub-proj.iam.gserviceaccount.com"
+# Answers the IAM calls of grant_license_reader; FAKE_ROLE picks the scenario and every call is logged.
+FAKE_IAM_GCLOUD = """#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_GCLOUD_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+mode = os.environ.get("FAKE_ROLE", "missing")
+if args[:3] == ["iam", "roles", "undelete"]:
+    sys.exit(1)
+if args[:3] == ["iam", "roles", "describe"]:
+    sys.exit(0 if mode in ("exists", "bind_denied") else 1)
+if args[:3] == ["iam", "roles", "create"]:
+    sys.exit(1 if mode == "create_denied" else 0)
+if args[:2] == ["projects", "add-iam-policy-binding"]:
+    sys.exit(1 if mode == "bind_denied" else 0)
+sys.exit(0)
+"""
+
+
+def license_perms():
+    return re.search(r'(?m)^LICENSE_READER_PERMS="([^"]+)"$', read("scripts/deploy.sh")).group(1)
+
+
+def read_log(path):
+    if not os.path.exists(path):
+        return ""
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def write_stub_bin(tmp, log_file):
+    """gcloud/bq stubs for deploy.sh and teardown.sh: no network, every gcloud call appended to log_file."""
+    bin_dir = os.path.join(tmp, "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    with open(os.path.join(bin_dir, "gcloud"), "w", encoding="utf-8") as fh:
+        fh.write("#!/usr/bin/env bash\n"
+                 'echo "$*" >> "%s"\n'
+                 'case "$*" in\n'
+                 '  *"config get-value account"*) echo "owner@example.org" ;;\n'
+                 '  *"config get-value project"*) echo "demo-hub-proj" ;;\n'
+                 '  *"projects describe"*) echo "123456789012" ;;\n'
+                 '  *"auth print-access-token"*) echo "" ;;\n'
+                 '  *"projects get-iam-policy demo-spoke-a"*"value(bindings.role)"*)\n'
+                 '    printf "roles/bigquery.dataViewer\\nprojects/demo-spoke-a/roles/%s\\n" ;;\n'
+                 '  *"projects get-iam-policy"*"value(bindings.role)"*) echo "roles/bigquery.jobUser" ;;\n'
+                 "  *\"projects get-iam-policy\"*) echo '{\"bindings\":[]}' ;;\n"
+                 '  *"run deploy --help"*) echo "--iap --no-iap --no-invoker-iam-check" ;;\n'
+                 '  *"describe"*) exit 1 ;;\n'
+                 '  *) exit 0 ;;\n'
+                 'esac\n' % (log_file, LICENSE_ROLE_ID))
+    with open(os.path.join(bin_dir, "bq"), "w", encoding="utf-8") as fh:
+        fh.write("#!/usr/bin/env bash\nexit 1\n")
+    for name in ("gcloud", "bq"):
+        os.chmod(os.path.join(bin_dir, name), 0o755)
+    return bin_dir
+
+
+class LinkedProjectLicenseReaderTest(unittest.TestCase):
+    """roles/discoveryengine.viewer cannot list license configs or user licenses, so every linked project needs the
+    read-only license reader custom role, or its Gemini Enterprise seats are silently hidden."""
+
+    def run_grant(self, mode, dry="0"):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            stub = os.path.join(tmp, "gcloud")
+            with open(stub, "w", encoding="utf-8") as fh:
+                fh.write(FAKE_IAM_GCLOUD)
+            os.chmod(stub, 0o755)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}", FAKE_ROLE=mode, FAKE_GCLOUD_LOG=log)
+            cmd = 'source "%s"; DRY_RUN=%s; grant_license_reader demo-ge-proj %s %s %s' % (
+                os.path.join(ROOT, "scripts/lib/common.sh"), dry, HUB_SA, LICENSE_ROLE_ID, license_perms())
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, check=False)
+            calls = read_log(log).splitlines()
+        return res, calls
+
+    def bind_call(self):
+        return ("projects add-iam-policy-binding demo-ge-proj --member serviceAccount:%s --role "
+                "projects/demo-ge-proj/roles/%s --condition=None --quiet" % (HUB_SA, LICENSE_ROLE_ID))
+
+    def test_permissions_cover_seats_and_license_configs(self):
+        perms = license_perms().split(",")
+        for perm in ("discoveryengine.licenseConfigs.list", "discoveryengine.userStores.listUserLicenses"):
+            self.assertIn(perm, perms)
+
+    def test_missing_role_is_created_ga_and_bound(self):
+        res, calls = self.run_grant("missing")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertEqual(res.stderr, "")
+        self.assertEqual(calls[0], "iam roles undelete %s --project demo-ge-proj --quiet" % LICENSE_ROLE_ID)
+        create = [c for c in calls if c.startswith("iam roles create")]
+        self.assertEqual(len(create), 1)
+        self.assertIn("--project demo-ge-proj", create[0])
+        self.assertIn("--permissions %s --stage GA" % license_perms(), create[0])
+        self.assertEqual(calls[-1], self.bind_call())
+        self.assertIn("granted projects/demo-ge-proj/roles/%s" % LICENSE_ROLE_ID, res.stdout)
+
+    def test_existing_role_is_updated_then_bound(self):
+        res, calls = self.run_grant("exists")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn("iam roles update %s --project demo-ge-proj --permissions %s --quiet"
+                      % (LICENSE_ROLE_ID, license_perms()), calls)
+        self.assertFalse([c for c in calls if c.startswith("iam roles create")])
+        self.assertEqual(calls[-1], self.bind_call())
+
+    def test_refusals_warn_with_the_exact_manual_commands(self):
+        res, calls = self.run_grant("create_denied")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertFalse([c for c in calls if c.startswith("projects add-iam-policy-binding")])
+        self.assertIn('gcloud iam roles create %s --project demo-ge-proj --title "AI Control Plane License Reader" '
+                      '--permissions %s --stage GA' % (LICENSE_ROLE_ID, license_perms()), res.stderr)
+        bind_cmd = ("gcloud projects add-iam-policy-binding demo-ge-proj --member serviceAccount:%s "
+                    "--role projects/demo-ge-proj/roles/%s --condition=None" % (HUB_SA, LICENSE_ROLE_ID))
+        self.assertIn(bind_cmd, res.stderr)
+        res, _ = self.run_grant("bind_denied")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn(bind_cmd, res.stderr)
+        self.assertNotIn("gcloud iam roles create", res.stderr)
+
+    def test_dry_run_changes_nothing(self):
+        res, calls = self.run_grant("missing", dry="1")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertEqual(calls, [])
+        self.assertIn("[dry-run] custom role projects/demo-ge-proj/roles/%s (%s) -> %s"
+                      % (LICENSE_ROLE_ID, license_perms(), HUB_SA), res.stdout)
+
+    def test_deploy_grants_it_on_every_linked_project(self):
+        deploy = read("scripts/deploy.sh")
+        call = 'grant_license_reader "$lp" "$SA_EMAIL" "$LICENSE_READER_ROLE_ID" "$LICENSE_READER_PERMS"'
+        self.assertIn(call, deploy)
+        block = deploy[deploy.index("# Linked secondary projects"):deploy.index('NORMALIZED_SCAN_PROJECTS="$(IFS=')]
+        self.assertIn(call, block)
+        self.assertLess(deploy.index("LICENSE_READER_PERMS="), deploy.index(call))
+
+    def test_teardown_removes_the_binding_and_lists_the_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            env = dict(os.environ, PATH=f"{write_stub_bin(tmp, log)}:{os.environ.get('PATH', '')}")
+            res = subprocess.run(["bash", os.path.join(ROOT, "scripts/teardown.sh"), "--project", "demo-hub-proj",
+                                  "--link-projects", "demo-spoke-a,demo-spoke-b,demo-spoke-a", "--yes"],
+                                 capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            calls = read_log(log)
+        self.assertIn("projects remove-iam-policy-binding demo-spoke-a --member serviceAccount:%s --role "
+                      "projects/demo-spoke-a/roles/%s --condition=None" % (HUB_SA, LICENSE_ROLE_ID), calls)
+        self.assertEqual(calls.count("projects get-iam-policy demo-spoke-a"), 1)  # duplicates are skipped
+        for project in ("demo-hub-proj", "demo-spoke-a", "demo-spoke-b"):
+            self.assertIn("gcloud iam roles delete %s --project %s" % (LICENSE_ROLE_ID, project), res.stdout)
+
+
+class DeploySummaryAndConsentTest(unittest.TestCase):
+    """The final summary warns when the hub has no Gemini Enterprise and nothing is linked (the customer case: the
+    dashboard in a new project, Gemini Enterprise in an existing one), and the prompt logging opt-out works."""
+
+    def deploy(self, *args, config=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            env = dict(os.environ, PATH=f"{write_stub_bin(tmp, log)}:{os.environ.get('PATH', '')}")
+            cmd = ["bash", os.path.join(ROOT, "scripts/deploy.sh")]
+            if config:
+                path = os.path.join(tmp, "deploy.env")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write('PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\n' + config)
+                cmd += ["--config", path]
+            res = subprocess.run(cmd + list(args) + ["--dry-run"], capture_output=True, text=True, env=env,
+                                 check=False)
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn("Deployment complete: demo-hub-proj", res.stdout)
+        return res
+
+    def test_hub_without_gemini_enterprise_warns_in_both_languages(self):
+        res = self.deploy("--project", "demo-hub-proj")
+        self.assertIn("No Gemini Enterprise app or seats found in demo-hub-proj. If Gemini Enterprise runs in another "
+                      "project, install into that project (recommended: governance and marker roles act on the "
+                      "primary project's IAM) or re-run with --link-projects <GE project>.", res.stderr)
+        self.assertIn("[한국어 안내] demo-hub-proj에서 Gemini Enterprise 앱이나 라이선스 좌석을 찾지 못했습니다", res.stderr)
+
+    def test_no_warning_with_linked_projects_configured_locations_or_module_off(self):
+        self.assertNotIn("No Gemini Enterprise app", self.deploy("--project", "demo-hub-proj",
+                                                                 "--link-projects", "demo-ge-proj").stderr)
+        # Configured locations are not looked up again in a dry run (no extra network call), so no warning.
+        self.assertNotIn("No Gemini Enterprise app", self.deploy(config='DISCOVERY_ENGINE_LOCATIONS="global"\n').stderr)
+        self.assertNotIn("No Gemini Enterprise app", self.deploy(config='DISABLED_MODULES="gemini_enterprise"\n').stderr)
+
+    def test_summary_lookup_is_skipped_in_dry_runs(self):
+        deploy = read("scripts/deploy.sh")
+        tail = deploy[deploy.index('log "Deployment complete: ${PROJECT_ID}"'):]
+        self.assertIn('if [[ -z "$HUB_GE_FOUND" && "$DRY_RUN" != "1" ]]; then', tail)
+        self.assertEqual(tail.count("ge_locations"), 1)
+
+    def test_no_log_prompts_turns_prompt_logging_off(self):
+        self.assertIn("GE Prompt Logging=true", self.deploy("--project", "demo-hub-proj").stdout)
+        res = self.deploy("--project", "demo-hub-proj", "--no-log-prompts")
+        self.assertIn("GE Prompt Logging=false", res.stdout)
+        self.assertIn("--no-log-prompts", subprocess.run(["bash", os.path.join(ROOT, "scripts/deploy.sh"), "--help"],
+                                                         capture_output=True, text=True, check=False).stdout)
+
+    def test_install_saves_the_opt_outs_for_later_deploys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            ws = os.path.join(tmp, "ws")  # install.sh writes deploy.<project>.env next to the scripts
+            for rel in ("scripts/install.sh", "scripts/deploy.sh", "scripts/lib/common.sh"):
+                os.makedirs(os.path.dirname(os.path.join(ws, rel)), exist_ok=True)
+                with open(os.path.join(ROOT, rel), "rb") as src, open(os.path.join(ws, rel), "wb") as dst:
+                    dst.write(src.read())
+                os.chmod(os.path.join(ws, rel), 0o755)
+            env = dict(os.environ, PATH=f"{write_stub_bin(tmp, log)}:{os.environ.get('PATH', '')}",
+                       ACP_SAVE_ENV_ON_DRY_RUN="1")
+            res = subprocess.run(["bash", os.path.join(ws, "scripts/install.sh"), "--project", "demo-hub-proj",
+                                  "--admins", "admin@example.org", "--no-log-prompts", "--no-data-access-logs",
+                                  "--read-only", "--dry-run"],
+                                 cwd=ws, capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("GE Prompt Logging=false", res.stdout)
+            with open(os.path.join(ws, "deploy.demo-hub-proj.env"), encoding="utf-8") as fh:
+                saved = fh.read()
+        for line in ('GE_PROMPT_LOGGING="false"', 'ENABLE_DATA_ACCESS_LOGS="false"', 'ENABLE_GOVERNANCE_ACTIONS="false"',
+                     'ENABLE_GE_OBSERVABILITY="true"'):
+            self.assertIn(line, saved)
 
 
 if __name__ == "__main__":

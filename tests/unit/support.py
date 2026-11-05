@@ -24,11 +24,18 @@ ADMIN_MARKER = "projects/%s/roles/CustomAntigravityAdminBlocked" % PROJECT
 LEGACY_MARKER = "projects/%s/roles/CustomAntigravityRestrictedUser" % PROJECT
 
 
+TEST_CAP_POLICY = {"period": "daily", "token_cap": 500000, "request_cap": 1000, "reset_timezone": "UTC"}
+
+
 def make_settings(**sections):
-    """Effective settings for a configured demo workspace, with optional section overrides."""
+    """Effective settings for a configured demo workspace, with optional section overrides.
+
+    The governance section starts from TEST_CAP_POLICY (daily caps of 500k tokens and 1000 requests) so the
+    cap tests do not depend on the shipped defaults, which leave caps off until an administrator sets one."""
     settings = copy.deepcopy(config.DEFAULTS)
     settings["workspace"]["project_id"] = PROJECT
     settings["workspace"]["timezone"] = "UTC"
+    settings["governance"]["antigravity"].update(TEST_CAP_POLICY)
     for section, values in sections.items():
         if section == "governance":
             settings["governance"]["antigravity"].update(values)

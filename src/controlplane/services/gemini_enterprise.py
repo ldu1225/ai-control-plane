@@ -128,8 +128,11 @@ def act_ctes(src, start_param="prev_start_ts"):
          "(%s AND %s) OR schedule_id IS NOT NULL AS is_auto FROM act_raw)"
          % (prompt, own_call, upload, assist, _system_text("q_text"))),
     ]
-    caps = {"user": bool(user), "agent": bool(method and spec_agent), "token": bool(token), "trace": bool(trace),
-            "prompt": bool(method and texts), "upload": bool(method and file_id)}
+    # Log Router adds a column to a BigQuery table only when the first entry carrying that field arrives, so on a
+    # fresh table optional columns (agent ids, assist tokens, file ids) are simply absent until first use. "method"
+    # tells whether assistant calls can be identified at all; without the agent id column there are 0 agent calls.
+    caps = {"user": bool(user), "method": bool(method), "agent": bool(method and spec_agent), "token": bool(token),
+            "trace": bool(trace), "prompt": bool(method and texts), "upload": bool(method and file_id)}
     return ctes, caps
 
 
@@ -269,7 +272,8 @@ def summary(ctx):
         if has_uploads:
             result["kpis"]["fileUploads"] = {"value": to_int(cur.get("uploads")),
                                              "previous": to_int(prev.get("uploads"))}
-        if asrc and (kpi["caps_a"] or {}).get("agent"):
+        if asrc and (kpi["caps_a"] or {}).get("method"):
+            # 0 until the first agent call adds the agent id column to the table (see act_ctes).
             result["kpis"]["agentCalls"] = {"value": to_int(cur.get("agent_calls")),
                                             "previous": to_int(prev.get("agent_calls"))}
         elif not asrc and ctx.audit_dataset_ready():
@@ -300,11 +304,15 @@ def summary(ctx):
 
 
 def _agent_usage(ctx, asrc, rng):
-    """Agent calls per bucket and agent (rows), or None when the activity log has no agent fields."""
+    """Agent calls per bucket and agent (rows). [] (0 calls) while the agent id column does not exist yet: Log Router
+    adds it with the first logged agent call, so a fresh table without it is not an unsupported schema. None, with a
+    warning, only when the activity log has no method column to identify assistant calls."""
     ctes, caps = act_ctes(asrc, start_param="start_ts")
-    if not caps["agent"]:
+    if not caps["method"]:
         ctx.warn(asrc.label, "unsupported_schema", "Agent fields were not found in the activity log schema.")
         return None
+    if not caps["agent"]:
+        return []
     sql = ("WITH %s,\n%s\nSELECT c.bucket, c.agent_id, ANY_VALUE(n.agent_name) AS agent_name, COUNT(*) AS calls\n"
            "FROM (SELECT agent_id, %s AS bucket FROM act WHERE agent_id IS NOT NULL) c\n"
            "LEFT JOIN act_names n ON n.agent_ref = c.agent_id\nGROUP BY c.bucket, c.agent_id"

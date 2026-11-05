@@ -80,11 +80,14 @@ def attribution_ctes(asrc):
     and scheduled runs). act_auto: automatic runs, used for operations whose token is not in the
     activity log (Gemini Enterprise screens grounding results of automatic runs under tokens of
     inner calls); such operations are attributed to the run's owner only when exactly one owner had an
-    automatic run within AUTO_WINDOW_MINUTES."""
+    automatic run within AUTO_WINDOW_MINUTES.
+
+    The assist token column appears in the table only with the first logged assist response; until then act_tok is
+    empty (nothing is attributed to a person yet), which is not an unsupported schema. None without user identities."""
     if asrc is None:
         return None
     ctes, caps = act_ctes(asrc, start_param="act_start_ts")
-    if not (caps["token"] and caps["user"]):
+    if not caps["user"]:
         return None
     # Activity rows are written around the sanitize call; pad the window by one day on both sides.
     ctes[0] = asrc.cte("a_src", start="act_start_ts", end="act_end_ts")
@@ -235,7 +238,8 @@ def summary(ctx):
         else:
             ctx.warn_error(asrc.label, rows, "Gemini Enterprise activity logs")
     elif asrc is not None:
-        ctx.warn(asrc.label, "unsupported_schema", "Assist tokens are not available for user attribution.")
+        # Only an activity log without user identities lands here; a missing assist token column is not a problem.
+        ctx.warn(asrc.label, "unsupported_schema", "User identities are not available for user attribution.")
     if "origins" in res:
         ok, rows = res["origins"]
         if ok and kpi_ok(res) and out["kpis"]["blocked"]["value"] is not None:

@@ -10,8 +10,8 @@
 # Never deleted automatically: the BigQuery audit dataset (it holds your logs), the Artifact Registry
 # repository and the Data Access audit log configuration. The script prints the commands for them.
 #
-# Users suspended by the dashboard keep the cap marker role until they are restored: restore them on
-# the Antigravity Controls page (or set the policy caps to 0 and run enforcement) before tearing down.
+# Users suspended by Antigravity caps get their access role back first (nobody stays suspended after the
+# control plane is gone); administrator blocks are kept unless --restore-blocked-users is given.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -24,9 +24,10 @@ CLI_PROJECT=""
 CLI_LINK_PROJECTS=""
 CLI_REGION=""
 DELETE_DATA=0
+RESTORE_BLOCKED="false"
 DRY_RUN=0
 YES=0
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; echo "  --restore-blocked-users  also restore users an administrator blocked"; exit "${1:-0}"; }
 need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
 normalize_cli_args "$@"
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
     --link-projects|--scan-projects) need_arg "$@"; CLI_LINK_PROJECTS="$2"; shift 2 ;;
     --region) need_arg "$@"; CLI_REGION="$2"; shift 2 ;;
     --delete-data) DELETE_DATA=1; shift ;;
+    --restore-blocked-users) RESTORE_BLOCKED="true"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -y|--yes) YES=1; shift ;;
     -h|--help) usage 0 ;;
@@ -106,6 +108,7 @@ TELEMETRY_DATASET="${TELEMETRY_DATASET:-telemetry_routed}"
 echo "This removes ${SERVICE_NAME} from project ${PROJECT_ID} (${REGION})."
 [[ "$DELETE_DATA" == "1" ]] && echo "It also deletes gs://${SETTINGS_BUCKET} and the log sink ${SINK}."
 if [[ "$DRY_RUN" == "1" ]]; then
+  restore_capped_users "$PROJECT_ID" "${GOVERNANCE_ACCESS_ROLE:-roles/discoveryengine.agentspaceUser}" "$RESTORE_BLOCKED"
   info "[dry-run] scheduler jobs: ${SERVICE_NAME}-enforce, ${SERVICE_NAME}-maintenance, ${SERVICE_NAME}-pricing-sync"
   info "[dry-run] telemetry route sinks (description \"AI Control Plane telemetry route\") on ${PROJECT_ID}${SCAN_PROJECTS:+ and linked projects}"
   info "[dry-run] Cloud Run services: ${SERVICE_NAME}, ${BRIDGE_NAME}"
@@ -119,6 +122,9 @@ if [[ "$YES" != "1" ]]; then
   read -r -p "Type the project id to continue: " answer
   [[ "$answer" == "$PROJECT_ID" ]] || die "cancelled"
 fi
+
+log "Antigravity suspensions"
+restore_capped_users "$PROJECT_ID" "${GOVERNANCE_ACCESS_ROLE:-roles/discoveryengine.agentspaceUser}" "$RESTORE_BLOCKED"
 
 log "Cloud Scheduler jobs"
 for job in "${SERVICE_NAME}-enforce" "${SERVICE_NAME}-maintenance" "${SERVICE_NAME}-pricing-sync"; do
@@ -175,12 +181,17 @@ quiet gcloud artifacts repositories remove-iam-policy-binding "$AR_REPOSITORY" \
   --location "$REGION" --project "$PROJECT_ID" \
   --member "serviceAccount:${BUILD_SA}" --role roles/artifactregistry.writer --quiet || true
 
+TORN_LINKED=()
 if [[ -n "$SCAN_PROJECTS" ]]; then
   IFS=',' read -r -a raw_linked <<<"$SCAN_PROJECTS"
   for raw_lp in "${raw_linked[@]}"; do
     lp="$(normalize_project_id "$raw_lp")"
     [[ -z "$lp" || "$lp" == "$PROJECT_ID" ]] && continue
+    [[ " ${TORN_LINKED[*]-} " == *" ${lp} "* ]] && continue
+    # Every role deploy.sh granted there is a binding of this member and is removed here, including the license
+    # reader custom role (projects/<linked project>/roles/CustomAiControlPlaneLicenseReader).
     remove_bindings "$lp" "serviceAccount:${SA_EMAIL}"
+    TORN_LINKED+=("$lp")
   done
 fi
 
@@ -247,7 +258,11 @@ log "Kept on purpose"
 info "BigQuery dataset (your audit logs):   bq rm -r -d ${PROJECT_ID}:${AUDIT_DATASET}"
 info "Container images:                     gcloud artifacts repositories delete ${AR_REPOSITORY} --location ${REGION} --project ${PROJECT_ID}"
 info "Data Access audit logs: IAM & Admin > Audit Logs in the Google Cloud console"
-info "Marker roles (delete only after every suspended user is restored; suspended users keep their other access through them)."
+info "Marker roles (delete only when no user holds them; users an administrator blocked keep their other access through them)."
 info "Default IDs are shown; use your own if you changed governance.antigravity.cap_marker_role or admin_marker_role:"
 info "  gcloud iam roles delete CustomAntigravityCapBlocked --project ${PROJECT_ID}"
 info "  gcloud iam roles delete CustomAntigravityAdminBlocked --project ${PROJECT_ID}"
+info "License reader custom role (its bindings are removed above; another dashboard in the same project may still use it):"
+for lr_project in "$PROJECT_ID" ${TORN_LINKED[@]+"${TORN_LINKED[@]}"}; do
+  info "  gcloud iam roles delete CustomAiControlPlaneLicenseReader --project ${lr_project}"
+done

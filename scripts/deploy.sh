@@ -24,7 +24,12 @@
 #   --service-name NAME     Cloud Run service name (default: ai-control-plane)
 #   --billing-account ID    Cloud Billing account ID to link if the project is unbilled
 #   --read-only             Skip IAM governance write roles (ENABLE_GOVERNANCE_ACTIONS=false)
+#   --enforcement-schedule CRON  Antigravity cap enforcement runs (default */15 * * * *: restores suspended
+#                           users at each period reset; suspends over-cap users only in automatic mode)
+#   --no-enforcement-schedule    No scheduled runs (enforce from the dashboard after every period reset)
 #   --no-data-access-logs   Skip enabling Data Access audit logs
+#   --no-log-prompts        Turn on Gemini Enterprise usage logs without prompt/response logging (sensitiveLoggingEnabled)
+#   --dataset NAME / --dataset-location LOC / --ge-locations LIST   Audit dataset, its location, GE locations
 #   --vpc-network NAME      Send Cloud Run egress through this VPC (needed when run.allowedVPCEgress forces it)
 #   --vpc-subnet NAME       Subnet for --vpc-network (enable Private Google Access on it)
 #   --skip-preflight-blockers  Continue even when the organization policy preflight finds blockers
@@ -54,8 +59,13 @@ CLI_READ_ONLY=""
 CLI_DATA_ACCESS_LOGS=""
 CLI_PREPARE_LINKED=""
 CLI_SCAN_ALL=""
+CLI_ENFORCEMENT_SCHEDULE=""
+CLI_LOG_PROMPTS=""
+CLI_DATASET=""
+CLI_DATASET_LOCATION=""
+CLI_GE_LOCATIONS=""
 
-usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
 normalize_cli_args "$@"
@@ -75,8 +85,15 @@ while [[ $# -gt 0 ]]; do
     --service-name) need_arg "$@"; CLI_SERVICE_NAME="$2"; shift 2 ;;
     --billing-account) need_arg "$@"; CLI_BILLING_ACCOUNT="$2"; shift 2 ;;
     --read-only) CLI_READ_ONLY="1"; shift ;;
+    --enforcement-schedule) need_arg "$@"; CLI_ENFORCEMENT_SCHEDULE="$2"; shift 2 ;;
+    --no-enforcement-schedule) CLI_ENFORCEMENT_SCHEDULE="off"; shift ;;
     --data-access-logs) CLI_DATA_ACCESS_LOGS="true"; shift ;;
     --no-data-access-logs) CLI_DATA_ACCESS_LOGS="false"; shift ;;
+    --log-prompts) CLI_LOG_PROMPTS="true"; shift ;;
+    --no-log-prompts) CLI_LOG_PROMPTS="false"; shift ;;
+    --dataset) need_arg "$@"; CLI_DATASET="$2"; shift 2 ;;
+    --dataset-location) need_arg "$@"; CLI_DATASET_LOCATION="$2"; shift 2 ;;
+    --ge-locations) need_arg "$@"; CLI_GE_LOCATIONS="$2"; shift 2 ;;
     --prepare-linked-projects) CLI_PREPARE_LINKED="true"; shift ;;
     --no-prepare-linked-projects) CLI_PREPARE_LINKED="false"; shift ;;
     --vpc-network) need_arg "$@"; VPC_NETWORK="$2"; shift 2 ;;
@@ -152,8 +169,15 @@ SCAN_ALL_PROJECTS="${SCAN_ALL_PROJECTS:-${AUTO_DISCOVER_PROJECTS:-}}"
 [[ -n "$CLI_BILLING_ACCOUNT" ]] && BILLING_ACCOUNT_ID="$CLI_BILLING_ACCOUNT"
 [[ "$CLI_READ_ONLY" == "1" ]] && ENABLE_GOVERNANCE_ACTIONS="false"
 [[ -n "$CLI_DATA_ACCESS_LOGS" ]] && ENABLE_DATA_ACCESS_LOGS="$CLI_DATA_ACCESS_LOGS"
+[[ -n "$CLI_LOG_PROMPTS" ]] && GE_PROMPT_LOGGING="$CLI_LOG_PROMPTS"
 [[ -n "$CLI_PREPARE_LINKED" ]] && PREPARE_LINKED_PROJECTS="$CLI_PREPARE_LINKED"
 [[ -n "$CLI_SCAN_ALL" ]] && SCAN_ALL_PROJECTS="$CLI_SCAN_ALL"
+[[ -n "$CLI_ENFORCEMENT_SCHEDULE" ]] && ENFORCEMENT_SCHEDULE="$CLI_ENFORCEMENT_SCHEDULE"
+# Flags the one-command installer forwards (install.sh); the installer's env snapshot cannot override them.
+[[ -n "$CLI_LOG_PROMPTS" ]] && GE_PROMPT_LOGGING="$CLI_LOG_PROMPTS"
+[[ -n "$CLI_DATASET" ]] && AUDIT_DATASET="$CLI_DATASET"
+[[ -n "$CLI_DATASET_LOCATION" ]] && DATASET_LOCATION="$CLI_DATASET_LOCATION"
+[[ -n "$CLI_GE_LOCATIONS" ]] && DISCOVERY_ENGINE_LOCATIONS="$CLI_GE_LOCATIONS"
 
 for tool in gcloud bq python3; do command -v "$tool" >/dev/null || die "$tool is required"; done
 ACCOUNT="$(ensure_gcloud_auth)"
@@ -202,7 +226,15 @@ BILLING_ACCOUNT_ID="$(trim_ws "${BILLING_ACCOUNT_ID:-}")"
 DISCOVERY_ENGINE_LOCATIONS="${DISCOVERY_ENGINE_LOCATIONS:-}"
 AGENT_ENGINE_REGIONS="${AGENT_ENGINE_REGIONS:-}"
 ENABLE_GOVERNANCE_ACTIONS="${ENABLE_GOVERNANCE_ACTIONS:-true}"
-ENFORCEMENT_SCHEDULE="${ENFORCEMENT_SCHEDULE:-}"
+# Antigravity cap enforcement runs. They restore suspended users when a settlement period resets (in every
+# enforcement mode) and, in automatic mode only, suspend users over their cap. On by default so nobody stays
+# suspended past a reset; "off" (or --no-enforcement-schedule) leaves it to "Run enforcement now" in the dashboard.
+# An empty value (older deploy.env files had ENFORCEMENT_SCHEDULE="") keeps the default.
+ENFORCEMENT_SCHEDULE_EXPLICIT=0
+[[ -n "$(trim_ws "${ENFORCEMENT_SCHEDULE:-}")" ]] && ENFORCEMENT_SCHEDULE_EXPLICIT=1
+ENFORCEMENT_SCHEDULE="$(trim_ws "${ENFORCEMENT_SCHEDULE:-}")"
+[[ -n "$ENFORCEMENT_SCHEDULE" ]] || ENFORCEMENT_SCHEDULE="*/15 * * * *"
+case "$ENFORCEMENT_SCHEDULE" in off|none) ENFORCEMENT_SCHEDULE="" ;; esac
 # Scheduler tick for scheduled work: the daily official price and exchange-rate check (at pricing.sync_time, default
 # 00:00 in the workspace timezone; a setting, not a cron here) and the telemetry route budget guard. "off" disables it.
 MAINTENANCE_SCHEDULE="$(trim_ws "${MAINTENANCE_SCHEDULE:-*/15 * * * *}")"
@@ -276,8 +308,16 @@ if [[ "$MAINTENANCE_SCHEDULE" != "off" ]]; then
   [[ "${#_cron_fields[@]}" -eq 5 ]] || die "MAINTENANCE_SCHEDULE must be a 5-field cron expression (for example */15 * * * *) or off"
 fi
 if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
-  [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]] || die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
-  [[ "$ACCESS_MODE" != "iap" ]] || die "ENFORCEMENT_SCHEDULE needs ACCESS_MODE google, google_oauth or password (IAP blocks the scheduler's OIDC token)"
+  read -r -a _cron_fields <<<"$ENFORCEMENT_SCHEDULE"
+  [[ "${#_cron_fields[@]}" -eq 5 ]] || die "ENFORCEMENT_SCHEDULE must be a 5-field cron expression (for example */15 * * * *) or off"
+  if [[ "$ENABLE_GOVERNANCE_ACTIONS" != "true" ]]; then
+    [[ "$ENFORCEMENT_SCHEDULE_EXPLICIT" == "1" ]] && die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
+    ENFORCEMENT_SCHEDULE=""  # read-only install: nothing is ever suspended, so there is nothing to restore
+  elif [[ "$ACCESS_MODE" == "iap" ]]; then
+    [[ "$ENFORCEMENT_SCHEDULE_EXPLICIT" == "1" ]] && die "ENFORCEMENT_SCHEDULE needs ACCESS_MODE google, google_oauth or password (IAP blocks the scheduler's OIDC token)"
+    warn "IAP access mode: no Antigravity enforcement schedule (IAP blocks the scheduler's OIDC token); run enforcement from the dashboard after each period reset"
+    ENFORCEMENT_SCHEDULE=""
+  fi
 fi
 for flag in CREATE_LOG_SINK ENABLE_DATA_ACCESS_LOGS ENABLE_GE_OBSERVABILITY GE_PROMPT_LOGGING ENABLE_GOVERNANCE_ACTIONS PREPARE_LINKED_PROJECTS; do
   [[ "${!flag}" == "true" || "${!flag}" == "false" ]] || die "$flag must be true or false"
@@ -497,6 +537,9 @@ else
 fi
 if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
   for role in "${GOVERNANCE_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
+  # Marker roles for per-user Antigravity caps (Gemini Enterprise User without businessaicode.*), created now so
+  # suspensions work right after installation without the "Create marker roles" step.
+  ensure_antigravity_marker_roles "$PROJECT_ID"
 else
   info "governance write roles skipped (ENABLE_GOVERNANCE_ACTIONS=false): dashboards and simulations only"
 fi
@@ -573,6 +616,9 @@ if [[ -n "$SCAN_PROJECTS" ]]; then
         warn "could not grant IAM roles on linked project ${lp} with ${ACCOUNT} (grant read roles to ${SA_EMAIL} if needed)"
       fi
     fi
+    # Gemini Enterprise seats of the linked project: the same read-only custom role as in the hub, because
+    # roles/discoveryengine.viewer cannot list license configs or user licenses (best effort, honors DRY_RUN).
+    grant_license_reader "$lp" "$SA_EMAIL" "$LICENSE_READER_ROLE_ID" "$LICENSE_READER_PERMS"
   done
   if [[ ${#CLEAN_LINKED[@]} -gt 0 ]]; then
     NORMALIZED_SCAN_PROJECTS="$(IFS=','; echo "${CLEAN_LINKED[*]}")"
@@ -774,11 +820,16 @@ if [[ -z "$AGENT_ENGINE_REGIONS" || -z "$AI_LOCATION" ]]; then
   info "Agent Platform endpoints: Agent Engine=${AGENT_ENGINE_REGIONS}, AI location=${AI_LOCATION}"
 fi
 
+# HUB_GE_FOUND: 1 = a Gemini Enterprise app or license configuration exists in the hub, 0 = none found,
+# empty = not looked up here (DISCOVERY_ENGINE_LOCATIONS was configured). Read by the final summary.
+HUB_GE_FOUND=""
 if [[ -z "$DISCOVERY_ENGINE_LOCATIONS" ]]; then
   DISCOVERY_ENGINE_LOCATIONS="$(ge_locations "$PROJECT_ID")"
   if [[ -n "$DISCOVERY_ENGINE_LOCATIONS" ]]; then
+    HUB_GE_FOUND=1
     info "Gemini Enterprise locations: ${DISCOVERY_ENGINE_LOCATIONS} (detected)"
   else
+    HUB_GE_FOUND=0
     DISCOVERY_ENGINE_LOCATIONS="global"
     info "no Gemini Enterprise app or license found yet: using DISCOVERY_ENGINE_LOCATIONS=global"
   fi
@@ -1050,8 +1101,13 @@ if [[ -n "$ENFORCEMENT_SCHEDULE" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
     run retry gcloud scheduler jobs create http "$JOB" "${JOB_ARGS[@]}" --headers Content-Type=application/json >/dev/null
   fi
   info "job ${JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> ${ENFORCE_URL}"
+  # When the organization requires IAM invoker checks (run.managed.requireInvokerIam) the service is not public and
+  # Cloud Run would reject the scheduler's OIDC call before the app sees it; restores would then never run.
+  run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+    --member "serviceAccount:${SCHEDULER_SA}" --role roles/run.invoker --condition=None --quiet >/dev/null \
+    || warn "could not grant roles/run.invoker on ${SERVICE_NAME} to ${SCHEDULER_SA}; if the service requires IAM invoker checks, scheduled enforcement (and automatic restores) will fail"
 else
-  info "enforcement schedule: on-demand from the dashboard (ENFORCEMENT_SCHEDULE empty)"
+  info "enforcement schedule: on-demand from the dashboard (ENFORCEMENT_SCHEDULE off)"
 fi
 
 # Maintenance tick: daily official price/FX check at pricing.sync_time (Settings > Data collection and cost) and the
@@ -1067,6 +1123,8 @@ if [[ "$MAINTENANCE_SCHEDULE" != "off" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; 
       --time-zone "Etc/UTC" --uri "$MAINT_URL" --http-method POST --message-body '{}'
       --oidc-service-account-email "$SA_EMAIL" --oidc-token-audience "$MAINT_URL"
       --attempt-deadline 600s --max-retry-attempts 1 --quiet)
+    gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+      --member "serviceAccount:${SA_EMAIL}" --role roles/run.invoker --condition=None --quiet >/dev/null 2>&1 || true
     if gcloud scheduler jobs describe "$MAINT_JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
       run retry gcloud scheduler jobs update http "$MAINT_JOB" "${MAINT_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null \
         && info "job ${MAINT_JOB}: ${MAINTENANCE_SCHEDULE} -> ${MAINT_URL}" \
@@ -1133,3 +1191,23 @@ info "Audit dataset : ${PROJECT_ID}:${AUDIT_DATASET} (${DATASET_LOCATION}, Data 
 [[ -n "$NORMALIZED_SCAN_PROJECTS" ]] && info "Linked scan   : ${NORMALIZED_SCAN_PROJECTS}"
 info "Settings store: gs://${SETTINGS_BUCKET}"
 info "Container     : ${IMAGE}"
+# A hub without Gemini Enterprise and no linked project usually means Gemini Enterprise runs in another project the
+# runtime service account cannot read (its pages stay empty). Advice only: never fails the deployment, and a dry run
+# only reuses the detection above (no extra lookup).
+if [[ ${#CLEAN_LINKED[@]} -eq 0 && ",$DISABLED_MODULES," != *",gemini_enterprise,"* ]]; then
+  if [[ -z "$HUB_GE_FOUND" && "$DRY_RUN" != "1" ]]; then
+    if [[ -n "$(ge_locations "$PROJECT_ID" || true)" ]]; then HUB_GE_FOUND=1; else HUB_GE_FOUND=0; fi
+  fi
+  if [[ "$HUB_GE_FOUND" == "0" ]]; then
+    warn "No Gemini Enterprise app or seats found in ${PROJECT_ID}. If Gemini Enterprise runs in another project, install into that project (recommended: governance and marker roles act on the primary project's IAM) or re-run with --link-projects <GE project>."
+    warn "[한국어 안내] ${PROJECT_ID}에서 Gemini Enterprise 앱이나 라이선스 좌석을 찾지 못했습니다. Gemini Enterprise가 다른 프로젝트에서 운영 중이면 그 프로젝트에 설치하거나(권장: 거버넌스와 마커 역할은 대표 프로젝트의 IAM에 적용됩니다) --link-projects <GE 프로젝트>로 다시 실행하세요."
+  fi
+fi
+if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
+  if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
+    info "Antigravity caps: enforcement runs ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}); suspended users are restored automatically at each period reset"
+  else
+    info "Antigravity caps: no enforcement schedule; select Run enforcement now in the dashboard after each period reset"
+  fi
+  antigravity_readiness "$PROJECT_ID"
+fi
