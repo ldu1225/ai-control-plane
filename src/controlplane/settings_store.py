@@ -32,6 +32,10 @@ LOG = logging.getLogger("controlplane.settings")
 
 RELOAD_SECONDS = 30
 ACCOUNT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._@\-]{1,127}$")
+# OAuth client connected in Settings > Access control: Google web client ID and the Secret Manager version that holds
+# its client secret (the secret value never enters the settings store).
+OAUTH_CLIENT_ID_RE = re.compile(r"^[0-9]{6,32}-[a-z0-9]{8,64}\.apps\.googleusercontent\.com$")
+SECRET_VERSION_RE = re.compile(r"^projects/[A-Za-z0-9._:-]{1,64}/secrets/[A-Za-z0-9_-]{1,255}/versions/[0-9]{1,12}$")
 EMPTY_AUTH = {"requests": [], "lastLogin": {}, "revoked": {}, "accounts": {}}
 EMPTY_GOVERNANCE = {"exceptions": [], "suspensions": [], "notified": {}, "lastRun": None, "lastScheduledRun": None}
 EMPTY_PRICING = {"syncedAt": None, "syncedBy": None, "trigger": None, "fx": None, "models": {}, "unitPrices": [],
@@ -85,7 +89,14 @@ def sanitize_auth(auth):
         name = str(meta.get("name") or "")[:120]
         updated_at = str(meta.get("updatedAt") or "")[:40]
         accounts[key] = {"role": role, "passwordHash": pw_hash, "name": name, "updatedAt": updated_at}
-    return {"requests": requests, "lastLogin": last_login, "revoked": revoked, "accounts": accounts}
+    out = {"requests": requests, "lastLogin": last_login, "revoked": revoked, "accounts": accounts}
+    oauth = auth.get("oauth")
+    if isinstance(oauth, dict) and OAUTH_CLIENT_ID_RE.match(str(oauth.get("clientId") or "")) and \
+            SECRET_VERSION_RE.match(str(oauth.get("secretVersion") or "")):
+        out["oauth"] = {"clientId": oauth["clientId"], "secretVersion": oauth["secretVersion"],
+                        "updatedAt": str(oauth.get("updatedAt") or "")[:40],
+                        "updatedBy": str(oauth.get("updatedBy") or "")[:254]}
+    return out
 
 
 def _opt_str(value, limit=40):

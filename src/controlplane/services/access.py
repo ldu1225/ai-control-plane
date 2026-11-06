@@ -5,6 +5,9 @@ Approved accounts are security.admins (role admin) and security.allowed_users (r
 an exact email or a *@domain pattern. Entries from config.yaml or the environment ("config") are
 fixed; entries added here ("ui") are stored as settings overrides. Removing an account also revokes
 its existing sessions.
+
+When Google sign-in goes through Identity-Aware Proxy (the sign-in bridge, or a dashboard behind IAP),
+approving a Google account also admits it at IAP, and the summary shows who IAP admits (iap_access).
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from ..auth import hash_password
 from ..httpkit import ApiError, now_iso
 from ..security import admin_guard, is_admin_email, uid_for
 from ..settings_store import ACCOUNT_ID_RE
+from . import iap_access, oauth_client
 
 LOG = logging.getLogger("controlplane.access")
 
@@ -143,121 +147,37 @@ def summary(ctx):
 
     users.sort(key=lambda u: (u["email"] != "admin", u["role"] != "admin", u["pattern"], u["email"]))
     requests = [r for r in reversed(state.get("requests") or []) if not _approved(r["email"], sec)]
+    refresh = str((getattr(ctx, "params", None) or {}).get("refresh") or "") == "1"
+    google = iap_access.status(ctx.app, ctx.quota_project, refresh=refresh)
+    if google.get("enabled"):
+        approved = set(sec.get("admins") or []) | set(sec.get("allowed_users") or [])
+        for user in users:
+            if user["email"] not in approved:
+                continue
+            user["iap"] = iap_access.coverage(google, user["email"])
+            last = iap_access.last_result(user["email"])
+            if last and user["iap"] != "covered":
+                user["iapLast"] = last
     return {"authMode": ctx.identity.auth_mode, "users": users, "requests": requests,
-            "sessionHours": sec.get("session_hours"), "self": actor}
+            "sessionHours": sec.get("session_hours"), "self": actor, "google": google,
+            "oauth": oauth_client.summary(ctx.app, oauth_client.redirect_uri(ctx.app))}
 
 
-_PUBLIC_EMAIL_DOMAINS = frozenset({
-    "gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com",
-    "live.com", "icloud.com", "me.com", "aol.com", "proton.me", "protonmail.com",
-    "naver.com", "daum.net", "hanmail.net", "kakao.com",
-})
-_RUN_APP_BRIDGE_RE = re.compile(r"^https://([a-z0-9-]+)-([0-9]+)\.([a-z0-9-]+)\.run\.app(?:[:/]|$)")
-
-
-def _iap_bridge_resource(ctx):
-    auth = getattr(ctx.app, "auth", None)
-    bridge_url = getattr(auth, "bridge_url", "") if auth else ""
-    if not bridge_url:
-        return None
-    explicit = (ctx.app.environ.get("SIGN_IN_BRIDGE_IAP_RESOURCE") or "").strip()
-    if explicit:
-        return explicit
-    m = _RUN_APP_BRIDGE_RE.match(bridge_url.strip().lower())
-    if m:
-        service, project_num, region = m.group(1), m.group(2), m.group(3)
-        return "projects/%s/iap_web/cloud_run-%s/services/%s" % (project_num, region, service)
-    return None
-
-
-def _principals_for_entries(entries):
-    out = set()
-    for raw in entries or ():
-        token = str(raw or "").strip().lower()
-        if not token or token == "*" or "@" not in token:
-            continue
-        domain = token.rpartition("@")[2]
-        if token.startswith("*@"):
-            if domain and domain not in _PUBLIC_EMAIL_DOMAINS:
-                out.add("domain:" + domain)
-        else:
-            out.add("user:" + token)
-            if domain and domain not in _PUBLIC_EMAIL_DOMAINS:
-                out.add("domain:" + domain)
-    return out
-
-
-def _sync_iap_bridge(ctx, removed_member=None):
-    """Best-effort sync of approved users/domains to the Cloud Run IAP sign-in bridge IAM policy."""
-    resource = _iap_bridge_resource(ctx)
-    if not resource or not getattr(ctx.app, "gcp", None):
-        return
-    try:
-        effective, _ = ctx.app.settings.snapshot()
-        quota_project = (effective.get("workspace") or {}).get("project_id") or ""
-        sec = effective.get("security") or {}
-        desired = _principals_for_entries(list(sec.get("admins") or []) + list(sec.get("allowed_users") or []))
-        desired.add("allAuthenticatedUsers")
-        removed = set()
-        if removed_member:
-            rm = str(removed_member).strip().lower()
-            if rm.startswith("*@"):
-                removed.add("domain:" + rm[2:])
-            elif "@" in rm:
-                removed.add("user:" + rm)
-        base_url = "https://iap.googleapis.com/v1/" + resource
-        policy, _ = ctx.app.gcp.request("POST", base_url + ":getIamPolicy", quota_project=quota_project,
-                                        json_body={}, timeout=10)
-        policy = policy or {}
-        bindings = list(policy.get("bindings") or [])
-        role = "roles/iap.httpsResourceAccessor"
-        target = None
-        for b in bindings:
-            if b.get("role") == role:
-                target = b
-                break
-        if target is None:
-            target = {"role": role, "members": []}
-            bindings.append(target)
-        current = set(target.get("members") or [])
-        updated = (current - removed) | (desired - removed)
-        if updated == current:
-            return
-        # Try bulk update first; if a domain/user is rejected by IAM, add new members individually.
-        target["members"] = sorted(updated)
-        new_policy = {"version": policy.get("version", 1), "bindings": bindings}
-        if policy.get("etag"):
-            new_policy["etag"] = policy["etag"]
-        try:
-            ctx.app.gcp.request("POST", base_url + ":setIamPolicy", quota_project=quota_project,
-                                json_body={"policy": new_policy}, timeout=10)
-            return
-        except Exception:  # pylint: disable=broad-except
-            pass
-        kept = current - removed
-        for cand in sorted(desired - kept):
-            trial = sorted(kept | {cand})
-            target["members"] = trial
-            try:
-                pol, _ = ctx.app.gcp.request("POST", base_url + ":getIamPolicy", quota_project=quota_project,
-                                             json_body={}, timeout=10)
-                pol = pol or {}
-                if pol.get("etag"):
-                    new_policy["etag"] = pol["etag"]
-                ctx.app.gcp.request("POST", base_url + ":setIamPolicy", quota_project=quota_project,
-                                    json_body={"policy": new_policy}, timeout=10)
-                kept.add(cand)
-            except Exception as exc:  # pylint: disable=broad-except
-                LOG.warning("iap bridge binding skipped member=%s reason=%s", cand, type(exc).__name__)
-    except Exception as exc:  # pylint: disable=broad-except
-        LOG.warning("iap bridge policy sync skipped reason=%s", type(exc).__name__)
-
-
-def _save_lists(ctx, admins, allowed, removed_member=None):
+def _save_lists(ctx, admins, allowed):
     ctx.app.settings.update_section("security", {"admins": admins, "allowed_users": allowed}, ctx.identity.email,
                                     check=admin_guard(ctx.identity))
     ctx.app.on_settings_changed()
-    _sync_iap_bridge(ctx, removed_member=removed_member)
+
+
+def _grant_iap(ctx, entries):
+    """Admits approved Google entries at IAP. Never fails the approval itself: the outcome is returned to the
+    administrator (iapResults) and shown next to the account."""
+    try:
+        return iap_access.grant(ctx.app, ctx.quota_project, entries)
+    except Exception as err:  # pylint: disable=broad-except
+        LOG.warning("IAP sign-in access not updated reason=%s", type(err).__name__)
+        return [{"entry": e, "principal": iap_access.principal_for(e), "result": "failed", "at": now_iso()}
+                for e in entries if iap_access.principal_for(e)]
 
 
 def _drop_requests(ctx, members):
@@ -321,6 +241,7 @@ def save_user(ctx):
                 allowed.append(member)
         _save_lists(ctx, admins, allowed)
         _drop_requests(ctx, email_members)
+    iap_results = _grant_iap(ctx, email_members) if email_members else []
 
     id_or_pw_members = [m for m in members if has_password or "@" not in m or m in existing_accounts]
     if id_or_pw_members:
@@ -341,7 +262,9 @@ def save_user(ctx):
 
     for member in members:
         LOG.info("access granted member=%s role=%s pw=%s", uid_for(member), role, bool(pw_hash))
-    return summary(ctx)
+    out = summary(ctx)
+    out["iapResults"] = iap_results
+    return out
 
 
 def delete_user(ctx):
@@ -364,8 +287,7 @@ def delete_user(ctx):
     if not in_lists and not in_accounts:
         raise ApiError("not_found", "Account not found.")
     if in_lists:
-        _save_lists(ctx, [m for m in admins if m != member], [m for m in allowed if m != member],
-                    removed_member=member)
+        _save_lists(ctx, [m for m in admins if m != member], [m for m in allowed if m != member])
     if member != "*" and not member.startswith("*@"):
         epoch = int(time.time() * 1000)
 
@@ -373,6 +295,11 @@ def delete_user(ctx):
             auth.get("accounts", {}).pop(member, None)
             auth["revoked"][member] = epoch
         ctx.app.settings.mutate_auth(apply, ctx.identity.email)
+        if in_lists and "@" in member:
+            try:
+                iap_access.revoke(ctx.app, ctx.quota_project, [member])
+            except Exception as err:  # pylint: disable=broad-except
+                LOG.warning("IAP sign-in access not removed reason=%s", type(err).__name__)
     LOG.info("access removed member=%s", uid_for(member))
     return summary(ctx)
 
@@ -381,4 +308,62 @@ def dismiss_request(ctx):
     """POST /api/v1/access/requests/dismiss {email}."""
     member = _norm_member(ctx.body.get("email"))
     _drop_requests(ctx, [member])
+    return summary(ctx)
+
+
+def _refreshed_summary(ctx, results):
+    ctx.params = dict(getattr(ctx, "params", None) or {}, refresh="1")
+    out = summary(ctx)
+    out["iapResults"] = results
+    return out
+
+
+def sync_iap(ctx):
+    """POST /api/v1/access/iap/sync: admits every approved Google account and *@domain rule at IAP (adds only what
+    is missing) and returns the refreshed summary with one result per entry."""
+    effective, _ = ctx.app.settings.snapshot()
+    sec = effective["security"]
+    if iap_access.resource(ctx.app) is None:
+        raise ApiError("conflict", "Google sign-in on this deployment does not go through Identity-Aware Proxy.")
+    entries = list(sec.get("admins") or []) + list(sec.get("allowed_users") or [])
+    return _refreshed_summary(ctx, _grant_iap(ctx, entries))
+
+
+_BARE_DOMAIN_RE = re.compile(r"^@?([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)$")
+
+
+def allow_iap(ctx):
+    """POST /api/v1/access/iap {member}: lets a domain (example.com or *@example.com) or one Google account sign in
+    through IAP without approving it. Accounts that are not approved then reach the dashboard and appear as access
+    requests, so administrators approve people as they ask."""
+    raw = str(ctx.body.get("member") or "").strip().lower()
+    bare = _BARE_DOMAIN_RE.match(raw)
+    entry = "*@" + bare.group(1) if bare else raw
+    if len(entry) > 254 or iap_access.principal_for(entry) is None:
+        raise ApiError("bad_request", "Field 'member' must be a domain (example.com), a *@domain pattern or an email "
+                                      "address.")
+    if iap_access.resource(ctx.app) is None:
+        raise ApiError("conflict", "Google sign-in on this deployment does not go through Identity-Aware Proxy.")
+    results = _grant_iap(ctx, [entry])
+    LOG.info("IAP sign-in access requested kind=%s result=%s", "domain" if entry.startswith("*@") else "user",
+             results[0]["result"] if results else "none")
+    return _refreshed_summary(ctx, results)
+
+
+def connect_oauth(ctx, handler):
+    """POST /api/v1/access/oauth {clientId, clientSecret}: connects a Google OAuth client of this project so every
+    approved Google account can sign in, including accounts outside the organization. Google checks the client and the
+    redirect URI first; the secret goes to Secret Manager. No redeployment."""
+    redirect = oauth_client.redirect_uri(ctx.app, handler.headers)
+    if not redirect:
+        raise ApiError("bad_request", "The dashboard address is unknown. Set PUBLIC_BASE_URL and deploy again.")
+    oauth_client.connect(ctx.app, ctx.quota_project, ctx.identity.email, ctx.body.get("clientId"),
+                         ctx.body.get("clientSecret"), redirect)
+    return summary(ctx)
+
+
+def disconnect_oauth(ctx):
+    """POST /api/v1/access/oauth/delete: stops using the connected OAuth client (back to the IAP sign-in bridge, or
+    ID/password sign-in only when there is no bridge)."""
+    oauth_client.disconnect(ctx.app, ctx.quota_project, ctx.identity.email)
     return summary(ctx)

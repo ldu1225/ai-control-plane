@@ -22,6 +22,7 @@ from .security import GUEST_MODE, GUEST_READ_ONLY_MESSAGE, Identity, IapVerifier
 from .settings_store import AuxDocStore, SettingsManager, UserDocStore, make_store
 from .services import base as svc_base
 from .services import access
+from .services import oauth_client
 from .services import agent_activity
 from .services import (agents, analyst, finops, gateway, gemini_enterprise, governance, layouts, maintenance,
                        model_armor, models, notebooklm, overview, pricing_sync, system, telemetry, telemetry_routing,
@@ -52,6 +53,10 @@ _route("GET", "/api/v1/access", access.summary, admin_read=True, mask=False)
 _route("POST", "/api/v1/access/users", access.save_user, admin=True, mask=False)
 _route("POST", "/api/v1/access/users/delete", access.delete_user, admin=True, mask=False)
 _route("POST", "/api/v1/access/requests/dismiss", access.dismiss_request, admin=True, mask=False)
+_route("POST", "/api/v1/access/iap", access.allow_iap, admin=True, mask=False)
+_route("POST", "/api/v1/access/iap/sync", access.sync_iap, admin=True, mask=False)
+_route("POST", "/api/v1/access/oauth", access.connect_oauth, admin=True, handler=True, mask=False)
+_route("POST", "/api/v1/access/oauth/delete", access.disconnect_oauth, admin=True, mask=False)
 _route("GET", "/api/v1/health", system.health)
 # Viewers get the read-only settings view (deployment identifiers hidden, storage details reduced).
 _route("GET", "/api/v1/settings", system.settings_get, mask=False, viewer_view=system.settings_viewer_view)
@@ -160,7 +165,10 @@ class App:
         mode = resolve_auth_mode(base["security"]["auth_mode"], self.environ)
         self.auth = None
         if mode == "google":
-            self.auth = GoogleSignIn(base, self.environ, self.settings)
+            quota_project = config.quota_project(base) or ""
+            self.auth = GoogleSignIn(base, self.environ, self.settings,
+                                     secret_reader=lambda version: oauth_client.read_version(self.gcp, version,
+                                                                                             quota_project))
         self.bridge = None
         if base["security"].get("bridge_return_url"):
             # Sign-in bridge service: only /auth/bridge behind Identity-Aware Proxy.

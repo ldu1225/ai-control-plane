@@ -302,6 +302,24 @@ function passwordFormView() {
   return form;
 }
 
+/** Google sign-in through IAP: which accounts it accepts and what to do on Google's "You don't have access" page. */
+function googleHintNote() {
+  const hint = state && state.googleHint;
+  if (!hint || !hint.iap) return null;
+  let text;
+  if (hint.internalOnly && hint.orgDomain) {
+    text = t('Google sign-in accepts {domain} accounts of your organization. If Google shows "You don\'t have access", choose another account or ask an administrator for an ID and password.', { domain: `@${hint.orgDomain}` });
+  } else if (hint.internalOnly) {
+    text = t('Google sign-in accepts your organization\'s Google accounts only. If Google shows "You don\'t have access", choose another account or ask an administrator for an ID and password.');
+  } else {
+    text = t('If Google shows "You don\'t have access", choose another account or ask an administrator to allow yours.');
+  }
+  const url = state && state.switchAccountUrl;
+  const link = typeof url === 'string' && /^https:\/\/[A-Za-z0-9.-]+\/_gcp_iap\/clear_login_cookie$/.test(url)
+    ? h('a', { href: url }, t('Use another Google account')) : null;
+  return h('p', { class: 'login-note' }, icon('info', { size: 14 }), h('span', null, text, link ? ' ' : null, link));
+}
+
 function signInView() {
   const guest = Boolean(state && state.guestAccess);
   const google = Boolean(state && state.googleEnabled !== false);
@@ -320,6 +338,7 @@ function signInView() {
       : (google
         ? t('Sign in with your assigned ID and password, or use an approved Google account.')
         : t('Sign in with your assigned account ID and password.'))),
+    google ? googleHintNote() : null,
   ];
 }
 

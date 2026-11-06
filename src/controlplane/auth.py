@@ -19,10 +19,15 @@ revocation epoch in the settings store, which invalidates every session of that 
 Identity providers
 - OAuth client (security.google_client_id + GOOGLE_OAUTH_CLIENT_SECRET): Google's authorization
   code flow described above.
+- OAuth client connected by an administrator (Settings > Access control): the client ID is kept in
+  the internal sign-in state and the client secret in Secret Manager (OAUTH_CONNECT_SECRET, read by
+  exact version). Any approved Google account can sign in, including accounts of other organizations.
 - Sign-in bridge (security.sign_in_bridge_url): no OAuth client is needed. A second Cloud Run service
   (the same image with auth_mode iap and security.bridge_return_url) sits behind Identity-Aware
   Proxy. IAP signs the user in with Google; the bridge returns a short-lived assertion (HMAC with
   the shared SESSION_SECRET, 2 minutes) bound to this browser's sign-in state to the callback.
+  IAP's Google-managed OAuth client admits accounts of the project's organization only.
+An OAuth client, when present and readable, takes precedence over the bridge.
 
 Secrets come from the environment (Secret Manager on Cloud Run): GOOGLE_OAUTH_CLIENT_SECRET and
 SESSION_SECRET. They are never part of the settings, the API or the logs.
@@ -38,6 +43,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 
@@ -178,9 +184,18 @@ def is_approved(email, settings):
 class GoogleSignIn:
     """Google OpenID Connect sign-in, built-in ID/Password sign-in, and session handling."""
 
-    def __init__(self, base_settings, environ, settings_manager=None):
+    SECRET_RETRY_SECONDS = 15
+
+    def __init__(self, base_settings, environ, settings_manager=None, secret_reader=None):
         sec = base_settings["security"]
         self.environ = environ
+        self.settings = settings_manager
+        # secret_reader(version_name) -> str reads one Secret Manager secret version (the client secret of an OAuth
+        # client connected in Settings > Access control). Values are cached per version (versions are immutable).
+        self.secret_reader = secret_reader
+        self._secret_values = {}
+        self._secret_failures = {}
+        self._secret_lock = threading.Lock()
         self.bridge_url = (sec.get("sign_in_bridge_url") or "").rstrip("/")
         self.client_id = sec.get("google_client_id") or ""
         self.client_secret = (environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip()
@@ -188,7 +203,7 @@ class GoogleSignIn:
         self.oauth_start_url = (environ.get("GOOGLE_OAUTH_START_URL") or "").strip()
         if self.client_id and not self.client_secret and not self.bridge_url:
             raise ValueError("auth_mode=google requires the GOOGLE_OAUTH_CLIENT_SECRET environment variable")
-        if not self.google_enabled:
+        if not (self.bridge_url or (self.client_id and self.client_secret) or self.connected_oauth()):
             LOG.info("Google OAuth / sign-in bridge not configured: running with built-in ID/Password sign-in only")
         self.public_base_url = (sec.get("public_base_url") or "").rstrip("/")
         if environ.get("K_SERVICE") and not self.public_base_url:
@@ -198,12 +213,57 @@ class GoogleSignIn:
         self.transactions = Signer(secret, "oauth-transaction")
         self.notices = Signer(secret, "notice")
         self.bridge = Signer(secret, "sign-in-bridge")
-        self.settings = settings_manager
         self._verify_request = None
+
+    # -- which identity provider signs users in ---------------------------------------
+    def connected_oauth(self):
+        """{clientId, secretVersion, updatedAt, updatedBy} of the OAuth client an administrator connected in
+        Settings > Access control, or None."""
+        if self.settings is None:
+            return None
+        conf = (self.settings.auth_state() or {}).get("oauth")
+        return dict(conf) if isinstance(conf, dict) and conf.get("clientId") and conf.get("secretVersion") else None
+
+    def _secret_value(self, version):
+        with self._secret_lock:
+            if version in self._secret_values:
+                return self._secret_values[version]
+            failed = self._secret_failures.get(version)
+            if failed and time.monotonic() - failed < self.SECRET_RETRY_SECONDS:
+                return None
+        value = None
+        if self.secret_reader is not None:
+            try:
+                value = str(self.secret_reader(version) or "").strip() or None
+            except Exception as err:  # pylint: disable=broad-except
+                LOG.warning("OAuth client secret unreadable reason=%s", type(err).__name__)
+        with self._secret_lock:
+            if value:
+                self._secret_values[version] = value
+                self._secret_failures.pop(version, None)
+            else:
+                self._secret_failures[version] = time.monotonic()
+        return value
+
+    def oauth_client(self):
+        """(client_id, client_secret, source) of the Google OAuth client that signs users in, or (None, None, None).
+        source is "deployment" (GOOGLE_OAUTH_CLIENT_ID + GOOGLE_OAUTH_CLIENT_SECRET) or "settings" (connected by an
+        administrator). A connected client whose secret cannot be read is skipped, so the bridge keeps working."""
+        if self.client_id and self.client_secret:
+            return self.client_id, self.client_secret, "deployment"
+        conf = self.connected_oauth()
+        if conf:
+            secret = self._secret_value(conf["secretVersion"])
+            if secret:
+                return conf["clientId"], secret, "settings"
+        return None, None, None
+
+    def oauth_active(self):
+        return bool(self.oauth_client()[0])
 
     @property
     def google_enabled(self):
-        return bool(self.bridge_url or (self.client_id and self.client_secret))
+        return bool(self.bridge_url or self.oauth_active())
 
     # -- helpers ------------------------------------------------------------------
     def canonical_host(self):
@@ -345,22 +405,24 @@ class GoogleSignIn:
     # -- flow ---------------------------------------------------------------------
     def start(self, headers, query):
         """Returns (location, cookies) for the redirect to Google."""
-        if not self.google_enabled:
+        client_id, _secret, _source = self.oauth_client()
+        if not (client_id or self.bridge_url):
             return "/login?error=unavailable", []
         params = urllib.parse.parse_qs(query or "", max_num_fields=8)
         next_path = safe_next((params.get("next") or ["/"])[0])
         https = request_is_https(headers)
         state = secrets.token_urlsafe(32)
-        if self.bridge_url and not (self.client_id and self.client_secret):
+        if not client_id:
             txn = self.transactions.sign({"s": state, "next": next_path, "m": "bridge"}, TRANSACTION_TTL)
             cookies = [self._cookie(TRANSACTION_COOKIE, txn, https, TRANSACTION_TTL), self._clear(NOTICE_COOKIE, https)]
             return "%s%s?%s" % (self.bridge_url, BRIDGE_PATH, urllib.parse.urlencode({"state": state})), cookies
         nonce = secrets.token_urlsafe(32)
         verifier = secrets.token_urlsafe(64)
         challenge = _b64e(hashlib.sha256(verifier.encode("ascii")).digest())
-        txn = self.transactions.sign({"s": state, "n": nonce, "v": verifier, "next": next_path}, TRANSACTION_TTL)
+        txn = self.transactions.sign({"s": state, "n": nonce, "v": verifier, "next": next_path, "c": client_id},
+                                     TRANSACTION_TTL)
         oauth_params = {
-            "client_id": self.client_id, "redirect_uri": self.redirect_uri(headers), "response_type": "code",
+            "client_id": client_id, "redirect_uri": self.redirect_uri(headers), "response_type": "code",
             "scope": SCOPES, "state": state, "nonce": nonce, "code_challenge": challenge,
             "code_challenge_method": "S256", "prompt": "select_account", "access_type": "online",
             "include_granted_scopes": "false"}
@@ -374,7 +436,8 @@ class GoogleSignIn:
         """Completes the sign-in. Returns (location, cookies). Never raises for user-caused errors."""
         https = request_is_https(headers)
         cookies = [self._clear(TRANSACTION_COOKIE, https)]
-        if not self.google_enabled:
+        client_id, client_secret, _source = self.oauth_client()
+        if not (client_id or self.bridge_url):
             return "/login?error=unavailable", cookies
         params = urllib.parse.parse_qs(query or "", max_num_fields=16)
         get = lambda key: (params.get(key) or [""])[0]  # noqa: E731
@@ -393,8 +456,11 @@ class GoogleSignIn:
             code = get("code")
             if not code or len(code) > 2048:
                 return "/login?error=failed", cookies
+            # The client that started this sign-in must still be the one in use (an administrator may have switched).
+            if not client_id or str(txn.get("c") or client_id) != client_id:
+                return "/login?error=expired", cookies
             try:
-                claims = self._exchange_and_verify(code, txn, headers)
+                claims = self._exchange_and_verify(code, txn, headers, client_id, client_secret)
             except ApiError:
                 return "/login?error=failed", cookies
         email = claims["email"]
@@ -438,9 +504,11 @@ class GoogleSignIn:
         return [self._clear(SESSION_COOKIE, https), self._clear(NOTICE_COOKIE, https)]
 
     # -- Google endpoints ----------------------------------------------------------
-    def _exchange_and_verify(self, code, txn, headers):
+    def _exchange_and_verify(self, code, txn, headers, client_id=None, client_secret=None):
         import requests
-        data = {"code": code, "client_id": self.client_id, "client_secret": self.client_secret,
+        client_id = client_id or self.client_id
+        client_secret = client_secret or self.client_secret
+        data = {"code": code, "client_id": client_id, "client_secret": client_secret,
                 "redirect_uri": self.redirect_uri(headers), "grant_type": "authorization_code",
                 "code_verifier": txn.get("v", "")}
         try:
@@ -458,7 +526,7 @@ class GoogleSignIn:
             id_token = None
         if not isinstance(id_token, str) or not id_token:
             raise ApiError("unauthenticated", "Google sign-in failed.")
-        claims = self.verify_id_token(id_token)
+        claims = self.verify_id_token(id_token, audience=client_id)
         if not hmac.compare_digest(str(claims.get("nonce", "")).encode("utf-8", "replace"),
                                    str(txn.get("n", "")).encode("utf-8", "replace")):
             LOG.warning("id token rejected reason=nonce_mismatch")
@@ -481,11 +549,11 @@ class GoogleSignIn:
 
     def switch_account_url(self):
         """Bridge mode: clears the IAP session on the bridge so the next sign-in asks for an account."""
-        if self.bridge_url and not (self.client_id and self.client_secret):
+        if self.bridge_url and not self.oauth_active():
             return self.bridge_url + "/_gcp_iap/clear_login_cookie"
         return None
 
-    def verify_id_token(self, id_token):
+    def verify_id_token(self, id_token, audience=None):
         """Verifies signature (Google certificates), audience, issuer and expiry; requires a
         verified email. Returns the claims with a normalized lower-case email."""
         from google.oauth2 import id_token as google_id_token
@@ -493,7 +561,8 @@ class GoogleSignIn:
             from google.auth.transport import requests as ga_requests
             self._verify_request = ga_requests.Request()
         try:
-            claims = google_id_token.verify_oauth2_token(id_token, self._verify_request, audience=self.client_id,
+            claims = google_id_token.verify_oauth2_token(id_token, self._verify_request,
+                                                         audience=audience or self.client_id,
                                                          clock_skew_in_seconds=10)
         except Exception as err:  # pylint: disable=broad-except
             LOG.warning("id token rejected reason=%s", type(err).__name__)

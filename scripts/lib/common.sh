@@ -158,6 +158,288 @@ caller_iam_member() {
   fi
 }
 
+# iap_org_domain PROJECT
+# Primary domain of the project's organization (the organization resource's display name). Prints nothing when the
+# project has no organization or the caller may not read it (roles/resourcemanager.organizationViewer).
+iap_org_domain() {
+  local project="$1" org_id disp
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  org_id="$(gcloud projects get-ancestors "$project" --format=json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    for item in json.load(sys.stdin):
+        if item.get("type") == "organization" and item.get("id"):
+            print(item["id"]); break
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  [[ -n "$org_id" ]] || return 0
+  disp="$(gcloud organizations describe "$org_id" --format='value(displayName)' 2>/dev/null || true)"
+  disp="$(trim_ws "$disp" | tr '[:upper:]' '[:lower:]')"
+  [[ "$disp" =~ ^[a-z0-9-]+(\.[a-z0-9-]+)+$ ]] && printf '%s' "$disp"
+  return 0
+}
+
+# configure_iap_access PROJECT PROJECT_NUMBER REGION SERVICE MODE [EXTRA_MEMBERS]
+# Lets Google accounts through Identity-Aware Proxy on SERVICE and reports exactly who IAP admits. IAP stops every
+# account that roles/iap.httpsResourceAccessor does not cover on Google's own page ("You don't have access"), before
+# the dashboard can show or record anything, so a refused binding must never pass silently.
+#   MODE bridge (the Google sign-in bridge; the dashboard approves people afterwards):
+#     - no domain restricted sharing: allAuthenticatedUsers (with IAP's Google-managed OAuth client this still means
+#       accounts of the project's organization only);
+#     - domain restricted sharing, or allAuthenticatedUsers refused: domain: bindings for the organization's domain and
+#       for the domains of ADMIN_EMAILS / ALLOWED_USERS, of people on the project IAM policy and of Gemini Enterprise
+#       license holders (public mail domains and google.com excluded).
+#   MODE gate (the dashboard itself behind IAP; everyone IAP admits is a viewer): an allowlist only, no organization-
+#     wide bindings.
+#   Both: user: bindings for ADMIN_EMAILS / ALLOWED_USERS (domain: for *@domain entries) and EXTRA_MEMBERS
+#   (BRIDGE_MEMBERS / IAP_MEMBERS). Sets IAP_OAUTH_CLIENT (managed | custom | unknown) and appends a block to
+#   IAP_REPORT (printed by iap_access_report at the end of the deployment).
+# Reads ADMIN_EMAILS, ALLOWED_USERS, ORGPOL_DRS, IAP_ORG_DOMAIN, DISCOVERY_ENGINE_LOCATIONS and DRY_RUN.
+IAP_REPORT=()
+configure_iap_access() {
+  local project="$1" number="$2" region="$3" service="$4" mode="$5" extra="${6:-}" out kind a b
+  local admitted="" refused="" failed="" readback=0 human
+  out="$(ACP_IAP_ADMINS="${ADMIN_EMAILS:-}" ACP_IAP_VIEWERS="${ALLOWED_USERS:-}" ACP_IAP_EXTRA="$extra" \
+    ACP_IAP_MODE="$mode" ACP_IAP_DRS="${ORGPOL_DRS:-0}" ACP_IAP_ORG_DOMAIN="${IAP_ORG_DOMAIN:-}" \
+    ACP_IAP_GE_LOCATIONS="${DISCOVERY_ENGINE_LOCATIONS:-global}" ACP_IAP_DRY="${DRY_RUN:-0}" \
+    python3 - "$project" "$number" "$region" "$service" <<'PYIAP'
+import json, os, re, subprocess, sys, time, urllib.parse, urllib.request
+
+project, number, region, service = sys.argv[1:5]
+mode = os.environ.get("ACP_IAP_MODE") or "bridge"
+dry = os.environ.get("ACP_IAP_DRY") == "1"
+drs = os.environ.get("ACP_IAP_DRS") == "1"
+ROLE = "roles/iap.httpsResourceAccessor"
+SKIP = {"gmail.com", "googlemail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com", "icloud.com", "me.com",
+        "aol.com", "proton.me", "protonmail.com", "naver.com", "daum.net", "hanmail.net", "kakao.com", "nate.com",
+        "google.com"}
+EMAIL = re.compile(r"^[a-z0-9._%+'\-]+@([a-z0-9-]+(?:\.[a-z0-9-]+)+)$")
+POLICY = re.compile(r"permitted customer|allowedPolicyMemberDomains|allowedPolicyMembers|organization polic", re.I)
+TRANSIENT = re.compile(r"NOT_FOUND|not found|UNAVAILABLE|DEADLINE|try again|ABORTED|concurrent|etag", re.I)
+
+
+def gc(*args, timeout=120):
+    try:
+        r = subprocess.run(["gcloud", *args, "--quiet"], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as err:  # pylint: disable=broad-except
+        return 1, "", str(err)
+
+
+def emit(*fields):
+    print("|".join(str(f).replace("|", "/").replace("\n", " ") for f in fields), flush=True)
+
+
+def domain_of(value):
+    value = (value or "").strip().lower()
+    if value.startswith("*@"):
+        value = "x" + value[1:]
+    m = EMAIL.match(value)
+    return m.group(1) if m else ""
+
+
+def usable(domain):
+    return bool(domain) and domain not in SKIP and not domain.endswith("gserviceaccount.com")
+
+
+entries = [t for t in re.split(r"[,\s]+", (os.environ.get("ACP_IAP_ADMINS") or "") + "," +
+                               (os.environ.get("ACP_IAP_VIEWERS") or "")) if t.strip()]
+explicit, entry_domains = [], []
+for raw in entries:
+    token = raw.strip().lower()
+    dom = domain_of(token)
+    if not dom:
+        continue
+    principal = "domain:" + dom if token.startswith("*@") else "user:" + token
+    if principal not in explicit:
+        explicit.append(principal)
+    if usable(dom) and dom not in entry_domains:
+        entry_domains.append(dom)
+for raw in re.split(r"[,\s]+", os.environ.get("ACP_IAP_EXTRA") or ""):
+    member = raw.strip()
+    if not member:
+        continue
+    if not re.match(r"^(allUsers|allAuthenticatedUsers|user:|group:|domain:|serviceAccount:|principal)", member):
+        member = ("domain:" + member[2:]) if member.startswith("*@") else \
+                 ("user:" + member) if "@" in member else ("domain:" + member)
+    if member == "allUsers" or (member == "allAuthenticatedUsers" and drs):
+        continue  # never public; allAuthenticatedUsers is refused under domain restricted sharing
+    if member not in explicit:
+        explicit.append(member)
+
+done = set()
+
+
+def bind(principal):
+    if principal in done:
+        return "dup"
+    done.add(principal)
+    if dry:
+        emit("DRY", principal)
+        return "dry"
+    text = ""
+    for attempt in range(3):
+        rc, so, se = gc("iap", "web", "add-iam-policy-binding", "--resource-type=cloud-run", "--service=" + service,
+                        "--region=" + region, "--project=" + project, "--member=" + principal, "--role=" + ROLE,
+                        "--condition=None")
+        if rc == 0:
+            emit("OK", principal)
+            return "ok"
+        text = (se or so or "").strip()
+        if POLICY.search(text):
+            emit("POLICY", principal)
+            return "policy"
+        if attempt < 2 and TRANSIENT.search(text):
+            time.sleep(6)
+            continue
+        break
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    emit("FAIL", principal, (lines[-1] if lines else "error")[:240])
+    return "fail"
+
+
+def project_domains():
+    rc, so, _ = gc("projects", "get-iam-policy", project, "--format=json")
+    found = []
+    if rc != 0:
+        return found
+    try:
+        policy = json.loads(so[so.index("{"):]) if "{" in so else {}
+    except ValueError:
+        return found
+    for binding in policy.get("bindings") or []:
+        for member in binding.get("members") or []:
+            if member.startswith(("user:", "group:")):
+                dom = domain_of(member.split(":", 1)[1])
+                if usable(dom) and dom not in found:
+                    found.append(dom)
+    return found
+
+
+def license_domains():
+    if dry:
+        return []
+    rc, token, _ = gc("auth", "print-access-token", timeout=30)
+    token = token.strip()
+    if rc != 0 or not token:
+        return []
+    counts = {}
+    for loc in [l.strip() for l in (os.environ.get("ACP_IAP_GE_LOCATIONS") or "global").split(",") if l.strip()]:
+        host = ("https://discoveryengine.googleapis.com" if loc == "global"
+                else "https://%s-discoveryengine.googleapis.com" % loc)
+        url = "%s/v1alpha/projects/%s/locations/%s/userStores/default_user_store/userLicenses?pageSize=500" % (
+            host, project, loc)
+        page = ""
+        for _ in range(4):
+            req = urllib.request.Request(url + ("&pageToken=" + urllib.parse.quote(page) if page else ""), headers={
+                "Authorization": "Bearer " + token, "X-Goog-User-Project": project})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json.load(resp)
+            except Exception:  # pylint: disable=broad-except
+                break
+            for item in data.get("userLicenses") or []:
+                dom = domain_of(item.get("userPrincipal") or "")
+                if usable(dom):
+                    counts[dom] = counts.get(dom, 0) + 1
+            page = data.get("nextPageToken") or ""
+            if not page:
+                break
+    return sorted(counts, key=lambda d: (-counts[d], d))
+
+
+opened = False
+if mode == "bridge" and not drs:
+    opened = bind("allAuthenticatedUsers") in ("ok", "dry")
+for principal in explicit:
+    bind(principal)
+if mode == "bridge" and not opened:
+    candidates = []
+    for dom in [(os.environ.get("ACP_IAP_ORG_DOMAIN") or "").strip().lower()] + entry_domains + project_domains() + \
+            license_domains():
+        if usable(dom) and dom not in candidates:
+            candidates.append(dom)
+    for dom in candidates[:20]:
+        bind("domain:" + dom)
+
+if not dry:
+    rc, so, _ = gc("iap", "web", "get-iam-policy", "--resource-type=cloud-run", "--service=" + service,
+                   "--region=" + region, "--project=" + project, "--format=json")
+    if rc == 0:
+        try:
+            policy = json.loads(so[so.index("{"):]) if "{" in so else {}
+            members = sorted({m for b in policy.get("bindings") or [] if b.get("role") == ROLE
+                              for m in b.get("members") or []})
+            emit("MEMBERS", ",".join(members))
+        except ValueError:
+            pass
+    custom, unreadable = False, False
+    for scope in (["--resource-type=cloud-run", "--service=" + service, "--region=" + region], []):
+        rc, so, _ = gc("iap", "settings", "get", "--project=" + project, *scope, "--format=json")
+        if rc != 0:
+            unreadable = True
+            continue
+        try:
+            data = json.loads(so[so.index("{"):]) if "{" in so else {}
+        except ValueError:
+            data = {}
+        if ((data.get("accessSettings") or {}).get("oauthSettings") or {}).get("clientId"):
+            custom = True
+            break
+    emit("OAUTH", "custom" if custom else ("unknown" if unreadable else "managed"))
+PYIAP
+)" || true
+  while IFS='|' read -r kind a b; do
+    case "$kind" in
+      OK) info "IAP access (${service}): ${a}" ;;
+      DRY) info "[dry-run] IAP access (${service}): ${a}" ;;
+      POLICY) refused+="${refused:+, }${a}"
+        warn "IAP access (${service}): ${a} refused by an organization policy (domain restricted sharing)" ;;
+      FAIL) failed+="${failed:+, }${a}"; warn "IAP access (${service}): ${a} not granted: ${b}" ;;
+      MEMBERS) admitted="$a"; readback=1 ;;
+      OAUTH) IAP_OAUTH_CLIENT="$a" ;;
+    esac
+  done <<<"$out"
+  [[ "${DRY_RUN:-0}" == "1" ]] && return 0
+  human="$(printf '%s' "$admitted" | tr ',' '\n' | grep -v '^serviceAccount:' | paste -sd, - | sed 's/,/, /g' || true)"
+  IAP_REPORT+=("Google 로그인(IAP) 점검: ${service}")
+  if [[ "$readback" != "1" ]]; then
+    IAP_REPORT+=("  통과 허용   : 확인 불가 (IAP 정책을 읽지 못함)")
+  elif [[ -z "$human" ]]; then
+    IAP_REPORT+=("  통과 허용   : 없음. 지금은 아무 Google 계정도 IAP를 통과할 수 없습니다")
+  else
+    IAP_REPORT+=("  통과 허용   : ${human}")
+  fi
+  [[ -n "$refused" ]] && IAP_REPORT+=("  조직 정책 거부: ${refused} (도메인 제한 공유)")
+  [[ -n "$failed" ]] && IAP_REPORT+=("  실패        : ${failed}")
+  case "${IAP_OAUTH_CLIENT:-unknown}" in
+    custom) IAP_REPORT+=("  OAuth       : 맞춤 OAuth 클라이언트. IAP가 허용한 조직 밖 계정도 Google 로그인 가능") ;;
+    managed) IAP_REPORT+=("  OAuth       : Google 관리형. 이 프로젝트 조직${IAP_ORG_DOMAIN:+(${IAP_ORG_DOMAIN})} 계정만 Google 로그인 가능")
+      IAP_REPORT+=("                조직 밖 계정(협력사, 계열사 다른 조직, 개인 Gmail)은 IAP 화면에서 막힙니다") ;;
+    *) IAP_REPORT+=("  OAuth       : 확인 불가. 기본값(Google 관리형)이면 이 프로젝트 조직 계정만 Google 로그인 가능") ;;
+  esac
+  if [[ "$mode" == "bridge" && -n "${OAUTH_CONNECT_SECRET:-}" ]]; then
+    IAP_REPORT+=("  조직 밖 계정 : 설정 > 접근 제어 > 'Google OAuth 클라이언트' 연결 (재배포 없음, README 5.4)")
+    IAP_REPORT+=("                리디렉션 URI ${BASE_URL:-<대시보드 주소>}/auth/google/callback. 또는 ID/비밀번호 계정 발급")
+  else
+    IAP_REPORT+=("  조직 밖 계정 : 대시보드 설정 > 접근 제어에서 ID/비밀번호 계정 발급 (README 5.4)")
+  fi
+  IAP_REPORT+=("  허용 추가   : 대시보드 설정 > 접근 제어 > Google 로그인(IAP), 또는")
+  IAP_REPORT+=("    gcloud iap web add-iam-policy-binding --resource-type=cloud-run --service=${service} --region=${region} --project=${project} --member=domain:<회사 도메인> --role=roles/iap.httpsResourceAccessor")
+  IAP_REPORT+=("  반영까지 몇 분 걸릴 수 있습니다.")
+  return 0
+}
+
+# iap_access_report: prints the Google sign-in (IAP) blocks collected by configure_iap_access.
+iap_access_report() {
+  local line
+  for line in ${IAP_REPORT[@]+"${IAP_REPORT[@]}"}; do
+    info "$line"
+  done
+}
+
 # Ensures gcloud has an authenticated active account with a valid access token; runs `gcloud auth login`
 # interactively when needed. Prints the active account email to stdout.
 ensure_gcloud_auth() {
@@ -930,8 +1212,10 @@ allowed, denied, allv = listed(lp("iam.allowedPolicyMemberDomains"))
 if allowed or allv == "DENY" or managed_on("iam.managed.allowedPolicyMembers"):
     sets["ORGPOL_DRS"] = "1"
     lines.append("AUTO|도메인 제한 공유(iam.allowedPolicyMemberDomains) 사용 중: allUsers/allAuthenticatedUsers 바인딩을 건너뛰고 "
-                 "대시보드는 자체 로그인(--no-invoker-iam-check)으로 공개합니다. 고객사 도메인 밖 계정(예: 협력사 계정)은 IAP "
-                 "로그인 브리지가 거부할 수 있으니 그때는 'admin' 계정 + Secret Manager 비밀번호로 로그인하세요.")
+                 "대시보드는 자체 로그인(--no-invoker-iam-check)으로 공개합니다. Google 로그인(IAP 브리지)에는 조직 도메인과 "
+                 "Gemini Enterprise 사용자·프로젝트 구성원의 도메인을 허용하고, 거부된 항목은 배포 끝 'Google 로그인(IAP) 점검'에 "
+                 "표시합니다. 조직 밖 계정(협력사 등)은 설정 > 접근 제어에서 Google OAuth 클라이언트를 연결하거나(재배포 없음) "
+                 "ID/비밀번호 계정('admin' + Secret Manager 비밀번호로 로그인 후 발급)을 쓰세요.")
 else:
     lines.append("OK|도메인 제한 공유: 없음")
 

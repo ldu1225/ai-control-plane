@@ -91,6 +91,7 @@ SERVICE_ACCOUNT_ID="$(trim_ws "${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}")"
 SETTINGS_BUCKET="$(trim_ws "${SETTINGS_BUCKET:-}")"
 SESSION_SECRET_NAME="$(trim_ws "${SESSION_SECRET_NAME:-${SERVICE_NAME}-session-secret}")"
 OAUTH_SECRET_NAME="$(trim_ws "${OAUTH_SECRET_NAME:-${SERVICE_NAME}-oauth-client-secret}")"
+OAUTH_CONNECT_SECRET_NAME="$(trim_ws "${OAUTH_CONNECT_SECRET_NAME:-${SERVICE_NAME}-oauth-connected-secret}")"
 ADMIN_SECRET_NAME="$(trim_ws "${ADMIN_SECRET_NAME:-${SERVICE_NAME}-admin-password}")"
 WHERE_LABEL="$( [[ -f "$CONFIG" ]] && basename "$CONFIG" || echo "--project" )"
 validate_project_id "$PROJECT_ID" "$WHERE_LABEL"
@@ -114,7 +115,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   info "[dry-run] Cloud Run services: ${SERVICE_NAME}, ${BRIDGE_NAME}"
   info "[dry-run] IAM bindings on ${PROJECT_ID}${SCAN_PROJECTS:+ and linked projects (${SCAN_PROJECTS})} for ${SA_EMAIL}"
   info "[dry-run] service accounts: ${SA_EMAIL}, ${BUILD_SA}, ${SCHEDULER_SA}, ${BRIDGE_SA}"
-  info "[dry-run] secrets: ${SESSION_SECRET_NAME}, ${OAUTH_SECRET_NAME}, ${ADMIN_SECRET_NAME}"
+  info "[dry-run] secrets: ${SESSION_SECRET_NAME}, ${OAUTH_SECRET_NAME}, ${OAUTH_CONNECT_SECRET_NAME}, ${ADMIN_SECRET_NAME}"
   [[ "$DELETE_DATA" == "1" ]] && info "[dry-run] delete gs://${SETTINGS_BUCKET}, log sink ${SINK} and the routed telemetry dataset ${TELEMETRY_DATASET} (only if labelled managed-by=ai-control-plane)"
   exit 0
 fi
@@ -227,7 +228,7 @@ for sa in "$SA_EMAIL" "$BUILD_SA" "$SCHEDULER_SA" "$BRIDGE_SA"; do
 done
 
 log "Secrets"
-for secret in "$SESSION_SECRET_NAME" "$OAUTH_SECRET_NAME" "$ADMIN_SECRET_NAME"; do
+for secret in "$SESSION_SECRET_NAME" "$OAUTH_SECRET_NAME" "$OAUTH_CONNECT_SECRET_NAME" "$ADMIN_SECRET_NAME"; do
   quiet gcloud secrets delete "$secret" --project "$PROJECT_ID" --quiet && info "deleted ${secret}" || info "${secret} not found"
 done
 

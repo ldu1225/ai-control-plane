@@ -12,7 +12,7 @@ from ..gcp import GcpError
 from ..httpkit import ApiError, issue_csrf_token
 from ..security import GUEST_MODE, admin_guard, is_admin_email, mask_for_viewer, resolve_auth_mode
 from .base import AUDIT_DATA_ACCESS, describe_error
-from . import analyst, pricing_sync, telemetry_routing
+from . import analyst, iap_access, pricing_sync, telemetry_routing
 
 LOG = logging.getLogger("controlplane.system")
 
@@ -103,7 +103,17 @@ def auth_state(ctx, handler):
         "deniedEmail": denied,
         "csrfToken": token,
     }
+    data["googleHint"] = _google_hint(app) if data["googleEnabled"] else None
     return data, [("Set-Cookie", cookie)]
+
+
+def _google_hint(app):
+    """Sign-in page guidance when Google sign-in goes through IAP: IAP's Google-managed OAuth client admits accounts
+    of the project's organization only (IAP_OAUTH_CLIENT=custom lifts that). Deployment-time facts only, no calls."""
+    if iap_access.resource(app) is None:
+        return None
+    oauth = str(app.environ.get("IAP_OAUTH_CLIENT") or "").strip().lower()
+    return {"iap": True, "orgDomain": iap_access.org_domain(app) or None, "internalOnly": oauth != "custom"}
 
 
 def password_login(ctx, handler):
