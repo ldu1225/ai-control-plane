@@ -163,6 +163,14 @@ function noticeAlert() {
           ? t('{email} is not on the list of approved accounts for this workspace. An access request has been sent to the administrators. Sign in again after it is approved, or choose another account.', { email: denied })
           : t('This Google account is not on the list of approved accounts for this workspace. An access request has been sent to the administrators. Sign in again after it is approved, or choose another account.'),
       });
+    case 'blocked':
+      return alertBox({
+        tone: 'danger',
+        title: t('Access has been blocked by an administrator'),
+        text: denied
+          ? t('AI service and dashboard access for {email} has been revoked by an administrator. Contact your administrator or choose another account.', { email: denied })
+          : t('AI service and dashboard access for this account has been revoked by an administrator. Contact your administrator or choose another account.'),
+      });
     case 'cancelled':
       return alertBox({ tone: 'neutral', title: t('Sign-in was cancelled'), text: t('Choose a Google account to continue.') });
     case 'expired':
@@ -332,7 +340,7 @@ function signInView() {
     hasAltActions ? h('div', { class: 'login-actions' },
       google ? googleButton() : null,
       guest ? linkButton(t('Continue as guest'), nextTarget(), 'ghost', 'arrow-right') : null,
-      google && notice.error === 'not_approved' && state && state.switchAccountUrl ? switchAccountButton(t('Use another account')) : null) : null,
+      google && (notice.error === 'not_approved' || notice.error === 'blocked') && state && state.switchAccountUrl ? switchAccountButton(t('Use another account')) : null) : null,
     note(guest
       ? t('Guests can look around with identifiers hidden. Administration needs an account approved by your administrators.')
       : (google

@@ -4,7 +4,8 @@ SchemaRegistry discovers tables (including date-sharded tables) through
 INFORMATION_SCHEMA, reads table schemas, and builds SQL expressions that only
 reference columns that exist. Table identifiers come from validated settings or
 INFORMATION_SCHEMA and are validated with strict regexes before interpolation;
-all values are passed as query parameters.
+all values are passed as query parameters, except the project ids of a central
+audit dataset filter (project_filter_sql), which are allow-listed and inlined.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ LOG = logging.getLogger("controlplane.schema")
 
 SHARD_RE = re.compile(r"^(.+)_(\d{8})$")
 SEGMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d{1,3})\])?$")
+# Characters a project id may have when it is inlined into SQL as a literal (see project_filter_sql).
+FILTER_PROJECT_RE = re.compile(r"^[a-z0-9.:\-]+$")
 TYPE_ALIASES = {"INTEGER": "INT64", "FLOAT": "FLOAT64", "BOOLEAN": "BOOL", "RECORD": "STRUCT",
                 "NUMERIC": "NUMERIC", "BIGNUMERIC": "BIGNUMERIC"}
 TABLES_TTL = 600
@@ -286,10 +289,36 @@ def expr(alias, schema, *candidates, cast=None):
 # Sources and the registry
 # ---------------------------------------------------------------------------
 
+def project_filter_sql(schema, projects):
+    """WHERE condition keeping only log entries of `projects` (read from logName), or None for no filter.
+
+    A central audit dataset (fed by an organization or folder aggregated sink) holds every project's entries in one
+    table, told apart by `projects/<id>/logs/...` in logName. None when `projects` is not a non-empty tuple or list, or
+    the schema has no top-level STRING logName column. The ids are inlined as literals because callers bind fixed
+    parameter dicts, so each must be a valid project id made only of [a-z0-9.:-] (no quote, backslash or space can
+    reach the SQL); other ids are dropped, and FALSE (no rows) is returned when none remains.
+    TODO(security): bind the ids as an ARRAY parameter once every caller merges source parameters into its own."""
+    if not isinstance(projects, (tuple, list)) or not projects:
+        return None
+    node = (getattr(schema, "tree", None) or {}).get("logname")
+    if node is None or node.type != "STRING" or node.mode == "REPEATED":
+        return None
+    ids, seen = [], set()
+    for pid in projects:
+        if isinstance(pid, str) and pid not in seen and valid_project(pid) and FILTER_PROJECT_RE.match(pid):
+            seen.add(pid)
+            ids.append(pid)
+    if not ids:
+        return "FALSE"
+    return "REGEXP_EXTRACT(%s, r'^projects/([^/]+)/') IN (%s)" % (quote_ident(node.name),
+                                                                  ", ".join("'%s'" % pid for pid in ids))
+
+
 class Source:
     """A resolved table (plain or date-sharded) with its schema."""
 
-    def __init__(self, project, dataset, logical, kind, table, schema, latest=None, location=None, created=None):
+    def __init__(self, project, dataset, logical, kind, table, schema, latest=None, location=None, created=None,
+                 project_filter=None):
         self.project = project
         self.dataset = dataset
         self.logical = logical
@@ -301,6 +330,8 @@ class Source:
         # When the table was created (timezone-aware datetime, plain tables only). Log Router creates a sink table on the
         # first routed entry, so log entries older than this exist only in Cloud Logging.
         self.created = created
+        # Project ids whose entries cte() keeps (tuple; central audit dataset), or None to keep every row.
+        self.project_filter = project_filter
 
     @property
     def label(self):
@@ -322,7 +353,8 @@ class Source:
         return self.schema.first_timestamp() if self.schema else None
 
     def cte(self, name, start="start_ts", end="end_ts", time_col=None, sfx=("sfx_start", "sfx_end")):
-        """`name AS (SELECT * FROM table WHERE <time filter>)` with shard suffix pruning."""
+        """`name AS (SELECT * FROM table WHERE <time filter>)` with shard suffix pruning (and the project filter of a
+        central audit dataset, see project_filter_sql)."""
         if not COLUMN_SEGMENT_RE.match(name):
             raise ValueError("invalid CTE name")
         col = time_col or self.time_column()
@@ -335,6 +367,9 @@ class Source:
             where.append("_PARTITIONTIME >= TIMESTAMP_SUB(@%s, INTERVAL 3 DAY)" % start)
         where.append("%s >= @%s" % (quote_ident(col), start))
         where.append("%s < @%s" % (quote_ident(col), end))
+        scoped = project_filter_sql(self.schema, self.project_filter)
+        if scoped:
+            where.append(scoped)
         return "%s AS (SELECT * FROM %s WHERE %s)" % (name, self.fq(), " AND ".join(where))
 
 
@@ -455,6 +490,9 @@ class UnionSource:
                 where.append("_PARTITIONTIME >= TIMESTAMP_SUB(@%s, INTERVAL 3 DAY)" % start)
             where.append("%s >= @%s" % (quote_ident(col), start))
             where.append("%s < @%s" % (quote_ident(col), end))
+            scoped = project_filter_sql(src.schema, getattr(src, "project_filter", None))
+            if scoped:
+                where.append(scoped)
             branches.append("SELECT %s FROM %s WHERE %s" % (", ".join(selects), src.fq(), " AND ".join(where)))
         if not branches:
             raise ValueError("no time column")

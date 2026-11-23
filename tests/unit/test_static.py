@@ -85,6 +85,37 @@ class StaticSiteTest(unittest.TestCase):
         self.assertFalse(etag_matches(None, '"abc"'))
 
 
+REAL_WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src", "web")
+
+
+class ShippedAssetsTest(unittest.TestCase):
+    """The real src/web: everything the stylesheets reference is served, and bundled fonts are open source."""
+
+    def setUp(self):
+        self.site = StaticSite(REAL_WEB, __version__)
+
+    def test_every_stylesheet_url_is_served(self):
+        css_dir = os.path.join(REAL_WEB, "assets", "css")
+        for name in sorted(os.listdir(css_dir)):
+            with open(os.path.join(css_dir, name), encoding="utf-8") as fh:
+                css = fh.read()
+            for url in re.findall(r"url\(\s*[\"']?(/assets/[^\"')\s]+)", css):
+                self.assertIsNotNone(self.site.resolve_asset(url[len("/assets/"):]), "%s: %s" % (name, url))
+
+    def test_bundled_fonts_ship_with_an_open_font_license(self):
+        fonts = os.path.join(REAL_WEB, "assets", "fonts")
+        files = sorted(os.listdir(fonts)) if os.path.isdir(fonts) else []
+        font_files = [f for f in files if f.lower().endswith((".woff2", ".woff", ".ttf", ".otf"))]
+        if not font_files:
+            return
+        self.assertIn("OFL.txt", files)
+        with open(os.path.join(fonts, "OFL.txt"), encoding="utf-8") as fh:
+            self.assertIn("SIL Open Font License, Version 1.1", fh.read())
+        for name in font_files:
+            # Google Sans (not Google Sans Flex) is proprietary: "Google Sans is not one of [the open source fonts]".
+            self.assertNotRegex(name.lower(), r"^google-?sans(?!-?flex)", name)
+
+
 class PipelineTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -155,7 +186,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(data["session"]["role"], "admin")  # loopback peer in local mode
         self.assertEqual(data["session"]["authMode"], "local")
         self.assertFalse(data["workspace"]["configured"])
-        self.assertEqual(len(data["modules"]), 13)
+        self.assertEqual(len(data["modules"]), 14)
         self.assertEqual(data["product"]["version"], __version__)
         self.assertEqual(payload["meta"]["warnings"], [])
         self.assertRegex(payload["meta"]["generatedAt"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")

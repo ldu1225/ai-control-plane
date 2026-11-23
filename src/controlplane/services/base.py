@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import decimal
 import logging
@@ -263,9 +264,48 @@ class Ctx:
         discovered, _ = self.app.cache.get_or_compute(cache_key, 300, discover)
         return discovered or []
 
+    def _scope_discovered(self, blocking=True):
+        """Projects found under workspace.scope_ids ([{id, name, parent, ...}], see scope.discover) for a folder or
+        organization scope, else None (projects scope: primary, configured and projects:search discovery).
+
+        [] when the scope could not be discovered (yet): outside a configured workspace with the real Google Cloud
+        client (unit tests make no calls), and with blocking=False until a discovery is cached."""
+        if self.ws.get("scope_type") not in ("folder", "organization"):
+            return None
+        from . import scope
+        if scope.scope_spec(self) is None:
+            return None
+        found = scope.discover(self, blocking=blocking) or {}
+        return [item for item in found.get("projects") or [] if isinstance(item, dict) and item.get("id")]
+
+    def _scoped_project_ids(self, discovered):
+        """Primary project first, then workspace.projects, then up to scope_max_projects discovered scope projects."""
+        from . import scope
+        out = []
+        if self.project and config.valid_project(self.project):
+            out.append(self.project)
+        seen = set(out)
+        for p in self.ws.get("projects") or []:
+            if config.valid_project(p) and p not in seen:
+                seen.add(p)
+                out.append(p)
+        added, limit = 0, scope.max_projects(self)
+        for item in discovered:
+            pid = item.get("id")
+            if added >= limit:
+                break
+            if isinstance(pid, str) and config.valid_project(pid) and pid not in seen:
+                seen.add(pid)
+                out.append(pid)
+                added += 1
+        return out
+
     @property
     def known_projects(self):
         """Projects known without making a blocking network call (configured + cached discovery)."""
+        scoped = self._scope_discovered(blocking=False)
+        if scoped is not None:
+            return self._scoped_project_ids(scoped) or ([self.project] if self.project else [])
         out = []
         if self.project and config.valid_project(self.project):
             out.append(self.project)
@@ -280,7 +320,12 @@ class Ctx:
 
     @property
     def all_projects(self):
-        """Ordered list of all GCP project IDs in the workspace (primary + configured + auto-discovered)."""
+        """Ordered list of all GCP project IDs in the workspace (primary + configured + auto-discovered).
+
+        Folder / organization scope: primary, configured, then the discovered scope projects (no 25-project cap)."""
+        scoped = self._scope_discovered(blocking=True)
+        if scoped is not None:
+            return self._scoped_project_ids(scoped) or [self.project]
         out = []
         if self.project and config.valid_project(self.project):
             out.append(self.project)
@@ -296,6 +341,9 @@ class Ctx:
     @property
     def project_details(self):
         """Metadata explaining how each project in the workspace was linked and grouped."""
+        scoped = self._scope_discovered(blocking=True)
+        if scoped is not None:
+            return self._scoped_project_details(scoped)
         crm_map = {item["id"]: item for item in self._crm_discovered(blocking=True)
                    if isinstance(item, dict) and item.get("id")}
         primary_parent = (crm_map.get(self.project) or {}).get("parent")
@@ -315,6 +363,31 @@ class Ctx:
                 "name": meta.get("name") or pid,
                 "parent": parent,
                 "sameOrg": bool(primary_parent and parent == primary_parent) if parent else None,
+                "source": source,
+            })
+        return details
+
+    def _scoped_project_details(self, discovered):
+        """project_details of a folder / organization scope: discovered projects have source "scope"; sameOrg is None
+        unless both parents are known (the primary project may lie outside the scope)."""
+        scope_map = {item["id"]: item for item in discovered}
+        primary_parent = (scope_map.get(self.project) or {}).get("parent")
+        configured_set = {p for p in (self.ws.get("projects") or []) if config.valid_project(p)}
+        details = []
+        for pid in self._scoped_project_ids(discovered) or [self.project]:
+            meta = scope_map.get(pid) or {}
+            parent = meta.get("parent")
+            if pid == self.project:
+                source = "primary"
+            elif pid in configured_set:
+                source = "configured"
+            else:
+                source = "scope"
+            details.append({
+                "id": pid,
+                "name": meta.get("name") or pid,
+                "parent": parent,
+                "sameOrg": parent == primary_parent if (parent and primary_parent) else None,
                 "source": source,
             })
         return details
@@ -343,6 +416,13 @@ class Ctx:
     @property
     def audit_dataset(self):
         return self.ws["audit_dataset"]
+
+    @property
+    def central_audit_project(self):
+        """Project of the central audit dataset that an organization or folder aggregated log sink fills with every
+        project's entries (workspace.audit_project), or "" when each scanned project has its own audit dataset."""
+        value = self.ws.get("audit_project") or ""
+        return value if config.valid_project(value) else ""
 
     @property
     def max_bytes(self):
@@ -433,12 +513,14 @@ class Ctx:
         return src
 
     def audit_dataset_ready(self):
-        """True when at least one scanned project has a readable audit dataset (`ge_analytics`).
+        """True when at least one scanned project has a readable audit dataset (`ge_analytics`); with a central audit
+        dataset (workspace.audit_project) only that project's dataset is checked.
 
         Cloud Logging sinks materialize BigQuery tables lazily on the first matching log entry, so an
         accessible dataset with missing tables means zero recorded events yet rather than an error."""
         dataset = self.audit_dataset
-        projects = self.projects
+        central = self.central_audit_project
+        projects = [central] if central else self.projects
         first_err = None
         for idx, proj in enumerate(projects):
             if (proj, dataset) in self._dataset_failed:
@@ -458,7 +540,10 @@ class Ctx:
 
         BigQuery cannot UNION or JOIN tables across different dataset locations (for example `ASIA-NORTHEAST3`
         and `US`) in a single SQL job. When multiple locations exist among `self.projects`, we pick the
-        location with the richest audit table coverage (breaking ties in favor of the primary project)."""
+        location with the richest audit table coverage (breaking ties in favor of the primary project).
+        None with a central audit dataset: there is one dataset, hence one location."""
+        if self.central_audit_project:
+            return None
         if getattr(self, "_cached_audit_loc_ready", False):
             return self._cached_audit_loc
         dataset = self.audit_dataset
@@ -494,8 +579,12 @@ class Ctx:
         """Resolves `logical` across all scanned projects (single `Source` or multi-project `UnionSource`).
 
         When the audit dataset exists and is readable, missing sink tables do NOT emit `table_not_found`
-        warnings because Log Router creates each table only after the first event arrives."""
+        warnings because Log Router creates each table only after the first event arrives. With a central audit
+        dataset (workspace.audit_project) the table is resolved there only (see _central_audit_source)."""
         from ..schema import UnionSource
+        central = self.central_audit_project
+        if central:
+            return self._central_audit_source(central, logical, optional)
         dataset = self.audit_dataset
         label = "bigquery:%s.%s" % (dataset, logical)
         projects = self.projects
@@ -541,6 +630,38 @@ class Ctx:
         elif not any_dataset_ok and first_err is not None and not optional:
             self._emit_dataset_failure(first_err[0], dataset, first_err[1])
         return None
+
+    def _central_audit_source(self, central, logical, optional):
+        """`logical` in the central audit dataset: a shallow copy of the registry `Source` whose project_filter keeps
+        only the entries of the scanned projects (self.projects, which reflects ?project=). The registry object itself
+        is never changed. Warnings follow audit_source for a single project."""
+        dataset = self.audit_dataset
+        label = "bigquery:%s.%s" % (dataset, logical)
+        if (central, dataset) in self._dataset_failed:
+            return None
+        try:
+            groups = self.registry.tables(central, dataset, self.quota_project, self.max_bytes)
+        except (GcpError, ValueError) as err:
+            if not optional:
+                self._emit_dataset_failure(central, dataset, err)
+            return None
+        if logical not in groups:
+            return None
+        try:
+            src = self.registry.source(central, dataset, logical, self.quota_project, self.max_bytes)
+        except (GcpError, ValueError) as err:
+            if not optional:
+                self.warn_error(label, err, "Table %s" % logical)
+            return None
+        if src is None:
+            return None
+        if src.time_column() is None:
+            if not optional:
+                self.warn(label, "unsupported_schema", "Table has no TIMESTAMP column to filter on.")
+            return None
+        scoped = copy.copy(src)
+        scoped.project_filter = tuple(self.projects)
+        return scoped
 
     def billing_source(self, warn_unconfigured=False):
         b = self.ws["billing"]

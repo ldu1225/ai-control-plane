@@ -28,6 +28,7 @@ export const ROUTES = [
   { path: 'model-armor', label: 'Model Armor', icon: 'shield', module: 'model_armor', group: 'Agent Platform', range: true, load: () => import('./pages/armor.js') },
   { path: 'models', label: 'Models & Tokens', icon: 'layers', module: 'model_usage', group: 'Models & Cost', range: true, load: () => import('./pages/models.js') },
   { path: 'finops', label: 'Cost & FinOps', icon: 'card', module: 'finops', group: 'Models & Cost', range: true, load: () => import('./pages/finops.js') },
+  { path: 'chargeback', label: 'Chargeback', icon: 'pie', module: 'chargeback', group: 'Models & Cost', range: false, load: () => import('./pages/chargeback.js') },
   { path: 'users', label: 'Users & Access', icon: 'users', module: 'users', group: 'Governance', range: true, load: () => import('./pages/users.js') },
   { path: 'antigravity', label: 'Antigravity Controls', icon: 'sliders', module: 'antigravity', group: 'Governance', range: false, load: () => import('./pages/antigravity.js') },
   { path: 'extensions', label: 'Telemetry Extensions', icon: 'plug', module: 'telemetry', group: 'Extend', range: true, load: () => import('./pages/telemetry.js') },
@@ -253,6 +254,7 @@ function openProjectMenu(anchor, ws, projects) {
       const src = detail ? detail.source : (p === ws.projectId ? 'primary' : 'configured');
       if (src === 'primary') return badge(t('Primary'), 'info', { size: 'sm' });
       if (src === 'configured') return badge(t('Explicitly linked'), 'accent', { size: 'sm' });
+      if (src === 'scope') return badge(t('In scope'), 'success', { size: 'sm' });
       return badge(t('Auto-discovered'), 'success', { size: 'sm' });
     };
     return h('div', { class: 'ws-popover' },

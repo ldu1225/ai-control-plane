@@ -102,7 +102,7 @@ function renderPage(ctx, body, d) {
       ],
       rows: d.byUser, searchable: false, pageSize: 6, initialSort: { key: 'blocked', dir: 'desc' },
       emptyText: t('No blocked content was attributed to users in this period.'),
-      onRowClick: (r) => r.uid && openUserDrawer(r.uid),
+      onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email }),
     }),
   });
   users.classList.add('span-7');

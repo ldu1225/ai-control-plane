@@ -166,7 +166,7 @@ function renderOverview(ctx, body, d) {
         { key: 'prompts', label: t('Prompts'), align: 'num', format: fmt.int },
       ],
       rows: d.topUsers, searchable: false, pageSize: 6, initialSort: { key: 'prompts', dir: 'desc' },
-      onRowClick: (r) => r.uid && openUserDrawer(r.uid),
+      onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email }),
     }) : emptyState({ icon: 'users', title: t('No user activity'), body: t('No user activity was recorded in this period.'), compact: true })),
   });
   usersCard.classList.add('span-4');

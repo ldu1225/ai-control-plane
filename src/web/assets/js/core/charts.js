@@ -275,6 +275,24 @@ class XYChart extends BaseChart {
     } else {
       const base = new Array(n).fill(0);
       visible.forEach((sr) => {
+        if (o.gaps && !stacked) {
+          // Opt-in for series where "no value" is not zero (percentiles, averages): unknown (null) values
+          // break the line, and a known value with no known neighbour is drawn as a dot.
+          const runs = [];
+          let run = null;
+          buckets.forEach((_, i) => {
+            if (!isNum(sr.values[i])) { run = null; return; }
+            if (!run) { run = []; runs.push(run); }
+            run.push({ x: xAt(i), y: yAt(sr.values[i]) });
+          });
+          const broken = s('path', { d: runs.map(monotonePath).join(''), fill: 'none', 'stroke-width': 2, 'stroke-linejoin': 'round', 'stroke-linecap': 'round' });
+          paint(broken, 'stroke', sr.color);
+          plot.append(broken);
+          runs.forEach((points) => {
+            if (points.length === 1 || o.dots) points.forEach((pt) => plot.append(paint(s('circle', { cx: pt.x, cy: pt.y, r: 2.5 }), 'fill', sr.color)));
+          });
+          return;
+        }
         const pts = [];
         const lower = [];
         buckets.forEach((_, i) => {
@@ -332,6 +350,7 @@ class XYChart extends BaseChart {
       });
       if (!isBar && !stacked) {
         visible.forEach((sr) => {
+          if (o.gaps && !isNum(sr.values[idx])) return;
           const v = isNum(sr.values[idx]) ? sr.values[idx] : 0;
           const c = s('circle', { cx: gx, cy: yAt(v), r: 3.5, stroke: '#fff', 'stroke-width': 1.5 });
           paint(c, 'fill', sr.color);

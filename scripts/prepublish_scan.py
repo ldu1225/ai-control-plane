@@ -57,10 +57,13 @@ OK_EMAIL_DOMAINS = ("example.com", "example.net", "example.org", "localhost",
 RUN_APP_RE = re.compile(r"https://[a-z0-9-]+-\d{6,}\.[a-z0-9-]+\.run\.app")
 HOME_RE = re.compile(r"/Users/[A-Za-z][\w.-]*/|/home/[a-z][\w.-]*/|C:\\Users\\[A-Za-z]")
 TWELVE_DIGITS_RE = re.compile(r"(?<![\w-])\d{12}(?![\w-])")
-# Values that are common words or defaults, never treated as identifiers.
+# Values that are common words, product defaults or product option values, never treated as identifiers.
 GENERIC = {"true", "false", "none", "null", "global", "us", "eu", "en", "ko", "utc", "asia/seoul", "us-central1",
            "ge_analytics", "google", "google_oauth", "iap", "local", "auto", "allauthenticatedusers",
-           "your organization", "billing_export", "billing_detailed_usage", "1gi", "512mi", "manual"}
+           "your organization", "billing_export", "billing_detailed_usage", "1gi", "512mi", "2gi", "manual",
+           "iam_allow_swap", "iam_deny", "notify_only", "telemetry_routed"}
+# Google Cloud region names (us-central1, asia-northeast3, europe-west1, ...): locations, not identifiers.
+REGION_RE = re.compile(r"[a-z]+-[a-z]+\d{1,2}")
 
 
 def mask(value):
@@ -128,6 +131,8 @@ def _is_identifier(low):
         return False
     if re.search(r"example\.(?:com|net|org)", low):
         return False
+    if REGION_RE.fullmatch(low):
+        return False  # region names are locations, not identifiers
     if low.isdigit():
         return len(low) >= 9  # project numbers; shorter numbers are sizes and limits
     if re.fullmatch(r"[a-z]+", low) and len(low) < 10:
@@ -157,8 +162,13 @@ def publish_set(args):
         base = ROOT
         names = pathlib.Path(args.files).read_text(encoding="utf-8").splitlines()
         return base, [base / n.strip() for n in names if n.strip()]
-    out = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=ROOT,
-                         capture_output=True, text=True, check=True).stdout
+    try:
+        out = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard"], cwd=ROOT,
+                             capture_output=True, text=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        # Not a Git checkout (for example a ZIP download): every file of the copy would be published.
+        print("note: no Git checkout at %s; scanning every file (as with --root)" % ROOT.name)
+        return ROOT, [p for p in ROOT.rglob("*") if p.is_file() and ".git" not in p.relative_to(ROOT).parts]
     return ROOT, [ROOT / n for n in out.splitlines() if n and (ROOT / n).is_file()]
 
 

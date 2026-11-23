@@ -7,14 +7,24 @@ Safety rules (from agy-admin):
   policy etag; a concurrent modification (409/ABORTED) triggers one retry with a fresh plan.
 - Gates G1/G2/G4 abort the cycle; G3 withholds restores; G5 only warns.
 
+Enforcement backends (governance.antigravity.enforcement_backend):
+- iam_allow_swap (default): the rules above; direct user: bindings of the primary project are swapped for marker roles.
+- iam_deny: suspended people are listed in one managed IAM deny policy per attachment point (services/enforcers.py),
+  which also stops access through groups, inheritance and workforce pools. The deny policy is the state: a person in
+  it is suspended (blocked when a block rule applies). Administrator decisions are recorded in the governance state
+  and applied by an enforcement run, by the enforcement job when one is configured (services/jobs.py). Extra gates:
+  G6 (denied principals per attachment point against the IAM limit) and G7 (surge guard).
+- notify_only: the plan and its notifications only; nobody loses access.
+
 Per-user caps over a settlement period:
 - A user is over the cap when tokens, requests or the estimated cost (tokens x configured unit
-  prices) reach the cap within the period (daily / weekly / monthly calendar periods reset at
-  governance.antigravity.reset_time (weekly periods on reset_weekday) in reset_timezone, which
-  defaults to the workspace time zone).
-- enforcement_mode=auto: the scheduled enforcement run suspends over-cap users until the period
-  resets. enforcement_mode=manual: over-cap users wait in a review queue; an administrator
-  suspends them or allows them for the rest of the period.
+  prices) reach the cap within the period. Calendar periods start at governance.antigravity.reset_time in
+  reset_timezone (default: the workspace time zone): daily every day, weekly on reset_weekday, monthly on reset_day of
+  the month (the last day in shorter months) and custom every cycle_days days counted from cycle_start.
+- enforcement_mode=auto: an over-cap user is suspended until the period resets, by the enforcement run that a usage
+  event starts as soon as the cap is reached (services/usage_events.py) or else by the next scheduled run.
+  enforcement_mode=manual: over-cap users wait in a review queue; an administrator suspends them or allows them for the
+  rest of the period.
 - Exception rules per user (both modes): allow (never suspended), block (always disallowed) and
   limit (individual caps). Suspensions end at the period reset even without telemetry, because
   the usage window itself restarts.
@@ -26,18 +36,20 @@ import copy
 import datetime as dt
 import logging
 import math
+import re
 import threading
+import time
 import urllib.parse
 from dataclasses import dataclass, field
 
-from .. import config, timeutil
+from .. import config, identity, timeutil
 from ..gcp import GcpError
 from ..httpkit import ApiError
 from ..schema import expr, quote_ident
-from ..security import is_human, uid_for
+from ..security import is_admin_email, is_human, uid_for
 from ..settings_store import EMPTY_GOVERNANCE
-from . import credit_ledger
-from .base import AGY_SINK, iso, parse_rfc3339, to_int
+from . import credit_ledger, enforcers, jobs
+from .base import AGY_SINK, discovery_host, discovery_locations, iso, parse_rfc3339, to_int
 from .pricing import price_table
 
 LOG = logging.getLogger("controlplane.governance")
@@ -71,6 +83,14 @@ REMEDIATION = {
                           "to the service identity and retry."),
     "ANCESTOR_UNCHECKED": ("Folder or organization IAM policies could not be read, so inherited access cannot be "
                            "ruled out. Grant read access to the ancestor policies or review them manually."),
+    "WORKFORCE_IDENTITY": ("The user signs in through Workforce Identity Federation (an external identity "
+                           "provider). Usage and cost are counted, but per-user caps swap direct user: bindings "
+                           "and cannot act on workforce principals. Restrict access through the identity provider "
+                           "or the workforce pool bindings."),
+    "DENY_POLICY_UNREADABLE": ("The managed deny policy could not be read at every attachment point, so suspensions "
+                               "are unknown. Grant Deny Reviewer (roles/iam.denyReviewer) on the organization to the "
+                               "dashboard service account, and Deny Admin (roles/iam.denyAdmin) to the identity that "
+                               "applies suspensions."),
 }
 NON_USER_PREFIXES = ("group:", "domain:", "principalset:", "principal:")
 NON_USER_EXACT = ("allusers", "allauthenticatedusers")
@@ -79,10 +99,34 @@ REQUIRED_PERMISSIONS = ("resourcemanager.projects.getIamPolicy", "resourcemanage
 WEBHOOK_HOSTS = ("hooks.slack.com", "chat.googleapis.com")
 _WRITE_LOCK = threading.Lock()
 
+BACKENDS = ("iam_allow_swap", "iam_deny", "notify_only")
+NOTIFY_ONLY_MESSAGE = "Notify only: no access was changed."
+NOTIFY_ONLY_REFUSED = ("The enforcement method is notify only, so the dashboard does not change access. Change it in "
+                       "Settings > Governance policy.")
+MISSING_ACCOUNT_MESSAGE = ("IAM does not find this account (deleted, or not a Google account), so it cannot be listed in "
+                           "a deny policy. Remove its rule or check the address.")
+
+
+def enforcement_backend(settings):
+    """governance.antigravity.enforcement_backend: iam_allow_swap (default), iam_deny or notify_only."""
+    ag = ((settings or {}).get("governance") or {}).get("antigravity") or {}
+    value = ag.get("enforcement_backend")
+    return value if value in BACKENDS else "iam_allow_swap"
+
 
 # ---------------------------------------------------------------------------
 # Configuration and policy index (pure)
 # ---------------------------------------------------------------------------
+
+# In Google Cloud IAM, roles/discoveryengine.user ("Discovery Engine User") has the exact same 135 permissions as
+# roles/discoveryengine.agentspaceUser ("Gemini Enterprise User"), including every businessaicode.* permission.
+# Administrators often grant one or both in the console. roles/businessaicode.user (9 permissions) is a strict subset
+# whose non-businessaicode.* permissions are also in the marker roles, whereas roles/discoveryengine.podcastApiUser
+# adds podcast permissions that a marker role would drop.
+EQUIVALENT_ACCESS_ROLES = ("roles/discoveryengine.agentspaceUser", "roles/discoveryengine.user")
+SUBSET_ACCESS_ROLES = ("roles/businessaicode.user",)
+BUILTIN_EXTRA_ACCESS_ROLES = ("roles/discoveryengine.podcastApiUser",)
+
 
 @dataclass(frozen=True)
 class GovConfig:
@@ -101,6 +145,27 @@ class GovConfig:
     @property
     def markers(self):
         return {self.cap_marker, self.admin_marker, *self.legacy_markers}
+
+    @property
+    def access_roles(self):
+        if self.access_role in EQUIVALENT_ACCESS_ROLES:
+            return (self.access_role, *(r for r in EQUIVALENT_ACCESS_ROLES if r != self.access_role))
+        return (self.access_role,)
+
+    @property
+    def replaceable_roles(self):
+        if self.access_role in EQUIVALENT_ACCESS_ROLES:
+            return (*self.access_roles, *SUBSET_ACCESS_ROLES)
+        return self.access_roles
+
+    @property
+    def all_extra_access_roles(self):
+        own = set(self.access_roles) | set(self.privileged_roles) | self.markers
+        out = list(self.extra_access_roles)
+        for role in BUILTIN_EXTRA_ACCESS_ROLES:
+            if role not in own and role not in out:
+                out.append(role)
+        return tuple(out)
 
 
 def utcnow():
@@ -130,10 +195,14 @@ def gov_config(settings):
 
 def period_anchor(settings):
     """Keyword arguments that locate calendar period boundaries: the reset time zone (empty = the
-    workspace time zone), the weekly reset weekday and the reset time."""
+    workspace time zone), the weekly reset weekday, the reset time, the monthly start day and the length and first day
+    of custom periods."""
     ag = settings["governance"]["antigravity"]
     tz = ag.get("reset_timezone") or (settings.get("workspace") or {}).get("timezone") or "UTC"
-    return {"tz": tz, "weekday": ag.get("reset_weekday", 0) or 0, "at": ag.get("reset_time") or "00:00"}
+    return {"tz": tz, "weekday": ag.get("reset_weekday", 0) or 0, "at": ag.get("reset_time") or "00:00",
+            "day": timeutil.reset_day_of_month(ag.get("reset_day", 1)),
+            "cycle_days": timeutil.cycle_length(ag.get("cycle_days", timeutil.CYCLE_DAYS_DEFAULT)),
+            "cycle_start": str(ag.get("cycle_start") or "")}
 
 
 @dataclass(frozen=True)
@@ -294,25 +363,32 @@ def estimate_cost(rec, pricing):
 # ---------------------------------------------------------------------------
 
 CREDIT_MODEL = "credit_budget"
+PERIOD_MODEL = "period"
 
 
 PERIOD_CAP_KEYS = ("cost_cap", "token_cap", "request_cap")
+CREDIT_BUDGET_KEYS = ("paid_budget_month", "org_paid_budget_month")
+
+
+def _positive(value):
+    try:
+        return float(value or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def credit_mode(ag):
-    """True when caps follow the Antigravity credit; cap_model "period" keeps the fixed period caps. When cap_model was
-    never chosen (empty), credit caps apply, except that an installation from before credit caps that already set a
-    fixed cap keeps the period model: an upgrade must never drop caps a customer relies on."""
+    """True when caps follow the Antigravity credit (cap_model "credit_budget"); False for the fixed caps per period
+    (cap_model "period"), where a person who reaches a cap stays suspended until the configured period ends (for
+    example the end of the month) and nothing resets weekly. When cap_model was never chosen (empty) the fixed period
+    caps apply (the default), except that an installation of an earlier version that relied on credit caps (a paid
+    budget set and no fixed cap) keeps them: an upgrade must never drop caps a customer relies on."""
     model = ag.get("cap_model") or ""
     if model:
         return model == CREDIT_MODEL
-    for key in PERIOD_CAP_KEYS:
-        try:
-            if float(ag.get(key) or 0) > 0:
-                return False
-        except (TypeError, ValueError):
-            continue
-    return True
+    if any(_positive(ag.get(key)) for key in PERIOD_CAP_KEYS):
+        return False
+    return any(usd_budget(ag.get(key)) is not None for key in CREDIT_BUDGET_KEYS)
 
 
 def usd_budget(value):
@@ -335,9 +411,10 @@ def credit_prefixes(ag):
     return tuple(p for p in (ag.get("credit_model_prefixes") or credit_ledger.CREDIT_MODEL_PREFIXES) if p)
 
 
-def credit_terms(ag, exc):
-    """(monthly credit, monthly paid budget or None) for one person: an individual limit rule replaces the defaults."""
-    credit = float(ag.get("credit_per_user_month") or 0)
+def credit_terms(ag, exc, tier_credit=None):
+    """(monthly credit, monthly paid budget or None) for one person: the credit of their license tier when known
+    (tier_credit), else credit_per_user_month; an individual limit rule replaces both."""
+    credit = float(ag.get("credit_per_user_month") or 0) if tier_credit is None else float(tier_credit)
     budget = usd_budget(ag.get("paid_budget_month"))
     if exc and exc.get("type") == "limit":
         if exc.get("creditMonth") is not None:
@@ -345,6 +422,41 @@ def credit_terms(ag, exc):
         if exc.get("paidBudget") is not None:
             budget = usd_budget(exc["paidBudget"])
     return max(0.0, credit), budget
+
+
+def credit_source_of(exc, tier):
+    """Where a person's monthly credit comes from: an individual rule, their license tier, or the fixed default."""
+    if exc and exc.get("type") == "limit" and exc.get("creditMonth") is not None:
+        return "rule"
+    return "license" if tier else "fixed"
+
+
+def license_credits(ctx):
+    """{person: (tier, monthly credit in USD)} from assigned Gemini Enterprise licenses whose subscription tier is in
+    credit_by_tier, when credit_source is "license". Empty when the source is "fixed" or licenses cannot be read:
+    everyone then gets credit_per_user_month. A person with licenses of several tiers gets the largest credit."""
+    ag = ctx.settings["governance"]["antigravity"]
+    if (ag.get("credit_source") or "license") != "license":
+        return {}
+    amounts = config.tier_amounts(ag.get("credit_by_tier"))
+    if not amounts:
+        return {}
+    try:
+        from . import gemini_enterprise
+        index = gemini_enterprise.license_index(ctx)
+    except Exception as err:  # pylint: disable=broad-except
+        LOG.warning("license tiers unavailable: %s", type(err).__name__)
+        return {}
+    out = {}
+    for person, items in index.people.items():
+        best = None
+        for item in items:
+            tier = item.get("tier")
+            if tier in amounts and (best is None or amounts[tier] > best[1]):
+                best = (tier, amounts[tier])
+        if best is not None:
+            out[person] = best
+    return out
 
 
 def split_cost(rec, pricing, prefixes=credit_ledger.CREDIT_MODEL_PREFIXES):
@@ -419,21 +531,30 @@ def grants_via_non_user(members, email):
 
 
 def classify(email, has_usage, idx, cfg, ancestor_check=None):
-    """Classifies one user into (state, reason) following the agy-admin rules."""
+    """Classifies one user into (state, reason) following the agy-admin rules. `email` is a person key: a Google
+    Account e-mail, or a workforce identity principal (never enforceable through direct user: bindings)."""
     if not idx.readable:
         return UNKNOWN, "POLICY_UNREADABLE"
+    if identity.is_workforce_key(email):
+        return NE, "WORKFORCE_IDENTITY"
     direct = idx.user_bindings(email)
     roles = {role for role, _ in direct}
     if roles & set(cfg.privileged_roles):
         return NE, "PRIVILEGED_ROLE"
-    if roles & set(cfg.extra_access_roles):
+    if roles & set(cfg.all_extra_access_roles):
         return NE, "OTHER_ACCESS_ROLE"
     markers = cfg.markers
-    has_access = cfg.access_role in roles
+    access_set = set(cfg.access_roles)
+    subset_only = SUBSET_ACCESS_ROLES if cfg.access_role in EQUIVALENT_ACCESS_ROLES else ()
+    has_access = bool(roles & access_set)
+    has_subset = bool(roles & set(subset_only))
     has_marker = bool(roles & markers)
-    conditional = any(cond for role, cond in direct if role == cfg.access_role or role in markers)
-    if (has_access and has_marker) or conditional:
+    managed = access_set | set(subset_only) | markers
+    conditional = any(cond for role, cond in direct if role in managed)
+    if ((has_access or has_subset) and has_marker) or conditional:
         return NE, "CONFLICTING_BINDINGS"
+    if has_subset and not has_access:
+        return NE, "OTHER_ACCESS_ROLE"
     if cfg.admin_marker in roles or roles & set(cfg.legacy_markers):
         return BLOCKED, None
     if cfg.cap_marker in roles:
@@ -441,7 +562,8 @@ def classify(email, has_usage, idx, cfg, ancestor_check=None):
     if has_access:
         return EA, None
     if has_usage:
-        if grants_via_non_user(idx.non_user_members(cfg.access_role), email):
+        non_user_roles = (*cfg.access_roles, *subset_only, *cfg.all_extra_access_roles)
+        if any(grants_via_non_user(idx.non_user_members(r), email) for r in non_user_roles):
             return NE, "GROUP_GRANT_PRESENT"
         result = ancestor_check(email) if ancestor_check is not None else None
         if result is True:
@@ -488,7 +610,7 @@ def suspension_ended(suspension, now):
 
 
 def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_on_access, cfg, access_role,
-             mode="auto", now=None, telemetry_truncated=False):
+             mode="auto", now=None, telemetry_truncated=False, backend="iam_allow_swap", deny=None):
     """Computes gates and the plan. `users` items need uid, state and overCap; optional
     `exception` ({"type": allow|block|limit}) and `suspension` ({"until": iso}) refine the plan:
     - block exception: users with access (EA or CAPPED) are disallowed in every cycle.
@@ -498,14 +620,21 @@ def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_o
       restarted), unless usage is known to be over the cap again.
     - mode "manual": over-cap users go to the review queue instead of the block list.
     - telemetry_truncated: usage was read only partly (log read cap), so counts are lower bounds. Over-cap
-      results stay valid, but usage-based restores are withheld (G3 warns)."""
+      results stay valid, but usage-based restores are withheld (G3 warns).
+    - approved (iam_deny): an administrator approved the suspension of this over-cap user (review decision), so it
+      is planned even in manual mode. forceReview: the user is over only because of an organization unit budget with
+      the review action, so the user goes to the review queue even in automatic mode. hold: a suspended user stays
+      suspended until the recorded suspension ends (no usage-based restore).
+    backend iam_deny adds G6 (denied principals per attachment point) and G7 (surge guard) from `deny`:
+    {"attachments": [attachment points], "unreadable": n, "foreign": n, "current": people denied now,
+     "surgeMin": n, "surgeRatio": r}."""
     now = now or utcnow()
     population = len(users)
     determinate = sum(1 for u in users if u["state"] != UNKNOWN)
+    deny = deny or {}
     gates = []
     gates.append({"id": "G1_POLICY_READABLE", "status": "pass" if policy_readable else "fail",
-                  "detail": "Project IAM policy read (version 3)." if policy_readable
-                  else "The project IAM policy could not be read."})
+                  "detail": _g1_detail(backend, policy_readable, deny)})
     g2_ok = population == 0 or determinate > 0
     gates.append({"id": "G2_ANY_DETERMINATE", "status": "pass" if g2_ok else "fail",
                   "detail": "%d of %d users have a determinate state." % (determinate, population) if population
@@ -539,14 +668,39 @@ def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_o
                 restore.append(uid)
             continue
         if state == EA and over:
-            (review if mode == "manual" else block).append(uid)
+            if u.get("approved"):
+                block.append(uid)
+            elif mode == "manual" or u.get("forceReview"):
+                review.append(uid)
+            else:
+                block.append(uid)
         elif state == CAPPED and over is not True:
             # Restores require known (non-null) usage below the caps and healthy telemetry (G3),
             # or a suspension whose settlement period has ended.
-            if suspension_ended(u.get("suspension"), now) or (over is False and g3_ok):
+            if suspension_ended(u.get("suspension"), now) or (over is False and g3_ok and not u.get("hold")):
                 restore.append(uid)
             elif not g3_ok:
                 withheld = True
+    severity = {u["uid"]: u.get("capUsage") or 0 for u in users}
+    approved = {u["uid"] for u in users if u.get("approved")}
+    # G7 (iam_deny): a deny policy stops access however it is granted, so a sudden wave of automatic suspensions (a
+    # telemetry or pricing glitch) is held for review instead of applied. Approved suspensions and block rules are
+    # administrator decisions and are not held.
+    g7 = None
+    if backend == "iam_deny":
+        smin = max(1, to_int(deny.get("surgeMin") or 10))
+        sratio = float(deny.get("surgeRatio") or 0.5)
+        auto = [uid for uid in block if uid not in approved]
+        if auto and len(auto) >= smin and len(auto) >= sratio * population:
+            review.extend(auto)
+            block = [uid for uid in block if uid in approved]
+            g7 = {"id": "G7_SURGE_GUARD", "status": "warn",
+                  "detail": "%d new suspensions of %d people reach the surge guard (%d people and %s%%), so nobody is "
+                            "suspended in this run." % (len(auto), population, smin, _pct(sratio))}
+        else:
+            g7 = {"id": "G7_SURGE_GUARD", "status": "pass",
+                  "detail": "%d new suspensions of %d people; the surge guard starts at %d people and %s%%."
+                            % (len(auto), population, smin, _pct(sratio))}
     # The change budget limits how many people one run suspends: a circuit breaker against a telemetry or pricing
     # glitch suspending everyone at once. Suspensions above it are deferred to the next run (block rules first, then
     # the people furthest over their limits), so a real wave, such as an organization budget being spent or a new
@@ -557,8 +711,8 @@ def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_o
     g4_ok = planned <= budget
     deferred = []
     if not g4_ok:
-        severity = {u["uid"]: u.get("capUsage") or 0 for u in users}
-        block.sort(key=lambda uid: -severity.get(uid, 0))   # stable: equal severity keeps the population order
+        # stable: approved suspensions first, then the people furthest over; equal severity keeps the population order
+        block.sort(key=lambda uid: (uid not in approved, -severity.get(uid, 0)))
         keep = disallow[:budget]
         room = budget - len(keep)
         deferred = disallow[len(keep):] + block[room:]
@@ -567,16 +721,78 @@ def evaluate(users, policy_readable, telemetry_ok, telemetry_records, non_user_o
                   "detail": "%d planned suspensions; budget is %d per run." % (planned, budget) if g4_ok else
                   "%d planned suspensions; budget is %d per run, so %d wait for the next run."
                   % (planned, budget, len(deferred))})
-    gates.append({"id": "G5_NON_USER_GRANT_ABSENT", "status": "pass" if not non_user_on_access else "warn",
-                  "detail": "No group or domain grants on %s." % access_role if not non_user_on_access else
-                  "%d group or domain grant(s) on %s; affected users are not enforceable."
-                  % (len(non_user_on_access), access_role)})
+    if backend == "iam_deny":
+        gates.append({"id": "G5_NON_USER_GRANT_ABSENT", "status": "pass",
+                      "detail": "Deny policies also stop access granted through groups, domains and inherited roles."})
+    elif backend == "notify_only":
+        gates.append({"id": "G5_NON_USER_GRANT_ABSENT", "status": "pass", "detail": "Notify only: nobody loses access."})
+    else:
+        gates.append({"id": "G5_NON_USER_GRANT_ABSENT", "status": "pass" if not non_user_on_access else "warn",
+                      "detail": "No group or domain grants on %s." % access_role if not non_user_on_access else
+                      "%d group or domain grant(s) on %s; affected users are not enforceable."
+                      % (len(non_user_on_access), access_role)})
+    # G6 (iam_deny): one resource holds at most DENY_PRINCIPAL_LIMIT denied principals. Every attachment point lists
+    # the same people, so the count after this run is the people denied now, minus restores, plus new suspensions.
+    # New suspensions beyond the limit wait (the least severe first); restores always go through.
+    held = []
+    if backend == "iam_deny":
+        limit, warn_at = enforcers.DENY_PRINCIPAL_LIMIT, enforcers.DENY_WARN_AT
+        states = {u["uid"]: u["state"] for u in users}
+        fresh = [uid for uid in disallow + block if states.get(uid) == EA]
+        after = max(0, to_int(deny.get("current")) - len(restore)) + len(fresh)
+        where = _attachment_label((deny.get("attachments") or [""])[0])
+        if after > limit and fresh:
+            order = sorted((uid for uid in block if states.get(uid) == EA),
+                           key=lambda uid: (uid in approved, severity.get(uid, 0)))
+            order += [uid for uid in reversed(disallow) if states.get(uid) == EA]
+            held = order[:min(len(fresh), after - limit)]
+            block = [uid for uid in block if uid not in held]
+            disallow = [uid for uid in disallow if uid not in held]
+            gates.append({"id": "G6_DENY_CAPACITY", "status": "warn",
+                          "detail": "%d new suspensions wait because %s would go over the limit of %d people."
+                                    % (len(held), where, limit)})
+        elif after >= warn_at:
+            gates.append({"id": "G6_DENY_CAPACITY", "status": "warn",
+                          "detail": "%d people at %s; a warning starts at %d and the limit is %d."
+                                    % (after, where, warn_at, limit)})
+        else:
+            gates.append({"id": "G6_DENY_CAPACITY", "status": "pass",
+                          "detail": "At most %d people per attachment point; the limit is %d." % (after, limit)})
+    if g7 is not None:
+        gates.append(g7)
     failed = [g for g in gates if g["status"] == "fail"]
     plan = {"block": block, "restore": restore, "disallow": disallow, "review": review, "manual": manual,
             "withheldRestores": withheld, "deferredBlocks": deferred, "changeBudget": budget,
-            "aborted": bool(failed),
+            "capacityHeld": held, "aborted": bool(failed),
             "abortReason": "; ".join("%s: %s" % (g["id"], g["detail"]) for g in failed) if failed else None}
     return gates, plan, budget
+
+
+def _pct(ratio):
+    """A ratio as a percentage without trailing zeros: 0.5 -> "50", 0.125 -> "12.5"."""
+    return "%g" % round(float(ratio) * 100, 1)
+
+
+def _attachment_label(attachment):
+    """An attachment point without the service prefix (projects/p, folders/1, organizations/1)."""
+    text = str(attachment or "")
+    return text.split("googleapis.com/", 1)[-1] or "-"
+
+
+def _g1_detail(backend, readable, deny):
+    if backend == "notify_only":
+        return "Notify only: no IAM policy is read or changed."
+    if backend != "iam_deny":
+        return "Project IAM policy read (version 3)." if readable else "The project IAM policy could not be read."
+    total = len(deny.get("attachments") or [])
+    if readable:
+        return "Deny policies read at %d attachment point(s)." % total
+    if not total:
+        return "No deny policy attachment point is configured: the workspace has no valid project or scope."
+    if deny.get("unreadable"):
+        return "The deny policy could not be read at %d of %d attachment points." % (deny["unreadable"], total)
+    return ("The deny policy at %d of %d attachment points was changed outside the dashboard, so the dashboard does "
+            "not change it." % (deny.get("foreign") or 0, total))
 
 
 # ---------------------------------------------------------------------------
@@ -612,17 +828,18 @@ def apply_changes(policy, changes, cfg):
     for email, action in changes:
         member = "user:%s" % email.lower()
         if action == "block":
-            _remove_member(new, cfg.access_role, member)
+            for role in cfg.replaceable_roles:
+                _remove_member(new, role, member)
             _add_member(new, cfg.cap_marker, member)
         elif action == "restore":
             _remove_member(new, cfg.cap_marker, member)
             _add_member(new, cfg.access_role, member)
         elif action == "disallow":
-            _remove_member(new, cfg.access_role, member)
-            _remove_member(new, cfg.cap_marker, member)
+            for role in (*cfg.replaceable_roles, cfg.cap_marker, *cfg.legacy_markers):
+                _remove_member(new, role, member)
             _add_member(new, cfg.admin_marker, member)
         elif action == "allow":
-            for role in (cfg.cap_marker, cfg.admin_marker) + tuple(cfg.legacy_markers):
+            for role in (*cfg.replaceable_roles, cfg.cap_marker, cfg.admin_marker, *cfg.legacy_markers):
                 _remove_member(new, role, member)
             _add_member(new, cfg.access_role, member)
         else:
@@ -659,7 +876,7 @@ def set_policy(ctx, policy):
     return ctx.rest("POST", url, json_body={"policy": policy, "updateMask": "bindings,etag"})
 
 
-def make_ancestor_check(ctx, cfg):
+def make_ancestor_check(ctx, cfg, extra_prefixes=()):
     cache = ctx.app.cache
     key = ("ancestors", ctx.project)
 
@@ -690,11 +907,12 @@ def make_ancestor_check(ctx, cfg):
         if state["value"] is None:
             state["value"], _ = cache.get_or_compute(key, 600, load)
         value = state["value"]
-        roles = {cfg.access_role, *cfg.privileged_roles, *cfg.extra_access_roles}
+        roles = {*cfg.replaceable_roles, *cfg.privileged_roles, *cfg.all_extra_access_roles}
         member = "user:%s" % email.lower()
         for pol in value["policies"]:
             for binding in pol.get("bindings") or []:
-                if binding.get("role") not in roles:
+                b_role = str(binding.get("role") or "")
+                if b_role not in roles and not (extra_prefixes and b_role.startswith(extra_prefixes)):
                     continue
                 members = [str(m).lower() for m in binding.get("members") or []]
                 if member in members or grants_via_non_user(members, email):
@@ -715,6 +933,158 @@ def marker_status(ctx, cfg):
     return out
 
 
+# A person is stopped by replacing the access role with a marker role: a custom role with the permissions of the
+# access role except businessaicode.* (Antigravity), so the Gemini Enterprise app keeps working. Which marker a person
+# holds also records why they are stopped: the cap marker (over a limit, restored at the reset) or the admin marker
+# (blocked by an administrator until unblocked). The deployment creates both roles. When an administrator's action
+# needs one that is missing or deleted, the helpers below create or restore it instead of refusing the action.
+
+MARKER_CREATE_ATTEMPTS = 5  # every attempt drops the permissions Google Cloud rejects in custom roles (as deploy.sh)
+
+
+def _marker_meta(cfg):
+    return {cfg.cap_marker_id: ("Antigravity Cap Blocked",
+                                "Assigned by AI Control Plane when a user exceeds the Antigravity cap. "
+                                "Same as the access role without businessaicode permissions."),
+            cfg.admin_marker_id: ("Antigravity Admin Blocked",
+                                  "Assigned by an administrator to disallow Antigravity. "
+                                  "Same as the access role without businessaicode permissions.")}
+
+
+def _marker_result(role_id, status, message):
+    return {"role": role_id, "status": status, "message": message}
+
+
+def _marker_failed(role_id, message, kind, reason=None):
+    """A failed result. kind is the upstream error kind; reason is what marker_unavailable() explains: denied,
+    deleted, reserved, base_role or error."""
+    return {"role": role_id, "status": "failed", "message": message, "kind": kind,
+            "reason": reason or ("denied" if kind == "denied" else "error")}
+
+
+def _marker_permissions(ctx, cfg):
+    """Permissions of a marker role: those of the access role without businessaicode.* (Antigravity). None when
+    the access role cannot be read."""
+    try:
+        role = ctx.rest("GET", "%s/%s" % (IAM_V1, cfg.access_role))
+    except GcpError as err:
+        LOG.warning("could not read %s kind=%s", cfg.access_role, err.kind)
+        return None
+    return [p for p in role.get("includedPermissions") or [] if not p.startswith("businessaicode.")]
+
+
+def _create_marker(ctx, role_id, meta, permissions):
+    """Creates one marker role. Returns (result, taken); taken is True when Google Cloud answers that the role ID
+    is in use, which _ensure_marker resolves by reading the role again."""
+    title, description = meta
+    perms = list(permissions)
+    for _ in range(MARKER_CREATE_ATTEMPTS):
+        try:
+            ctx.rest("POST", "%s/projects/%s/roles" % (IAM_V1, ctx.project),
+                     json_body={"roleId": role_id, "role": {"title": title, "description": description,
+                                                            "includedPermissions": perms, "stage": "GA"}})
+            return _marker_result(role_id, "created",
+                                  "Created with %d permissions (businessaicode.* excluded)." % len(perms)), False
+        except GcpError as err:
+            bad = [p for p in perms if p in (err.message or "")]
+            if err.kind == "invalid" and bad:
+                perms = [p for p in perms if p not in bad]
+                continue
+            return (_marker_failed(role_id, "The role could not be created (%s)." % err.kind, err.kind),
+                    err.kind == "conflict")
+    return _marker_failed(role_id, "The role could not be created.", "invalid"), False
+
+
+def _ensure_marker(ctx, cfg, role_id, base_permissions):
+    url = "%s/projects/%s/roles/%s" % (IAM_V1, ctx.project, urllib.parse.quote(role_id, safe=""))
+    for _ in (1, 2):
+        try:
+            existing = ctx.rest("GET", url)
+        except GcpError as err:
+            if err.kind != "not_found":
+                return _marker_failed(role_id, "The role could not be read (%s)." % err.kind, err.kind)
+            existing = None
+        if existing is not None and not existing.get("deleted"):
+            return _marker_result(role_id, "exists", "The role already exists.")
+        if existing is not None:
+            # Deleted in the last 7 days: Google Cloud still restores it, and the bindings on it work again.
+            body = {"etag": existing["etag"]} if existing.get("etag") else {}
+            try:
+                ctx.rest("POST", url + ":undelete", json_body=body)
+            except GcpError as err:
+                return _marker_failed(role_id, "The deleted role could not be restored (%s)." % err.kind, err.kind,
+                                      reason="denied" if err.kind == "denied" else "deleted")
+            return _marker_result(role_id, "restored", "The deleted role was restored.")
+        permissions = base_permissions()
+        if not permissions:
+            return _marker_failed(role_id, "The permissions of %s could not be read." % cfg.access_role, "unreadable",
+                                  reason="base_role")
+        result, taken = _create_marker(ctx, role_id, _marker_meta(cfg)[role_id], permissions)
+        if not taken:
+            return result
+        # Taken: created by someone else a moment ago (the next read finds it) or the ID of a deleted role.
+    # The ID is in use although no role can be read. Google Cloud keeps the ID of a deleted role unusable while it
+    # removes the role for good, up to 44 days after the deletion.
+    return _marker_failed(role_id, "The role ID is still reserved by a deleted role.", "conflict", reason="reserved")
+
+
+def ensure_marker_roles(ctx, cfg, role_ids=None):
+    """Makes the marker roles usable (both by default): an existing role is left as it is, a role deleted in the
+    last 7 days is restored, a missing role is created. One result per role: {"role", "status", "message"} with
+    status exists | restored | created | failed; failed results also carry "kind" and "reason" (_marker_failed).
+    The caller holds _WRITE_LOCK."""
+    loaded = {}
+
+    def base_permissions():
+        # Read once, and only when a role has to be created.
+        if "value" not in loaded:
+            loaded["value"] = _marker_permissions(ctx, cfg)
+        return loaded["value"]
+    return [_ensure_marker(ctx, cfg, role_id, base_permissions)
+            for role_id in (role_ids or (cfg.cap_marker_id, cfg.admin_marker_id))]
+
+
+def marker_unavailable(result, cfg):
+    """What an administrator reads when an action needs a marker role that could not be made usable: what the role
+    is for, why it is not there and what to do about it."""
+    lead = "Role %s is needed to stop Antigravity for a person, but " % result["role"]
+    reason, kind = result.get("reason"), result.get("kind")
+    if reason == "denied":
+        return lead + ("the dashboard service account is not allowed to read or create custom roles in this project. "
+                       "Grant it roles/iam.roleAdmin and try again.")
+    if reason == "deleted":
+        return lead + ("it is deleted and could not be restored (%s). Restore it in IAM > Roles, or enter another "
+                       "role ID in Settings > Governance policy." % kind)
+    if reason == "reserved":
+        return lead + ("Google Cloud does not accept this role ID right now, which happens for up to 44 days after a "
+                       "role with the same ID was deleted. Enter another role ID in Settings > Governance policy.")
+    if reason == "base_role":
+        return lead + "it could not be created because the permissions of %s could not be read." % cfg.access_role
+    return lead + "it could not be prepared (%s). Try again in a moment." % kind
+
+
+def _setup_markers(ctx, cfg, trigger):
+    """Creates or restores both marker roles and records it in the audit log. Returns (results, audit_logged)."""
+    results = ensure_marker_roles(ctx, cfg)
+    logged = write_audit(ctx, "setup", {
+        "result": "success" if all(r["status"] != "failed" for r in results) else "partial",
+        "target": "marker roles", "results": results, "trigger": trigger})
+    return results, logged
+
+
+def prepare_markers(ctx, cfg, needed, known):
+    """Before an administrator's action assigns marker roles: {role id: why it cannot be assigned} for the roles in
+    `needed` that are unusable (empty when all can be assigned). `known` is {role id: exists} as read by
+    marker_status. When a needed role is not known to exist, both marker roles are created or restored exactly as
+    setup() does. The caller holds _WRITE_LOCK."""
+    if all(known.get(role_id) is True for role_id in needed):
+        return {}
+    results, _ = _setup_markers(ctx, cfg, "on_demand")
+    if any(r["status"] in ("created", "restored") for r in results):
+        ctx.app.invalidate_governance()  # the status page lists the roles as present from now on
+    return {r["role"]: marker_unavailable(r, cfg) for r in results if r["status"] == "failed" and r["role"] in needed}
+
+
 def permission_status(ctx):
     url = "%s/projects/%s:testIamPermissions" % (CRM_V3, ctx.project)
     try:
@@ -730,29 +1100,23 @@ def permission_status(ctx):
 # ---------------------------------------------------------------------------
 
 # Antigravity inference logs name the caller in labels.user_id as an IAM principal: "user:alice@example.com" (the
-# documented format; older entries carried the bare email). Usage is keyed by the plain lowercase email, the same key
-# as the direct "user:" bindings of the IAM policy (PolicyIndex.direct_users), so caps, the user list and IAM states
-# line up instead of showing "user:..." duplicates that never match a binding.
+# documented format; older entries carried the bare email) or, for Workforce Identity Federation users, the workforce
+# principal URI. Usage is keyed by identity.person_key: the plain lowercase email, the same key as the direct "user:"
+# bindings of the IAM policy (PolicyIndex.direct_users), so caps, the user list and IAM states line up instead of
+# showing "user:..." duplicates that never match a binding; workforce users by their lowercase principal URI.
 USER_PRINCIPAL_PREFIX_RE = r"(?i)^user:"
 
 
 def agy_user_sql(user_expr):
-    """BigQuery expression: the plain lowercase email behind labels.user_id (a leading "user:" removed)."""
-    return "LOWER(REGEXP_REPLACE(TRIM(%s), r'%s', ''))" % (user_expr, USER_PRINCIPAL_PREFIX_RE)
+    """BigQuery expression: the person key behind labels.user_id (lower-cased, a leading "user:" removed)."""
+    return identity.sql_person_key(user_expr)
 
 
 def usage_user(principal):
-    """The person behind labels.user_id as a plain lowercase email, or None. As in direct_users only users count:
-    service accounts ("serviceAccount:..." or a .gserviceaccount.com email), workforce identities ("principal://...")
-    and other principal types get no per-user usage or caps."""
-    if not isinstance(principal, str):
-        return None
-    value = principal.strip().lower()
-    if value.startswith("user:"):
-        value = value[5:].strip()
-    if ":" in value.partition("@")[0] or not is_human(value):
-        return None
-    return value
+    """The person behind labels.user_id (identity.person_key), or None: service accounts ("serviceAccount:..." or a
+    .gserviceaccount.com email) and other principal types get no per-user usage or caps. Workforce identities are
+    people: their usage and cost are counted, while caps report them as not enforceable (WORKFORCE_IDENTITY)."""
+    return identity.person_key(principal)
 
 
 AGY_PAYLOAD_COLUMN = "jsonpayload_v1_inferenceresponselog"
@@ -779,6 +1143,8 @@ def agy_fields(src, alias="t"):
         return expr(alias, s, *payload_paths(s, "metadata.%s" % name), cast="INT64")
     return {
         "user": agy_user_sql(user) if user else None,
+        # The label as logged: workforce subjects are case-sensitive, the key above is lower-cased (_note_principal).
+        "principal": user,
         "client": expr(alias, s, "labels.client_name", cast="STRING"),
         "model": expr(alias, s, "labels.model_id", "labels.model", cast="STRING"),
         "total": tokens("totalTokenCount"),
@@ -793,6 +1159,17 @@ def agy_fields(src, alias="t"):
 USAGE_COUNTERS = ("requests", "tokens", "promptTokens", "candidateTokens", "cachedTokens")
 
 
+def _note_principal(usage, person, raw):
+    """Keeps the workforce principal as logged (subject case intact) next to its lower-case key. Google documents
+    google.subject, and so the workforce principal identifier, as case-sensitive: a deny policy entry built from the
+    key would not match a subject with upper-case letters (_apply_deny). E-mail addresses are case-insensitive, so
+    Google accounts need nothing."""
+    if person in usage.principals or not isinstance(raw, str) or not identity.is_workforce_key(person):
+        return
+    if identity.person_key(raw) == person:
+        usage.principals[person] = raw.strip()
+
+
 class Usage:
     def __init__(self, source):
         self.source = source
@@ -803,11 +1180,15 @@ class Usage:
         self.by_model = {}
         self.by_client = {}
         self.daily = {}
+        # {project: newest entry timestamp} of a BigQuery sink table read (see _logging_tail_ranges).
+        self.project_last = {}
+        # {workforce person key: principal as logged} (see _note_principal).
+        self.principals = {}
 
     def user(self, email):
         return self.users.setdefault(email, {"requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0,
                                              "cachedTokens": 0, "clients": set(), "models": set(), "last": None,
-                                             "byModel": {}})
+                                             "byModel": {}, "byProject": {}})
 
     @staticmethod
     def add_model(rec, model, requests, tokens, prompt, cand, cached=0):
@@ -818,6 +1199,18 @@ class Usage:
         agg["promptTokens"] += prompt
         agg["candidateTokens"] += cand
         agg["cachedTokens"] = agg.get("cachedTokens", 0) + cached
+
+    @staticmethod
+    def add_project(rec, project, model, requests, tokens, prompt, cand, cached=0):
+        """Adds one model's usage in one project to rec["byProject"] (Google bills per project)."""
+        prec = rec.setdefault("byProject", {}).setdefault(project or "unknown", {
+            "requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0, "cachedTokens": 0, "byModel": {}})
+        prec["requests"] += requests
+        prec["tokens"] += tokens
+        prec["promptTokens"] += prompt
+        prec["candidateTokens"] += cand
+        prec["cachedTokens"] += cached
+        Usage.add_model(prec, model, requests, tokens, prompt, cand, cached)
 
     def merge(self, other):
         """Adds `other`, which must hold different log entries (Cloud Logging entries the sink table never received)."""
@@ -835,6 +1228,11 @@ class Usage:
                 Usage.add_model(u, model, agg.get("requests") or 0, agg.get("tokens") or 0,
                                 agg.get("promptTokens") or 0, agg.get("candidateTokens") or 0,
                                 agg.get("cachedTokens") or 0)
+            for project, prec in (rec.get("byProject") or {}).items():
+                for model, agg in (prec.get("byModel") or {}).items():
+                    Usage.add_project(u, project, model, agg.get("requests") or 0, agg.get("tokens") or 0,
+                                      agg.get("promptTokens") or 0, agg.get("candidateTokens") or 0,
+                                      agg.get("cachedTokens") or 0)
         for mine, theirs in ((self.by_model, other.by_model), (self.by_client, other.by_client)):
             for key, agg in theirs.items():
                 cur = mine.setdefault(key, {k: 0 for k in USAGE_COUNTERS})
@@ -845,6 +1243,17 @@ class Usage:
                 bucket = dt.date.fromisoformat(bucket[:10])
             r0, t0 = self.daily.get((person, bucket), (0, 0))
             self.daily[(person, bucket)] = (r0 + req, t0 + tok)
+        for person, raw in (getattr(other, "principals", None) or {}).items():
+            self.principals.setdefault(person, raw)
+
+
+_LOGNAME_PROJECT_RE = re.compile(r"^projects/([^/]+)/")
+
+
+def entry_project(log_name, default=None):
+    """The project id in a log entry name (projects/<id>/logs/<log>), or `default`."""
+    m = _LOGNAME_PROJECT_RE.match(log_name or "") if isinstance(log_name, str) else None
+    return m.group(1) if m else default
 
 
 def _bq_usage(ctx, src, start, end, email=None, rng=None):
@@ -860,16 +1269,41 @@ def _bq_usage(ctx, src, start, end, email=None, rng=None):
     if email:
         where += " AND %s = @email" % f["user"]  # matches "user:<email>" and the bare email alike
         params["email"] = email
-    base = ("WITH %s,\nu AS (SELECT %s AS ts, %s AS email, %s AS client, %s AS model, IFNULL(%s, 0) AS total, "
-            "IFNULL(%s, 0) AS prompt, IFNULL(%s, 0) AS cand, IFNULL(%s, 0) AS cached FROM s t WHERE %s)"
-            % (src.cte("s", start="w_start", end="w_end"), f["ts"], f["user"], f["client"] or null,
-               f["model"] or null, f["total"] or "0", f["prompt"] or "0", f["candidates"] or "0",
-               f["cached"] or "0", where))
+    lname = expr("t", src.schema, "logName", cast="STRING")
+    project_sql = "REGEXP_EXTRACT(%s, r'^projects/([^/]+)/')" % lname if lname else null
+    base = ("WITH %s,\nu AS (SELECT %s AS ts, %s AS email, %s AS principal, %s AS client, %s AS model, "
+            "IFNULL(%s, 0) AS total, IFNULL(%s, 0) AS prompt, IFNULL(%s, 0) AS cand, IFNULL(%s, 0) AS cached, "
+            "%s AS project FROM s t WHERE %s)"
+            % (src.cte("s", start="w_start", end="w_end"), f["ts"], f["user"], f["principal"] or null,
+               f["client"] or null, f["model"] or null, f["total"] or "0", f["prompt"] or "0", f["candidates"] or "0",
+               f["cached"] or "0", project_sql, where))
     usage = Usage("bigquery")
-    rows = ctx.query(base + "\nSELECT email, model, COUNT(*) AS requests, SUM(total) AS tokens, SUM(prompt) AS prompt_tokens, "
-                     "SUM(cand) AS candidate_tokens, SUM(cached) AS cached_tokens, "
-                     "ARRAY_AGG(DISTINCT client IGNORE NULLS LIMIT 20) AS clients, "
-                     "MAX(ts) AS last_ts\nFROM u GROUP BY email, model", params, "antigravity")
+    main_sql = (base + "\nSELECT email, model, project, COUNT(*) AS requests, SUM(total) AS tokens, "
+                "SUM(prompt) AS prompt_tokens, SUM(cand) AS candidate_tokens, SUM(cached) AS cached_tokens, "
+                "ARRAY_AGG(DISTINCT client IGNORE NULLS LIMIT 20) AS clients, "
+                "ANY_VALUE(principal) AS principal, MAX(ts) AS last_ts\nFROM u GROUP BY email, model, project")
+    tasks = {"main": lambda: ctx.query(main_sql, params, "antigravity")}
+    if email:
+        client_sql = (base + "\nSELECT client AS k, COUNT(*) AS requests, SUM(total) AS tokens, SUM(prompt) AS p, "
+                      "SUM(cand) AS c, SUM(cached) AS ca FROM u GROUP BY k")
+        tasks["client"] = lambda: ctx.query(client_sql, params, "antigravity")
+    if rng is not None:
+        from .base import bucket_sql
+        bucket_params = dict(params, tz=rng.tz_name, start_date=rng.start, bucket_days=rng.bucket_days)
+        bucket_query = (base + "\nSELECT %s AS bucket, email, COUNT(*) AS requests, SUM(total) AS tokens "
+                        "FROM u GROUP BY bucket, email" % bucket_sql("ts"))
+        tasks["bucket"] = lambda: ctx.query(bucket_query, bucket_params, "antigravity")
+    # The per-person rows, the per-client totals and the per-day buckets read the same rows independently, so they
+    # run together: one person's details used to wait for four jobs in a row. The main query's failure wins.
+    if len(tasks) == 1:
+        res = {"main": (True, tasks["main"]())}
+    else:
+        res = ctx.run(tasks)
+        for name in tasks:
+            ok, value = res[name]
+            if not ok:
+                raise value
+    rows = res["main"][1]
     for row in rows:
         if not row.get("email"):
             continue
@@ -877,9 +1311,15 @@ def _bq_usage(ctx, src, start, end, email=None, rng=None):
         prompt, cand = to_int(row.get("prompt_tokens")), to_int(row.get("candidate_tokens"))
         cached = to_int(row.get("cached_tokens"))
         usage.records += requests
+        row_project, row_last = row.get("project"), row.get("last_ts")
+        if isinstance(row_project, str) and isinstance(row_last, dt.datetime):
+            seen = usage.project_last.get(row_project)
+            if seen is None or row_last > seen:
+                usage.project_last[row_project] = row_last
         person = usage_user(row["email"])
         if person is None:
             continue  # a service account or another non-user principal: telemetry, but no per-user usage
+        _note_principal(usage, person, row.get("principal"))
         u = usage.user(person)
         u["requests"] += requests
         u["tokens"] += tokens
@@ -890,25 +1330,30 @@ def _bq_usage(ctx, src, start, end, email=None, rng=None):
         if row.get("model"):
             u["models"].add(row["model"])
         Usage.add_model(u, row.get("model"), requests, tokens, prompt, cand, cached)
+        project = row.get("project") if isinstance(row.get("project"), str) else None
+        Usage.add_project(u, project, row.get("model"), requests, tokens, prompt, cand, cached)
         last = row.get("last_ts")
         if last is not None and (u["last"] is None or last > u["last"]):
             u["last"] = last
     if email:
-        for dim, target in (("model", usage.by_model), ("client", usage.by_client)):
-            sub = ctx.query(base + "\nSELECT %s AS k, COUNT(*) AS requests, SUM(total) AS tokens, SUM(prompt) AS p, "
-                            "SUM(cand) AS c, SUM(cached) AS ca FROM u GROUP BY k" % dim, params, "antigravity")
-            for row in sub:
-                target[row.get("k") or "unknown"] = {"requests": to_int(row.get("requests")),
-                                                     "tokens": to_int(row.get("tokens")),
-                                                     "promptTokens": to_int(row.get("p")),
-                                                     "candidateTokens": to_int(row.get("c")),
-                                                     "cachedTokens": to_int(row.get("ca"))}
+        # Per-model totals of the one person: the main rows already group by model (and project), so they are summed
+        # here instead of a separate job.
+        for row in rows:
+            agg = usage.by_model.setdefault(row.get("model") or "unknown", {
+                "requests": 0, "tokens": 0, "promptTokens": 0, "candidateTokens": 0, "cachedTokens": 0})
+            agg["requests"] += to_int(row.get("requests"))
+            agg["tokens"] += to_int(row.get("tokens"))
+            agg["promptTokens"] += to_int(row.get("prompt_tokens"))
+            agg["candidateTokens"] += to_int(row.get("candidate_tokens"))
+            agg["cachedTokens"] += to_int(row.get("cached_tokens"))
+        for row in res["client"][1]:
+            usage.by_client[row.get("k") or "unknown"] = {"requests": to_int(row.get("requests")),
+                                                         "tokens": to_int(row.get("tokens")),
+                                                         "promptTokens": to_int(row.get("p")),
+                                                         "candidateTokens": to_int(row.get("c")),
+                                                         "cachedTokens": to_int(row.get("ca"))}
     if rng is not None:
-        params.update({"tz": rng.tz_name, "start_date": rng.start, "bucket_days": rng.bucket_days})
-        from .base import bucket_sql
-        sub = ctx.query(base + "\nSELECT %s AS bucket, email, COUNT(*) AS requests, SUM(total) AS tokens "
-                        "FROM u GROUP BY bucket, email" % bucket_sql("ts"), params, "antigravity")
-        for row in sub:
+        for row in res["bucket"][1]:
             person = usage_user(row.get("email"))
             if person is not None:
                 usage.daily[(person, row.get("bucket"))] = (to_int(row.get("requests")), to_int(row.get("tokens")))
@@ -924,15 +1369,42 @@ def _user_label_regex(email):
     return "(?i)^(user:)?%s$" % "".join(parts)
 
 
+_LABEL_SAFE_PUNCT = frozenset(".-:/+=~!$&'()*,;%")
+
+
+def _principal_label_regex(key):
+    """RE2 pattern for labels.user_id of one workforce identity: the exact principal, case-insensitive. Symbols become
+    character classes (no escapes); a principal with other symbols cannot be filtered on."""
+    parts = []
+    for ch in key:
+        if ch.isalnum() or ch in "@_":
+            parts.append(ch)
+        elif ch in _LABEL_SAFE_PUNCT:
+            parts.append("[%s]" % ch)
+        else:
+            raise GcpError("invalid", message="unsupported principal")
+    return "(?i)^%s$" % "".join(parts)
+
+
+def _log_ts(value):
+    """A Cloud Logging filter timestamp: RFC 3339 UTC, with microseconds when the value has them (a tail read starts
+    just after a sink table's newest entry, stored to the microsecond)."""
+    value = value.astimezone(dt.timezone.utc)
+    return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ") if value.microsecond else iso(value)
+
+
 def _logging_usage_project(ctx, project, log_id, start, end, email=None, rng=None):
     flt = 'logName="projects/%s/logs/%s" AND timestamp>="%s" AND timestamp<"%s"' % (
-        project, log_id, iso(start), iso(end))
+        project, log_id, _log_ts(start), _log_ts(end))
     if email:
-        if not config.EMAIL_RE.match(email):
+        if identity.is_workforce_key(email):
+            flt += ' AND labels.user_id=~"%s"' % _principal_label_regex(email)
+        elif not config.EMAIL_RE.match(email):
             raise GcpError("invalid", message="invalid email")
-        # labels.user_id is "user:<email>" (documented format); older entries carried the bare email. The match is
-        # case-insensitive like IAM principals; dots and other symbols become character classes (no escapes).
-        flt += ' AND labels.user_id=~"%s"' % _user_label_regex(email)
+        else:
+            # labels.user_id is "user:<email>" (documented format); older entries carried the bare email. The match
+            # is case-insensitive like IAM principals; dots and other symbols become character classes (no escapes).
+            flt += ' AND labels.user_id=~"%s"' % _user_label_regex(email)
     ag = ctx.settings["governance"]["antigravity"]
     limit = int(ag.get("max_log_entries") or 20000)
     tz = timeutil.get_zone(ctx.tz_name)
@@ -979,7 +1451,7 @@ def _logging_usage(ctx, start, end, email=None, rng=None, ranges=None):
         proj = projects[0]
         lo, hi = ranges[proj]
         entries, truncated, tz = _logging_usage_project(ctx, proj, log_id, lo, hi, email=email, rng=rng)
-        all_entries.extend(entries)
+        all_entries.extend((entry, proj) for entry in entries)
         usage.truncated = truncated
     else:
         tasks = {p: (lambda pr=p: _logging_usage_project(ctx, pr, log_id, ranges[pr][0], ranges[pr][1],
@@ -993,10 +1465,10 @@ def _logging_usage(ctx, start, end, email=None, rng=None, ranges=None):
                     raise val
                 continue
             entries, truncated, _ = val
-            all_entries.extend(entries)
+            all_entries.extend((entry, p) for entry in entries)
             if truncated:
                 usage.truncated = True
-    for entry in all_entries:
+    for entry, read_project in all_entries:
         labels = entry.get("labels") or {}
         principal = labels.get("user_id")
         if not isinstance(principal, str) or not principal.strip():
@@ -1005,6 +1477,7 @@ def _logging_usage(ctx, start, end, email=None, rng=None, ranges=None):
         user = usage_user(principal)  # "user:alice@example.com" -> "alice@example.com"
         if user is None:
             continue  # a service account or another non-user principal: telemetry, but no per-user usage
+        _note_principal(usage, user, principal)
         meta = ((entry.get("jsonPayload") or {}).get("metadata") or {})
         total = to_int(meta.get("totalTokenCount"))
         prompt = to_int(meta.get("promptTokenCount"))
@@ -1024,6 +1497,8 @@ def _logging_usage(ctx, start, end, email=None, rng=None, ranges=None):
         if model:
             u["models"].add(model)
         Usage.add_model(u, model, 1, total, prompt, cand, cached)
+        Usage.add_project(u, entry_project(entry.get("logName"), read_project), model, 1, total, prompt, cand,
+                          cached)
         if ts and (u["last"] is None or ts > u["last"]):
             u["last"] = ts
         if email:
@@ -1059,6 +1534,25 @@ def _bq_first_seen(ctx, src, start, end):
             if r.get("project") and r.get("first_ts") is not None}
 
 
+FIRST_SEEN_TTL = 6 * 3600
+
+
+def _first_seen(ctx, src, start, late, end):
+    """_bq_first_seen with a cache. The earliest entry at or after `start` never changes once it exists (later entries
+    are newer), so a result that has every late project is kept for FIRST_SEEN_TTL whatever the window end; a project
+    without an entry yet is read again next time."""
+    cache = getattr(getattr(ctx, "app", None), "cache", None)
+    key = ("agy_first_seen", getattr(src, "label", ""), tuple(sorted(late)), iso(start))
+    if cache is not None:
+        found, hit = cache.get(key)
+        if found:
+            return hit
+    first = _bq_first_seen(ctx, src, start, end)
+    if cache is not None and all(p in first for p in late):
+        cache.set(key, first, FIRST_SEEN_TTL)
+    return first
+
+
 def logging_gaps(ctx, src, start, end):
     """{project: (from, to)}: the parts of [start, end) whose inference logs exist only in Cloud Logging.
 
@@ -1067,7 +1561,12 @@ def logging_gaps(ctx, src, start, end):
     Metadata logging was turned on before the dashboard was installed), and a scanned project without a sink table
     has all of them there. Empty when every sink table predates `start` (the normal case after the first period)."""
     projects = list(getattr(ctx, "projects", None) or [ctx.project])
-    created = {s.project: getattr(s, "created", None) for s in (getattr(src, "sources", None) or [src])}
+    central = getattr(ctx, "central_audit_project", "")
+    if isinstance(central, str) and central:
+        # One table fed by an organization or folder aggregated sink holds every project's entries.
+        created = {p: getattr(src, "created", None) for p in projects}
+    else:
+        created = {s.project: getattr(s, "created", None) for s in (getattr(src, "sources", None) or [src])}
     gaps, late = {}, []
     for p in projects:
         if p not in created:
@@ -1075,7 +1574,7 @@ def logging_gaps(ctx, src, start, end):
         elif created[p] is not None and created[p] > start:
             late.append(p)
     if late:
-        first = _bq_first_seen(ctx, src, start, end)
+        first = _first_seen(ctx, src, start, late, end)
         for p in late:
             stop = min(x for x in (first.get(p), created[p], end) if x is not None)
             if stop > start:
@@ -1083,21 +1582,83 @@ def logging_gaps(ctx, src, start, end):
     return gaps
 
 
-def _add_logging_gaps(ctx, src, usage, start, end, email=None, rng=None, log_label=None):
-    """Adds Cloud Logging entries the sink table never received (see logging_gaps). Never raises."""
+def _read_logging_gaps(ctx, src, start, end, email=None, rng=None, fresh=False):
+    """Reads the Cloud Logging entries the sink table never received (see logging_gaps) without touching ctx notices:
+    (extra Usage or None, failure or None), failure = (stage, GcpError). Never raises GcpError, so it can run while
+    the table is queried. Readings are kept 5 minutes; fresh (enforcement runs) reads anew and replaces the kept one."""
     try:
         gaps = logging_gaps(ctx, src, start, end)
     except GcpError as err:
-        ctx.warn_error(src.label, err, "The first entries of the Antigravity inference log table")
-        return
+        return None, ("first", err)
     if not gaps:
-        return
+        return None, None
     key = ("agy_logging_gap", tuple(sorted((p, iso(a), iso(b)) for p, (a, b) in gaps.items())), email or "", rng)
+
+    def load():
+        return _logging_usage(ctx, start, end, email=email, rng=rng, ranges=gaps)
     try:
-        extra, _ = ctx.app.cache.get_or_compute(
-            key, 300, lambda: _logging_usage(ctx, start, end, email=email, rng=rng, ranges=gaps))
+        if fresh:
+            extra = load()
+            ctx.app.cache.set(key, extra, 300)
+        else:
+            extra, _ = ctx.app.cache.get_or_compute(key, 300, load)
     except GcpError as err:
-        ctx.warn_error(log_label, err, "Cloud Logging inference logs older than the sink table")
+        return None, ("logging", err)
+    return extra, None
+
+
+def _apply_logging_gaps(ctx, src, usage, extra, failure, log_label):
+    if failure is not None:
+        stage, err = failure
+        if stage == "first":
+            ctx.warn_error(src.label, err, "The first entries of the Antigravity inference log table")
+        else:
+            ctx.warn_error(log_label, err, "Cloud Logging inference logs older than the sink table")
+        return
+    if extra is None:
+        return
+    if extra.records:
+        ctx.add_source(log_label)
+    if extra.truncated:
+        ctx.warn(log_label, "truncated", "Inference log entries were truncated at max_log_entries.")
+    usage.merge(extra)
+
+
+def _logging_tail_ranges(ctx, src, usage, start, end):
+    """{project: (from, to)}: for every scanned project, the part of [start, end) that neither the sink table holds
+    (entries after its newest one, or the whole window when it has none in it) nor the gap read covers (logging_gaps:
+    projects without a table, and the time before a table was created). Empty when the gaps cannot be determined, so
+    nothing is ever counted twice."""
+    try:
+        gaps = logging_gaps(ctx, src, start, end)
+    except GcpError:
+        return {}
+    out = {}
+    for project in list(getattr(ctx, "projects", None) or [ctx.project]):
+        lo = start
+        if project in gaps:
+            if gaps[project][1] >= end:
+                continue   # the gap read covers the whole window of this project
+            lo = max(lo, gaps[project][1])
+        last = (getattr(usage, "project_last", None) or {}).get(project)
+        if last is not None:
+            lo = max(lo, last + dt.timedelta(microseconds=1))
+        if lo < end:
+            out[project] = (lo, end)
+    return out
+
+
+def _apply_logging_tail(ctx, src, usage, start, end, email, rng, log_label):
+    """Adds the Cloud Logging entries that Log Router has not streamed to the sink table yet (usually seconds behind,
+    sometimes minutes). Enforcement runs only (fresh reads): a run that a usage event starts must see the entry that
+    reached the cap. A failure leaves the table's usage as it is and warns."""
+    ranges = _logging_tail_ranges(ctx, src, usage, start, end)
+    if not ranges:
+        return
+    try:
+        extra = _logging_usage(ctx, start, end, email=email, rng=rng, ranges=ranges)
+    except GcpError as err:
+        ctx.warn_error(log_label, err, "Cloud Logging inference logs newer than the sink table")
         return
     if extra.records:
         ctx.add_source(log_label)
@@ -1108,7 +1669,8 @@ def _add_logging_gaps(ctx, src, usage, start, end, email=None, rng=None, log_lab
 
 def antigravity_usage(ctx, start, end, email=None, rng=None, fresh=False):
     """Returns a Usage. Never raises for upstream failures (usage.ok=False + warning). fresh skips the 5-minute cache of
-    Cloud Logging reads (enforcement runs decide on the latest entries)."""
+    Cloud Logging reads and also reads the entries newer than the sink table from Cloud Logging (enforcement runs decide
+    on the latest entries)."""
     ag = ctx.settings["governance"]["antigravity"]
     mode = ag.get("usage_source", "auto")
     src = None
@@ -1117,15 +1679,31 @@ def antigravity_usage(ctx, start, end, email=None, rng=None, fresh=False):
     log_label = "logging:%s" % urllib.parse.unquote(ag["inference_log"])
     if src is not None:
         label = src.label
-        try:
-            usage = _bq_usage(ctx, src, start, end, email=email, rng=rng)
-            ctx.add_source(label)
-        except GcpError as err:
-            ctx.warn_error(label, err, "The Antigravity inference log table")
-            usage = Usage("bigquery")
-            return usage
+        tasks = {"bq": lambda: _bq_usage(ctx, src, start, end, email=email, rng=rng)}
         if mode == "auto":
-            _add_logging_gaps(ctx, src, usage, start, end, email=email, rng=rng, log_label=log_label)
+            # Entries older than the sink table are read from Cloud Logging while the table is queried, not after it.
+            tasks["gaps"] = lambda: _read_logging_gaps(ctx, src, start, end, email=email, rng=rng, fresh=fresh)
+        if len(tasks) == 1:
+            try:
+                res = {"bq": (True, tasks["bq"]())}
+            except GcpError as err:
+                res = {"bq": (False, err)}
+        else:
+            res = ctx.run(tasks)
+        ok, usage = res["bq"]
+        if not ok:
+            if not isinstance(usage, GcpError):
+                raise usage
+            ctx.warn_error(label, usage, "The Antigravity inference log table")
+            return Usage("bigquery")
+        ctx.add_source(label)
+        if "gaps" in res:
+            ok, value = res["gaps"]
+            if not ok:
+                raise value
+            _apply_logging_gaps(ctx, src, usage, value[0], value[1], log_label)
+        if fresh and mode == "auto":
+            _apply_logging_tail(ctx, src, usage, start, end, email, rng, log_label)
         return usage
     if mode == "bigquery":
         return Usage("unavailable")
@@ -1198,6 +1776,71 @@ def telemetry_seen(ctx, usage, now):
     return bool(seen)
 
 
+DEV_TOOLS_LOCATIONS = ("global", "us", "eu")
+DEV_TOOLS_CACHE_TTL = 300
+
+
+def _call_safe(fn):
+    try:
+        return True, fn()
+    except (GcpError, ValueError) as err:
+        return False, err
+
+
+def dev_tools_logging_status(ctx):
+    """Reads Gemini Enterprise AI developer tools compliance settings across multi-region locations (global, us, eu)
+    to detect active locations where Metadata logging is still off.
+
+    Gemini Enterprise configures AI developer tools and Metadata logging separately per location, while Antigravity
+    routes Gemini 4 and preview models to `global`. Read-only; failures never break the status page."""
+    raw_projects = getattr(ctx, "projects", None) or [getattr(ctx, "project", None)]
+    projects = tuple(p for p in raw_projects if config.valid_project(p))
+    locs = list(DEV_TOOLS_LOCATIONS)
+    if hasattr(ctx, "ws"):
+        for loc in discovery_locations(ctx):
+            if loc not in locs and config.LOCATION_RE.match(loc or ""):
+                locs.append(loc)
+    locations = tuple(locs)
+    empty = {"checked": False, "locations": [], "enabledLocations": [], "missingLocations": [], "allEnabled": None}
+    if not projects or not locations:
+        return empty
+
+    def probe():
+        tasks = {}
+        for proj in projects:
+            for loc in locations:
+                url = "%s/v1alpha/projects/%s/locations/%s/devToolsConfig" % (discovery_host(loc), proj, loc)
+                tasks[(proj, loc)] = (lambda u=url: ctx.rest("GET", u, timeout=15))
+        results = ctx.run(tasks) if hasattr(ctx, "run") else {k: _call_safe(fn) for k, fn in tasks.items()}
+        checked = False
+        items, enabled, missing = [], [], []
+        for proj in projects:
+            for loc in locations:
+                ok, val = results.get((proj, loc), (False, None))
+                if not ok or not isinstance(val, dict):
+                    continue
+                checked = True
+                if not val.get("devToolsEnabled"):
+                    continue
+                log_cfg = val.get("loggingConfig") if isinstance(val.get("loggingConfig"), dict) else {}
+                meta_on = bool(log_cfg.get("metadataLoggingEnabled"))
+                items.append({"project": proj, "location": loc, "devToolsEnabled": True,
+                              "metadataLoggingEnabled": meta_on})
+                (enabled if meta_on else missing).append({"project": proj, "location": loc})
+        all_on = (bool(enabled) and not missing) if (enabled or missing) else None
+        return {"checked": checked, "locations": items, "enabledLocations": enabled,
+                "missingLocations": missing, "allEnabled": all_on}
+
+    cache = getattr(getattr(ctx, "app", None), "cache", None)
+    if cache is None:
+        return probe()
+    try:
+        val, _ = cache.get_or_compute(("agy_dev_tools_logging", projects, locations), DEV_TOOLS_CACHE_TTL, probe)
+        return val
+    except (GcpError, ValueError):
+        return empty
+
+
 # ---------------------------------------------------------------------------
 # Exception rules and suspension records (persistent governance state)
 # ---------------------------------------------------------------------------
@@ -1263,15 +1906,17 @@ def public_suspension(item):
 
 
 def restore_at(state, suspension, over, next_reset, now):
-    """When a suspended user regains access: the recorded period end, else the next reset while the
-    user is over the cap. None when not suspended, already due, or without a fixed reset."""
+    """When a suspended user regains access: while the user is over the cap, the end of the current period (or the
+    recorded end when that is later), because a suspension recorded under an earlier, shorter period (for example
+    weekly before the switch to monthly caps) does not lift while the usage of the current period is over the cap;
+    otherwise the recorded period end. None when not suspended, already due, or without a fixed reset."""
     if state != CAPPED:
         return None
     until = parse_rfc3339((suspension or {}).get("until"))
+    if over and next_reset is not None:
+        return iso(max(until, next_reset) if until is not None else next_reset)
     if until is not None and until > now:
         return iso(until)
-    if over and next_reset is not None:
-        return iso(next_reset)
     return None
 
 
@@ -1281,17 +1926,126 @@ SCHEDULER_STALE_AFTER = dt.timedelta(hours=2)
 
 
 def scheduler_status(ctx, state, now=None):
-    """Scheduled enforcement: configured (Cloud Scheduler can call the enforcement endpoint), the last scheduled run
-    and stale (configured, has run before, but not within SCHEDULER_STALE_AFTER)."""
+    """Scheduled enforcement: configured (Cloud Scheduler can call the enforcement endpoint, or runs the enforcement
+    job), the last scheduled run and stale (configured, has run before, but not within SCHEDULER_STALE_AFTER)."""
     ag = ctx.settings["governance"]["antigravity"]
     invokers = list(ag.get("scheduler_invokers") or [])
     base = (ctx.settings.get("security") or {}).get("public_base_url") or ""
-    configured = bool(invokers and base)
+    job = jobs.job_name(ctx.settings) if enforcement_backend(ctx.settings) == "iam_deny" else ""
+    configured = bool((invokers and base) or job)
     last = state.get("lastScheduledRun")
     last_at = parse_rfc3339(last.get("at")) if isinstance(last, dict) else None
     now = now or utcnow()
     stale = bool(configured and last_at is not None and now - last_at > SCHEDULER_STALE_AFTER)
-    return {"configured": configured, "lastRun": last, "stale": stale}
+    return {"configured": configured, "lastRun": last, "stale": stale, "job": job or None}
+
+
+def realtime_status(ctx, state, now=None):  # pylint: disable=unused-argument
+    """Real-time enforcement (services/usage_events.py): configured (a Pub/Sub push subscription posts every inference
+    log entry to the usage-event endpoint), when the last event arrived and when an event last started an enforcement
+    run (counts and times only)."""
+    ag = ctx.settings["governance"]["antigravity"]
+    rec = state.get("usageEvents") if isinstance(state.get("usageEvents"), dict) else {}
+    return {"configured": bool(ag.get("usage_events_subscription")),
+            "lastEventAt": rec.get("lastEventAt"), "lastTriggerAt": rec.get("lastTriggerAt"),
+            "lastTriggerVia": rec.get("lastTriggerVia"), "triggers": to_int(rec.get("triggers"))}
+
+
+# A run request older than this is not the reason of the job execution that finds it (the scheduler started that one).
+RUN_REQUEST_TTL = dt.timedelta(minutes=5)
+
+
+def note_run_request(ctx, trigger):
+    """Records why the dashboard starts an enforcement job execution (usage or admin); the execution records it as its
+    trigger (claim_run_request). A failure only costs the label."""
+    stamp = {"trigger": trigger, "at": iso(utcnow())}
+    try:
+        mutate_state(ctx, lambda state: state.__setitem__("runRequest", stamp))
+    except ApiError as err:
+        LOG.warning("enforcement run request not recorded: %s", err.code)
+
+
+def claim_run_request(ctx, default="scheduler", now=None):
+    """The trigger of this enforcement job execution: the run request the dashboard recorded just before starting it
+    (at most RUN_REQUEST_TTL old), which is consumed, else `default` (Cloud Scheduler started it)."""
+    req = governance_state(ctx).get("runRequest")
+    if not isinstance(req, dict) or not req.get("at"):
+        return default
+    claimed = []
+
+    def take(state):
+        cur = state.get("runRequest")
+        if isinstance(cur, dict) and cur.get("at") == req.get("at"):
+            state.pop("runRequest", None)
+            claimed.append(cur.get("trigger"))
+    try:
+        mutate_state(ctx, take)
+    except ApiError as err:
+        LOG.warning("enforcement run request not claimed: %s", err.code)
+        return default
+    at = parse_rfc3339(req.get("at"))
+    if claimed and claimed[0] in ("usage", "admin") and at is not None and (now or utcnow()) - at <= RUN_REQUEST_TTL:
+        return claimed[0]
+    return default
+
+
+def request_enforcement(ctx, trigger="admin"):
+    """Starts an enforcement run of the saved policy right away, after a change that can suspend or restore someone: an
+    administrator's policy or rule change, or a usage event that reached a cap (trigger "usage"). The enforcement job
+    runs it when one is configured (its service account alone writes deny policies), else a cycle in this process;
+    notify_only changes nobody's access and runs nothing. Never raises.
+
+    Returns {"via": "job" | "run" | None, "started": bool, "error": code or None, "execution": name or None,
+    "suspended": n, "restored": n} (counts only for a cycle that ran here)."""
+    out = {"via": None, "started": False, "error": None, "execution": None, "suspended": 0, "restored": 0}
+    backend = enforcement_backend(ctx.settings)
+    if backend == "notify_only":
+        return out
+    if backend == "iam_deny" and jobs.job_name(ctx.settings):
+        out["via"] = "job"
+        note_run_request(ctx, trigger)
+        try:
+            started = jobs.trigger(ctx)
+        except GcpError as err:
+            LOG.warning("enforcement job run refused kind=%s", err.kind)
+            out["error"] = err.kind
+            return out
+        write_audit(ctx, "enforce_job_run", {"result": "success", "target": started["job"], "trigger": trigger,
+                                             "execution": started["execution"]})
+        _refresh_status_cache(ctx)
+        out.update(started=True, execution=started.get("execution"))
+        return out
+    out["via"] = "run"
+    try:
+        result = enforce_cycle(ctx, trigger=trigger)
+    except (ApiError, GcpError) as err:
+        LOG.warning("enforcement run failed code=%s", getattr(err, "code", None) or getattr(err, "kind", "error"))
+        out["error"] = getattr(err, "code", None) or getattr(err, "kind", "error")
+        return out
+    changes = result.get("changes") or []
+    out.update(started=True, suspended=_applied(changes, "block"), restored=_applied(changes, "restore"))
+    return out
+
+
+# Settings whose change can suspend or restore someone: saving one in automatic mode applies the policy at once.
+POLICY_KEYS = frozenset({
+    "cap_model", "period", "window", "reset_timezone", "reset_weekday", "reset_time", "reset_day", "cycle_days",
+    "cycle_start", "token_cap", "request_cap", "cost_cap", "currency", "pricing_source", "model_prices",
+    "input_price_per_million", "output_price_per_million", "credit_per_user_month", "paid_budget_month",
+    "org_paid_budget_month", "credit_model_prefixes", "credit_source", "credit_by_tier", "enforcement_mode"})
+
+
+def after_policy_change(ctx, keys):
+    """After an administrator saved or reset governance settings (`keys`, the setting names): in automatic mode an
+    enforcement run applies the new policy at once (people now over a cap are suspended, people no longer over one are
+    restored) instead of at the next scheduled run. `ctx` must carry the saved settings. Returns request_enforcement's
+    result, or None when nothing needs to run. Never raises."""
+    if not (set(keys or ()) & POLICY_KEYS):
+        return None
+    ag = ctx.settings["governance"]["antigravity"]
+    if (ag.get("enforcement_mode") or "manual") != "auto" or not ctx.settings["modules"].get("antigravity", False):
+        return None
+    return request_enforcement(ctx, trigger="admin")
 
 
 # ---------------------------------------------------------------------------
@@ -1303,13 +2057,13 @@ def policy_params(ctx, source):
     period = source.get("period") or ag["period"]
     window = source.get("window") or ag["window"]
     if period not in timeutil.PERIODS:
-        raise ApiError("bad_request", "Parameter 'period' must be one of daily, weekly, monthly, all.")
+        raise ApiError("bad_request", "Parameter 'period' must be one of daily, weekly, monthly, custom, all.")
     if window not in timeutil.WINDOWS:
         raise ApiError("bad_request", "Parameter 'window' must be 'calendar' or 'rolling'.")
     caps = []
     for name, default in (("tokenCap", ag["token_cap"]), ("requestCap", ag["request_cap"])):
         value = source.get(name, default)
-        if isinstance(value, str) and value.isdigit():
+        if isinstance(value, str) and value.isascii() and value.isdigit():   # isdigit() alone takes superscripts
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 10 ** 12:
             raise ApiError("bad_request", "Field '%s' must be a non-negative integer." % name)
@@ -1330,7 +2084,10 @@ def _usage_tasks(ctx, tasks, credit, segs, start, end, fresh, now=None):
             seg_fresh = bool(fresh and seg.end > horizon)
             tasks[("usage", i)] = (lambda a=seg.start, b=seg.end, f=seg_fresh: antigravity_usage(ctx, a, b, fresh=f))
     else:
-        tasks["usage"] = lambda: antigravity_usage(ctx, start, end, fresh=fresh)
+        # Cached reads round `end` to the minute so cache keys stay stable; fresh enforcement runs must see entries
+        # written during the current minute (for example the usage event that just reached a cap).
+        query_end = max(end, (now or utcnow()).astimezone(dt.timezone.utc)) if fresh else end
+        tasks["usage"] = lambda: antigravity_usage(ctx, start, query_end, fresh=fresh)
 
 
 def _segment_usages(res, segs):
@@ -1356,12 +2113,20 @@ def _segment_usages(res, segs):
     return every, week, month, parts
 
 
-def _credit_ledgers(ag, emails, exceptions, segs, parts, pricing):
-    """{email: (ledger, budget, known, partial, week_cost)} for every person in `emails`."""
+def _credit_ledgers(ag, emails, exceptions, segs, parts, pricing, tiers=None, terms=None):
+    """{email: (ledger, budget, known, partial, week_cost)} for every person in `emails`. tiers ({person: (tier,
+    monthly credit)}, see license_credits) sets each person's credit by license tier; terms, when a dict, receives
+    {person: {"creditMonth", "creditSource", "tier"}}."""
     prefixes = credit_prefixes(ag)
+    tiers = tiers or {}
     out = {}
     for email in emails:
-        credit_month, budget = credit_terms(ag, exceptions.get(email))
+        tier, tier_credit = tiers.get(email) or (None, None)
+        exc = exceptions.get(email)
+        credit_month, budget = credit_terms(ag, exc, tier_credit)
+        if terms is not None:
+            terms[email] = {"creditMonth": round(credit_month, 6), "creditSource": credit_source_of(exc, tier),
+                            "tier": tier}
         costs, known, partial, week_cost = [], True, False, 0.0
         for seg, part in zip(segs, parts):
             rec = part.users.get(email)
@@ -1397,15 +2162,134 @@ def _credit_ratio(led, budget):
     return 0.0
 
 
+# ---------------------------------------------------------------------------
+# Enforcement backends: deny policy state and organization unit budgets
+# ---------------------------------------------------------------------------
+
+def _deny_people(dstate):
+    """{person key: deny principal} of the people our deny policy lists at any readable attachment point (a person
+    listed at only some points is suspended too; the next run lists them everywhere)."""
+    out = {}
+    for principal in sorted(dstate.principals | dstate.partial):
+        key = identity.person_key(principal)
+        if key and identity.is_person_key(key):
+            out[key] = principal
+    return out
+
+
+def _deny_state(email, deny_people, exceptions):
+    """(state, reason) of one person with the iam_deny backend: listed in the deny policy = suspended (blocked when a
+    block rule applies), otherwise enforceable (a deny policy also stops group, inherited and workforce access)."""
+    if email in deny_people:
+        return (BLOCKED if (exceptions.get(email) or {}).get("type") == "block" else CAPPED), None
+    return EA, None
+
+
+def _deny_warnings(ctx, dstate):
+    errors = sorted({st.error for st in dstate.attachments if st.error is not None})
+    if errors:
+        failed = sum(1 for st in dstate.attachments if st.error is not None)
+        ctx.warn(enforcers.SOURCE, "partial_data", "The deny policy could not be read at %d of %d attachment points "
+                                                   "(%s)." % (failed, len(dstate.attachments), ", ".join(errors)))
+    if len(dstate.attachments) > enforcers.QUOTA_WARN_POINTS:
+        ctx.warn(enforcers.SOURCE, "quota", "%d deny policy attachment points: every run reads each of them, and the "
+                                            "IAM policy API allows %d policy reads and %d writes per minute per project "
+                                            "by default. Choose the folders or organization of the workspace scope as "
+                                            "the deny policy attachment, or ask for a higher quota."
+                 % (len(dstate.attachments), enforcers.POLICY_API_QUOTA_PER_MINUTE,
+                    enforcers.POLICY_API_QUOTA_PER_MINUTE))
+
+
+def _unit_budgets(ctx, credit, ledgers, month_usage, pricing, people):
+    """Organization unit budgets of the running month (services/budgets.py). Returns ({person: {"suspend": [unit ids],
+    "review": [unit ids], "paid": bool}}, BudgetStatus or None) for the people whose usage is attributed to a unit,
+    or a unit above it, whose budget is used up; attribution through a project label counts for the BudgetStatus only,
+    never for these decisions. With credit caps the facts come from the same month ledgers as enforcement (fresh);
+    with period caps from the chargeback report of the month (kept for 5 minutes). Never raises: a failure is a
+    warning, and then no unit budget applies."""
+    from . import budgets, chargeback, org_model   # budgets imports chargeback, which imports this module
+    try:
+        tree = budgets.load(ctx)
+        if not tree.units and not tree.projects:
+            return {}, None
+        org = org_model.load(ctx)
+        cb = ctx.settings.get("chargeback") or {}
+        if credit:
+            mode = cb.get("allocation_mode") or "credit_share"
+            prefixes = credit_prefixes(ctx.settings["governance"]["antigravity"])
+            facts = []
+            for email in people:
+                item = ledgers.get(email)
+                rec = month_usage.users.get(email) if month_usage is not None else None
+                if item is None or not rec:
+                    continue
+                led, _budget, known, _partial, _week = item
+                row = {"email": email, "cost": led.cost_month if known else None,
+                       "chargeable": led.paid_month if known else None,
+                       "byProject": project_split(rec, pricing, prefixes, led.free_month, "gemini", known)}
+                facts.extend(chargeback.usage_facts(row, mode))
+            label_key = cb.get("project_unit_label") or ""
+            labels = chargeback._project_labels(ctx) if label_key else {}   # pylint: disable=protected-access
+            for fact in facts:
+                fact["unit"], fact["via"] = org.unit_for(fact["person"], fact["project"],
+                                                         labels.get(fact["project"]) or {}, label_key)
+        else:
+            facts, currency = budgets._facts(ctx, chargeback.current_month(ctx))  # pylint: disable=protected-access
+            if currency != "USD":
+                ctx.warn(budgets.SOURCE, "currency_mismatch", "Budgets are in USD, so they are not measured against "
+                                                              "a chargeback report in %s." % currency)
+                return {}, None
+        status = budgets.evaluate(tree, org, facts)
+        # Project labels are set by project owners, not administrators, so spend attributed through a label counts for
+        # the status (report and notify alerts) but never decides a suspension or a review: a label must not be able
+        # to spend another unit's budget away and get its members suspended.
+        decided = [fact for fact in facts if fact.get("via") != "label"]
+        decide = status if len(decided) == len(facts) else budgets.evaluate(tree, org, decided)
+    except ApiError as err:
+        LOG.warning("unit budgets unavailable: %s", err.code)
+        ctx.warn(budgets.SOURCE, "status_unavailable", "The budget status is unavailable: %s" % err.message)
+        return {}, None
+    except GcpError as err:
+        ctx.warn_error(budgets.SOURCE, err, "The chargeback figures of the budget status")
+        return {}, None
+    except Exception:  # pylint: disable=broad-except
+        LOG.exception("unit budgets failed")
+        ctx.warn(budgets.SOURCE, "internal_error", "The budget status could not be computed.")
+        return {}, None
+    units, paid = {}, set()
+    for fact in decided:
+        units.setdefault(fact.get("person"), set()).add(fact.get("unit"))
+        if (fact.get("chargeable") or 0) > 0:
+            paid.add(fact.get("person"))
+    flags = {}
+    for person, unit_ids in units.items():
+        ordered = sorted(u for u in unit_ids if isinstance(u, str))
+        suspend = decide.suspend_nodes_for(ordered)
+        review = decide.review_nodes_for(ordered)
+        if suspend or review:
+            flags[person] = {"suspend": [n["unitId"] for n in suspend], "review": [n["unitId"] for n in review],
+                             "paid": person in paid}
+    return flags, status
+
+
 def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, mode=None, now=None, fresh=False):
     """Computes the full governance status. Returns (public_payload, internal).
 
     cost_cap and mode default to the saved policy. mode "auto" plans blocks for over-cap users;
-    "manual" puts them in the review queue. With credit caps (cap_model credit_budget, the default) the usage of the
+    "manual" puts them in the review queue. With fixed caps per period (cap_model period, the default) a person who
+    reaches a cap stays over it until the configured period ends (for example the 1st of the next month), so the
+    suspension lasts until then. With credit caps (cap_model credit_budget) the usage of the
     month so far is read per weekly cycle and each person's weekly free credit and monthly paid budget decide
-    (services/credit_ledger.py); token and request caps then apply per weekly cycle. fresh skips cached log reads."""
+    (services/credit_ledger.py); token and request caps then apply per weekly cycle. fresh skips cached log reads.
+
+    The enforcement backend decides where the state comes from: the primary project's allow policy (iam_allow_swap),
+    the managed deny policy (iam_deny: listed = suspended), or nowhere (notify_only: everyone keeps access and over-cap
+    people go to the review queue, which is announced). Used-up organization unit budgets (services/budgets.py) act
+    like the organization budget for the people whose usage is attributed to the unit: they are suspended (action
+    suspend) or reviewed (action review) while nothing is free for them."""
     cfg = gov_config(ctx.settings)
     ag = ctx.settings["governance"]["antigravity"]
+    backend = enforcement_backend(ctx.settings)
     credit = credit_mode(ag)
     cost_cap = float(ag.get("cost_cap") or 0) if cost_cap is None else float(cost_cap)
     if credit:
@@ -1425,11 +2309,12 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
     gstate = governance_state(ctx)
     exceptions = active_exceptions(gstate, now)
     suspensions = {s["email"]: s for s in gstate.get("suspensions") or []}
-    tasks = {
-        "policy": lambda: get_policy(ctx),
-        "markers": lambda: marker_status(ctx, cfg),
-        "perms": lambda: permission_status(ctx),
-    }
+    tasks = {}
+    if backend == "iam_allow_swap":
+        tasks.update({"policy": lambda: get_policy(ctx), "markers": lambda: marker_status(ctx, cfg),
+                      "perms": lambda: permission_status(ctx)})
+    elif backend == "iam_deny":
+        tasks["deny"] = lambda: enforcers.read_state(ctx)
     _usage_tasks(ctx, tasks, credit, segs, start, end, fresh, now)
     if (ag.get("pricing_source") or "auto") == "auto":
         tasks["prices"] = lambda: price_table(ctx, "USD" if credit else (ag.get("currency") or ""))
@@ -1444,90 +2329,164 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
         else:
             ctx.warn_error("pricing:auto", value, "Automatic token prices")
     pricing = pricing_from(ag, table, currency="USD" if credit else None)
-    parts = []
+    parts, month_usage = [], None
     if credit:
-        usage, window_usage, _month_usage, parts = _segment_usages(res, segs)
+        usage, window_usage, month_usage, parts = _segment_usages(res, segs)
     else:
         ok, usage = res["usage"]
         if not ok:
             usage = Usage("unavailable")
         window_usage = usage
-    ok, policy = res["policy"]
-    readable = ok
-    if not ok:
-        ctx.warn_error("api:cloudresourcemanager.projects.getIamPolicy", policy, "The project IAM policy")
-        policy = None
+    policy, dstate, deny_people = None, None, {}
+    if backend == "iam_allow_swap":
+        ok, policy = res["policy"]
+        readable = ok
+        if not ok:
+            ctx.warn_error("api:cloudresourcemanager.projects.getIamPolicy", policy, "The project IAM policy")
+            policy = None
+        else:
+            ctx.add_source("api:cloudresourcemanager.projects.getIamPolicy")
+    elif backend == "iam_deny":
+        ok, dstate = res["deny"]
+        if not ok or not isinstance(dstate, enforcers.DenyState):
+            dstate = enforcers.DenyState([])
+        readable = dstate.readable
+        deny_people = _deny_people(dstate) if readable else {}
+        _deny_warnings(ctx, dstate)
     else:
-        ctx.add_source("api:cloudresourcemanager.projects.getIamPolicy")
-    idx = PolicyIndex(policy, readable=readable)
-    ancestor = make_ancestor_check(ctx, cfg)
-    population = {e for e in usage.users if is_human(e)}
-    population |= idx.direct_users({cfg.access_role, *cfg.markers})
+        readable = True   # notify_only reads no IAM policy
+    idx = PolicyIndex(policy, readable=readable and backend == "iam_allow_swap")
+    ancestor = make_ancestor_check(ctx, cfg) if backend == "iam_allow_swap" else None
+    population = {e for e in usage.users if identity.is_person_key(e)}
+    if backend == "iam_allow_swap":
+        population |= idx.direct_users({*cfg.access_roles, *cfg.markers})
+    else:
+        # Everyone the deny policy lists, everyone a block rule denies (with or without usage) and every approved
+        # suspension is in scope, so that the plan covers the whole policy.
+        population |= set(deny_people)
+        population |= {e for e, x in exceptions.items() if x.get("type") == "block" and identity.is_person_key(e)}
+        population |= {e for e, s in suspensions.items() if s.get("approved") and identity.is_person_key(e)}
     ledgers, org_paid, org_budget, org_used_up = {}, None, None, False
+    terms = {}
     if credit and usage.ok:
-        ledgers = _credit_ledgers(ag, sorted(population), exceptions, segs, parts, pricing)
+        ledgers = _credit_ledgers(ag, sorted(population), exceptions, segs, parts, pricing,
+                                  tiers=license_credits(ctx), terms=terms)
         org_paid = round(sum(item[0].paid_month for item in ledgers.values()), 6)
         org_budget = usd_budget(ag.get("org_paid_budget_month"))
         org_used_up = org_budget is not None and org_paid >= org_budget - credit_ledger.EPS
+    unit_flags, budget_status = {}, None
+    if usage.ok:
+        unit_flags, budget_status = _unit_budgets(ctx, credit, ledgers, month_usage, pricing, sorted(population))
+    # Unit budgets are calendar months (chargeback months start on the 1st), whatever day the cap period starts.
+    month_reset = None if credit else timeutil.governance_next_reset("monthly", "calendar", now=now,
+                                                                     **dict(anchor, day=1))
+    prefixes = credit_prefixes(ag)
     users = []
     for email in sorted(population):
         u = window_usage.users.get(email) or _EMPTY_USAGE
         has_usage = (usage.users.get(email) or _EMPTY_USAGE)["requests"] > 0
-        state, reason = classify(email, has_usage, idx, cfg, ancestor)
+        if backend == "iam_allow_swap":
+            state, reason = classify(email, has_usage, idx, cfg, ancestor)
+        elif backend == "iam_deny":
+            state, reason = _deny_state(email, deny_people, exceptions) if readable else \
+                (UNKNOWN, "DENY_POLICY_UNREADABLE")
+        else:
+            state, reason = EA, None
         exc = exceptions.get(email)
         tcap, rcap, ccap = effective_caps(exc, token_cap, request_cap, cost_cap)
         if credit:
             ccap = 0.0
-        susp = suspensions.get(email) if state == CAPPED else None
+        record = suspensions.get(email)
+        susp = record if state == CAPPED else None
+        flags = unit_flags.get(email) or {}
+        unit_suspend, unit_review = bool(flags.get("suspend")), bool(flags.get("review"))
+        force_review = False
         row = {"uid": uid_for(email), "email": email, "state": state, "reason": reason, "plannedAction": "none",
                "exception": public_exception(exc), "suspension": public_suspension(susp),
                "caps": {"tokenCap": tcap, "requestCap": rcap, "costCap": ccap}}
+        if backend == "iam_deny" and record and not suspension_ended(record, now):
+            if state == EA and record.get("approved"):
+                row["approved"] = True   # an administrator approved this suspension (review queue)
+            elif state == CAPPED and record.get("hold"):
+                row["hold"] = True       # stays suspended until the recorded end
         reset_at = next_reset
         if usage.ok and credit:
             led, budget, known, partial, week_cost = ledgers[email]
             row["caps"]["paidBudget"] = budget
             row["caps"]["creditWeek"] = round(led.credit_week, 6)
             over_t, ratio_t, reasons_t = cap_check(u["tokens"], u["requests"], tcap, rcap)
-            limited = budget is not None or org_used_up
+            # A used-up unit budget acts like the organization budget: suspended while nothing is free right now.
+            org_or_unit = org_used_up or unit_suspend or unit_review
+            limited = budget is not None or org_or_unit
             if known:
-                over_l, reasons_l = credit_ledger.decide(led, budget, org_used_up)
+                over_l, reasons_l = credit_ledger.decide(led, budget, org_or_unit)
+                if over_l and (unit_suspend or unit_review) and \
+                        not credit_ledger.budget_used_up(led, budget, org_used_up):
+                    reasons_l = ["unit_budget"] + [r for r in reasons_l if r != "budget"]
+                    force_review = not unit_suspend and not over_t
             else:
                 over_l, reasons_l = (None if limited else False), []
             over = True if over_t else over_l
             reasons = reasons_l + reasons_t
             times = []
             if over_l:
-                times.append(credit_ledger.restore_time(led, budget, now, next_reset, month_end, org_used_up))
+                times.append(credit_ledger.restore_time(led, budget, now, next_reset, month_end, org_or_unit))
             if over_t:
                 times.append(next_reset)
             reset_at = None if (not times or None in times) else max(times)
             row.update({"requests": u["requests"], "tokens": u["tokens"], "promptTokens": u["promptTokens"],
                         "candidateTokens": u["candidateTokens"], "clients": sorted(u["clients"]),
-                        "models": sorted(u["models"]), "estimatedCost": round(week_cost, 6) if known else None,
+                        "models": sorted(u["models"]), "byModel": _model_rows(u, pricing, prefixes),
+                        "estimatedCost": round(week_cost, 6) if known else None,
                         "costPartial": partial, "overCap": over,
                         "capUsage": round(max(ratio_t or 0.0, _credit_ratio(led, budget)), 4) if known else ratio_t,
-                        "overCapReasons": reasons, "credit": _credit_row(led, budget, known, org_used_up)})
+                        "overCapReasons": reasons,
+                        "credit": dict(_credit_row(led, budget, known, org_or_unit), **(terms.get(email) or {}))})
         elif usage.ok:
             cost, partial = estimate_cost(u, pricing)
             over, cap_usage, reasons = cap_check(u["tokens"], u["requests"], tcap, rcap, cost, ccap)
+            if (unit_suspend or unit_review) and flags.get("paid"):
+                # Period caps: a used-up unit budget stops paid usage (this month's chargeable amount) until the month
+                # starts again.
+                force_review = not unit_suspend and not over
+                over, reasons = True, list(reasons or []) + ["unit_budget"]
+                if month_reset is not None:
+                    reset_at = max(reset_at, month_reset) if reset_at is not None else month_reset
             row.update({"requests": u["requests"], "tokens": u["tokens"], "promptTokens": u["promptTokens"],
                         "candidateTokens": u["candidateTokens"], "clients": sorted(u["clients"]),
-                        "models": sorted(u["models"]), "estimatedCost": cost, "costPartial": partial,
+                        "models": sorted(u["models"]), "byModel": _model_rows(u, pricing, prefixes),
+                        "estimatedCost": cost, "costPartial": partial,
                         "overCap": over, "capUsage": cap_usage, "overCapReasons": reasons})
         else:
             # Usage telemetry is unavailable: usage-derived fields are unknown (null), never zero.
             row.update({"requests": None, "tokens": None, "promptTokens": None, "candidateTokens": None,
-                        "clients": None, "models": None, "estimatedCost": None, "costPartial": False,
-                        "overCap": None, "capUsage": None, "overCapReasons": None})
+                        "clients": None, "models": None, "byModel": None, "estimatedCost": None,
+                        "costPartial": False, "overCap": None, "capUsage": None, "overCapReasons": None})
             if credit:
                 row["credit"] = None
+        if force_review:
+            row["forceReview"] = True
+        if flags:
+            row["unitBudget"] = {"suspend": list(flags.get("suspend") or []), "review": list(flags.get("review") or [])}
         # resetAt: when this person's caps lift without further usage (the suspension end of a block planned now).
         row["resetAt"] = iso(reset_at) if (row["overCap"] and reset_at is not None) else None
         row["restoreAt"] = restore_at(state, susp, row["overCap"], reset_at, now)
         users.append(row)
-    non_user = idx.non_user_members(cfg.access_role) if readable else []
+    non_user = list(dict.fromkeys(m for r in cfg.access_roles for m in idx.non_user_members(r))) \
+        if (readable and backend == "iam_allow_swap") else []
+    deny_info = None
+    if backend == "iam_deny":
+        deny_info = {"attachments": [st.attachment for st in dstate.attachments],
+                     "unreadable": sum(1 for st in dstate.attachments if st.error is not None),
+                     "foreign": sum(1 for st in dstate.attachments if st.error is None and st.foreign),
+                     "current": len(deny_people),
+                     "surgeMin": to_int(ag.get("surge_guard_min")) or 10,
+                     "surgeRatio": float(ag.get("surge_guard_ratio") or 0.5)}
+    # Notify only changes nobody's access, so over-cap people go to the review queue, which is announced once per
+    # period, whatever the enforcement mode.
     gates, plan, budget_n = evaluate(users, readable, usage.ok, usage.records, non_user, cfg, cfg.access_role,
-                                     mode=mode, now=now, telemetry_truncated=usage.truncated)
+                                     mode="manual" if backend == "notify_only" else mode, now=now,
+                                     telemetry_truncated=usage.truncated, backend=backend, deny=deny_info)
     planned = {}
     for action in ("block", "review", "restore", "disallow", "manual"):
         for uid in plan[action]:
@@ -1561,15 +2520,22 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
         row = by_email.get(email)
         if row is not None:
             state = row["state"]
-        else:
+        elif backend == "iam_allow_swap":
             state = classify(email, False, idx, cfg)[0] if readable else UNKNOWN
+        elif backend == "iam_deny":
+            state = _deny_state(email, deny_people, exceptions)[0] if readable else UNKNOWN
+        else:
+            state = EA
         exception_rows.append(dict(public_exception(item), uid=uid_for(email), email=email, state=state))
-    ok, markers = res["markers"]
-    if not ok:
-        markers = [{"role": cfg.cap_marker_id, "exists": None}, {"role": cfg.admin_marker_id, "exists": None}]
-    ok, perms = res["perms"]
-    if not ok:
-        perms = {p: None for p in REQUIRED_PERMISSIONS}
+    if backend == "iam_allow_swap":
+        ok, markers = res["markers"]
+        if not ok:
+            markers = [{"role": cfg.cap_marker_id, "exists": None}, {"role": cfg.admin_marker_id, "exists": None}]
+        ok, perms = res["perms"]
+        if not ok:
+            perms = {p: None for p in REQUIRED_PERMISSIONS}
+    else:
+        markers, perms = [], {}   # marker roles and allow-policy permissions are only used by the allow swap
     usage_source = usage.source if usage.ok else "unavailable"
     paid_limits = credit and (usd_budget(ag.get("paid_budget_month")) is not None or org_budget is not None
                               or any((e.get("paidBudget") is not None) for e in exceptions.values()))
@@ -1585,14 +2551,22 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
     costs = [u["estimatedCost"] for u in users if u.get("estimatedCost") is not None]
     used_models = {m for rec in usage.users.values() for m in (rec.get("byModel") or {})} if usage.ok else set()
     store = _state_store(ctx)
+    # When a decision "for this period" ends (an allow rule's expiry): the next reset, or the end of a rolling window.
+    period_end = next_reset if credit else timeutil.governance_period_end(period, window, now=now, **anchor)
     policy_out = {"tokenCap": token_cap, "requestCap": request_cap, "costCap": cost_cap,
                   "currency": pricing.currency, "currencySetting": ag.get("currency") or "",
                   "period": period, "window": window,
+                  # The saved fixed-cap period: credit caps always evaluate their weekly cycle (period above), so the
+                  # policy editor starts fixed caps from these and never carries the weekly credit reset over.
+                  "periodSetting": ag.get("period") or "monthly", "windowSetting": ag.get("window") or "calendar",
                   "windowStart": iso(start), "windowEnd": iso(end), "nextReset": iso(next_reset),
+                  "periodEnd": iso(period_end),
                   "resetTimezone": tz, "resetWeekday": anchor["weekday"], "resetTime": anchor["at"],
+                  "resetDay": anchor["day"], "cycleDays": anchor["cycle_days"],
+                  "cycleStart": timeutil.cycle_start_date(anchor["cycle_start"]).isoformat(),
                   "creditPerUserMonth": float(ag.get("credit_per_user_month") or 0),
                   "changeBudget": budget_n, "enforcementMode": mode,
-                  "capModel": CREDIT_MODEL if credit else "period",
+                  "capModel": CREDIT_MODEL if credit else PERIOD_MODEL,
                   "pricing": pricing.public(used_models)}
     totals = {"requests": sum(u["requests"] or 0 for u in users) if usage.ok else None,
               "tokens": sum(u["tokens"] or 0 for u in users) if usage.ok else None,
@@ -1624,17 +2598,26 @@ def compute_status(ctx, period, window, token_cap, request_cap, cost_cap=None, m
         "reviewQueue": review_queue if (readable and usage.ok) else None,
         "exceptions": exception_rows,
         "totals": totals,
-        "enforcement": {"mode": mode, "lastRun": gstate.get("lastRun"),
+        "enforcement": {"mode": mode, "backend": backend, "lastRun": gstate.get("lastRun"),
                         "scheduler": scheduler_status(ctx, gstate, now),
+                        "realtime": realtime_status(ctx, gstate, now),
                         "durable": store.governance_durable() if store is not None else None},
         "prerequisites": {"markerRoles": markers, "permissions": perms,
                           "telemetryDetected": telemetry_seen(ctx, usage, now),
                           "inferenceLog": urllib.parse.unquote(ag.get("inference_log") or "")},
     }
+    policy_out["enforcementBackend"] = backend
+    if backend == "iam_deny":
+        payload["enforcement"]["deny"] = {
+            "readable": readable, "policyId": enforcers.policy_id(ctx.settings),
+            "attachments": len(dstate.attachments), "people": len(deny_people), "partial": len(dstate.partial),
+            "limit": enforcers.DENY_PRINCIPAL_LIMIT}
+    if budget_status is not None:
+        payload["budgets"] = budget_status.public()
     internal = {"policy": policy, "readable": readable, "cfg": cfg, "usage": usage, "idx": idx, "now": now,
-                "nextReset": next_reset, "tz": tz, "mode": mode, "state": gstate,
-                "periodEnd": next_reset if credit else
-                timeutil.governance_period_end(period, window, now=now, **anchor)}
+                "nextReset": next_reset, "tz": tz, "mode": mode, "state": gstate, "backend": backend,
+                "deny": dstate, "denyPeople": deny_people, "budgetStatus": budget_status,
+                "periodEnd": period_end, "pricing": pricing, "credit": credit, "orgUsedUp": org_used_up}
     return payload, internal
 
 
@@ -1646,9 +2629,64 @@ def current_period_end(ctx, now=None):
     return timeutil.governance_period_end(ag["period"], ag["window"], now=now, **period_anchor(ctx.settings))
 
 
+# ---------------------------------------------------------------------------
+# GET /api/v1/governance/antigravity/period-preview
+# ---------------------------------------------------------------------------
+
+def _preview_int(params, name, default, lo, hi):
+    raw = params.get(name)
+    if raw in (None, ""):
+        return default
+    # ASCII digits only: isdigit() alone also takes superscripts, which int() rejects (a 500 instead of a 400).
+    if not (isinstance(raw, str) and raw.isascii() and raw.isdigit() and lo <= int(raw) <= hi):
+        raise ApiError("bad_request", "Parameter '%s' must be a whole number from %d to %d." % (name, lo, hi))
+    return int(raw)
+
+
+def period_preview(ctx):
+    """The current cap period and the next two for period settings that are being edited (not saved yet), computed by
+    the same rules as enforcement: {"periods": [{"start", "end"}], "rolling", "timezone", "now"}. Parameters default to
+    the saved policy: period, window, tz, weekday (0 = Monday), at (HH:MM), day (1-31), cycleDays (1-92) and
+    cycleStart (YYYY-MM-DD)."""
+    params = ctx.params
+    ag = ctx.settings["governance"]["antigravity"]
+    saved = period_anchor(ctx.settings)
+    period = params.get("period") or ag["period"]
+    window = params.get("window") or ag["window"]
+    if period not in timeutil.PERIODS:
+        raise ApiError("bad_request", "Parameter 'period' must be one of daily, weekly, monthly, custom, all.")
+    if window not in timeutil.WINDOWS:
+        raise ApiError("bad_request", "Parameter 'window' must be 'calendar' or 'rolling'.")
+    tz = params.get("tz") or saved["tz"]
+    if not timeutil.valid_timezone(tz):
+        raise ApiError("bad_request", "Parameter 'tz' must be an IANA time zone.")
+    at = params.get("at") or saved["at"]
+    if not config.TIME_OF_DAY_RE.match(str(at)):
+        raise ApiError("bad_request", "Parameter 'at' must be a time as HH:MM.")
+    cycle_start = params.get("cycleStart")
+    if cycle_start in (None, ""):
+        cycle_start = saved["cycle_start"]
+    else:
+        try:
+            cycle_start = config.VALIDATORS["governance.antigravity.cycle_start"](cycle_start)
+        except config.Invalid:
+            raise ApiError("bad_request", "Parameter 'cycleStart' must be a date as YYYY-MM-DD.")
+    anchor = {"tz": tz, "at": at, "cycle_start": cycle_start,
+              "weekday": _preview_int(params, "weekday", int(saved["weekday"] or 0), 0, 6),
+              "day": _preview_int(params, "day", saved["day"], 1, 31),
+              "cycle_days": _preview_int(params, "cycleDays", saved["cycle_days"], 1, timeutil.CYCLE_DAYS_MAX)}
+    now = utcnow()
+    periods = timeutil.governance_periods(period, window, now=now, count=3, **anchor)
+    return {"period": period, "window": window, "timezone": tz, "now": iso(now),
+            "rolling": period == "all" or window == "rolling",
+            "cycleStart": timeutil.cycle_start_date(cycle_start).isoformat(),
+            "periods": [{"start": iso(start), "end": iso(end)} for start, end in periods]}
+
+
 def status(ctx):
     period, window, token_cap, request_cap = policy_params(ctx, ctx.params)
     payload, _ = compute_status(ctx, period, window, token_cap, request_cap)
+    payload.setdefault("prerequisites", {})["metadataLogging"] = dev_tools_logging_status(ctx)
     return payload
 
 
@@ -1662,15 +2700,18 @@ def default_status(ctx):
 # GET /api/v1/governance/antigravity/billing-report?month=YYYY-MM
 # ---------------------------------------------------------------------------
 
+REPORT_MONTH_RE = re.compile(r"([0-9]{4})-([0-9]{1,2})")   # fullmatch; ASCII digits only (isdigit takes superscripts)
+
+
 def _report_month(ctx, tz, now):
     """(start, end) aware local datetimes of the requested calendar month (default: the current month)."""
     raw = str(ctx.params.get("month") or "").strip()
     local_now = now.astimezone(tz)
     if raw:
-        parts = raw.split("-")
-        if len(parts) != 2 or not (parts[0].isdigit() and parts[1].isdigit()) or len(parts[0]) != 4:
+        found = REPORT_MONTH_RE.fullmatch(raw)
+        if not found:
             raise ApiError("bad_request", "Parameter 'month' must be YYYY-MM.")
-        year, month = int(parts[0]), int(parts[1])
+        year, month = int(found.group(1)), int(found.group(2))
         if not 1 <= month <= 12 or year < 2020:
             raise ApiError("bad_request", "Parameter 'month' must be YYYY-MM.")
         start = local_now.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -1706,6 +2747,34 @@ def _model_rows(rec, pricing, prefixes):
         mcost, mpartial = estimate_cost({"tokens": agg.get("tokens"), "byModel": {model: agg}}, pricing)
         out.append(dict(_token_columns(agg), model=model, cost=mcost, costPartial=mpartial,
                         credit=credit_ledger.credit_eligible(model, prefixes)))
+    total_cost = sum(m["cost"] for m in out if m["cost"] is not None)
+    for m in out:
+        m["costShare"] = round(m["cost"] / total_cost, 4) if (m["cost"] is not None and total_cost > 0) else None
+    out.sort(key=lambda m: (-(m["cost"] if m["cost"] is not None else -1.0),
+                            -to_int(m.get("tokens")), -to_int(m.get("requests")), m.get("model") or ""))
+    return out
+
+
+def project_split(rec, pricing, prefixes, credit, weight="gemini", known=True):
+    """[{project, requests, tokens, cost, credit, chargeable}] of one person's usage. Google bills per project, so
+    each project gets the list cost of the usage in it; the credit the person used (`credit`) is spread over the
+    projects in proportion to their credit-eligible (Gemini) cost, or to their whole cost with weight="cost" (period
+    caps), and the rest is charged back. Amounts are None when the person's cost is unknown."""
+    items = []
+    for project, prec in sorted((rec.get("byProject") or {}).items()):
+        gemini, other, _ok, _partial = split_cost(prec, pricing, prefixes)
+        items.append((project, prec, gemini, other))
+    basis = sum((g if weight == "gemini" else g + o) for _, _, g, o in items)
+    out = []
+    for project, prec, gemini, other in items:
+        row = {"project": project, "requests": to_int(prec.get("requests")), "tokens": to_int(prec.get("tokens")),
+               "cost": None, "credit": None, "chargeable": None}
+        if known:
+            cost = gemini + other
+            part = gemini if weight == "gemini" else cost
+            share = (credit or 0.0) * part / basis if basis > 0 else 0.0
+            row.update(cost=round(cost, 6), credit=round(share, 6), chargeable=round(cost - share, 6))
+        out.append(row)
     return out
 
 
@@ -1736,8 +2805,10 @@ def _credit_billing_report(ctx):
     pricing = pricing_from(ag, table, currency="USD")
     every, _week, month_usage, parts = _segment_usages(res, segs)
     exceptions = active_exceptions(governance_state(ctx), now)
-    people = sorted(e for e in month_usage.users if is_human(e))
-    ledgers = _credit_ledgers(ag, people, exceptions, segs, parts, pricing) if every.ok else {}
+    people = sorted(e for e in month_usage.users if identity.is_person_key(e))
+    terms = {}
+    ledgers = (_credit_ledgers(ag, people, exceptions, segs, parts, pricing, tiers=license_credits(ctx), terms=terms)
+               if every.ok else {})
     prefixes = credit_prefixes(ag)
     rows, models_used = [], set()
     keys = ("requests", "tokens", "promptTokens", "cachedTokens", "outputTokens")
@@ -1749,13 +2820,17 @@ def _credit_billing_report(ctx):
         by_model = _model_rows(rec, pricing, prefixes)
         models_used.update(m["model"] for m in by_model)
         money = (lambda v: round(v, 6) if known else None)
+        term = terms.get(email) or {}
         row = dict(_token_columns(rec), uid=uid_for(email), email=email, cost=money(led.cost_month),
                    costPartial=partial, gemini=money(led.gemini_month), other=money(led.other_month),
                    credit=money(led.free_month), chargeable=money(led.paid_month), budget=budget,
                    creditWeek=round(led.credit_week, 6), byModel=by_model, last=iso(rec.get("last")),
                    weeks=[{"start": iso(w["start"]), "end": iso(w["end"]), "gemini": round(w["gemini"], 6),
                            "other": round(w["other"], 6), "free": round(w["free"], 6), "paid": round(w["paid"], 6)}
-                          for w in led.weeks] if known else None)
+                          for w in led.weeks] if known else None,
+                   creditMonth=term.get("creditMonth"), creditSource=term.get("creditSource"),
+                   tier=term.get("tier"),
+                   byProject=project_split(rec, pricing, prefixes, led.free_month, "gemini", known))
         rows.append(row)
         for k in keys:
             totals[k] += row[k]
@@ -1814,6 +2889,8 @@ def billing_report(ctx):
         usage = Usage("unavailable")
     credit_usd = float(ag.get("credit_per_user_month") or 0)
     credit = _to_currency_from_usd(credit_usd, pricing.currency, table) if credit_usd > 0 else 0.0
+    tiers = license_credits(ctx) if usage.ok else {}
+    prefixes = credit_prefixes(ag)
     rows, models_used = [], set()
     totals = {"requests": 0, "tokens": 0, "promptTokens": 0, "cachedTokens": 0, "outputTokens": 0,
               "cost": 0.0, "chargeable": 0.0}
@@ -1832,14 +2909,22 @@ def billing_report(ctx):
                              "cost": mcost, "costPartial": mpartial})
         prompt = to_int(rec.get("promptTokens"))
         output = max(to_int(rec.get("tokens")) - prompt, to_int(rec.get("candidateTokens")), 0)
+        tier, tier_usd = tiers.get(email) or (None, None)
+        user_credit = credit
+        if tier_usd is not None:
+            user_credit = _to_currency_from_usd(tier_usd, pricing.currency, table) if tier_usd > 0 else 0.0
         chargeable = None
-        if cost is not None and credit is not None:
-            chargeable = round(max(0.0, cost - credit), 6)
+        if cost is not None and user_credit is not None:
+            chargeable = round(max(0.0, cost - user_credit), 6)
+        known = chargeable is not None
         row = {"uid": uid_for(email), "email": email, "requests": to_int(rec.get("requests")),
                "tokens": to_int(rec.get("tokens")), "promptTokens": prompt,
                "cachedTokens": to_int(rec.get("cachedTokens")), "outputTokens": output,
-               "cost": cost, "costPartial": partial, "credit": credit, "chargeable": chargeable,
-               "byModel": by_model, "last": iso(rec.get("last"))}
+               "cost": cost, "costPartial": partial, "credit": user_credit, "chargeable": chargeable,
+               "byModel": by_model, "last": iso(rec.get("last")),
+               "creditSource": "license" if tier else "fixed", "tier": tier,
+               "byProject": project_split(rec, pricing, prefixes, (cost - chargeable) if known else 0.0, "cost",
+                                          known)}
         rows.append(row)
         for key in ("requests", "tokens", "promptTokens", "cachedTokens", "outputTokens"):
             totals[key] += row[key]
@@ -1882,13 +2967,20 @@ def write_audit(ctx, action, payload):
         return False
 
 
+def webhook_text(text):
+    """The text with < and > replaced by the look-alikes ‹ and ›. Slack and Google Chat read <...> as mentions and
+    links (<!channel>, <users/all>, <https://...|text>), and the texts carry names from the HR CSV (unit paths): those
+    must stay plain text. Entities (&lt;) would be shown as written by Google Chat, so & and the rest stay as they are."""
+    return str(text).replace("<", "\u2039").replace(">", "\u203a")
+
+
 def send_webhook(ctx, text):
     url = ctx.settings["governance"]["antigravity"].get("webhook_url") or ""
     if not url or not config.valid_webhook(url):
         return False
     try:
         import requests
-        resp = requests.post(url, json={"text": text}, timeout=5, allow_redirects=False)
+        resp = requests.post(url, json={"text": webhook_text(text)}, timeout=5, allow_redirects=False)
         return 200 <= resp.status_code < 300
     except Exception as err:  # pylint: disable=broad-except
         LOG.warning("webhook delivery failed: %s", type(err).__name__)
@@ -1912,7 +3004,8 @@ def _marker_for(action, cfg):
 def _result_of(mode, plan, changes):
     if mode == "dry_run":
         return "dry_run"
-    if plan["aborted"] or (plan.get("deferredBlocks") and not any(c["status"] == "applied" for c in changes)):
+    if plan["aborted"] or ((plan.get("deferredBlocks") or plan.get("capacityHeld"))
+                           and not any(c["status"] == "applied" for c in changes)):
         return "aborted"
     if changes and all(c["status"] == "applied" for c in changes):
         return "success"
@@ -1928,13 +3021,16 @@ def _applied(changes, action):
 
 
 STATUS_PATH = "/api/v1/governance/antigravity/status"
+ENFORCEMENT_STATUS_PATH = "/api/v1/governance/antigravity/enforcement"
 
 
 def _refresh_status_cache(ctx):
-    """Drops only the cached governance status (it carries the last-run summary)."""
+    """Drops only the cached governance status (it carries the last-run summary) and the cached enforcement status
+    (latest job execution and deny policy counts)."""
     cache = getattr(ctx.app, "cache", None)
     if cache is not None and hasattr(cache, "clear_matching"):
-        cache.clear_matching(lambda k: isinstance(k, tuple) and len(k) > 1 and k[0] == "route" and k[1] == STATUS_PATH)
+        cache.clear_matching(lambda k: isinstance(k, tuple) and len(k) > 1 and k[0] == "route"
+                             and k[1] in (STATUS_PATH, ENFORCEMENT_STATUS_PATH))
 
 
 def _suspension_record(ctx, user, until, trigger, now):
@@ -1958,9 +3054,11 @@ def _record_changes(state, ctx, users_by_email, applied, internal, trigger):
     state["suspensions"] = list(susp.values())
 
 
-def _save_cycle(ctx, payload, internal, changes, result, eval_mode, trigger, suspension_trigger):
+def _save_cycle(ctx, payload, internal, changes, result, eval_mode, trigger, suspension_trigger, deny_record=None):
     """Persists suspension records, prunes stale records and expired exception rules, and records the
-    run. Returns the users that entered the review queue in this period and were not announced yet."""
+    run. Returns the users that entered the review queue in this period and were not announced yet. deny_record
+    (iam_deny) is where the managed deny policy is attached now ({"attachments", "policyId", "at"}), kept so that a
+    later change of the attachment points removes the policy from the old ones."""
     users = payload["users"] or []
     by_email = {u["email"]: u for u in users}
     applied = [(c["email"], c["action"]) for c in changes if c["status"] == "applied"]
@@ -1977,9 +3075,21 @@ def _save_cycle(ctx, payload, internal, changes, result, eval_mode, trigger, sus
     def apply(state):
         _record_changes(state, ctx, by_email, applied, internal, suspension_trigger)
         if internal["readable"]:
-            # Records of users who are no longer suspended (restored outside this cycle) are dropped.
+            # Records of users who are no longer suspended (restored outside this cycle) are dropped. An approved
+            # suspension that is not applied yet (deferred, held or failed) stays until its period ends.
             state["suspensions"] = [s for s in state["suspensions"] if s["email"] in blocked_now
-                                    or (by_email.get(s["email"]) or {}).get("state") == CAPPED]
+                                    or (by_email.get(s["email"]) or {}).get("state") == CAPPED
+                                    or (s.get("approved") and not suspension_ended(s, now))]
+        # A person still over the cap stays suspended until the current period ends. A record made under an earlier,
+        # shorter period (for example weekly before the switch to monthly caps) is extended to that end, so that the
+        # record, the restore time shown and a restore without telemetry all follow the current policy.
+        for record in state["suspensions"]:
+            user = by_email.get(record["email"]) or {}
+            if user.get("state") != CAPPED or user.get("overCap") is not True:
+                continue
+            lift, until = parse_rfc3339(user.get("resetAt")), parse_rfc3339(record.get("until"))
+            if lift is not None and until is not None and lift > until:
+                record["until"] = iso(lift)
         state["exceptions"] = [e for e in state.get("exceptions") or [] if not _expired(e, now)]
         notified = {k: v for k, v in (state.get("notified") or {}).items() if v == window_start and k in review}
         del fresh[:]
@@ -1991,6 +3101,8 @@ def _save_cycle(ctx, payload, internal, changes, result, eval_mode, trigger, sus
         state["lastRun"] = run
         if trigger == "scheduler":
             state["lastScheduledRun"] = run
+        if deny_record is not None:
+            state["deny"] = deny_record
     try:
         mutate_state(ctx, apply)
     except ApiError as err:
@@ -2000,8 +3112,12 @@ def _save_cycle(ctx, payload, internal, changes, result, eval_mode, trigger, sus
 
 def _run(ctx, mode, period, window, token_cap, request_cap, eval_mode, trigger, suspension_trigger, kind):
     """One enforcement cycle (mode dry_run | apply). eval_mode "auto" blocks over-cap users;
-    "manual" leaves them in the review queue while restores and exception rules still apply."""
+    "manual" leaves them in the review queue while restores and exception rules still apply. The enforcement backend
+    decides how the plan is applied: one atomic update of the primary project's allow policy (iam_allow_swap), the
+    managed deny policy at every attachment point (iam_deny), or not at all (notify_only)."""
     previous = (governance_state(ctx).get("lastRun") or {}).get("result")
+    deny_record = None
+    backend = enforcement_backend(ctx.settings)
     with _WRITE_LOCK:
         for attempt in (1, 2):
             payload, internal = compute_status(ctx, period, window, token_cap, request_cap, mode=eval_mode,
@@ -2009,22 +3125,47 @@ def _run(ctx, mode, period, window, token_cap, request_cap, eval_mode, trigger, 
             plan, gates = payload["plan"], payload["gates"]
             users = {u["uid"]: u for u in payload["users"] or []}
             cfg = internal["cfg"]
+            backend = internal.get("backend") or backend
             changes = [{"uid": uid, "email": users[uid]["email"],
                         "action": "disallow" if (users[uid].get("exception") or {}).get("type") == "block" else "block",
                         "status": "skipped",
                         "message": "Deferred to the next run: more suspensions than the change budget allows in one "
                                    "run."}
                        for uid in plan.get("deferredBlocks") or []]
+            changes += [{"uid": uid, "email": users[uid]["email"],
+                         "action": "disallow" if (users[uid].get("exception") or {}).get("type") == "block" else "block",
+                         "status": "skipped",
+                         "message": "Deferred to the next run: the deny policy would go over the limit of %d people."
+                                    % enforcers.DENY_PRINCIPAL_LIMIT}
+                        for uid in plan.get("capacityHeld") or []]
             executed = False
-            if mode == "dry_run" or plan["aborted"]:
-                message = "Dry run: no IAM change was made." if mode == "dry_run" else \
-                    "Aborted by safety gates: no IAM change was made."
+            if mode == "dry_run" or plan["aborted"] or backend == "notify_only":
+                if mode == "dry_run":
+                    message = "Dry run: no IAM change was made."
+                elif plan["aborted"]:
+                    message = "Aborted by safety gates: no IAM change was made."
+                else:
+                    message = NOTIFY_ONLY_MESSAGE
                 for action in CYCLE_ACTIONS:
                     for uid in plan[action]:
                         changes.append({"uid": uid, "email": users[uid]["email"], "action": action,
                                         "status": "skipped", "message": message})
+                if mode == "apply" and backend != "iam_deny":
+                    deny_record = _cleanup_leftover_deny(ctx, internal, trigger)
                 break
+            if backend == "iam_deny":
+                executed, applied, deny_record = _apply_deny(ctx, internal, users, plan)
+                changes.extend(applied)
+                break
+            deny_record = _cleanup_leftover_deny(ctx, internal, trigger) if mode == "apply" else None
             markers = {m["role"]: m["exists"] for m in payload["prerequisites"]["markerRoles"]}
+            needed = {_marker_for(action, cfg) for action in CYCLE_ACTIONS if plan[action]} - {None}
+            if trigger == "admin":
+                unavailable = prepare_markers(ctx, cfg, needed, markers)
+            else:
+                # A scheduled run never creates roles: nobody is there to see it. The next administrator's action does.
+                unavailable = {m: "Marker role %s does not exist. Run setup first." % m
+                               for m in needed if markers.get(m) is not True}
             mutations = []
             for action in CYCLE_ACTIONS:
                 for uid in plan[action]:
@@ -2036,9 +3177,9 @@ def _run(ctx, mode, period, window, token_cap, request_cap, eval_mode, trigger, 
                                         "message": "The user state changed; no IAM change was made."})
                         continue
                     marker = _marker_for(action, cfg)
-                    if marker and markers.get(marker) is not True:
+                    if marker in unavailable:
                         changes.append({"uid": uid, "email": user["email"], "action": action, "status": "failed",
-                                        "message": "Marker role %s does not exist. Run setup first." % marker})
+                                        "message": unavailable[marker]})
                         continue
                     mutations.append((uid, user["email"], action))
             if not mutations:
@@ -2063,7 +3204,8 @@ def _run(ctx, mode, period, window, token_cap, request_cap, eval_mode, trigger, 
         result = _result_of(mode, plan, changes)
         new_review = []
         if mode == "apply":
-            new_review = _save_cycle(ctx, payload, internal, changes, result, eval_mode, trigger, suspension_trigger)
+            new_review = _save_cycle(ctx, payload, internal, changes, result, eval_mode, trigger, suspension_trigger,
+                                     deny_record=deny_record)
         audit_action = ("cap_dry_run" if mode == "dry_run" else "cap_apply") if kind == "cap" else \
             ("enforce_dry_run" if mode == "dry_run" else "enforce")
         audit_logged = write_audit(ctx, audit_action, {
@@ -2071,7 +3213,7 @@ def _run(ctx, mode, period, window, token_cap, request_cap, eval_mode, trigger, 
             "changes": [{"email": c["email"], "action": c["action"], "status": c["status"]} for c in changes],
             "period": period, "window": window, "tokenCap": token_cap, "requestCap": request_cap,
             "costCap": payload["policy"]["costCap"], "enforcementMode": eval_mode, "trigger": trigger,
-            "review": len(plan["review"])})
+            "review": len(plan["review"]), "backend": backend})
         webhook = False
         counts = (_applied(changes, "block"), _applied(changes, "restore"), _applied(changes, "disallow"))
         if mode == "apply" and kind == "cap" and (executed or plan["aborted"] or plan["manual"]):
@@ -2080,27 +3222,169 @@ def _run(ctx, mode, period, window, token_cap, request_cap, eval_mode, trigger, 
                                                         len(plan["manual"]),
                                                         "; aborted by safety gates" if plan["aborted"] else ""))
         elif mode == "apply" and kind == "enforce" and (executed or new_review or
-                                                        ((plan["aborted"] or plan.get("deferredBlocks"))
+                                                        ((plan["aborted"] or plan.get("deferredBlocks")
+                                                          or plan.get("capacityHeld"))
                                                          and previous != "aborted")):
             parts = ["AI Control Plane %s enforcement (%s): %d suspended until the period reset, %d restored, "
                      "%d blocked by exception rules" % (eval_mode, result, counts[0], counts[1], counts[2])]
             if plan.get("deferredBlocks"):
                 parts.append("%d suspension(s) deferred to the next run by the change budget (%d per run)"
                              % (len(plan["deferredBlocks"]), plan.get("changeBudget") or 0))
+            if plan.get("capacityHeld"):
+                parts.append("%d suspension(s) held because the deny policy would go over the limit of %d people"
+                             % (len(plan["capacityHeld"]), enforcers.DENY_PRINCIPAL_LIMIT))
             if new_review:
                 parts.append("%d user(s) over the cap await review: %s" % (len(new_review), ", ".join(new_review[:10])))
             if plan["aborted"]:
                 parts.append("aborted by safety gates")
+            if backend == "notify_only":
+                parts.append("notify only, so no access was changed")
             webhook = send_webhook(ctx, "; ".join(parts) + ".")
+        alerts = _budget_alerts(ctx, internal) if mode == "apply" else 0
     if executed:
         ctx.app.invalidate_governance()
     elif mode == "apply":
         _refresh_status_cache(ctx)
     out = {"mode": mode, "executed": executed, "plan": plan, "gates": gates, "changes": changes,
-           "auditLogged": audit_logged, "webhookSent": webhook}
+           "auditLogged": audit_logged, "webhookSent": webhook, "backend": backend, "budgetAlerts": alerts}
     if kind == "enforce":
         out.update({"enforcementMode": eval_mode, "trigger": trigger, "newReview": new_review})
     return out
+
+
+def _deny_principal_for(person, listed, logged):
+    """The deny principal of `person`: for a workforce identity the principal as logged (usage.principals), because
+    the subject is case-sensitive and the person key is lower-cased; else the entry the policy lists now, else the one
+    built from the key (Google accounts: e-mail addresses are case-insensitive)."""
+    raw = (logged or {}).get(person)
+    found = identity.deny_principal(raw) if raw else None
+    return found or listed.get(person) or identity.deny_principal(person)
+
+
+def _apply_deny(ctx, internal, users, plan):
+    """Applies the plan to the managed deny policy (iam_deny): everyone listed now stays listed unless restored, and
+    suspensions and block rules add people. enforcers.apply checks the invariants first and writes nothing when one
+    fails. Attachment points that are no longer configured (the scope or deny_attachment changed) get the policy
+    removed. Returns (executed, changes, deny record for the governance state)."""
+    dstate = internal["deny"]
+    listed = dict(internal.get("denyPeople") or {})
+    logged = getattr(internal.get("usage"), "principals", None) or {}
+    now = internal["now"]
+    changes, wanted, adds, removes = [], [], {}, set()
+    for action in CYCLE_ACTIONS:
+        for uid in plan[action]:
+            user = users[uid]
+            email = user["email"]
+            try:
+                check_transition(user["state"], action)
+            except ValueError:
+                changes.append({"uid": uid, "email": email, "action": action, "status": "skipped",
+                                "message": "The user state changed; no IAM change was made."})
+                continue
+            # A restore removes the entry as listed; a suspension writes the principal as logged.
+            principal = (listed.get(email) or identity.deny_principal(email)) if action == "restore" else \
+                _deny_principal_for(email, listed, logged)
+            if not principal:
+                changes.append({"uid": uid, "email": email, "action": action, "status": "failed",
+                                "message": "This identity cannot be written to a deny policy."})
+                continue
+            if action == "restore":
+                removes.add(email)
+            else:
+                adds[email] = principal
+            wanted.append((uid, email, action, principal))
+    # People who stay listed keep their entry, rewritten in the logged case when it was written lower-cased before.
+    desired = {_deny_principal_for(key, listed, logged) for key in listed if key not in removes} | set(adds.values())
+    points = [st.attachment for st in dstate.attachments]
+    record = {"attachments": list(points), "policyId": enforcers.policy_id(ctx.settings), "at": iso(now)}
+    result = enforcers.apply(ctx, dstate, desired)
+    executed = bool(result["applied"])
+    if result["violations"]:
+        message = "The deny policy change was refused: %s" % result["violations"][0]
+        for uid, email, action, _principal in wanted:
+            changes.append({"uid": uid, "email": email, "action": action, "status": "failed", "message": message})
+    else:
+        failed = [item for item in result["items"] if item.get("status") == "failed"]
+        pending = any(item.get("status") == "pending" for item in result["items"])
+        missing = set(result.get("missing") or ())
+        for uid, email, action, principal in wanted:
+            side = "remove" if action == "restore" else "add"
+            bad = [item for item in failed if principal in (item.get(side) or ())]
+            if principal in missing and side == "add":
+                changes.append({"uid": uid, "email": email, "action": action, "status": "failed",
+                                "message": MISSING_ACCOUNT_MESSAGE})
+            elif bad:
+                where = ", ".join(_attachment_label(item["attachment"]) for item in bad[:3])
+                changes.append({"uid": uid, "email": email, "action": action, "status": "failed",
+                                "message": "The deny policy update failed at %s (%s)." % (where, bad[0].get("error")
+                                                                                         or "error")})
+            else:
+                changes.append({"uid": uid, "email": email, "action": action, "status": "applied",
+                                "message": "Deny policy updated; it takes effect within a few minutes." if pending
+                                else "Deny policy updated."})
+        if missing:
+            ctx.warn(enforcers.SOURCE, "invalid", "%d account(s) could not be listed in the deny policy because IAM "
+                                                  "does not find them (deleted, or not a Google account)."
+                     % len(missing))
+    stale = [ap for ap in ((internal.get("state") or {}).get("deny") or {}).get("attachments") or []
+             if isinstance(ap, str) and ap not in points]
+    if stale:
+        cleanup = enforcers.apply(ctx, enforcers.read_state(ctx, attachments=stale), frozenset(), attachments=stale)
+        executed = executed or bool(cleanup["applied"])
+        kept = [item["attachment"] for item in cleanup["items"] if item.get("status") == "failed"]
+        record["attachments"] += kept
+        LOG.info("deny policy removed from %d attachment point(s) that are no longer configured; %d kept",
+                 len(stale) - len(kept), len(kept))
+    return executed, changes, record
+
+
+LEFTOVER_RETRY = dt.timedelta(hours=1)
+
+
+def _cleanup_leftover_deny(ctx, internal, trigger):
+    """With another backend than iam_deny: removes the managed deny policy left at the attachment points recorded while
+    iam_deny was in use, so nobody stays suspended by a method that is no longer used. Needs Deny Admin; tried by
+    administrator runs and at most hourly by scheduled runs. Returns the deny record to store, or None to keep it."""
+    record = (internal.get("state") or {}).get("deny") or {}
+    points = [ap for ap in record.get("attachments") or [] if isinstance(ap, str)]
+    if not points:
+        return None
+    now = internal["now"]
+    last = parse_rfc3339(record.get("cleanupAt"))
+    if trigger != "admin" and last is not None and now - last < LEFTOVER_RETRY:
+        return None
+    if record.get("policyId") and record.get("policyId") != enforcers.policy_id(ctx.settings):
+        return None   # written under another policy id: reported by the enforcement status, removed by hand
+    cleanup = enforcers.apply(ctx, enforcers.read_state(ctx, attachments=points), frozenset(), attachments=points)
+    kept = [item["attachment"] for item in cleanup["items"] if item.get("status") == "failed"]
+    LOG.info("leftover deny policies: %d removed, %d kept", len(points) - len(kept), len(kept))
+    return dict(record, attachments=kept, cleanupAt=iso(now))
+
+
+def _budget_alerts(ctx, internal):
+    """Announces the budget thresholds (organization units and projects) crossed for the first time this month to the
+    webhook. Returns the number of thresholds announced."""
+    status = internal.get("budgetStatus")
+    if status is None:
+        return 0
+    from . import budgets, chargeback, org_model   # budgets imports chargeback, which imports this module
+    month = chargeback.current_month(ctx)
+    try:
+        fresh = budgets.record_alerts(ctx, month, budgets.new_alerts(status, month, budgets.load_alerts(ctx)))
+        if not fresh:
+            return 0
+        org = org_model.load(ctx)
+    except (ApiError, ValueError) as err:
+        LOG.warning("budget alerts not sent: %s", getattr(err, "code", type(err).__name__))
+        return 0
+    lines = [budgets.alert_text(node, threshold, status, org) for node, threshold in fresh[:20]]
+    if len(fresh) > 20:
+        lines.append("%d more budget alert(s)." % (len(fresh) - 20))
+    send_webhook(ctx, "AI Control Plane budgets: " + " ".join(lines))
+    write_audit(ctx, "budget_alert", {"result": "success", "target": "%d thresholds" % len(fresh), "month": month,
+                                      "alerts": [{"budget": node["id"], "threshold": threshold}
+                                                 for node, threshold in fresh[:50]]})
+    return len(fresh)
 
 
 def cap(ctx):
@@ -2110,21 +3394,54 @@ def cap(ctx):
     if mode not in ("dry_run", "apply"):
         raise ApiError("bad_request", "Field 'mode' must be 'dry_run' or 'apply'.")
     period, window, token_cap, request_cap = policy_params(ctx, ctx.body)
+    if mode == "apply" and enforcement_backend(ctx.settings) == "iam_deny" and jobs.job_name(ctx.settings):
+        raise ApiError("bad_request", "The enforcement job applies the saved policy only. Save these caps in the "
+                                      "policy and select Run enforcement now, or run a dry run here.")
     return _run(ctx, mode, period, window, token_cap, request_cap, eval_mode="auto", trigger="admin",
                 suspension_trigger="bulk", kind="cap")
 
 
 def enforce(ctx):
     """Saved policy in the configured enforcement mode. Called by Cloud Scheduler (OIDC) or by an
-    administrator ("Run now")."""
+    administrator ("Run now"). With the iam_deny backend and an enforcement job, a run that applies starts the job
+    (its service account alone holds Deny Admin) and returns {"triggered": true, "job", "execution", "operation"}."""
     dry = ctx.body.get("dryRun", False)
     if not isinstance(dry, bool):
         raise ApiError("bad_request", "Field 'dryRun' must be true or false.")
-    ag = ctx.settings["governance"]["antigravity"]
     trigger = "scheduler" if ctx.identity.auth_mode == "scheduler" else "admin"
-    return _run(ctx, "dry_run" if dry else "apply", ag["period"], ag["window"], ag["token_cap"],
+    if not dry and enforcement_backend(ctx.settings) == "iam_deny" and jobs.job_name(ctx.settings):
+        return _start_job(ctx, trigger)
+    return enforce_cycle(ctx, trigger=trigger, dry_run=dry)
+
+
+def enforce_cycle(ctx, *, trigger="scheduler", dry_run=False):
+    """One enforcement cycle of the saved policy in the configured mode: the run behind the enforce endpoint, also
+    called by the enforcement job (controlplane/enforce_job.py). Returns the enforce endpoint's result."""
+    ag = ctx.settings["governance"]["antigravity"]
+    return _run(ctx, "dry_run" if dry_run else "apply", ag["period"], ag["window"], ag["token_cap"],
                 ag["request_cap"], eval_mode=ag.get("enforcement_mode") or "manual", trigger=trigger,
                 suspension_trigger="auto", kind="enforce")
+
+
+def _start_job(ctx, trigger):
+    """Starts one execution of the enforcement job (services/jobs.py) and records it in the audit log. An
+    administrator's run is recorded as such (note_run_request), so it never counts as a scheduled run."""
+    if trigger == "admin":
+        note_run_request(ctx, trigger)
+    try:
+        started = jobs.trigger(ctx)
+    except GcpError as err:
+        LOG.warning("enforcement job run refused kind=%s", err.kind)
+        write_audit(ctx, "enforce_job_run", {"result": "failed", "target": jobs.job_name(ctx.settings),
+                                             "trigger": trigger, "error": err.kind})
+        raise ApiError("upstream_error", "The enforcement job could not be started (%s). The dashboard service "
+                                         "account needs roles/run.jobsExecutor on the job." % err.kind)
+    audit_logged = write_audit(ctx, "enforce_job_run", {"result": "success", "target": started["job"],
+                                                        "trigger": trigger, "execution": started["execution"]})
+    _refresh_status_cache(ctx)
+    return {"triggered": True, "mode": "apply", "executed": False, "job": started["job"],
+            "execution": started["execution"], "operation": started["operation"], "trigger": trigger,
+            "backend": "iam_deny", "auditLogged": audit_logged}
 
 
 # ---------------------------------------------------------------------------
@@ -2163,6 +3480,110 @@ def _put_exception(state, item):
     state["exceptions"] = [e for e in state.get("exceptions") or [] if e["email"] != item["email"]] + [item]
 
 
+def _reconcile(ctx):
+    """Applies recorded administrator decisions with the iam_deny backend: the enforcement job runs them when one is
+    configured (its service account alone writes deny policies), else an enforcement run here. Returns {"via": "job"
+    or "run", "started": bool, "error": code or None, "execution", "changes": {person: change of the run}}."""
+    if jobs.job_name(ctx.settings):
+        note_run_request(ctx, "admin")
+        try:
+            started = jobs.trigger(ctx)
+        except GcpError as err:
+            LOG.warning("enforcement job run refused kind=%s", err.kind)
+            return {"via": "job", "started": False, "error": err.kind, "execution": None, "changes": {}}
+        return {"via": "job", "started": True, "error": None, "execution": started.get("execution"), "changes": {}}
+    out = enforce_cycle(ctx, trigger="admin")
+    return {"via": "run", "started": True, "error": None, "execution": None,
+            "changes": {c["email"]: c for c in out.get("changes") or [] if c.get("email")}}
+
+
+def _decision_result(user, action, rec, done):
+    """The result of one recorded decision after _reconcile: applied, queued (the job applies it, or the run deferred
+    it), skipped or failed."""
+    base = {"uid": user["uid"], "email": user["email"]}
+    if rec["via"] == "job":
+        if rec["started"]:
+            return dict(base, status="queued", message="Recorded. The enforcement job is applying it; IAM can take a few "
+                                                       "minutes to put it into effect.")
+        return dict(base, status="queued", message="Recorded. The enforcement job could not be started (%s); the next "
+                                                   "scheduled run applies it." % rec["error"])
+    change = rec["changes"].get(user["email"])
+    if change is None:
+        if action == "block":
+            return dict(base, status="skipped", message="The user is no longer over the cap, so nobody was suspended.")
+        return dict(base, status="applied", message=done)
+    if change["status"] == "applied":
+        return dict(base, status="applied", message=done)
+    return dict(base, status="queued" if change["status"] == "skipped" else "failed", message=change["message"])
+
+
+def _review_rules(ctx, backend, decision, uids, note):
+    """review() with the iam_deny and notify_only backends. A suspension is recorded as approved and an allow as a
+    rule for the rest of the period; with iam_deny an enforcement run (or the job) applies them. Notify only refuses
+    suspensions."""
+    ag = ctx.settings["governance"]["antigravity"]
+    payload, internal = compute_status(ctx, ag["period"], ag["window"], ag["token_cap"], ag["request_cap"],
+                                       mode="manual")
+    users = {u["uid"]: u for u in payload["users"] or []}
+    results, approve, allow = [], [], []
+    for uid in uids:
+        user = users.get(uid)
+        if user is None:
+            results.append({"uid": uid, "email": None, "status": "skipped", "message": "User not found."})
+            continue
+        skip = None
+        if decision == "suspend":
+            if backend == "notify_only":
+                skip = NOTIFY_ONLY_REFUSED
+            elif user["state"] != EA:
+                skip = "The user has no access that can be suspended."
+            elif user["overCap"] is not True:
+                skip = "The user is not over the cap."
+            elif (user["exception"] or {}).get("type") == "allow":
+                skip = "An allow exception applies to this user."
+            else:
+                approve.append(user)
+        elif user["state"] in (EA, CAPPED):
+            allow.append(user)
+        else:
+            skip = "The user cannot be allowed in its current state."
+        if skip:
+            results.append({"uid": uid, "email": user["email"], "status": "skipped", "message": skip})
+    if approve or allow:
+        def apply(state):
+            susp = {s["email"]: s for s in state.get("suspensions") or []}
+            for user in approve:
+                record = _suspension_record(ctx, user, internal["nextReset"], "review", internal["now"])
+                record["approved"] = True
+                susp[user["email"]] = record
+            for user in allow:
+                if (susp.get(user["email"]) or {}).get("approved"):
+                    susp.pop(user["email"], None)   # an allow cancels an approved suspension not applied yet
+                _put_exception(state, _exception_item(
+                    ctx, user["email"], "allow", internal["periodEnd"],
+                    note or "Allowed for the rest of the period by an administrator."))
+            state["suspensions"] = list(susp.values())
+        mutate_state(ctx, apply, required=True)
+    restores = [user for user in allow if user["state"] == CAPPED]
+    rec = _reconcile(ctx) if backend == "iam_deny" and (approve or restores) else None
+    for user in approve:
+        results.append(_decision_result(user, "block", rec, "Suspended until the period reset."))
+    for user in allow:
+        if user["state"] == CAPPED and rec is not None:
+            results.append(_decision_result(user, "restore", rec, "Restored for the rest of the period."))
+        else:
+            results.append({"uid": user["uid"], "email": user["email"], "status": "applied",
+                            "message": "Allowed for the rest of the period."})
+    done = [r for r in results if r["status"] in ("applied", "queued")]
+    audit_logged = write_audit(ctx, "review_%s" % decision, {
+        "result": "success" if len(done) == len(results) else ("partial" if done else "failed"),
+        "target": "%d users" % len(results), "backend": backend, "via": rec["via"] if rec else None,
+        "changes": [{"email": r["email"], "status": r["status"]} for r in results]})
+    if approve or allow:
+        ctx.app.invalidate_governance()
+    return {"decision": decision, "results": results, "auditLogged": audit_logged, "via": rec["via"] if rec else None}
+
+
 def review(ctx):
     """suspend: over-cap users with access are suspended until the period reset.
     allow: users are allowed for the rest of the period (suspended users are restored now)."""
@@ -2171,6 +3592,9 @@ def review(ctx):
         raise ApiError("bad_request", "Field 'decision' must be 'suspend' or 'allow'.")
     uids = _uids(ctx.body.get("uids"))
     note = _note(ctx.body.get("note"))
+    backend = enforcement_backend(ctx.settings)
+    if backend != "iam_allow_swap":
+        return _review_rules(ctx, backend, decision, uids, note)
     ag = ctx.settings["governance"]["antigravity"]
     executed = False
     with _WRITE_LOCK:
@@ -2180,6 +3604,7 @@ def review(ctx):
             users = {u["uid"]: u for u in payload["users"] or []}
             cfg = internal["cfg"]
             markers = {m["role"]: m["exists"] for m in payload["prerequisites"]["markerRoles"]}
+            cap_problem = False  # False: not checked yet. None: the cap marker can be assigned. Text: why it cannot.
             results, mutations, allow_only = [], [], []
             for uid in uids:
                 user = users.get(uid)
@@ -2194,12 +3619,13 @@ def review(ctx):
                         skip = "The user is not over the cap."
                     elif (user["exception"] or {}).get("type") == "allow":
                         skip = "An allow exception applies to this user."
-                    elif markers.get(cfg.cap_marker_id) is not True:
-                        results.append({"uid": uid, "email": user["email"], "status": "failed",
-                                        "message": "Marker role %s does not exist. Run setup first."
-                                        % cfg.cap_marker_id})
-                        continue
                     else:
+                        if cap_problem is False:
+                            cap_problem = prepare_markers(ctx, cfg, {cfg.cap_marker_id}, markers).get(cfg.cap_marker_id)
+                        if cap_problem:
+                            results.append({"uid": uid, "email": user["email"], "status": "failed",
+                                            "message": cap_problem})
+                            continue
                         mutations.append((uid, user["email"], "block"))
                 elif user["state"] == CAPPED:
                     mutations.append((uid, user["email"], "restore"))
@@ -2330,18 +3756,36 @@ def exception_save(ctx):
         if action is not None:
             state["suspensions"] = [s for s in state.get("suspensions") or [] if s["email"] != email]
     mutate_state(ctx, apply, required=True)
+    enforcement = None
+    if action is not None and enforcement_backend(ctx.settings) == "iam_deny":
+        # The rule is the decision; an enforcement run (or the job) writes the deny policy.
+        enforcement = _decision_result({"uid": uid_for(email), "email": email}, action, _reconcile(ctx),
+                                       "Deny policy updated.")
+    run = _apply_now(ctx) if (action is None and kind == "limit") else None
     audit_logged = write_audit(ctx, "exception_save", {
         "result": "success", "target": email, "type": kind, "scope": scope, "until": item["until"],
-        "caps": caps or None, "iamAction": action, "previousState": previous, "newState": new_state})
+        "caps": caps or None, "iamAction": action, "previousState": previous, "newState": new_state,
+        "enforcement": (enforcement or {}).get("status"), "run": (run or {}).get("via")})
     ctx.app.invalidate_governance()
     return {"exception": dict(public_exception(item), email=email, uid=uid_for(email), state=new_state),
             "change": {"action": action, "previousState": previous, "newState": new_state} if action else None,
-            "auditLogged": audit_logged}
+            "enforcement": enforcement, "run": run, "auditLogged": audit_logged}
+
+
+def _apply_now(ctx):
+    """A rule change that can suspend or restore someone (an individual cap saved, an allow rule or an individual cap
+    removed): in automatic mode an enforcement run applies it at once; manual mode leaves it to the review queue and
+    the next scheduled run. Returns request_enforcement's result, or None when nothing ran."""
+    ag = ctx.settings["governance"]["antigravity"]
+    if (ag.get("enforcement_mode") or "manual") != "auto":
+        return None
+    return request_enforcement(ctx, trigger="admin")
 
 
 def exception_delete(ctx):
     """Removes one user's exception rule. Removing a block rule restores access (unless
-    restoreAccess is false); other rules return the user to the default policy."""
+    restoreAccess is false); other rules return the user to the default policy. With the iam_deny backend a removed
+    block rule without restoreAccess keeps the person suspended until the current period ends."""
     email, _ = _target_email(ctx)
     if not email:
         raise ApiError("bad_request", "Field 'email' is required.")
@@ -2351,20 +3795,41 @@ def exception_delete(ctx):
     current = next((e for e in governance_state(ctx).get("exceptions") or [] if e["email"] == email), None)
     if current is None:
         raise ApiError("not_found", "No exception rule exists for this user.")
-    change = None
+    deny = enforcement_backend(ctx.settings) == "iam_deny"
+    change, record = None, None
+    now = utcnow()
     if current["type"] == "block" and restore_access:
         _, previous, new_state, action = _change_user(ctx, _decide_unblock, email=email)
         if action:
             change = {"action": action, "previousState": previous, "newState": new_state}
+            if deny:
+                # A suspension that ended now: the next run lifts the deny entry unless a cap applies again.
+                record = {"email": email, "since": iso(now), "until": iso(now), "trigger": "unblock",
+                          "by": ctx.identity.email, "reasons": []}
+    elif current["type"] == "block" and deny:
+        _, previous, _, _ = _change_user(ctx, lambda state: None, email=email)
+        if previous == BLOCKED:
+            record = {"email": email, "since": iso(now), "until": iso(current_period_end(ctx, now)), "trigger": "admin",
+                      "by": ctx.identity.email, "reasons": [], "hold": True}
 
     def apply(state):
         state["exceptions"] = [e for e in state.get("exceptions") or [] if e["email"] != email]
+        if record is not None:
+            state["suspensions"] = [s for s in state.get("suspensions") or [] if s["email"] != email] + [record]
     mutate_state(ctx, apply, required=True)
+    enforcement = None
+    if change is not None and deny:
+        enforcement = _decision_result({"uid": uid_for(email), "email": email}, "restore", _reconcile(ctx),
+                                       "Deny policy updated.")
+    run = _apply_now(ctx) if current["type"] in ("allow", "limit") else None
     audit_logged = write_audit(ctx, "exception_delete", {"result": "success", "target": email,
                                                          "type": current["type"],
-                                                         "iamAction": change["action"] if change else None})
+                                                         "iamAction": change["action"] if change else None,
+                                                         "enforcement": (enforcement or {}).get("status"),
+                                                         "run": (run or {}).get("via")})
     ctx.app.invalidate_governance()
-    return {"email": email, "removed": True, "change": change, "auditLogged": audit_logged}
+    return {"email": email, "removed": True, "change": change, "enforcement": enforcement, "run": run,
+            "auditLogged": audit_logged}
 
 
 # ---------------------------------------------------------------------------
@@ -2375,9 +3840,14 @@ def _resolve_uid(ctx, uid, policy_idx, cfg, usage):
     for email in usage.users:
         if uid_for(email) == uid:
             return email
-    for email in policy_idx.direct_users({cfg.access_role, *cfg.markers, *cfg.privileged_roles}):
+    direct_scope = {*cfg.replaceable_roles, *cfg.all_extra_access_roles, *cfg.markers, *cfg.privileged_roles}
+    for email in policy_idx.direct_users(direct_scope):
         if uid_for(email) == uid:
             return email
+    if getattr(ctx.app, "settings", None) is not None:
+        for email in ctx.app.settings.blocked_accounts():
+            if uid_for(email) == uid:
+                return email
     try:
         from .users import user_table
         rng = timeutil.parse_range({}, ctx.tz_name, ctx.ws["default_range_days"])
@@ -2390,10 +3860,65 @@ def _resolve_uid(ctx, uid, policy_idx, cfg, usage):
     return None
 
 
+def _unconditional_marker_conflict(idx, email, cfg):
+    """True when the user is in CONFLICTING_BINDINGS solely because unconditional replaceable access roles and marker
+    roles coexist (for example roles/discoveryengine.user alongside CustomAntigravityAdminBlocked). An explicit
+    administrator allow or disallow resolves this cleanly; automated runs never touch it."""
+    direct = idx.user_bindings(email)
+    roles = {role for role, _ in direct}
+    if roles & (set(cfg.privileged_roles) | set(cfg.all_extra_access_roles)):
+        return False
+    managed = set(cfg.replaceable_roles) | cfg.markers
+    if any(cond for role, cond in direct if role in managed):
+        return False
+    return bool(roles & set(cfg.replaceable_roles)) and bool(roles & cfg.markers)
+
+
+def _change_user_rules(ctx, backend, decide, uid=None, email=None):
+    """_change_user with the iam_deny and notify_only backends: the person's state comes from the deny policy (notify
+    only: enforceable) and nothing is written here; the caller records the rule and requests an enforcement run.
+    Returns (email, previous_state, new_state, action) like _change_user; with notify only the action is None."""
+    cfg = gov_config(ctx.settings)
+    listed = {}
+    if backend == "iam_deny":
+        dstate = enforcers.read_state(ctx)
+        if not dstate.readable:
+            raise ApiError("upstream_error", REMEDIATION["DENY_POLICY_UNREADABLE"])
+        listed = _deny_people(dstate)
+    gstate = governance_state(ctx)
+    target = email
+    if not target:
+        known = list(listed) + [e["email"] for e in gstate.get("exceptions") or []] + \
+            [s["email"] for s in gstate.get("suspensions") or []]
+        target = next((key for key in known if uid_for(key) == uid), None)
+    if not target:
+        ag = ctx.settings["governance"]["antigravity"]
+        start, end = timeutil.governance_window(ag["period"], ag["window"], **period_anchor(ctx.settings))
+        target = _resolve_uid(ctx, uid, PolicyIndex(None, readable=False), cfg, antigravity_usage(ctx, start, end))
+    if not target:
+        raise ApiError("not_found", "User not found.")
+    if backend == "notify_only":
+        return target, EA, EA, None
+    state, _ = _deny_state(target, listed, active_exceptions(gstate, utcnow()))
+    action = decide(state) if callable(decide) else decide
+    if action is None:
+        return target, state, state, None
+    try:
+        check_transition(state, action)
+    except ValueError:
+        if action == "allow":
+            raise ApiError("conflict", "The user already has access.")
+        raise ApiError("conflict", "The user does not currently have access that can be disallowed.")
+    return target, state, TARGET_STATE[action], action
+
+
 def _change_user(ctx, decide, uid=None, email=None):
     """One user's IAM transition as an etag-guarded read-modify-write (one retry on conflict).
     decide is an action or callable(state) -> action | None. Returns (email, previous_state,
     new_state, action); action None means that no change was needed."""
+    backend = enforcement_backend(ctx.settings)
+    if backend != "iam_allow_swap":
+        return _change_user_rules(ctx, backend, decide, uid=uid, email=email)
     cfg = gov_config(ctx.settings)
     ag = ctx.settings["governance"]["antigravity"]
     start, end = timeutil.governance_window(ag["period"], ag["window"], **period_anchor(ctx.settings))
@@ -2411,22 +3936,31 @@ def _change_user(ctx, decide, uid=None, email=None):
                 raise ApiError("not_found", "User not found.")
             has_usage = (usage.users.get(target) or {}).get("requests", 0) > 0
             state, reason = classify(target, has_usage, idx, cfg, make_ancestor_check(ctx, cfg))
-            action = decide(state) if callable(decide) else decide
+            repairable = (state == NE and reason == "CONFLICTING_BINDINGS" and
+                          _unconditional_marker_conflict(idx, target, cfg))
+            if callable(decide):
+                action = decide(EA if repairable else state)
+            else:
+                action = decide
             if action is None:
                 return target, state, state, None
-            if state in (NE, UNKNOWN):
+            if repairable and action in ("allow", "disallow"):
+                pass
+            elif state in (NE, UNKNOWN):
                 raise ApiError("conflict", REMEDIATION.get(reason) or "This user cannot be managed per user.")
-            try:
-                check_transition(state, action)
-            except ValueError:
-                if action == "allow":
-                    raise ApiError("conflict", "The user already has access.")
-                raise ApiError("conflict", "The user does not currently have access that can be disallowed.")
+            else:
+                try:
+                    check_transition(state, action)
+                except ValueError:
+                    if action == "allow":
+                        raise ApiError("conflict", "The user already has access.")
+                    raise ApiError("conflict", "The user does not currently have access that can be disallowed.")
             marker = _marker_for(action, cfg)
             if marker:
                 markers = {m["role"]: m["exists"] for m in marker_status(ctx, cfg)}
-                if markers.get(marker) is not True:
-                    raise ApiError("conflict", "Marker role %s does not exist. Run setup first." % marker)
+                unavailable = prepare_markers(ctx, cfg, {marker}, markers)
+                if marker in unavailable:
+                    raise ApiError("conflict", unavailable[marker])
             new_policy = apply_changes(policy, [(target, action)], cfg)
             try:
                 set_policy(ctx, new_policy)
@@ -2442,7 +3976,8 @@ def _change_user(ctx, decide, uid=None, email=None):
 def _sync_after_action(ctx, email, previous, action):
     """Keeps exception rules consistent with drawer actions: disallow is an always-block rule;
     allowing a suspended user allows them for the rest of the period (otherwise the next cycle
-    would suspend them again); allowing a blocked user removes the block rule."""
+    would suspend them again); allowing a blocked user removes the block rule. With the iam_deny backend, lifting a
+    block also records a suspension that ended now, so the next run removes the deny entry unless a cap applies."""
     ag = ctx.settings["governance"]["antigravity"]
     item = None
     if action == "disallow":
@@ -2450,9 +3985,16 @@ def _sync_after_action(ctx, email, previous, action):
     elif action == "allow" and previous == CAPPED:
         until = timeutil.governance_period_end(ag["period"], ag["window"], **period_anchor(ctx.settings))
         item = _exception_item(ctx, email, "allow", until, "Restored early by an administrator.")
+    ended = None
+    if action == "allow" and previous == BLOCKED and enforcement_backend(ctx.settings) == "iam_deny":
+        now = iso(utcnow())
+        ended = {"email": email, "since": now, "until": now, "trigger": "unblock", "by": ctx.identity.email,
+                 "reasons": []}
 
     def apply(state):
         state["suspensions"] = [s for s in state.get("suspensions") or [] if s["email"] != email]
+        if ended is not None:
+            state["suspensions"].append(ended)
         if item is not None:
             _put_exception(state, item)
         elif action == "allow":
@@ -2463,6 +4005,11 @@ def _sync_after_action(ctx, email, previous, action):
     except ApiError as err:
         LOG.warning("governance state was not saved after %s: %s", action, err.code)
         return None
+    if action == "allow" and getattr(ctx.app, "settings", None) is not None and ctx.app.settings.is_blocked(email):
+        try:
+            ctx.app.settings.mutate_auth(lambda auth: (auth.get("blocked") or {}).pop(email, None), ctx.identity.email)
+        except ApiError:
+            pass
     return public_exception(item)
 
 
@@ -2473,13 +4020,432 @@ def user_action(ctx):
         raise ApiError("bad_request", "Field 'action' must be 'allow' or 'disallow'.")
     if not isinstance(uid, str) or len(uid) != 16 or any(c not in "0123456789abcdef" for c in uid):
         raise ApiError("bad_request", "Field 'uid' is invalid.")
+    backend = enforcement_backend(ctx.settings)
+    if backend == "notify_only":
+        raise ApiError("conflict", NOTIFY_ONLY_REFUSED)
     email, state, new_state, _ = _change_user(ctx, action, uid=uid)
     exception = _sync_after_action(ctx, email, state, action)
+    enforcement = None
+    if backend == "iam_deny":
+        enforcement = _decision_result({"uid": uid, "email": email}, "disallow" if action == "disallow" else "restore",
+                                       _reconcile(ctx), "Deny policy updated.")
     audit_logged = write_audit(ctx, action, {"result": "success", "target": email, "previousState": state,
-                                             "newState": new_state, "uid": uid})
+                                             "newState": new_state, "uid": uid,
+                                             "enforcement": (enforcement or {}).get("status")})
     ctx.app.invalidate_governance()
     return {"uid": uid, "email": email, "action": action, "previousState": state, "newState": new_state,
-            "auditLogged": audit_logged, "exception": exception}
+            "auditLogged": audit_logged, "exception": exception, "enforcement": enforcement}
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/governance/antigravity/enforcement
+# ---------------------------------------------------------------------------
+
+def enforcement_status(ctx):
+    """How suspensions are applied: {"backend", "attachment", "policyId", "permissions", "geApp", "agentPlatform",
+    "surgeGuard", "job", "realtime", "deny", "leftover", "spendCaps"}. deny (iam_deny): {"readable", "people",
+    "partial", "attachments": [{attachment, exists, count, limit, ratio, error, foreign}]}; leftover: deny policies
+    recorded while iam_deny was in use and not removed yet, with another backend. Reads only; never raises for an
+    unavailable part."""
+    settings = ctx.settings
+    ag = settings["governance"]["antigravity"]
+    backend = enforcement_backend(settings)
+    gstate = governance_state(ctx)
+    out = {"backend": backend, "attachment": ag.get("deny_attachment") or "projects",
+           "policyId": enforcers.policy_id(settings), "permissions": enforcers.denied_permissions(settings),
+           "geApp": ag.get("deny_ge_app") is True, "agentPlatform": ag.get("deny_agent_platform") is True,
+           "surgeGuard": {"min": to_int(ag.get("surge_guard_min")) or 10,
+                          "ratio": float(ag.get("surge_guard_ratio") or 0.5)},
+           "job": jobs.status(ctx), "realtime": realtime_status(ctx, gstate),
+           "deny": None, "leftover": None, "spendCaps": None}
+    record = gstate.get("deny") or {}
+    recorded = [ap for ap in record.get("attachments") or [] if isinstance(ap, str)]
+    if backend == "iam_deny":
+        dstate = enforcers.read_state(ctx)
+        _deny_warnings(ctx, dstate)
+        out["deny"] = {"readable": dstate.readable, "people": len(_deny_people(dstate)),
+                       "partial": len(dstate.partial),
+                       "attachments": [{"attachment": st.attachment, "exists": st.exists, "count": len(st.principals),
+                                        "limit": enforcers.DENY_PRINCIPAL_LIMIT,
+                                        "ratio": round(len(st.principals) / float(enforcers.DENY_PRINCIPAL_LIMIT), 4),
+                                        "error": st.error, "foreign": st.foreign} for st in dstate.attachments]}
+        stale = [ap for ap in recorded if ap not in {st.attachment for st in dstate.attachments}]
+        if stale:
+            out["leftover"] = {"attachments": stale, "policyId": record.get("policyId") or out["policyId"]}
+    elif recorded:
+        out["leftover"] = {"attachments": recorded, "policyId": record.get("policyId") or out["policyId"]}
+        ctx.warn(enforcers.SOURCE, "partial_data",
+                 "Deny policies written while the enforcement method was the IAM deny policy remain at %d attachment "
+                 "point(s); the people listed there stay suspended until they are removed." % len(recorded))
+    if record.get("policyId") and record.get("policyId") != out["policyId"]:
+        ctx.warn(enforcers.SOURCE, "partial_data",
+                 "The deny policy id changed from %s to %s; remove the old policy with gcloud iam policies delete."
+                 % (record["policyId"], out["policyId"]))
+    try:
+        from . import spend_caps
+        out["spendCaps"] = spend_caps.get_spend_caps(ctx)
+    except (ApiError, GcpError) as err:
+        LOG.warning("spend caps status unavailable: %s", getattr(err, "code", None) or getattr(err, "kind", ""))
+    except Exception:  # pylint: disable=broad-except
+        LOG.exception("spend caps status failed")
+    markers = gstate.get("markers")
+    if backend != "iam_allow_swap" and markers:
+        out["markers"] = {key: markers.get(key) for key in ("at", "holders", "released", "waiting", "manual", "error")}
+        if markers.get("waiting"):
+            ctx.warn(MARKER_SOURCE, "partial_data",
+                     "%d people still hold a marker role of the allow-policy method; they get their access role back "
+                     "once the current enforcement method no longer needs the marker." % markers["waiting"])
+        if markers.get("error"):
+            ctx.warn(MARKER_SOURCE, "api_error",
+                     "Marker roles left by the allow-policy method could not be checked or released (%s). The dashboard "
+                     "service account needs the project IAM roles of the allow-policy method until they are released."
+                     % markers["error"])
+    return out
+
+
+SPEND_CAP_VIEWER_KEYS = ("enabled", "accountConfigured", "error")
+
+
+def enforcement_viewer_view(data):
+    """GET .../enforcement for viewers and guests (the route's viewer_view, applied after the cache, which does not
+    know the caller): spend caps keep only SPEND_CAP_VIEWER_KEYS. Their budget names carry the billing account id
+    (administrators only, like /api/v1/budgets/spend-caps), and caps and desired amounts are keyed by project id, which
+    guest redaction cannot reach because dict keys are never scrubbed."""
+    caps = data.get("spendCaps") if isinstance(data, dict) else None
+    if not isinstance(caps, dict):
+        return data
+    return dict(data, spendCaps=dict({key: caps.get(key) for key in SPEND_CAP_VIEWER_KEYS}, adminOnly=True))
+
+
+# ---------------------------------------------------------------------------
+# Marker roles left by iam_allow_swap after a switch to iam_deny or notify_only
+# ---------------------------------------------------------------------------
+
+MARKER_SOURCE = "api:cloudresourcemanager.projects.iamPolicy"
+
+
+def _marker_candidates(ctx, backend, idx, cfg, holders, now):
+    """(release, waiting, manual) of the marker holders. A person is released once the current backend no longer
+    needs the marker; see release_markers."""
+    gstate = governance_state(ctx)
+    exceptions = active_exceptions(gstate, now)
+    records = {s["email"]: s for s in gstate.get("suspensions") or []}
+    listed, rows, usage_ok = set(), {}, False
+    if backend == "iam_deny":
+        ag = ctx.settings["governance"]["antigravity"]
+        payload, internal = compute_status(ctx, ag["period"], ag["window"], ag["token_cap"], ag["request_cap"],
+                                           mode="manual")
+        dstate = internal.get("deny")
+        if dstate is not None and dstate.readable:
+            listed = {identity.person_key(p) for p in dstate.principals}   # listed at every attachment point
+        rows = {u["email"]: u for u in payload["users"] or []}
+        usage = internal.get("usage")
+        usage_ok = bool(usage is not None and usage.ok)
+    release, waiting, manual = [], [], []
+    for email in holders:
+        state, reason = classify(email, False, idx, cfg)
+        if state == NE and reason == "CONFLICTING_BINDINGS" and _unconditional_marker_conflict(idx, email, cfg):
+            release.append(email)   # also holds the access role: removing the marker changes no access
+            continue
+        if state not in (CAPPED, BLOCKED):
+            manual.append(email)
+            continue
+        kind = (exceptions.get(email) or {}).get("type")
+        record = records.get(email)
+        running = record is not None and not suspension_ended(record, now)
+        if kind == "allow":
+            free = True
+        elif kind == "block" or running:
+            free = False
+        elif backend == "iam_deny":
+            row = rows.get(email)
+            free = usage_ok and (row is None or row.get("overCap") is False)
+        else:
+            free = True
+        (release if free or email in listed else waiting).append(email)
+    return release, waiting, manual
+
+
+def _save_markers(ctx, summary):
+    try:
+        mutate_state(ctx, lambda state: state.__setitem__("markers", summary))
+    except ApiError as err:
+        LOG.warning("marker release summary was not saved: %s", err.code)
+    return summary
+
+
+def release_markers(ctx, trigger="scheduled"):
+    """With the iam_deny or notify_only backend: gives the access role back to the people who still hold a marker role
+    of iam_allow_swap in the primary project's allow policy (suspended or blocked before the backend was switched), so
+    that a switch never leaves anyone suspended for good. A person is released once the current backend no longer
+    needs the marker, the same way iam_allow_swap would have restored them:
+      iam_deny     the deny policy lists them at every attachment point, or nothing stops them now (an allow rule; or
+                   no block rule, no running suspension record and usage read without being over a cap);
+      notify_only  an allow rule, or no block rule and no running suspension record.
+    People who also hold the access role only lose the marker. One etag-guarded setIamPolicy for everyone released
+    (re-read and retried once on a conflict). Needs the project IAM write role of iam_allow_swap; without it nothing
+    changes. Never raises for an upstream failure. Run by the maintenance tick (services/maintenance.py); the summary
+    (counts only) is kept in the governance state for the enforcement status. Returns {"at", "holders", "released",
+    "waiting", "manual", "error"}, or None with iam_allow_swap."""
+    backend = enforcement_backend(ctx.settings)
+    if backend == "iam_allow_swap":
+        return None
+    cfg = gov_config(ctx.settings)
+    now = utcnow()
+    out = {"at": iso(now), "holders": 0, "released": 0, "waiting": 0, "manual": 0, "error": None}
+    released = []
+    with _WRITE_LOCK:
+        try:
+            policy = get_policy(ctx)
+        except GcpError as err:
+            LOG.warning("marker roles: getIamPolicy failed kind=%s", err.kind)
+            out["error"] = err.kind
+            return _save_markers(ctx, out)
+        idx = PolicyIndex(policy)
+        holders = sorted(idx.direct_users(cfg.markers))
+        out["holders"] = len(holders)
+        if not holders:
+            return _save_markers(ctx, out)
+        release, waiting, manual = _marker_candidates(ctx, backend, idx, cfg, holders, now)
+        out["manual"] = len(manual)
+        for attempt in (1, 2):
+            if not release:
+                break
+            try:
+                set_policy(ctx, apply_changes(policy, [(email, "allow") for email in release], cfg))
+                released = list(release)
+                break
+            except GcpError as err:
+                if err.kind == "conflict" and attempt == 1:
+                    try:
+                        policy = get_policy(ctx)
+                    except GcpError as again:
+                        out["error"] = again.kind
+                        break
+                    idx = PolicyIndex(policy)
+                    still = idx.direct_users(cfg.markers)
+                    release = [email for email in release if email in still]
+                    continue
+                LOG.warning("marker roles: setIamPolicy failed kind=%s", err.kind)
+                out["error"] = err.kind
+                break
+        out["released"] = len(released)
+        out["waiting"] = out["holders"] - out["released"] - out["manual"]
+    if released:
+        write_audit(ctx, "marker_release", {"result": "success", "target": "%d users" % len(released),
+                                            "backend": backend, "trigger": trigger, "users": released[:50]})
+        ctx.app.invalidate_governance()
+    LOG.info("marker roles: %d holders, %d released, %d waiting, %d manual", out["holders"], out["released"],
+             out["waiting"], out["manual"])
+    return _save_markers(ctx, out)
+
+
+# ---------------------------------------------------------------------------
+# Full AI service & dashboard access block / restore (Users & Access drawer)
+# ---------------------------------------------------------------------------
+
+AI_ROLE_PREFIXES = (
+    "roles/discoveryengine.",
+    "roles/businessaicode.",
+    "roles/cloudaicompanion.",
+    "roles/aiplatform.",
+    "roles/notebooklm.",
+    "roles/geminidataanalytics.",
+    "roles/modelarmor.",
+    "roles/mcp.",
+)
+AI_PERMISSION_PREFIXES = (
+    "discoveryengine.",
+    "businessaicode.",
+    "cloudaicompanion.",
+    "aiplatform.",
+    "notebooklm.",
+    "geminidataanalytics.",
+    "modelarmor.",
+)
+PROJECT_WIDE_PRIVILEGED_ROLES = ("roles/owner", "roles/editor", "roles/resourcemanager.projectIamAdmin")
+
+
+def _custom_role_is_ai(ctx, role_name, cache):
+    if role_name in cache:
+        return cache[role_name]
+    if not str(role_name or "").startswith("projects/"):
+        cache[role_name] = False
+        return False
+    try:
+        data = ctx.rest("GET", "%s/%s" % (IAM_V1, role_name))
+    except GcpError:
+        cache[role_name] = False
+        return False
+    perms = [str(p) for p in data.get("includedPermissions") or []]
+    if "resourcemanager.projects.setIamPolicy" in perms:
+        cache[role_name] = False
+        return False
+    cache[role_name] = any(p.startswith(AI_PERMISSION_PREFIXES) for p in perms)
+    return cache[role_name]
+
+
+def is_ai_service_role(ctx, role_name, cfg, custom_cache):
+    role = str(role_name or "")
+    if role in cfg.markers or role in cfg.replaceable_roles or role in cfg.all_extra_access_roles:
+        return True
+    if role.startswith(AI_ROLE_PREFIXES):
+        return True
+    return _custom_role_is_ai(ctx, role, custom_cache)
+
+
+def _normalize_restore_roles(removed_roles, cfg, fallback=None):
+    out = []
+    for role in removed_roles:
+        mapped = cfg.access_role if (role in cfg.markers or role in cfg.replaceable_roles) else role
+        if mapped not in out:
+            out.append(mapped)
+    if not out and fallback:
+        for role in fallback:
+            if role not in cfg.markers and role not in out:
+                out.append(role)
+    return out
+
+
+def set_user_ai_access(ctx, action, uid=None, email=None, note=""):
+    """Blocks or restores a user's entire AI access on this project (Gemini Enterprise, NotebookLM, Antigravity,
+    Agent Platform IAM roles) and revokes or restores their AI Control Plane dashboard sign-in."""
+    if action not in ("block_all", "unblock_all"):
+        raise ApiError("bad_request", "Field 'action' must be 'block_all' or 'unblock_all'.")
+    note = _note(note)
+    cfg = gov_config(ctx.settings)
+    ag = ctx.settings["governance"]["antigravity"]
+    start, end = timeutil.governance_window(ag["period"], ag["window"], **period_anchor(ctx.settings))
+    mgr = getattr(ctx.app, "settings", None)
+    existing_blocks = mgr.blocked_accounts() if mgr is not None else {}
+    custom_cache = {}
+    removed_roles = []
+    restored_roles = []
+    residual_warnings = []
+
+    with _WRITE_LOCK:
+        usage = antigravity_usage(ctx, start, end)
+        for attempt in (1, 2):
+            try:
+                policy = get_policy(ctx)
+            except GcpError as err:
+                LOG.warning("getIamPolicy failed kind=%s", err.kind)
+                raise ApiError("upstream_error", "The project IAM policy could not be read.")
+            idx = PolicyIndex(policy)
+            target = (email or "").strip().lower() or _resolve_uid(ctx, uid, idx, cfg, usage)
+            if not target or not config.EMAIL_RE.match(target) or not is_human(target):
+                raise ApiError("not_found", "User not found.")
+            if target == ctx.identity.email:
+                raise ApiError("conflict", "You cannot block your own account.")
+            if action == "block_all" and is_admin_email(target, ctx.settings["security"].get("admins")):
+                raise ApiError("conflict", "This user is a dashboard administrator. Remove administrator privileges "
+                                           "in Settings > Access control first.")
+            direct = idx.user_bindings(target)
+            direct_roles = {role for role, _ in direct}
+            if action == "block_all":
+                project_priv = sorted(direct_roles & set(PROJECT_WIDE_PRIVILEGED_ROLES))
+                if project_priv:
+                    raise ApiError("conflict",
+                                   "This user holds %s on the project, which grants full project control beyond AI "
+                                   "services. Remove that role in Google Cloud IAM first." % project_priv[0])
+                unconditional_ai = [role for role, cond in direct
+                                    if not cond and is_ai_service_role(ctx, role, cfg, custom_cache)]
+                prior = (existing_blocks.get(target) or {}).get("restoreRoles") or []
+                restore_roles = _normalize_restore_roles(unconditional_ai, cfg, fallback=prior)
+                removed_roles = list(unconditional_ai)
+                if unconditional_ai:
+                    new_policy = copy.deepcopy(policy)
+                    new_policy["bindings"] = [dict(b) for b in new_policy.get("bindings") or []]
+                    member = "user:%s" % target
+                    for role in unconditional_ai:
+                        _remove_member(new_policy, role, member)
+                    new_policy["version"] = 3
+                    try:
+                        set_policy(ctx, new_policy)
+                    except GcpError as err:
+                        if err.kind == "conflict" and attempt == 1:
+                            continue
+                        LOG.warning("setIamPolicy failed kind=%s", err.kind)
+                        raise ApiError("upstream_error", "The IAM policy update failed.")
+                cond_ai = [role for role, cond in direct if cond and is_ai_service_role(ctx, role, cfg, custom_cache)]
+                if cond_ai:
+                    residual_warnings.append("Conditional project IAM bindings remain (%s) and must be removed in "
+                                             "Google Cloud IAM." % ", ".join(sorted(set(cond_ai))))
+                group_ai = any(grants_via_non_user(idx.non_user_members(b.get("role")), target)
+                               for b in idx.bindings
+                               if is_ai_service_role(ctx, b.get("role"), cfg, custom_cache))
+                if group_ai:
+                    residual_warnings.append("A Google Group or domain IAM binding on an AI role still grants access.")
+                anc = make_ancestor_check(ctx, cfg, extra_prefixes=AI_ROLE_PREFIXES)(target)
+                if anc is True:
+                    residual_warnings.append("An inherited folder or organization IAM binding still grants access.")
+                break
+            else:
+                prior = (existing_blocks.get(target) or {}).get("restoreRoles") or []
+                restored_roles = [r for r in prior if r not in cfg.markers] or [cfg.access_role]
+                new_policy = copy.deepcopy(policy)
+                new_policy["bindings"] = [dict(b) for b in new_policy.get("bindings") or []]
+                member = "user:%s" % target
+                for role in (*cfg.markers,):
+                    _remove_member(new_policy, role, member)
+                for role in restored_roles:
+                    _add_member(new_policy, role, member)
+                new_policy["version"] = 3
+                try:
+                    set_policy(ctx, new_policy)
+                except GcpError as err:
+                    if err.kind == "conflict" and attempt == 1:
+                        continue
+                    LOG.warning("setIamPolicy failed kind=%s", err.kind)
+                    raise ApiError("upstream_error", "The IAM policy update failed.")
+                break
+
+    if mgr is not None:
+        if action == "block_all":
+            from . import access as access_svc, iap_access
+            admins_ui, allowed_ui = access_svc._ui_lists(mgr)
+            if target in allowed_ui:
+                access_svc._save_lists(ctx, admins_ui, [m for m in allowed_ui if m != target])
+                try:
+                    iap_access.revoke(ctx.app, ctx.quota_project, [target])
+                except Exception:  # pylint: disable=broad-except
+                    pass
+            epoch = int(time.time() * 1000)
+            block_doc = {"at": iso(utcnow()), "by": ctx.identity.email,
+                         "note": note or "All AI access blocked by an administrator.",
+                         "removedRoles": removed_roles, "restoreRoles": restore_roles}
+
+            def apply_block(auth):
+                auth["revoked"][target] = epoch
+                auth.setdefault("blocked", {})[target] = block_doc
+            mgr.mutate_auth(apply_block, ctx.identity.email)
+        else:
+            mgr.mutate_auth(lambda auth: (auth.get("blocked") or {}).pop(target, None), ctx.identity.email)
+
+    def apply_gov(state):
+        state["suspensions"] = [s for s in state.get("suspensions") or [] if s["email"] != target]
+        if action == "block_all":
+            _put_exception(state, _exception_item(ctx, target, "block", None,
+                                                  note or "All AI access blocked by an administrator."))
+        else:
+            state["exceptions"] = [e for e in state.get("exceptions") or []
+                                   if not (e["email"] == target and e["type"] == "block")]
+    try:
+        mutate_state(ctx, apply_gov)
+    except ApiError as err:
+        LOG.warning("governance state was not saved after %s: %s", action, err.code)
+
+    audit_logged = write_audit(ctx, action, {
+        "result": "success", "target": target, "uid": uid_for(target),
+        "removedRoles": removed_roles if action == "block_all" else None,
+        "restoredRoles": restored_roles if action == "unblock_all" else None,
+        "dashboardBlocked": action == "block_all",
+        "warnings": residual_warnings or None})
+    ctx.app.invalidate_governance()
+    return {"uid": uid_for(target), "email": target, "action": action,
+            "aiBlocked": action == "block_all",
+            "removedRoles": removed_roles, "restoredRoles": restored_roles,
+            "warnings": residual_warnings, "auditLogged": audit_logged}
 
 
 # ---------------------------------------------------------------------------
@@ -2487,64 +4453,10 @@ def user_action(ctx):
 # ---------------------------------------------------------------------------
 
 def setup(ctx):
+    """Creates the marker roles that are missing and restores the ones deleted in the last 7 days."""
     cfg = gov_config(ctx.settings)
-    base_role = cfg.access_role
-    results = []
-    try:
-        role = ctx.rest("GET", "%s/%s" % (IAM_V1, base_role))
-        permissions = [p for p in role.get("includedPermissions") or [] if not p.startswith("businessaicode.")]
-    except GcpError as err:
-        LOG.warning("could not read %s kind=%s", base_role, err.kind)
-        permissions = None
-    titles = {cfg.cap_marker_id: ("Antigravity Cap Blocked",
-                                  "Assigned by AI Control Plane when a user exceeds the Antigravity cap. "
-                                  "Same as the access role without businessaicode permissions."),
-              cfg.admin_marker_id: ("Antigravity Admin Blocked",
-                                    "Assigned by an administrator to disallow Antigravity. "
-                                    "Same as the access role without businessaicode permissions.")}
     with _WRITE_LOCK:
-        for role_id in (cfg.cap_marker_id, cfg.admin_marker_id):
-            url = "%s/projects/%s/roles/%s" % (IAM_V1, ctx.project, urllib.parse.quote(role_id, safe=""))
-            try:
-                existing = ctx.rest("GET", url)
-                if existing.get("deleted"):
-                    results.append({"role": role_id, "status": "failed",
-                                    "message": "The role exists in a deleted state; undelete it in IAM."})
-                else:
-                    results.append({"role": role_id, "status": "exists", "message": "The role already exists."})
-                continue
-            except GcpError as err:
-                if err.kind != "not_found":
-                    results.append({"role": role_id, "status": "failed",
-                                    "message": "The role could not be read (%s)." % err.kind})
-                    continue
-            if not permissions:
-                results.append({"role": role_id, "status": "failed",
-                                "message": "The permissions of %s could not be read." % base_role})
-                continue
-            title, description = titles[role_id]
-            perms = list(permissions)
-            status = None
-            for _ in range(2):
-                try:
-                    ctx.rest("POST", "%s/projects/%s/roles" % (IAM_V1, ctx.project),
-                             json_body={"roleId": role_id, "role": {"title": title, "description": description,
-                                                                    "includedPermissions": perms, "stage": "GA"}})
-                    status = {"role": role_id, "status": "created",
-                              "message": "Created with %d permissions (businessaicode.* excluded)." % len(perms)}
-                    break
-                except GcpError as err:
-                    bad = [p for p in perms if p in (err.message or "")]
-                    if err.kind == "invalid" and bad:
-                        perms = [p for p in perms if p not in bad]
-                        continue
-                    status = {"role": role_id, "status": "failed",
-                              "message": "The role could not be created (%s)." % err.kind}
-                    break
-            results.append(status or {"role": role_id, "status": "failed", "message": "The role could not be created."})
-        audit_logged = write_audit(ctx, "setup", {
-            "result": "success" if all(r["status"] != "failed" for r in results) else "partial",
-            "target": "marker roles", "results": results})
+        results, audit_logged = _setup_markers(ctx, cfg, "admin")
     ctx.app.invalidate_governance()
     return {"results": results, "auditLogged": audit_logged}
 

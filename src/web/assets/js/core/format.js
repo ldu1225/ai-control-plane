@@ -112,6 +112,23 @@ export const fmt = {
       second: withSeconds ? '2-digit' : undefined, hour12: false, timeZone: timezone,
     }).format(dt);
   },
+  /**
+   * ISO timestamp -> weekday, date and time in the workspace timezone (\"Mon, Nov 23, 00:00\"), for deadlines such as
+   * the end of an allow rule or a period reset. hourCycle h23 shows a midnight boundary as 00:00 of the new day. `tz`
+   * shows it in another IANA zone instead (a cap period in its reset time zone).
+   */
+  dateTimeDay(iso, tz) {
+    if (!iso) return DASH;
+    const dt = new Date(iso);
+    if (Number.isNaN(dt.getTime())) return String(iso);
+    const zone = tz || timezone;
+    const yearOf = (d) => df({ year: 'numeric', timeZone: zone }).format(d);
+    const sameYear = yearOf(dt) === yearOf(new Date());
+    return df({
+      year: sameYear ? undefined : 'numeric', month: 'short', day: 'numeric', weekday: 'short',
+      hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: zone,
+    }).format(dt);
+  },
   time(iso) {
     if (!iso) return DASH;
     const dt = new Date(iso);

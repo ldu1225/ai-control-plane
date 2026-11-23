@@ -243,6 +243,57 @@ class Gcp:
                 return items, False
         return items, True
 
+    def stream_lines(self, method, url, *, quota_project, json_body=None, params=None, timeout=60,
+                     deadline_seconds=120, max_bytes=1024 * 1024):
+        """Performs an authenticated call whose response is a stream of lines (newline-delimited JSON).
+
+        Returns (lines, truncated): the non-empty lines received until the stream ended, the wall-clock deadline
+        passed or `max_bytes` was reached; truncated is True in the last two cases. `timeout` bounds each read,
+        so the call returns at most `timeout` seconds after the deadline. Raises GcpError like request()."""
+        import requests
+        hdrs = self.auth_headers(quota_project)
+        deadline = time.monotonic() + deadline_seconds
+        lines = []
+        size = 0
+        truncated = False
+        try:
+            with self._session().request(method, url, params=params, json=json_body, headers=hdrs,
+                                         timeout=timeout, allow_redirects=False, stream=True) as resp:
+                if resp.status_code >= 300:
+                    try:
+                        payload = resp.json()
+                    except ValueError:
+                        payload = None
+                    message, reason = _google_error(payload)
+                    parsed = urllib.parse.urlsplit(url)
+                    LOG.warning("upstream error method=%s host=%s path=%s status=%s reason=%s message=%s", method,
+                                parsed.hostname, parsed.path[:160], resp.status_code, reason, log_safe(message))
+                    raise GcpError(_kind_for_status(resp.status_code, reason), status=resp.status_code,
+                                   message=message, reason=reason)
+                pending = b""
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        size += len(chunk)
+                        if size > max_bytes:
+                            truncated = True
+                            break
+                        pending += chunk
+                        while b"\n" in pending:
+                            line, _, pending = pending.partition(b"\n")
+                            if line.strip():
+                                lines.append(line.rstrip(b"\r").decode("utf-8", "replace"))
+                    if time.monotonic() > deadline:
+                        truncated = True
+                        break
+                else:
+                    if pending.strip():
+                        lines.append(pending.rstrip(b"\r").decode("utf-8", "replace"))
+        except requests.exceptions.Timeout:
+            raise GcpError("timeout", message="request timed out")
+        except requests.exceptions.RequestException as err:
+            raise GcpError("network", message=type(err).__name__)
+        return lines, truncated
+
     # -- BigQuery -----------------------------------------------------------------
     def bq_client(self, quota_project):
         creds = self.credentials(quota_project)

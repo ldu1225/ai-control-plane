@@ -21,6 +21,14 @@
 #   5) Pre-deployment log collection only:
 #      bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
 #        --prepare-only --project PROJECT_ID
+#
+#   6) Per-user caps enforced with an IAM deny policy by a dedicated Cloud Run job (README 8.9):
+#      bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+#        --project PROJECT_ID --enforcement-backend iam_deny [--grant-org-roles]
+#
+# Running the command again updates the deployment. The settings of every run are saved in
+# deploy.PROJECT_ID.env next to the scripts; a later run (or scripts/deploy.sh --project PROJECT_ID) keeps them
+# unless a flag gives a new value. Run with --help for every option.
 set -euo pipefail
 
 REPO_URL="${ACP_REPO_URL:-https://github.com/ldu1225/ai-control-plane.git}"
@@ -50,6 +58,40 @@ Run directly in Google Cloud Shell (or macOS/Linux) — no manual git clone or c
   5) Pre-deployment log collection only:
      bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
        --prepare-only --project PROJECT_ID
+
+  6) Per-user caps enforced with an IAM deny policy by a dedicated Cloud Run job (README 8.9):
+     bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+       --project PROJECT_ID --enforcement-backend iam_deny [--grant-org-roles]
+
+Options
+  --project ID / --projects ID1,ID2   Project to deploy into, or one separate deployment per project
+  --link-projects ID1,ID2             Projects monitored together in this dashboard (alias --scan-projects);
+                                      none clears the saved list
+  --region REGION                     Region (default asia-northeast3); the BigQuery dataset follows it unless
+                                      --dataset-location is given
+  --admins EMAILS / --viewers EMAILS  Administrators (default: the active gcloud account) and viewers
+                                      (--viewers none clears them; aliases --admin, --viewer, --allowed-users)
+  --prepare-only                      Only turn on log collection (scripts/prepare.sh); it takes --dataset,
+                                      --dataset-location, --ge-locations, --service-name, --[no-]data-access-logs
+                                      and --[no-]log-prompts
+  -y, --yes                           Never start the interactive wizard
+  --dry-run                           Print what would change and change nothing
+  -h, --help                          Show this help
+
+  Passed to scripts/deploy.sh (see scripts/deploy.sh --help) and saved for later runs:
+  --access-mode MODE  --org-name NAME  --service-name NAME  --billing-account ID
+  --dataset NAME  --dataset-location LOC  --ge-locations LIST  --vpc-network NAME  --vpc-subnet NAME
+  --read-only | --no-read-only  --[no-]data-access-logs  --[no-]log-prompts
+  --[no-]prepare-linked-projects  --[no-]auto-discover-projects
+  --enforcement-schedule CRON | --no-enforcement-schedule  --[no-]realtime-enforcement
+  --maintenance-schedule CRON | --no-maintenance-schedule
+  --enforcement-backend iam_allow_swap|iam_deny|notify_only  --deny-attachment projects|scope
+  --enforcement-job-region REGION  --[no-]grant-org-roles
+  Passed to scripts/deploy.sh for this run only: --config FILE  --skip-preflight-blockers
+
+Running the command again updates the deployment in place. Settings are saved per project in
+deploy.PROJECT_ID.env next to the scripts (git-ignored); later runs keep them unless a flag gives a new value.
+Remove everything with scripts/teardown.sh --project PROJECT_ID.
 HELP
   exit "${1:-0}"
 }
@@ -90,9 +132,26 @@ if [[ -z "$LOCAL_ROOT" ]]; then
     fi
   fi
   if [[ "$UPDATED" != "1" ]]; then
+    # The settings snapshots of earlier runs (deploy.PROJECT_ID.env) and the deploy.env backup survive the re-clone:
+    # without them a later run would fall back to the defaults (for example another region or access mode).
+    KEEP_DIR=""
+    if [[ -d "$INSTALL_DIR" ]]; then
+      KEEP_DIR="$(mktemp -d 2>/dev/null || true)"
+      if [[ -n "$KEEP_DIR" ]]; then
+        for _kept in "$INSTALL_DIR"/deploy.*.env "$INSTALL_DIR/deploy.env.bak"; do
+          [[ -f "$_kept" ]] && cp -p "$_kept" "$KEEP_DIR/" 2>/dev/null || true
+        done
+      fi
+    fi
     rm -rf "$INSTALL_DIR"
     printf '\n==> Downloading AI Control Plane into %s\n' "$INSTALL_DIR"
     git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
+    if [[ -n "$KEEP_DIR" ]]; then
+      for _kept in "$KEEP_DIR"/*; do
+        [[ -f "$_kept" ]] && cp -p "$_kept" "$INSTALL_DIR/" 2>/dev/null || true
+      done
+      rm -rf "$KEEP_DIR"
+    fi
   fi
   chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
   cd "$INSTALL_DIR"
@@ -116,28 +175,100 @@ CLI_LINK_PROJECTS=""
 CLI_REGION=""
 CLI_ADMINS=""
 CLI_VIEWERS=""
-EXTRA_ARGS=()
-DEPLOY_ONLY_ARGS=()
+EXTRA_ARGS=()      # passed to scripts/deploy.sh
+PREPARE_ARGS=()    # passed to scripts/prepare.sh (--prepare-only); it takes fewer flags than deploy.sh
+# Settings given on this run (KEY and value), written to deploy.<project>.env so that later runs keep them.
+SAVE_KEYS=()
+SAVE_VALS=()
 
 need_val() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
+lower_trim() { trim_ws "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+# one_of FLAG VALUE CHOICE...: values of these flags are saved to deploy.<project>.env, which deploy.sh sources.
+one_of() {
+  local flag="$1" value="$2" choice
+  shift 2
+  for choice in "$@"; do
+    [[ "$value" == "$choice" ]] && return 0
+  done
+  die "$flag must be one of: $*"
+}
+# save_setting KEY VALUE: remembers a setting given on this run (the last one given wins).
+save_setting() {
+  local i
+  for i in ${SAVE_KEYS[@]+"${!SAVE_KEYS[@]}"}; do
+    if [[ "${SAVE_KEYS[$i]}" == "$1" ]]; then
+      SAVE_VALS[$i]="$2"
+      return 0
+    fi
+  done
+  SAVE_KEYS+=("$1")
+  SAVE_VALS+=("$2")
+}
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prepare-only) PREPARE_ONLY=1; shift ;;
     -y|--yes) AUTO_YES=1; shift ;;
-    --dry-run) DRY_RUN=1; EXTRA_ARGS+=(--dry-run); shift ;;
+    --dry-run) DRY_RUN=1; EXTRA_ARGS+=(--dry-run); PREPARE_ARGS+=(--dry-run); shift ;;
     --project) need_val "$@"; CLI_PROJECT="$2"; shift 2 ;;
     --projects) need_val "$@"; CLI_PROJECTS="$2"; shift 2 ;;
     --link-projects|--scan-projects) need_val "$@"; CLI_LINK_PROJECTS="$2"; shift 2 ;;
     --region) need_val "$@"; CLI_REGION="$2"; shift 2 ;;
     --admins|--admin) need_val "$@"; CLI_ADMINS="$2"; shift 2 ;;
     --viewers|--viewer|--allowed-users) need_val "$@"; CLI_VIEWERS="$2"; shift 2 ;;
-    --org-name|--access-mode|--service-name|--billing-account|--config|--dataset|--dataset-location|--ge-locations|--vpc-network|--vpc-subnet)
-      need_val "$@"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
-    --read-only|--data-access-logs|--no-data-access-logs|--prepare-linked-projects|--no-prepare-linked-projects|--auto-discover-projects|--no-auto-discover-projects|--log-prompts|--no-log-prompts|--skip-preflight-blockers)
-      EXTRA_ARGS+=("$1"); shift ;;
-    # Deploy-only flags (prepare.sh does not take them).
-    --enforcement-schedule) need_val "$@"; DEPLOY_ONLY_ARGS+=("$1" "$2"); shift 2 ;;
-    --no-enforcement-schedule) DEPLOY_ONLY_ARGS+=("$1"); shift ;;
+    # Settings that scripts/prepare.sh takes as well.
+    --dataset|--dataset-location|--ge-locations|--service-name)
+      need_val "$@"
+      case "$1" in
+        --dataset) save_setting AUDIT_DATASET "$2" ;;
+        --dataset-location) save_setting DATASET_LOCATION "$2" ;;
+        --ge-locations) save_setting DISCOVERY_ENGINE_LOCATIONS "$2" ;;
+        --service-name) save_setting SERVICE_NAME "$2" ;;
+      esac
+      EXTRA_ARGS+=("$1" "$2"); PREPARE_ARGS+=("$1" "$2"); shift 2 ;;
+    --data-access-logs|--no-data-access-logs|--log-prompts|--no-log-prompts)
+      case "$1" in
+        --data-access-logs) save_setting ENABLE_DATA_ACCESS_LOGS true ;;
+        --no-data-access-logs) save_setting ENABLE_DATA_ACCESS_LOGS false ;;
+        --log-prompts) save_setting GE_PROMPT_LOGGING true ;;
+        --no-log-prompts) save_setting GE_PROMPT_LOGGING false ;;
+      esac
+      EXTRA_ARGS+=("$1"); PREPARE_ARGS+=("$1"); shift ;;
+    # Deploy settings with a value.
+    --access-mode)
+      need_val "$@"; one_of "$1" "$2" google google_oauth iap password
+      save_setting ACCESS_MODE "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --org-name) need_val "$@"; save_setting ORGANIZATION_NAME "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --billing-account) need_val "$@"; save_setting BILLING_ACCOUNT_ID "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --vpc-network) need_val "$@"; save_setting VPC_NETWORK "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --vpc-subnet) need_val "$@"; save_setting VPC_SUBNET "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --enforcement-schedule) need_val "$@"; save_setting ENFORCEMENT_SCHEDULE "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --maintenance-schedule) need_val "$@"; save_setting MAINTENANCE_SCHEDULE "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --enforcement-backend)
+      need_val "$@"; one_of "$1" "$2" iam_allow_swap iam_deny notify_only
+      save_setting ENFORCEMENT_BACKEND "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --deny-attachment)
+      need_val "$@"; one_of "$1" "$2" projects scope
+      save_setting DENY_ATTACHMENT "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --enforcement-job-region)
+      need_val "$@"
+      [[ "$2" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || die "$1 must be a region such as asia-northeast3"
+      save_setting ENFORCEMENT_JOB_REGION "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    # Deploy switches.
+    --read-only) save_setting ENABLE_GOVERNANCE_ACTIONS false; EXTRA_ARGS+=("$1"); shift ;;
+    --no-read-only) save_setting ENABLE_GOVERNANCE_ACTIONS true; EXTRA_ARGS+=("$1"); shift ;;
+    --prepare-linked-projects) save_setting PREPARE_LINKED_PROJECTS true; EXTRA_ARGS+=("$1"); shift ;;
+    --no-prepare-linked-projects) save_setting PREPARE_LINKED_PROJECTS false; EXTRA_ARGS+=("$1"); shift ;;
+    --auto-discover-projects) save_setting SCAN_ALL_PROJECTS true; EXTRA_ARGS+=("$1"); shift ;;
+    --no-auto-discover-projects) save_setting SCAN_ALL_PROJECTS false; EXTRA_ARGS+=("$1"); shift ;;
+    --no-enforcement-schedule) save_setting ENFORCEMENT_SCHEDULE off; EXTRA_ARGS+=("$1"); shift ;;
+    --realtime-enforcement) save_setting REALTIME_ENFORCEMENT true; EXTRA_ARGS+=("$1"); shift ;;
+    --no-realtime-enforcement) save_setting REALTIME_ENFORCEMENT false; EXTRA_ARGS+=("$1"); shift ;;
+    --no-maintenance-schedule) save_setting MAINTENANCE_SCHEDULE off; EXTRA_ARGS+=("$1"); shift ;;
+    --grant-org-roles) save_setting GRANT_ORG_ROLES true; EXTRA_ARGS+=("$1"); shift ;;
+    --no-grant-org-roles) save_setting GRANT_ORG_ROLES false; EXTRA_ARGS+=("$1"); shift ;;
+    # Passed to deploy.sh for this run only (never saved).
+    --config) need_val "$@"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --skip-preflight-blockers) EXTRA_ARGS+=("$1"); shift ;;
     -h|--help) show_install_help 0 ;;
     *) echo "unknown argument: $1" >&2; show_install_help 2 ;;
   esac
@@ -149,6 +280,13 @@ ACCOUNT="$(ensure_gcloud_auth)"
 TARGET_PROJECTS="${CLI_PROJECTS:-$CLI_PROJECT}"
 ACTIVE_PROJECT="$(normalize_project_id "$(gcloud config get-value project 2>/dev/null || true)")"
 [[ "$ACTIVE_PROJECT" == "(unset)" ]] && ACTIVE_PROJECT=""
+
+# saved_setting PROJECT KEY: the value an earlier run saved for KEY in deploy.<PROJECT>.env (empty when absent).
+saved_setting() {
+  local file="$ROOT/deploy.${1}.env"
+  [[ -f "$file" ]] || return 0
+  bash -c 'set +u; source "$1" >/dev/null 2>&1 || true; key="$2"; printf "%s" "${!key:-}"' _ "$file" "$2" 2>/dev/null || true
+}
 
 PROJ_LINES=()
 resolve_project_csv() {  # resolve_project_csv RAW_CSV -> comma-separated project IDs
@@ -204,36 +342,52 @@ if [[ -z "$TARGET_PROJECTS" && "$AUTO_YES" == "0" && ( -t 0 || "${ACP_FORCE_WIZA
   [[ -n "$TARGET_PROJECTS" ]] || die "no project selected"
 
   if [[ "$PREPARE_ONLY" == "0" ]]; then
+    # A project deployed before offers its saved settings as the defaults (Enter keeps them).
+    PREV_PROJECT=""
+    [[ "$TARGET_PROJECTS" != *,* ]] && PREV_PROJECT="$TARGET_PROJECTS"
     if [[ "$TARGET_PROJECTS" != *,* && -z "$CLI_LINK_PROJECTS" ]]; then
-      read -r -p "  2. Additional projects to monitor together in this dashboard (optional, IDs/numbers) []: " INPUT_LINK
+      PREV_LINKS="$(saved_setting "$PREV_PROJECT" SCAN_PROJECTS)"
+      read -r -p "  2. Additional projects to monitor together in this dashboard (optional, IDs/numbers) [${PREV_LINKS}${PREV_LINKS:+; none clears}]: " INPUT_LINK
       INPUT_LINK="$(trim_ws "${INPUT_LINK:-}")"
-      [[ -n "$INPUT_LINK" ]] && CLI_LINK_PROJECTS="$(resolve_project_csv "$INPUT_LINK")"
+      if [[ "$(lower_trim "$INPUT_LINK")" == "none" ]]; then
+        CLI_LINK_PROJECTS="none"
+      elif [[ -n "$INPUT_LINK" ]]; then
+        CLI_LINK_PROJECTS="$(resolve_project_csv "$INPUT_LINK")"
+      fi
       STEP_OFFSET=1
     else
       STEP_OFFSET=0
     fi
 
-    DEF_REGION="${CLI_REGION:-asia-northeast3}"
+    DEF_REGION="${CLI_REGION:-}"
+    [[ -n "$DEF_REGION" || -z "$PREV_PROJECT" ]] || DEF_REGION="$(saved_setting "$PREV_PROJECT" REGION)"
+    DEF_REGION="${DEF_REGION:-asia-northeast3}"
     read -r -p "  $((2 + STEP_OFFSET)). Region [${DEF_REGION}]: " INPUT_REGION
     CLI_REGION="$(trim_ws "${INPUT_REGION:-$DEF_REGION}")"
 
-    DEF_ADMINS="${CLI_ADMINS:-$ACCOUNT}"
+    DEF_ADMINS="${CLI_ADMINS:-}"
+    [[ -n "$DEF_ADMINS" || -z "$PREV_PROJECT" ]] || DEF_ADMINS="$(saved_setting "$PREV_PROJECT" ADMIN_EMAILS)"
+    DEF_ADMINS="${DEF_ADMINS:-$ACCOUNT}"
     read -r -p "  $((3 + STEP_OFFSET)). Administrator email(s) [${DEF_ADMINS}]: " INPUT_ADMINS
     CLI_ADMINS="$(trim_ws "${INPUT_ADMINS:-$DEF_ADMINS}")"
 
-    read -r -p "  $((4 + STEP_OFFSET)). Viewer email(s) (optional, comma-separated) [${CLI_VIEWERS}]: " INPUT_VIEWERS
-    CLI_VIEWERS="$(trim_ws "${INPUT_VIEWERS:-$CLI_VIEWERS}")"
+    DEF_VIEWERS="${CLI_VIEWERS:-}"
+    [[ -n "$DEF_VIEWERS" || -z "$PREV_PROJECT" ]] || DEF_VIEWERS="$(saved_setting "$PREV_PROJECT" ALLOWED_USERS)"
+    read -r -p "  $((4 + STEP_OFFSET)). Viewer email(s) (optional, comma-separated) [${DEF_VIEWERS}${DEF_VIEWERS:+; none clears}]: " INPUT_VIEWERS
+    CLI_VIEWERS="$(trim_ws "${INPUT_VIEWERS:-$DEF_VIEWERS}")"
   fi
 elif [[ -z "$TARGET_PROJECTS" ]]; then
   [[ -n "$ACTIVE_PROJECT" ]] || die "pass --project PROJECT_ID (no active gcloud project)"
   TARGET_PROJECTS="$ACTIVE_PROJECT"
 fi
 
-CLI_REGION="${CLI_REGION:-asia-northeast3}"
-CLI_ADMINS="${CLI_ADMINS:-$ACCOUNT}"
+# "none" clears a saved list of linked projects or viewers (it saves an empty value). An empty flag value is still
+# refused: it is more often a mistake than a wish.
+[[ "$(lower_trim "$CLI_LINK_PROJECTS")" == "none" ]] && CLI_LINK_PROJECTS="none"
+[[ "$(lower_trim "$CLI_VIEWERS")" == "none" ]] && CLI_VIEWERS="none"
 
 NORMALIZED_LINK_PROJECTS=""
-if [[ -n "$CLI_LINK_PROJECTS" ]]; then
+if [[ -n "$CLI_LINK_PROJECTS" && "$CLI_LINK_PROJECTS" != "none" ]]; then
   LINK_OUT=()
   IFS=',' read -r -a RAW_LINK_ARR <<<"$CLI_LINK_PROJECTS"
   for rlp in "${RAW_LINK_ARR[@]}"; do
@@ -253,69 +407,115 @@ if [[ "$PREPARE_ONLY" == "1" ]]; then
     [[ " ${PREP_LIST[*]-} " == *" ${_npp} "* ]] || PREP_LIST+=("$_npp")
   done
   PREP_ALL="$(IFS=','; echo "${PREP_LIST[*]}")"
+  # prepare.sh takes only the log collection flags (PREPARE_ARGS); a later --dataset-location there wins.
   if [[ "$PREP_ALL" == *,* ]]; then
-    exec "$ROOT/scripts/prepare.sh" --projects "$PREP_ALL" --dataset-location "$CLI_REGION" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+    exec "$ROOT/scripts/prepare.sh" --projects "$PREP_ALL" --dataset-location "${CLI_REGION:-asia-northeast3}" ${PREPARE_ARGS[@]+"${PREPARE_ARGS[@]}"}
   else
-    exec "$ROOT/scripts/prepare.sh" --project "$PREP_ALL" --dataset-location "$CLI_REGION" ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+    exec "$ROOT/scripts/prepare.sh" --project "$PREP_ALL" --dataset-location "${CLI_REGION:-asia-northeast3}" ${PREPARE_ARGS[@]+"${PREPARE_ARGS[@]}"}
   fi
 fi
 
-# Save per-project env snapshots (git-ignored via /*.env) so re-runs or customizations are effortless.
-# Opt-outs given on this run are saved too, so a later scripts/deploy.sh --project PROJECT_ID keeps them.
-SAVE_DATA_ACCESS="true"
-SAVE_LOG_PROMPTS="true"
-SAVE_GOVERNANCE="true"
-for _xa in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
-  case "$_xa" in
-    --data-access-logs) SAVE_DATA_ACCESS="true" ;;
-    --no-data-access-logs) SAVE_DATA_ACCESS="false" ;;
-    --log-prompts) SAVE_LOG_PROMPTS="true" ;;
-    --no-log-prompts) SAVE_LOG_PROMPTS="false" ;;
-    --read-only) SAVE_GOVERNANCE="false" ;;
-  esac
-done
+# Per-project settings snapshots (git-ignored via /*.env): scripts/deploy.sh --project PROJECT_ID reads
+# deploy.PROJECT_ID.env, so a later run (of this installer or of deploy.sh) keeps what was chosen here.
+# A new snapshot starts from the defaults; an existing one keeps every line (including lines added by hand) and only
+# the settings given on this run are replaced or added.
+[[ -n "$CLI_REGION" ]] && save_setting REGION "$CLI_REGION"
+[[ -n "$CLI_ADMINS" ]] && save_setting ADMIN_EMAILS "$CLI_ADMINS"
+if [[ "$CLI_VIEWERS" == "none" ]]; then
+  save_setting ALLOWED_USERS ""
+elif [[ -n "$CLI_VIEWERS" ]]; then
+  save_setting ALLOWED_USERS "$CLI_VIEWERS"
+fi
+update_snapshot() {  # update_snapshot FILE KEY=VALUE...: replaces each KEY's line in FILE, or appends it
+  python3 - "$@" <<'PY'
+import os, re, shlex, sys
+path, pairs = sys.argv[1], sys.argv[2:]
+lines = []
+if os.path.exists(path):
+    with open(path, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+# Plain values keep the familiar KEY="value" form; anything bash would expand inside double quotes is single-quoted.
+SAFE = re.compile(r"^[A-Za-z0-9 @._,:/*+=~%-]*$")
+for pair in pairs:
+    key, _, value = pair.partition("=")
+    text = '%s="%s"' % (key, value) if SAFE.match(value) else "%s=%s" % (key, shlex.quote(value))
+    pattern = re.compile(r"^\s*(?:export\s+)?%s=" % re.escape(key))
+    hits = [i for i, line in enumerate(lines) if pattern.match(line)]
+    if hits:
+        lines[hits[0]] = text
+        for i in reversed(hits[1:]):
+            del lines[i]
+    else:
+        lines.append(text)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+os.replace(tmp, path)
+PY
+}
 if [[ "$DRY_RUN" != "1" || "${ACP_SAVE_ENV_ON_DRY_RUN:-0}" == "1" ]]; then
   IFS=',' read -r -a SAVE_PROJECTS <<<"$TARGET_PROJECTS"
   for raw_pid in "${SAVE_PROJECTS[@]}"; do
     pid="$(normalize_project_id "$raw_pid")"
     [[ -n "$pid" ]] || continue
-    PER_PID_LINKS=""
-    if [[ -n "$NORMALIZED_LINK_PROJECTS" ]]; then
+    validate_project_id "$pid" "--project"
+    ENV_OUT="$ROOT/deploy.${pid}.env"
+    PAIRS=("PROJECT_ID=${pid}")
+    if [[ ! -f "$ENV_OUT" ]]; then
+      printf '# AI Control Plane settings for %s, saved by scripts/install.sh (git-ignored).\n' "$pid" >"$ENV_OUT"
+      printf '# scripts/install.sh and scripts/deploy.sh --project %s read them; flags on the command line win.\n' "$pid" >>"$ENV_OUT"
+      NEW_REGION="${CLI_REGION:-asia-northeast3}"
+      # No DATASET_LOCATION unless --dataset-location is given (saved below): deploy.sh puts the dataset in REGION, so
+      # when an organization policy refuses the first region, a re-run with --region moves the dataset location too.
+      PAIRS+=("SCAN_PROJECTS=" "REGION=${NEW_REGION}" "DEFAULT_LOCALE=ko"
+        "WORKSPACE_TIMEZONE=Asia/Seoul" "ACCESS_MODE=google" "ADMIN_EMAILS=${CLI_ADMINS:-$ACCOUNT}"
+        "ALLOWED_USERS=" "ENABLE_DATA_ACCESS_LOGS=true" "ENABLE_GE_OBSERVABILITY=true" "GE_PROMPT_LOGGING=true"
+        "ENABLE_GOVERNANCE_ACTIONS=true")
+    elif [[ -n "$CLI_REGION" ]]; then
+      # Earlier installers saved DATASET_LOCATION equal to the region of that run. Such a value follows a new --region
+      # (it is emptied, so deploy.sh uses REGION); a different saved location or --dataset-location is kept. An
+      # existing dataset never moves: deploy.sh only creates a missing one.
+      OLD_REGION="$(saved_setting "$pid" REGION)"
+      OLD_DSLOC="$(saved_setting "$pid" DATASET_LOCATION)"
+      if [[ -n "$OLD_DSLOC" && "$(lower_trim "$OLD_DSLOC")" == "$(lower_trim "$OLD_REGION")" ]]; then
+        PAIRS+=("DATASET_LOCATION=")
+      fi
+    fi
+    if [[ "$CLI_LINK_PROJECTS" == "none" ]]; then
+      PAIRS+=("SCAN_PROJECTS=")
+    elif [[ -n "$NORMALIZED_LINK_PROJECTS" ]]; then
       FILT_LINKS=()
       IFS=',' read -r -a _larr <<<"$NORMALIZED_LINK_PROJECTS"
       for _lp in "${_larr[@]}"; do
         [[ -n "$_lp" && "$_lp" != "$pid" ]] && FILT_LINKS+=("$_lp")
       done
+      PER_PID_LINKS=""
       [[ ${#FILT_LINKS[@]} -gt 0 ]] && PER_PID_LINKS="$(IFS=','; echo "${FILT_LINKS[*]}")"
+      PAIRS+=("SCAN_PROJECTS=${PER_PID_LINKS}")
     fi
-    ENV_OUT="$ROOT/deploy.${pid}.env"
-    cat >"$ENV_OUT" <<EOF
-PROJECT_ID="${pid}"
-SCAN_PROJECTS="${PER_PID_LINKS}"
-REGION="${CLI_REGION}"
-DATASET_LOCATION="${CLI_REGION}"
-DEFAULT_LOCALE="ko"
-WORKSPACE_TIMEZONE="Asia/Seoul"
-ACCESS_MODE="google"
-ADMIN_EMAILS="${CLI_ADMINS}"
-ALLOWED_USERS="${CLI_VIEWERS}"
-ENABLE_DATA_ACCESS_LOGS="${SAVE_DATA_ACCESS}"
-ENABLE_GE_OBSERVABILITY="true"
-GE_PROMPT_LOGGING="${SAVE_LOG_PROMPTS}"
-ENABLE_GOVERNANCE_ACTIONS="${SAVE_GOVERNANCE}"
-EOF
+    for i in ${SAVE_KEYS[@]+"${!SAVE_KEYS[@]}"}; do
+      PAIRS+=("${SAVE_KEYS[$i]}=${SAVE_VALS[$i]}")
+    done
+    update_snapshot "$ENV_OUT" "${PAIRS[@]}"
   done
 fi
 
-DEPLOY_CMD=("$ROOT/scripts/deploy.sh" --region "$CLI_REGION" --admins "$CLI_ADMINS")
-[[ -n "$CLI_VIEWERS" ]] && DEPLOY_CMD+=(--viewers "$CLI_VIEWERS")
-[[ -n "$NORMALIZED_LINK_PROJECTS" ]] && DEPLOY_CMD+=(--link-projects "$NORMALIZED_LINK_PROJECTS")
+# Only the settings given on this run are passed on: deploy.sh reads the rest from deploy.<project>.env, so a re-run
+# without --region or --admins keeps the region and administrators chosen before.
+DEPLOY_CMD=("$ROOT/scripts/deploy.sh")
 if [[ "$TARGET_PROJECTS" == *,* ]]; then
   DEPLOY_CMD+=(--projects "$TARGET_PROJECTS")
 else
   DEPLOY_CMD+=(--project "$TARGET_PROJECTS")
 fi
+[[ -n "$CLI_REGION" ]] && DEPLOY_CMD+=(--region "$CLI_REGION")
+[[ -n "$CLI_ADMINS" ]] && DEPLOY_CMD+=(--admins "$CLI_ADMINS")
+[[ -n "$CLI_VIEWERS" ]] && DEPLOY_CMD+=(--viewers "$CLI_VIEWERS")   # "none" clears them in deploy.sh as well
+if [[ "$CLI_LINK_PROJECTS" == "none" ]]; then
+  DEPLOY_CMD+=(--link-projects none)
+elif [[ -n "$NORMALIZED_LINK_PROJECTS" ]]; then
+  DEPLOY_CMD+=(--link-projects "$NORMALIZED_LINK_PROJECTS")
+fi
 [[ ${#EXTRA_ARGS[@]} -gt 0 ]] && DEPLOY_CMD+=("${EXTRA_ARGS[@]}")
-[[ ${#DEPLOY_ONLY_ARGS[@]} -gt 0 ]] && DEPLOY_CMD+=("${DEPLOY_ONLY_ARGS[@]}")
 
 exec "${DEPLOY_CMD[@]}"

@@ -21,6 +21,7 @@ import support  # noqa: F401  (puts src/ on sys.path)
 from controlplane import app as app_module
 from controlplane import schema as schema_mod
 from controlplane.gcp import Gcp, GcpError, QueryResult
+from controlplane.security import uid_for
 
 try:  # build_params needs the BigQuery client library (pinned in requirements.txt)
     import google.cloud.bigquery  # noqa: F401
@@ -105,13 +106,22 @@ ENDPOINTS = [
     "/api/v1/overview/summary", "/api/v1/overview/summary?granularity=week&start=2026-09-01&end=2026-10-19",
     "/api/v1/gemini-enterprise/summary", "/api/v1/gemini-enterprise/licenses",
     "/api/v1/gemini-enterprise/file-uploads", "/api/v1/notebooklm/summary", "/api/v1/models/usage",
-    "/api/v1/models/catalog", "/api/v1/agent-platform/gateway", "/api/v1/agent-platform/registry",
+    "/api/v1/models/catalog", "/api/v1/agent-platform/gateway", "/api/v1/agent-platform/gateways",
+    "/api/v1/agent-platform/gateways/traffic", "/api/v1/agent-platform/registry",
     "/api/v1/agent-platform/deployments", "/api/v1/model-armor/summary",
     "/api/v1/model-armor/events?verdict=all&filter=sdp", "/api/v1/users", "/api/v1/governance/antigravity/status",
     "/api/v1/governance/antigravity/status?period=weekly&window=rolling", "/api/v1/governance/audit-log",
     "/api/v1/finops/summary", "/api/v1/finops/summary?project=demo-project", "/api/v1/telemetry/discover",
     "/api/v1/telemetry/connectors", "/api/v1/telemetry/connectors/data?id=conn_0000abcd",
     "/api/v1/telemetry/connectors/data?id=conn_0000beef", "/api/v1/health",
+    "/api/v1/scope/projects", "/api/v1/org/tree", "/api/v1/chargeback/summary",
+    "/api/v1/chargeback/summary?month=2026-10", "/api/v1/chargeback/report?level=user",
+    "/api/v1/chargeback/report?level=unit&month=2026-10", "/api/v1/chargeback/report?level=project",
+    "/api/v1/budgets", "/api/v1/budgets/spend-caps", "/api/v1/governance/antigravity/enforcement",
+    "/api/v1/governance/antigravity/period-preview",
+    "/api/v1/governance/antigravity/period-preview?period=monthly&day=31",
+    "/api/v1/governance/antigravity/period-preview?period=custom&cycleDays=14&cycleStart=2026-10-01",
+    "/api/v1/scope/candidates?kind=project&query=sales", "/api/v1/scope/candidates?kind=organization",
 ]
 
 
@@ -260,6 +270,10 @@ class OfflineEndpointsTest(unittest.TestCase):
             self.assertIn("topStatuses", results[path])
         if self.mode == "empty":
             # Sources succeeded without rows: lists are empty (not null) and counters are zero.
+            self.assertEqual(results["/api/v1/agent-platform/gateways"]["gateways"], [])
+            self.assertEqual(results["/api/v1/agent-platform/gateways"]["kpis"]["gateways"], 0)
+            self.assertEqual(results["/api/v1/agent-platform/gateways/traffic"]["kpis"]["requests"], 0)
+            self.assertEqual(results["/api/v1/agent-platform/gateways/traffic"]["byGateway"], [])
             self.assertEqual(results["/api/v1/agent-platform/registry"]["agents"], [])
             self.assertEqual(results["/api/v1/agent-platform/registry"]["kpis"]["total"], 0)
             self.assertEqual(results["/api/v1/model-armor/summary"]["byApp"], [])
@@ -274,6 +288,40 @@ class OfflineEndpointsTest(unittest.TestCase):
             status, payload = self.get("/api/v1/users/detail?uid=%s" % users[0]["uid"])
             self.assertEqual(status, 200, payload)
             self.assertFalse({w["code"] for w in payload["meta"]["warnings"]} & {"internal_error"})
+
+    def test_user_detail_in_two_parts(self):
+        """The drawer asks for the core and the activity part at once, with the address of the opened row."""
+        email = "alice@example.com"
+        uid = uid_for(email)
+        parts = {}
+        for part in ("core", "activity"):
+            status, payload = self.get("/api/v1/users/detail?uid=%s&email=%s&part=%s" % (uid, email, part))
+            self.assertEqual(status, 200, payload)
+            self.assertFalse({w["code"] for w in payload["meta"]["warnings"]} & {"internal_error", "query_failed"})
+            parts[part] = payload["data"]
+        core, activity = parts["core"], parts["activity"]
+        self.assertEqual((core["part"], activity["part"]), ("core", "activity"))
+        self.assertEqual((core["user"]["email"], activity["user"]["email"]), (email, email))
+        for key in ("activity", "agents", "files", "armorEvents"):
+            self.assertIsNone(core[key], key)
+        for key in ("antigravity", "models", "modelTotals", "iam"):
+            self.assertIsNone(activity[key], key)
+        self.assertIsInstance(core["models"], list)
+        self.assertIn("capPeriod", core["iam"])
+        # A hint naming someone else is ignored: the uid is resolved as before.
+        status, payload = self.get("/api/v1/users/detail?uid=%s&email=bob@example.com&part=core" % uid)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["data"]["user"]["email"], email)
+        if self.mode == "empty":
+            # An address without any trace is "not found", also for a single part: a part sees only some traces, so it
+            # relies on the uid lookup that runs alongside, and cannot be used to probe an arbitrary address.
+            nobody = "nobody@example.com"
+            status, _ = self.get("/api/v1/users/detail?uid=%s&email=%s" % (uid_for(nobody), nobody))
+            self.assertEqual(status, 404)
+            for part in ("core", "activity"):
+                status, payload = self.get("/api/v1/users/detail?uid=%s&email=%s&part=%s"
+                                           % (uid_for(nobody), nobody, part))
+                self.assertEqual(status, 404, (part, payload))
 
 
 class OfflineEndpointsWithRowsTest(OfflineEndpointsTest):

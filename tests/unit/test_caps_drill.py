@@ -185,5 +185,59 @@ class DrillCatchesBrokenEnginesTest(unittest.TestCase):
         self.assertIn("R2", rules(res))
 
 
+UNITS = [{"name": "Platform", "members": ["steady@cymbal.example.com", "claude-only@cymbal.example.com",
+                                          "contractor@cymbal.example.com"], "budget": 60.0, "action": "suspend"}]
+
+
+class DenyBackendDrillTest(unittest.TestCase):
+    """The same month with the IAM deny policy and an organization unit budget: R1-R10 hold."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.res = caps_drill.Drill(dt.datetime(2026, 11, 23, tzinfo=SEOUL), 10, budget=100.0, skip_quiet=True,
+                                   backend="iam_deny", units=UNITS).run()
+
+    def test_every_rule_holds(self):
+        self.assertEqual(self.res.violations, [])
+
+    def test_the_unit_budget_stops_its_people_before_their_own_budget(self):
+        stops = [e for e in self.res.events if e.action == "block" and "unit_budget" in e.reasons]
+        self.assertTrue(stops)
+        self.assertTrue({e.email for e in stops} <= set(UNITS[0]["members"]))
+        self.assertNotIn("budget", stops[0].reasons)   # their own paid budget (USD 100) is not spent yet
+
+    def test_a_deny_policy_also_stops_group_access(self):
+        self.assertTrue(any(e.email == "contractor@cymbal.example.com" and e.action == "block"
+                            for e in self.res.events))
+        self.assertGreater(self.res.denied.get("contractor@cymbal.example.com", 0), 0)
+
+
+class DenyDrillCatchesBrokenEnginesTest(unittest.TestCase):
+    def drill(self, days=6):
+        return caps_drill.Drill(dt.datetime(2026, 11, 23, tzinfo=SEOUL), days, budget=100.0, skip_quiet=True,
+                                backend="iam_deny", units=UNITS).run()
+
+    def test_unit_budget_ignored(self):
+        with mock.patch.object(gov, "_unit_budgets", lambda *args, **kwargs: ({}, None)):
+            res = self.drill()
+        self.assertIn("R7", rules(res))
+
+    def test_an_extra_denied_permission(self):
+        both = ["businessaicode.googleapis.com/locations.generateContent",
+                "discoveryengine.googleapis.com/assistants.assist"]
+        with mock.patch.object(caps_drill.enforcers, "denied_permissions", lambda settings: list(both)):
+            res = self.drill(3)
+        self.assertIn("R8", rules(res))
+
+    def test_restores_that_leave_the_deny_entry(self):
+        real = gov._apply_deny   # pylint: disable=protected-access
+
+        def no_restores(ctx, internal, users, plan):
+            return real(ctx, internal, users, dict(plan, restore=[]))
+        with mock.patch.object(gov, "_apply_deny", no_restores):
+            res = self.drill(9)
+        self.assertTrue({"R3", "R9"} & set(rules(res)))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,6 +8,7 @@ settings_store.SettingsManager).
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import logging
 import os
 import re
@@ -21,8 +22,16 @@ LOG = logging.getLogger("controlplane.config")
 MODULE_IDS = (
     "overview", "gemini_enterprise", "notebooklm", "model_usage", "agent_gateway",
     "agent_registry", "agent_deployments", "model_armor", "users", "antigravity",
-    "finops", "telemetry", "analyst",
+    "finops", "chargeback", "telemetry", "analyst",
 )
+
+# Monthly Antigravity (AI developer tools) credit per licensed user, by Gemini Enterprise subscription tier, in USD.
+# Source: Gemini Enterprise "Quotas and pay-as-you-go usage" (Standard 10, Plus 15; the Standard Emerging Market
+# edition has no bundled AI developer tools quota; the Pay-as-you-go edition has no included quota) and the
+# SubscriptionTier enum of the Discovery Engine API (ENTERPRISE = Standard, SEARCH_AND_ASSISTANT = Plus).
+# Tiers not listed fall back to governance.antigravity.credit_per_user_month.
+DEFAULT_CREDIT_BY_TIER = ("SUBSCRIPTION_TIER_ENTERPRISE=10", "SUBSCRIPTION_TIER_SEARCH_AND_ASSISTANT=15",
+                          "SUBSCRIPTION_TIER_ENTERPRISE_EMERGING=0", "SUBSCRIPTION_TIER_CONSUMPTION_ONLY=0")
 
 # Mandatory exclusions: these patterns are always applied, even if removed from settings.
 MANDATORY_EXCLUDED_SKU_PATTERNS = ("code assist", "duet ai")
@@ -61,6 +70,20 @@ DEFAULTS = {
         "discovery_engine_locations": ["global"],
         "agent_engine_regions": ["us-central1"],
         "telemetry_datasets": [],
+        # Which projects the workspace covers. projects: the primary project, workspace.projects and (with
+        # scan_all_projects) up to 25 projects the service identity can see. folder / organization: every active
+        # project under scope_ids (nested folders included), up to scope_max_projects.
+        "scope_type": "projects",
+        "scope_ids": [],
+        "scope_max_projects": 300,
+        # gemini_enterprise: keep only scope projects with a Gemini Enterprise subscription distributed to them
+        # (license configurations in a discovery_engine_locations location); none: keep every scope project.
+        "scope_filter": "gemini_enterprise",
+        # Project that holds a central audit dataset fed by an organization or folder aggregated log sink. Empty:
+        # every project has its own audit dataset (per-project sinks).
+        "audit_project": "",
+        # Pages of 500 user licenses read per project and location.
+        "license_max_pages": 200,
     },
     "security": {
         "auth_mode": "auto",
@@ -129,7 +152,10 @@ DEFAULTS = {
             "legacy_marker_roles": ["CustomAntigravityRestrictedUser"],
             "privileged_roles": ["roles/owner", "roles/editor", "roles/discoveryengine.admin"],
             "extra_access_roles": [],
-            "period": "weekly",
+            # Settlement period of the fixed caps per period (the default cap model): monthly from reset_day (the 1st)
+            # to the end of the month. A person who uses up a cap on the 11th stays suspended until the period ends
+            # and is restored automatically on the 1st of the next month; nothing resets weekly.
+            "period": "monthly",
             "window": "calendar",
             # Caps of 0 are disabled: nothing is over a cap until an administrator sets one.
             "token_cap": 0,
@@ -159,25 +185,85 @@ DEFAULTS = {
             # so set these to that cycle to make weekly caps line up with the credit pool.
             "reset_weekday": 0,
             "reset_time": "00:00",
+            # Monthly periods start on this day of the month at reset_time (1 = from the 1st to the last day; in a month
+            # without the day, such as the 31st, the period starts on the month's last day).
+            "reset_day": 1,
+            # period "custom": periods of cycle_days days (1-92) counted from cycle_start (YYYY-MM-DD at reset_time;
+            # empty = 1970-01-01), for example every 14 days from a Monday.
+            "cycle_days": 30,
+            "cycle_start": "",
             # Antigravity credit included per licensed user and month in USD (Gemini Enterprise Standard
             # 10, Plus 15; enforced weekly as a shared pool of credit / 4 x seats). Used by the
             # credit-based cap preset and the monthly billing report.
             "credit_per_user_month": 10.0,
-            # How caps work. credit_budget: each person has a weekly free share of that credit for Gemini models
+            # How caps work. period (default): the fixed token, request and cost caps per settlement period above; a
+            # person who reaches a cap is suspended until the period ends (monthly: the 1st of the next month) and
+            # nothing resets weekly. credit_budget: each person has a weekly free share of that credit for Gemini models
             # (third-party models such as Claude are always paid) and a monthly paid budget in USD; a person whose
             # paid budget is spent is stopped only while nothing is free (the week's share is used up or they pay
-            # again) and is restored at the next weekly reset or month start. period: the fixed token, request and
-            # cost caps per settlement period above. Empty (default) = credit_budget, except that an installation
-            # from before credit caps with fixed caps already set keeps period until an administrator chooses.
+            # again) and is restored at the next weekly reset or month start. Empty (default) = period, except that an
+            # installation that relied on credit caps (a paid budget set, no fixed cap) keeps credit_budget until an
+            # administrator chooses.
             "cap_model": "",
             "paid_budget_month": -1.0,       # USD per person and month beyond the free credit; -1 = no limit,
                                              # 0 = credits only
             "org_paid_budget_month": -1.0,   # USD for everyone together; when spent, everyone is credits only
             "credit_model_prefixes": ["gemini"],   # model ids that draw on the included credit
+            # license: each person's monthly credit follows the subscription tier of their assigned license
+            # (credit_by_tier), falling back to credit_per_user_month when the tier or the license is unknown;
+            # fixed: credit_per_user_month for everyone. Individual limit rules always win.
+            "credit_source": "license",
+            "credit_by_tier": list(DEFAULT_CREDIT_BY_TIER),
             # Service accounts allowed to call the enforcement endpoint with a Google OIDC token
             # (Cloud Scheduler). Configured in config.yaml or SCHEDULER_INVOKERS only.
             "scheduler_invokers": [],
+            # How a suspension is applied (services/enforcers.py):
+            # iam_allow_swap: swap the person's direct user: binding for a marker role in the primary project's allow
+            #   policy (one project, direct bindings only); iam_deny: list the person in an IAM deny policy managed by
+            #   the control plane (works for group, inherited and workforce access and for many projects; needs Deny
+            #   Admin on the organization for the identity that applies it); notify_only: plan and notify, never change
+            #   access.
+            "enforcement_backend": "iam_allow_swap",
+            # Where the deny policy is attached: projects = every workspace project; scope = the folders or
+            # organization of workspace.scope_ids (inherited by every project below), else every project.
+            "deny_attachment": "projects",
+            # Id of the deny policy the control plane manages at each attachment point (fixed prefix; deployment
+            # setting). Other deny policies are never read for changes or modified.
+            "deny_policy_id": "ai-control-plane-caps",
+            # Also deny the Gemini Enterprise assistant (discoveryengine assistants.assist) to suspended people.
+            "deny_ge_app": False,
+            # Also deny Agent Platform model calls (aiplatform endpoints.predict) to suspended people: Antigravity
+            # signed in with Application Default Credentials or pay-as-you-go calls Agent Platform directly.
+            "deny_agent_platform": False,
+            # Cloud Run job that applies suspensions with its own service account
+            # (projects/PROJECT/locations/REGION/jobs/JOB). Empty: the web service applies them itself.
+            # Deployment setting (config.yaml or ENFORCEMENT_JOB).
+            "enforcement_job": "",
+            # Pub/Sub push subscription that posts every Antigravity inference log entry to the usage-event endpoint
+            # (projects/PROJECT/subscriptions/SUBSCRIPTION), so that automatic mode suspends a person as soon as a cap
+            # is reached instead of at the next scheduled run. Deployment setting (config.yaml or
+            # USAGE_EVENTS_SUBSCRIPTION); empty = scheduled runs only.
+            "usage_events_subscription": "",
+            # G7 surge guard: when one run would newly suspend at least surge_guard_min people and at least
+            # surge_guard_ratio of the population, the run suspends nobody and asks for a manual review.
+            "surge_guard_min": 10,
+            "surge_guard_ratio": 0.5,
+            # Manage a Google Cloud spend cap budget (hard stop by Google) for every project budget node marked as a
+            # hard cap. Needs the billing account in workspace.billing.account_id and budget permissions.
+            "spend_caps": False,
         },
+    },
+    # Internal chargeback: usage allocated to people, projects and the organization tree (services/chargeback.py).
+    "chargeback": {
+        # credit_share: what each person pays beyond their weekly free credit share (the Antigravity cap ledger);
+        # list: cost at unit prices without any credit.
+        "allocation_mode": "credit_share",
+        # Project label whose value names an organization unit (its cost center or unit id); empty = not used.
+        "project_unit_label": "",
+        # Monthly price per assigned license seat by subscription tier ("TIER=USD"); empty = seats not charged.
+        "seat_prices": [],
+        # Optional BigQuery dataset ('dataset' or 'project.dataset') that receives a copy of every month close.
+        "close_dataset": "",
     },
     "telemetry": {
         "connectors": [],
@@ -525,6 +611,51 @@ def _sku_pattern(value):
     return _text(60, allow_empty=False)(value).lower()
 
 
+TIER_RE = re.compile(r"^SUBSCRIPTION_TIER_[A-Z0-9_]{1,60}$")
+SCOPE_ID_RE = re.compile(r"^[0-9]{1,30}$")
+LABEL_KEY_RE = re.compile(r"^([a-z][a-z0-9_\-]{0,62})?$")
+# Deny policy ids: lowercase letters, digits and hyphens, 63 characters at most, always with the control plane prefix.
+DENY_POLICY_ID_RE = re.compile(r"^ai-control-plane-[a-z0-9](?:[a-z0-9-]{0,44}[a-z0-9])?$")
+ENFORCEMENT_JOB_RE = re.compile(r"^(projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/locations/[a-z][a-z0-9-]{1,30}/jobs/"
+                                r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?)?$")
+
+
+def _tier_amount(value):
+    """'SUBSCRIPTION_TIER_X=amount' (USD, 0 to 1e6), normalized."""
+    if not isinstance(value, str) or value.count("=") != 1:
+        raise Invalid("must look like 'SUBSCRIPTION_TIER_NAME=amount'")
+    left, right = (part.strip() for part in value.split("="))
+    left = left.upper()
+    if not TIER_RE.match(left):
+        raise Invalid("must start with a subscription tier such as SUBSCRIPTION_TIER_ENTERPRISE")
+    try:
+        amount = float(right)
+    except ValueError:
+        raise Invalid("must end with an amount in USD")
+    if amount != amount or amount < 0 or amount > 1e6:
+        raise Invalid("amount must be between 0 and 1000000")
+    return "%s=%s" % (left, format(amount, "g"))
+
+
+def tier_amounts(values):
+    """{tier: amount} from 'TIER=amount' entries; invalid entries are skipped and the first entry of a tier wins."""
+    out = {}
+    for value in values or ():
+        try:
+            norm = _tier_amount(value)
+        except Invalid:
+            continue
+        tier, _, amount = norm.partition("=")
+        out.setdefault(tier, float(amount))
+    return out
+
+
+def _dataset_ref_or_empty(value):
+    if value == "":
+        return ""
+    return _dataset_ref(value)
+
+
 MODEL_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9.\-_]{0,120}$")
 CURRENCY_RE = re.compile(r"^([A-Z]{3})?$")
 
@@ -665,6 +796,29 @@ def _model_or_empty(value):
         return ""
     return _regex(MODEL_ID_RE, "model id")(value)
 
+
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _date_or_empty(value):
+    """A calendar date YYYY-MM-DD from 2000-01-01 to 2100-12-31, or empty."""
+    if value == "":
+        return ""
+    if not isinstance(value, str) or not DATE_RE.match(value.strip()):
+        raise Invalid("must be a date as YYYY-MM-DD or empty")
+    try:
+        day = dt.date.fromisoformat(value.strip())
+    except ValueError:
+        raise Invalid("must be a valid calendar date")
+    if not dt.date(2000, 1, 1) <= day <= dt.date(2100, 12, 31):
+        raise Invalid("must be between 2000-01-01 and 2100-12-31")
+    return day.isoformat()
+
+
+# Pub/Sub subscription names: projects/PROJECT/subscriptions/ID (ID: 3-255 characters, starts with a letter; Pub/Sub
+# also allows ~ + %, which deployments never use).
+SUBSCRIPTION_RE = re.compile(r"^(projects/[a-z][a-z0-9-]{4,28}[a-z0-9]/subscriptions/[A-Za-z][A-Za-z0-9_.-]{2,254})?$")
+
 VALIDATORS = {
     "product.name": _text(60, allow_empty=False),
     "product.tagline": _text(140),
@@ -677,7 +831,13 @@ VALIDATORS = {
     "server.port": _int(1, 65535),
     "server.cache_ttl_seconds": _int(0, 86400),
     "workspace.project_id": _pred(valid_project, "project id", lower=True),
-    "workspace.projects": _list(_pred(valid_project, "project id", lower=True), 50),
+    "workspace.projects": _list(_pred(valid_project, "project id", lower=True), 500),
+    "workspace.scope_type": _enum("projects", "folder", "organization"),
+    "workspace.scope_ids": _list(_regex(SCOPE_ID_RE, "numeric folder or organization id"), 20),
+    "workspace.scope_max_projects": _int(1, 5000),
+    "workspace.scope_filter": _enum("gemini_enterprise", "none"),
+    "workspace.audit_project": _project_or_empty,
+    "workspace.license_max_pages": _int(1, 1000),
     "workspace.scan_all_projects": _bool,
     "workspace.quota_project_id": _project_or_empty,
     "workspace.timezone": _timezone,
@@ -731,7 +891,7 @@ VALIDATORS = {
     "governance.antigravity.legacy_marker_roles": _list(_regex(ROLE_ID_RE, "custom role id"), 10),
     "governance.antigravity.privileged_roles": _list(_regex(ROLE_RE, "role name"), 50),
     "governance.antigravity.extra_access_roles": _list(_regex(ROLE_RE, "role name"), 50),
-    "governance.antigravity.period": _enum("daily", "weekly", "monthly", "all"),
+    "governance.antigravity.period": _enum("daily", "weekly", "monthly", "custom", "all"),
     "governance.antigravity.window": _enum("calendar", "rolling"),
     "governance.antigravity.token_cap": _int(0, 10 ** 12),
     "governance.antigravity.request_cap": _int(0, 10 ** 9),
@@ -750,12 +910,34 @@ VALIDATORS = {
     "governance.antigravity.reset_timezone": _timezone_or_empty,
     "governance.antigravity.reset_weekday": _int(0, 6),
     "governance.antigravity.reset_time": _pred(lambda v: bool(TIME_OF_DAY_RE.match(str(v or ""))), "time as HH:MM"),
+    "governance.antigravity.reset_day": _int(1, 31),
+    "governance.antigravity.cycle_days": _int(1, 92),
+    "governance.antigravity.cycle_start": _date_or_empty,
     "governance.antigravity.credit_per_user_month": _float(0, 1e6),
     "governance.antigravity.cap_model": _enum("", "credit_budget", "period"),
     "governance.antigravity.paid_budget_month": _float(-1, 1e9),
     "governance.antigravity.org_paid_budget_month": _float(-1, 1e9),
     "governance.antigravity.credit_model_prefixes": _list(_regex(MODEL_PREFIX_RE, "model id prefix", lower=True), 20),
+    "governance.antigravity.credit_source": _enum("license", "fixed"),
+    "governance.antigravity.credit_by_tier": _list(_tier_amount, 30),
+    "chargeback.allocation_mode": _enum("credit_share", "list"),
+    "chargeback.project_unit_label": _regex(LABEL_KEY_RE, "project label key (lowercase letters, digits, '_' or '-')"),
+    "chargeback.seat_prices": _list(_tier_amount, 30),
+    "chargeback.close_dataset": _dataset_ref_or_empty,
     "governance.antigravity.scheduler_invokers": _list(_regex(EMAIL_RE, "service account email", lower=True), 10),
+    "governance.antigravity.enforcement_backend": _enum("iam_allow_swap", "iam_deny", "notify_only"),
+    "governance.antigravity.deny_attachment": _enum("projects", "scope"),
+    "governance.antigravity.deny_policy_id": _regex(DENY_POLICY_ID_RE, "deny policy id starting with "
+                                                                      "'ai-control-plane-'"),
+    "governance.antigravity.deny_ge_app": _bool,
+    "governance.antigravity.deny_agent_platform": _bool,
+    "governance.antigravity.enforcement_job": _regex(ENFORCEMENT_JOB_RE, "Cloud Run job name "
+                                                                         "(projects/PROJECT/locations/REGION/jobs/JOB)"),
+    "governance.antigravity.usage_events_subscription": _regex(SUBSCRIPTION_RE, "Pub/Sub subscription name "
+                                                                                "(projects/PROJECT/subscriptions/ID)"),
+    "governance.antigravity.surge_guard_min": _int(1, 100000),
+    "governance.antigravity.surge_guard_ratio": _float(0.01, 1.0),
+    "governance.antigravity.spend_caps": _bool,
     "analyst.max_bytes_billed": _int(10000000, 10 ** 13),
     "analyst.max_rows": _int(1, 5000),
     "analyst.allow_viewers": _bool,
@@ -819,12 +1001,13 @@ for _module in MODULE_IDS:
 UI_LOCKED_KEYS = {"security.auth_mode", "security.iap_audience", "security.google_client_id",
                   "security.public_base_url", "security.sign_in_bridge_url", "security.bridge_return_url",
                   "security.guest_access", "security.guest_redact_terms",
-                  "governance.antigravity.scheduler_invokers"}
+                  "governance.antigravity.scheduler_invokers", "governance.antigravity.enforcement_job",
+                  "governance.antigravity.deny_policy_id", "governance.antigravity.usage_events_subscription"}
 INTERNAL_KEYS = {"model_catalog.known_models", "telemetry.connectors"}
 
 EDITABLE_SECTIONS = ("product", "branding", "workspace", "security", "modules", "model_catalog",
                      "ai_engine", "agent_lifecycle", "finops", "governance", "analyst", "gateway",
-                     "telemetry", "pricing")
+                     "telemetry", "pricing", "chargeback")
 
 
 def section_prefix(section):
@@ -970,6 +1153,12 @@ ENV_MAP = {
     "PROJECT_ID": "workspace.project_id",
     "QUOTA_PROJECT_ID": "workspace.quota_project_id",
     "AUDIT_DATASET_ID": "workspace.audit_dataset",
+    "AUDIT_PROJECT": "workspace.audit_project",
+    "SCOPE_TYPE": "workspace.scope_type",
+    "ENFORCEMENT_BACKEND": "governance.antigravity.enforcement_backend",
+    "ENFORCEMENT_JOB": "governance.antigravity.enforcement_job",
+    "USAGE_EVENTS_SUBSCRIPTION": "governance.antigravity.usage_events_subscription",
+    "DENY_ATTACHMENT": "governance.antigravity.deny_attachment",
     "BILLING_PROJECT_ID": "workspace.billing.project_id",
     "BILLING_DATASET_ID": "workspace.billing.dataset",
     "BILLING_TABLE_ID": "workspace.billing.table",
@@ -999,6 +1188,7 @@ ENV_MAP = {
 # Comma-separated list values.
 LIST_ENV_MAP = {
     "SCAN_PROJECTS": "workspace.projects",
+    "SCOPE_IDS": "workspace.scope_ids",
     "DISCOVERY_ENGINE_LOCATIONS": "workspace.discovery_engine_locations",
     "AGENT_ENGINE_REGIONS": "workspace.agent_engine_regions",
     "SCHEDULER_INVOKERS": "governance.antigravity.scheduler_invokers",

@@ -964,7 +964,9 @@ class MultiProjectHubAndTeardownTest(unittest.TestCase):
                           "ai-control-plane-pricing-sync", res_dry.stdout)
             self.assertIn("[dry-run] telemetry route sinks", res_dry.stdout)
             self.assertIn("[dry-run] IAM bindings on demo-hub and linked projects (demo-spoke-a,demo-spoke-b)", res_dry.stdout)
-            self.assertFalse(os.path.exists(gcloud_log) and "delete" in open(gcloud_log, encoding="utf-8").read())
+            if os.path.exists(gcloud_log):
+                with open(gcloud_log, encoding="utf-8") as fh:
+                    self.assertNotIn("delete", fh.read())
 
             # 2) Non-dry-run loading SCAN_PROJECTS automatically from deploy.demo-hub.env
             with open(os.path.join(ws, "deploy.demo-hub.env"), "w", encoding="utf-8") as fh:
@@ -1231,6 +1233,1175 @@ class DeploySummaryAndConsentTest(unittest.TestCase):
             self.assertIn(line, saved)
 
 
+ENFORCER_SA = "ai-control-plane-enforcer@demo-hub-proj.iam.gserviceaccount.com"
+SCHEDULER_SA = "ai-control-plane-scheduler@demo-hub-proj.iam.gserviceaccount.com"
+ENFORCER_JOB_NAME = "projects/demo-hub-proj/locations/asia-northeast3/jobs/ai-control-plane-enforcer"
+# Answers the calls of grant_org_deny_roles; FAKE_ORG picks the scenario and every call is logged.
+FAKE_ORG_GCLOUD = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_GCLOUD_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+mode = os.environ.get("FAKE_ORG", "org")
+if args[:2] == ["projects", "get-ancestors"]:
+    if mode == "unreadable":
+        sys.exit(1)
+    chain = [{"id": "demo-hub-proj", "type": "project"}]
+    if mode != "none":
+        chain += [{"id": "4455", "type": "folder"}, {"id": "998877665544", "type": "organization"}]
+    print(json.dumps(chain))
+    sys.exit(0)
+if args[:2] == ["organizations", "add-iam-policy-binding"]:
+    sys.exit(1 if mode == "refused" else 0)
+sys.exit(0)
+"""
+
+
+def lines_with(text, needle):
+    return [line for line in text.splitlines() if needle in line]
+
+
+def copy_scripts(ws, *rels):
+    for rel in rels:
+        os.makedirs(os.path.dirname(os.path.join(ws, rel)), exist_ok=True)
+        with open(os.path.join(ROOT, rel), "rb") as src, open(os.path.join(ws, rel), "wb") as dst:
+            dst.write(src.read())
+        os.chmod(os.path.join(ws, rel), 0o755)
+
+
+class DenyPolicyEnforcementDeployTest(unittest.TestCase):
+    """ENFORCEMENT_BACKEND=iam_deny (README 8.9): a Cloud Run job applies suspensions with an IAM deny policy on the
+    enforcement schedule as its own service account, the web endpoint's scheduler is not created (no double
+    enforcement), and the organization roles are granted only with GRANT_ORG_ROLES=true. The default backend deploys
+    exactly what it did before."""
+
+    def deploy(self, *args, config="", expect_ok=True):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            env = dict(os.environ, PATH=f"{write_stub_bin(tmp, log)}:{os.environ.get('PATH', '')}")
+            path = os.path.join(tmp, "deploy.env")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\n' + config)
+            res = subprocess.run(["bash", os.path.join(ROOT, "scripts/deploy.sh"), "--config", path, *args, "--dry-run"],
+                                 capture_output=True, text=True, env=env, check=False)
+        if expect_ok:
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("Deployment complete: demo-hub-proj", res.stdout)
+        return res
+
+    def teardown(self, config, *args):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            env = dict(os.environ, PATH=f"{write_stub_bin(tmp, log)}:{os.environ.get('PATH', '')}")
+            path = os.path.join(tmp, "deploy.env")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('PROJECT_ID="demo-hub-proj"\nSCAN_PROJECTS="demo-spoke-a"\n' + config)
+            res = subprocess.run(["bash", os.path.join(ROOT, "scripts/teardown.sh"), "--config", path, *args],
+                                 capture_output=True, text=True, env=env, check=False)
+            calls = read_log(log).splitlines()
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        return res, calls
+
+    def run_org_roles(self, mode, grant, dry="0"):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            stub = os.path.join(tmp, "gcloud")
+            with open(stub, "w", encoding="utf-8") as fh:
+                fh.write(FAKE_ORG_GCLOUD)
+            os.chmod(stub, 0o755)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}", FAKE_ORG=mode, FAKE_GCLOUD_LOG=log)
+            cmd = ('source "%s"; DRY_RUN=%s; grant_org_deny_roles demo-hub-proj %s %s %s; '
+                   'echo "commands=${#ORG_DENY_ROLE_COMMANDS[@]}"') % (
+                os.path.join(ROOT, "scripts/lib/common.sh"), dry, ENFORCER_SA, HUB_SA, grant)
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, check=False)
+            calls = read_log(log).splitlines()
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        return res, calls
+
+    @staticmethod
+    def org_commands(org):
+        return ["gcloud organizations add-iam-policy-binding %s --member=serviceAccount:%s --role=roles/iam.denyAdmin "
+                "--condition=None" % (org, ENFORCER_SA),
+                "gcloud organizations add-iam-policy-binding %s --member=serviceAccount:%s --role=roles/iam.denyReviewer "
+                "--condition=None" % (org, HUB_SA)]
+
+    def test_default_backend_deploys_no_job_and_keeps_the_web_scheduler(self):
+        res = self.deploy()
+        for text in (res.stdout, res.stderr):
+            self.assertNotIn("ai-control-plane-enforcer", text)
+            self.assertNotIn("run jobs ", text)
+            self.assertNotIn("organization roles", text)
+        self.assertIn("scheduler jobs create http ai-control-plane-enforce --project demo-hub-proj", res.stderr)
+        self.assertIn("##SCHEDULER_INVOKERS=%s" % SCHEDULER_SA, res.stderr)
+        self.assertNotIn("ENFORCEMENT_JOB=", res.stderr)
+
+    def test_iam_deny_runs_the_job_on_the_schedule_instead_of_the_web_endpoint(self):
+        res = self.deploy("--link-projects", "demo-spoke-a", config='ENFORCEMENT_BACKEND="iam_deny"\n')
+        err = res.stderr
+        self.assertIn("gcloud iam service-accounts create ai-control-plane-enforcer --project demo-hub-proj", err)
+        job = lines_with(err, "run jobs deploy ai-control-plane-enforcer")
+        self.assertEqual(len(job), 1, err)
+        for part in ("--region asia-northeast3", "--service-account %s" % ENFORCER_SA,
+                     "--command python --args=-m,controlplane.enforce_job", "--tasks 1 --max-retries 0 --task-timeout 600s",
+                     "##SETTINGS_BUCKET=demo-hub-proj-ai-control-plane-settings", "##ENFORCEMENT_BACKEND=iam_deny",
+                     "##ENFORCEMENT_JOB=" + ENFORCER_JOB_NAME, "##PYTHONPATH=/app/src"):
+            self.assertIn(part, job[0])
+        self.assertNotIn("--set-secrets", job[0])  # it serves no requests and signs nobody in
+        sched = lines_with(err, "scheduler jobs create http ai-control-plane-enforcer ")
+        self.assertEqual(len(sched), 1, err)
+        for part in ("--location asia-northeast3", "--schedule */5 * * * *",
+                     "--uri https://run.googleapis.com/v2/%s:run --http-method POST" % ENFORCER_JOB_NAME,
+                     "--oauth-service-account-email %s" % SCHEDULER_SA):
+            self.assertIn(part, sched[0])
+        # No double enforcement: the web endpoint's scheduler and its invoker allow-list are not set up.
+        self.assertNotIn("scheduler jobs create http ai-control-plane-enforce ", err)
+        self.assertNotIn("--oidc-service-account-email", err)
+        self.assertNotIn("SCHEDULER_INVOKERS", err)
+        # Only the dashboard ("Run now", status card) and the scheduler may run the job, on this job only.
+        for member, role in ((HUB_SA, "roles/run.jobsExecutor"), (HUB_SA, "roles/run.viewer"),
+                             (SCHEDULER_SA, "roles/run.jobsExecutor")):
+            self.assertIn("run jobs add-iam-policy-binding ai-control-plane-enforcer --project demo-hub-proj --region "
+                          "asia-northeast3 --member serviceAccount:%s --role %s" % (member, role), err)
+        # `gcloud run jobs add-iam-policy-binding` has no --condition flag; passing one stops the deployment (seen live).
+        job_bindings = lines_with(err, "run jobs add-iam-policy-binding")
+        self.assertEqual(len(job_bindings), 3, err)
+        for line in job_bindings:
+            self.assertNotIn("--condition", line)
+        service = lines_with(err, "gcloud run deploy ai-control-plane ")
+        self.assertTrue(service)
+        for line in service:
+            self.assertIn("##ENFORCEMENT_BACKEND=iam_deny", line)
+            self.assertIn("##ENFORCEMENT_JOB=" + ENFORCER_JOB_NAME, line)
+        # The job's account gets read roles and audit writes only; Deny Admin comes from the organization.
+        roles = set(re.findall(r"projects add-iam-policy-binding demo-hub-proj --member serviceAccount:%s --role (\S+)"
+                               % re.escape(ENFORCER_SA), err))
+        self.assertEqual(roles, {"roles/bigquery.dataViewer", "roles/bigquery.jobUser", "roles/discoveryengine.viewer",
+                                 "roles/logging.viewer", "roles/logging.privateLogViewer", "roles/logging.logWriter",
+                                 "roles/serviceusage.serviceUsageConsumer"})
+        self.assertIn("--member serviceAccount:%s --role roles/storage.objectAdmin" % ENFORCER_SA, err)
+        self.assertIn("[dry-run] grant enforcement job read roles on demo-spoke-a -> %s" % ENFORCER_SA, res.stdout)
+        self.assertIn("[dry-run] organization roles not granted (GRANT_ORG_ROLES=false)", res.stdout)
+        self.assertIn("Antigravity caps: deny-policy enforcement by the Cloud Run job ai-control-plane-enforcer "
+                      "(asia-northeast3) */5 * * * *", res.stdout)
+        self.assertTrue(config.ENFORCEMENT_JOB_RE.match(ENFORCER_JOB_NAME))
+
+    def test_job_region_attachment_and_org_grants_from_the_command_line(self):
+        res = self.deploy("--enforcement-backend", "iam_deny", "--enforcement-job-region", "us-central1",
+                          "--deny-attachment", "scope", "--grant-org-roles")
+        job_name = "projects/demo-hub-proj/locations/us-central1/jobs/ai-control-plane-enforcer"
+        job = lines_with(res.stderr, "run jobs deploy ai-control-plane-enforcer")[0]
+        self.assertIn("--region us-central1", job)
+        self.assertIn("##DENY_ATTACHMENT=scope", job)
+        sched = lines_with(res.stderr, "scheduler jobs create http ai-control-plane-enforcer ")[0]
+        self.assertIn("--location us-central1", sched)
+        self.assertIn("--uri https://run.googleapis.com/v2/%s:run" % job_name, sched)
+        service = lines_with(res.stderr, "gcloud run deploy ai-control-plane ")[0]
+        self.assertIn("--region asia-northeast3", service)  # the dashboard stays in REGION
+        self.assertIn("##ENFORCEMENT_JOB=" + job_name, service)
+        self.assertIn("[dry-run] organization roles on the organization of demo-hub-proj: roles/iam.denyAdmin -> %s, "
+                      "roles/iam.denyReviewer -> %s" % (ENFORCER_SA, HUB_SA), res.stdout)
+
+    def test_iam_deny_keeps_its_schedule_in_iap_and_read_only_installs(self):
+        # The scheduler calls the Cloud Run Admin API, not the dashboard: IAP never applies and the dashboard's account
+        # needs no write role.
+        res = self.deploy("--read-only", config='ACCESS_MODE="iap"\nIAP_MEMBERS="example.org"\n'
+                                                'ENFORCEMENT_BACKEND="iam_deny"\n')
+        self.assertTrue(lines_with(res.stderr, "scheduler jobs create http ai-control-plane-enforcer "))
+        self.assertNotIn("no Antigravity enforcement schedule", res.stderr)
+        res = self.deploy("--no-enforcement-schedule", config='ENFORCEMENT_BACKEND="iam_deny"\n')
+        self.assertTrue(lines_with(res.stderr, "run jobs deploy ai-control-plane-enforcer"))
+        self.assertFalse(lines_with(res.stderr, "scheduler jobs create http ai-control-plane-enforce"))
+        self.assertNotIn("--member serviceAccount:%s --role roles/run.jobsExecutor" % SCHEDULER_SA, res.stderr)
+        self.assertIn("Run enforcement now runs ai-control-plane-enforcer", res.stdout)
+
+    def test_notify_only_needs_no_job_no_org_role_and_no_write_role(self):
+        res = self.deploy("--read-only", config='ENFORCEMENT_BACKEND="notify_only"\n')
+        for text in (res.stdout, res.stderr):
+            self.assertNotIn("ai-control-plane-enforcer", text)
+            self.assertNotIn("roles/resourcemanager.projectIamAdmin", text)
+            self.assertNotIn("organization roles", text)
+        self.assertIn("scheduler jobs create http ai-control-plane-enforce --project demo-hub-proj", res.stderr)
+        self.assertIn("##ENFORCEMENT_BACKEND=notify_only", res.stderr)
+        self.assertIn("Antigravity caps: notify only (plans and notifications; access never changes)", res.stdout)
+
+    def test_invalid_enforcement_settings_stop_the_deployment(self):
+        for bad, message in (('ENFORCEMENT_BACKEND="deny"', "ENFORCEMENT_BACKEND must be iam_allow_swap, iam_deny or "
+                                                            "notify_only"),
+                             ('DENY_ATTACHMENT="folder"', "DENY_ATTACHMENT must be projects or scope"),
+                             ('GRANT_ORG_ROLES="yes"', "GRANT_ORG_ROLES must be true or false"),
+                             ('ENFORCEMENT_JOB_REGION="Seoul"', "invalid ENFORCEMENT_JOB_REGION")):
+            res = self.deploy(config=bad + "\n", expect_ok=False)
+            self.assertNotEqual(res.returncode, 0, msg=bad)
+            self.assertIn(message, res.stderr)
+
+    def test_org_roles_are_granted_only_with_grant_org_roles(self):
+        res, calls = self.run_org_roles("org", "true")
+        self.assertEqual([c for c in calls if c.startswith("organizations ")], [
+            "organizations add-iam-policy-binding 998877665544 --member=serviceAccount:%s --role=roles/iam.denyAdmin "
+            "--condition=None --quiet" % ENFORCER_SA,
+            "organizations add-iam-policy-binding 998877665544 --member=serviceAccount:%s --role=roles/iam.denyReviewer "
+            "--condition=None --quiet" % HUB_SA])
+        self.assertIn("granted roles/iam.denyAdmin to serviceAccount:%s on organization 998877665544" % ENFORCER_SA,
+                      res.stdout)
+        self.assertIn("commands=0", res.stdout)
+        self.assertEqual(res.stderr, "")
+        res, calls = self.run_org_roles("org", "false")
+        self.assertFalse([c for c in calls if c.startswith("organizations ")])
+        self.assertIn("(GRANT_ORG_ROLES=false)", res.stderr)
+        for cmd in self.org_commands("998877665544"):
+            self.assertIn(cmd, res.stderr)
+        self.assertIn("commands=2", res.stdout)
+
+    def test_refused_or_unreadable_organization_prints_the_commands(self):
+        res, calls = self.run_org_roles("refused", "true")
+        self.assertEqual(len([c for c in calls if c.startswith("organizations add-iam-policy-binding")]), 2)
+        self.assertIn("could not grant the organization roles", res.stderr)
+        for cmd in self.org_commands("998877665544"):
+            self.assertIn(cmd, res.stderr)
+        res, calls = self.run_org_roles("unreadable", "true")
+        self.assertFalse([c for c in calls if c.startswith("organizations ")])
+        for cmd in self.org_commands("ORGANIZATION_ID"):
+            self.assertIn(cmd, res.stderr)
+        self.assertIn("gcloud projects get-ancestors demo-hub-proj", res.stderr)
+
+    def test_project_without_organization_cannot_use_deny_policies(self):
+        res, calls = self.run_org_roles("none", "true")
+        self.assertFalse([c for c in calls if c.startswith("organizations ")])
+        self.assertIn("demo-hub-proj has no organization", res.stderr)
+        self.assertIn("(ENFORCEMENT_BACKEND=iam_deny) is unavailable here", res.stderr)
+        self.assertIn("[한국어 안내] demo-hub-proj 프로젝트에는 조직이 없습니다", res.stderr)
+        self.assertIn("commands=0", res.stdout)
+
+    def test_org_roles_dry_run_changes_nothing(self):
+        res, calls = self.run_org_roles("org", "true", dry="1")
+        self.assertEqual(calls, [])
+        self.assertIn("[dry-run] organization roles on the organization of demo-hub-proj: roles/iam.denyAdmin -> %s"
+                      % ENFORCER_SA, res.stdout)
+
+    def test_install_forwards_and_saves_the_enforcement_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            ws = os.path.join(tmp, "ws")  # install.sh writes deploy.<project>.env next to the scripts
+            copy_scripts(ws, "scripts/install.sh", "scripts/deploy.sh", "scripts/lib/common.sh")
+            env = dict(os.environ, PATH=f"{write_stub_bin(tmp, log)}:{os.environ.get('PATH', '')}",
+                       ACP_SAVE_ENV_ON_DRY_RUN="1")
+            base = ["bash", os.path.join(ws, "scripts/install.sh"), "--project", "demo-hub-proj",
+                    "--admins", "admin@example.org"]
+            res = subprocess.run(base + ["--enforcement-backend", "iam_deny", "--deny-attachment", "scope",
+                                         "--enforcement-job-region", "us-central1", "--grant-org-roles", "--dry-run"],
+                                 cwd=ws, capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertTrue(lines_with(res.stderr, "run jobs deploy ai-control-plane-enforcer"))
+            with open(os.path.join(ws, "deploy.demo-hub-proj.env"), encoding="utf-8") as fh:
+                saved = fh.read()
+            # Values outside the allowed choices stop the installer before anything is saved or deployed.
+            bad = subprocess.run(base + ["--enforcement-backend", "deny", "--dry-run"],
+                                 cwd=ws, capture_output=True, text=True, env=env, check=False)
+        for line in ('ENFORCEMENT_BACKEND="iam_deny"', 'DENY_ATTACHMENT="scope"', 'ENFORCEMENT_JOB_REGION="us-central1"',
+                     'GRANT_ORG_ROLES="true"'):
+            self.assertIn(line, saved)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("--enforcement-backend must be one of: iam_allow_swap iam_deny notify_only", bad.stderr)
+
+    def test_teardown_stops_the_job_before_deleting_the_deny_policy(self):
+        res, calls = self.teardown('ENFORCEMENT_BACKEND="iam_deny"\nENFORCEMENT_JOB_REGION="us-central1"\n', "--yes")
+
+        def first(prefix):
+            return next(i for i, call in enumerate(calls) if call.startswith(prefix))
+
+        stop_schedule = first("scheduler jobs delete ai-control-plane-enforcer --project demo-hub-proj --location "
+                              "us-central1")
+        stop_job = first("run jobs delete ai-control-plane-enforcer --project demo-hub-proj --region us-central1")
+        for project in ("demo-hub-proj", "demo-spoke-a"):
+            delete = first("iam policies delete ai-control-plane-caps --attachment-point=cloudresourcemanager."
+                           "googleapis.com/projects/%s --kind=denypolicies" % project)
+            self.assertLess(stop_schedule, delete)
+            self.assertLess(stop_job, delete)
+        self.assertIn("iam service-accounts delete %s --project demo-hub-proj --quiet" % ENFORCER_SA, calls)
+        self.assertTrue([c for c in calls if c.startswith("projects get-iam-policy demo-spoke-a") and ENFORCER_SA in c])
+        # The organization cannot be read here, so the commands for an organization administrator are printed.
+        self.assertIn("gcloud organizations remove-iam-policy-binding ORGANIZATION_ID --member=serviceAccount:%s "
+                      "--role=roles/iam.denyAdmin --condition=None" % ENFORCER_SA, res.stdout)
+
+    def test_teardown_leaves_deny_policies_alone_without_the_job(self):
+        res, calls = self.teardown("", "--yes")
+        self.assertFalse([c for c in calls if c.startswith("iam policies delete")])
+        self.assertFalse([c for c in calls if c.startswith("organizations ")])
+        self.assertIn("Cloud Run job ai-control-plane-enforcer", res.stdout)
+        res, calls = self.teardown('ENFORCEMENT_BACKEND="iam_deny"\n', "--dry-run")
+        self.assertFalse([c for c in calls if "delete" in c])
+        self.assertIn("[dry-run] managed deny policy ai-control-plane-caps on demo-hub-proj and linked projects",
+                      res.stdout)
+        self.assertIn("ai-control-plane-enforcer (asia-northeast3)", res.stdout)
+
+    def test_settings_are_documented_and_match_the_application(self):
+        example = read("deploy.env.example")
+        for line in ('ENFORCEMENT_BACKEND="iam_allow_swap"', 'DENY_ATTACHMENT="projects"', 'ENFORCEMENT_JOB_REGION=""',
+                     'GRANT_ORG_ROLES="false"'):
+            self.assertRegex(example, r"(?m)^%s" % re.escape(line))
+        usage = subprocess.run(["bash", os.path.join(ROOT, "scripts/deploy.sh"), "--help"],
+                               capture_output=True, text=True, check=False).stdout
+        for flag in ("--enforcement-backend", "--deny-attachment", "--enforcement-job-region", "--grant-org-roles"):
+            self.assertIn(flag, usage)
+        self.assertIn("--enforcement-backend iam_deny", subprocess.run(
+            ["bash", os.path.join(ROOT, "scripts/install.sh"), "--help"], capture_output=True, text=True,
+            check=False).stdout)
+        # The variables the scripts and Terraform set are the ones the application reads, with the same choices.
+        terraform = read("terraform/main.tf")
+        for env_name in ("ENFORCEMENT_BACKEND", "DENY_ATTACHMENT", "ENFORCEMENT_JOB"):
+            self.assertIn(env_name, config.ENV_MAP)
+            self.assertIn("%s " % env_name, terraform)
+        deploy = read("scripts/deploy.sh")
+        self.assertIn("iam_allow_swap|iam_deny|notify_only) ;;", deploy)
+        self.assertIn("projects|scope) ;;", deploy)
+        backend = config.VALIDATORS["governance.antigravity.enforcement_backend"]
+        attachment = config.VALIDATORS["governance.antigravity.deny_attachment"]
+        for value in ("iam_allow_swap", "iam_deny", "notify_only"):
+            self.assertEqual(backend(value), value)
+        for value in ("projects", "scope"):
+            self.assertEqual(attachment(value), value)
+        with self.assertRaises(config.Invalid):
+            backend("deny")
+
+    def test_readmes_document_the_settings_and_the_rollback_command(self):
+        self.assertIn('gcloud iam policies delete "$DENY_POLICY_ID" --attachment-point="$point" --kind=denypolicies',
+                      read("scripts/teardown.sh"))
+        for readme, heading in (("README.md", "### 8.9 거부 정책 집행과 집행 작업"),
+                                ("README.en.md", "### 8.9 Deny-policy enforcement and the enforcement job")):
+            text = read(readme)
+            self.assertIn(heading, text, readme)
+            start = text.index(heading)
+            section = text[start:text.index("\n## 9. ", start)]
+            self.assertIn("gcloud iam policies delete ai-control-plane-caps \\\n  --attachment-point=cloudresourcemanager."
+                          "googleapis.com/projects/PROJECT_ID --kind=denypolicies", section, readme)
+            for key in ("ENFORCEMENT_BACKEND", "DENY_ATTACHMENT", "ENFORCEMENT_JOB_REGION", "GRANT_ORG_ROLES",
+                        "roles/iam.denyAdmin", "roles/iam.denyReviewer", "roles/run.jobsExecutor", "2,500"):
+                self.assertIn(key, section, (readme, key))
+
+
+class RealtimeEnforcementScriptTest(unittest.TestCase):
+    def _deploy_dry_run(self, extra_args=(), env_lines=""):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            cfg = os.path.join(tmp, "deploy.env")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write('PROJECT_ID="demo-hub-proj"\nREGION="asia-northeast3"\nADMIN_EMAILS="admin@example.org"\n'
+                         'ACCESS_MODE="google"\nCREATE_LOG_SINK="false"\n' + env_lines)
+            env = dict(os.environ, PATH=f"{write_stub_bin(tmp, log)}:{os.environ.get('PATH', '')}")
+            res = subprocess.run(
+                ["bash", os.path.join(ROOT, "scripts/deploy.sh"), "--config", cfg, "--dry-run", *extra_args],
+                cwd=ROOT, capture_output=True, text=True, env=env, check=False,
+            )
+            return res
+
+    def test_deploy_enables_realtime_by_default_even_without_bq_sink(self):
+        res = self._deploy_dry_run()
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn("USAGE_EVENTS_SUBSCRIPTION=projects/demo-hub-proj/subscriptions/ai-control-plane-agy-usage-push",
+                      res.stderr)
+        self.assertIn("Pub/Sub topic ai-control-plane-agy-usage + log sink ai-control-plane-agy-usage", res.stdout)
+        self.assertIn("Real-time caps:", res.stdout)
+
+    def test_deploy_no_realtime_flag_and_iap_disable_push(self):
+        res_off = self._deploy_dry_run(extra_args=("--no-realtime-enforcement",))
+        self.assertEqual(res_off.returncode, 0, msg=(res_off.stdout, res_off.stderr))
+        self.assertNotIn("USAGE_EVENTS_SUBSCRIPTION=", res_off.stderr)
+        self.assertNotIn("Pub/Sub topic ai-control-plane-agy-usage", res_off.stdout)
+
+        res_iap = self._deploy_dry_run(env_lines='ACCESS_MODE="iap"\nIAP_MEMBERS="user:admin@example.org"\n')
+        self.assertEqual(res_iap.returncode, 0, msg=(res_iap.stdout, res_iap.stderr))
+        self.assertNotIn("USAGE_EVENTS_SUBSCRIPTION=", res_iap.stderr)
+
+    def test_teardown_dry_run_includes_realtime_pubsub_resources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            cfg = os.path.join(tmp, "deploy.env")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write('PROJECT_ID="demo-hub-proj"\nREGION="asia-northeast3"\n')
+            env = dict(os.environ, PATH=f"{write_stub_bin(tmp, log)}:{os.environ.get('PATH', '')}")
+            res = subprocess.run(
+                ["bash", os.path.join(ROOT, "scripts/teardown.sh"), "--config", cfg, "--dry-run"],
+                cwd=ROOT, capture_output=True, text=True, env=env, check=False,
+            )
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("ai-control-plane-agy-usage-push", res.stdout)
+            self.assertIn("ai-control-plane-agy-usage", res.stdout)
+
+    def test_realtime_setting_documented_and_wired_in_terraform(self):
+        self.assertRegex(read("deploy.env.example"), r'(?m)^REALTIME_ENFORCEMENT="true"')
+        tf = read("terraform/main.tf")
+        self.assertIn("USAGE_EVENTS_SUBSCRIPTION", tf)
+        self.assertIn('resource "google_pubsub_subscription" "usage_events_push"', tf)
+        self.assertIn('resource "google_logging_project_sink" "usage_events"', tf)
+        common = read("scripts/lib/common.sh")
+        self.assertNotRegex(common, r"gcloud pubsub topics add-iam-policy-binding[^\n]*\\\n[^\n]*--condition")
+
+
+# Fake gcloud for the deploy, install and teardown runs below: every call is logged; FAKE_EXISTING lists resource names
+# whose `describe` succeeds; FAKE_POLICY / FAKE_ROLES answer get-iam-policy (JSON / value(bindings.role));
+# FAKE_SETTINGS is the dashboard's settings object (gcloud storage cat); FAKE_FAIL lists call prefixes that fail and
+# FAKE_FAIL_RE is a regular expression for calls that fail.
+FAKE_GCLOUD = """#!/usr/bin/env python3
+import os, re, sys
+args = sys.argv[1:]
+line = " ".join(args)
+with open(os.environ["FAKE_GCLOUD_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(line + "\\n")
+if "--data-file=-" in args:
+    sys.stdin.read()  # as gcloud does: the writer of the pipe must never see a closed pipe
+existing = [s for s in os.environ.get("FAKE_EXISTING", "").split(",") if s]
+if any(line.startswith(p) for p in os.environ.get("FAKE_FAIL", "").split("|") if p):
+    sys.exit(1)
+if os.environ.get("FAKE_FAIL_RE") and re.search(os.environ["FAKE_FAIL_RE"], line):
+    sys.exit(1)
+if "config get-value account" in line:
+    print("owner@example.org")
+elif "config get-value project" in line:
+    print("demo-hub-proj")
+elif "projects describe" in line:
+    print("123456789012")
+elif "auth print-access-token" in line:
+    print("")
+elif "projects get-iam-policy" in line and "value(bindings.role)" in line:
+    print(os.environ.get("FAKE_ROLES", "roles/bigquery.jobUser"))
+elif "projects get-iam-policy" in line:
+    print(os.environ.get("FAKE_POLICY", '{"bindings": []}'))
+elif "run deploy --help" in line:
+    print("--iap --no-iap --no-invoker-iam-check")
+elif "storage cat" in line:
+    print(os.environ.get("FAKE_SETTINGS", ""))
+elif "describe" in args:
+    sys.exit(0 if any(name in args for name in existing) else 1)
+sys.exit(0)
+"""
+# Fake bq: logs every call and shows FAKE_DATASET for `bq show`; anything else succeeds (or fails without a dataset).
+FAKE_BQ = """#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_GCLOUD_LOG"], "a", encoding="utf-8") as fh:
+    fh.write("bq " + " ".join(args) + "\\n")
+dataset = os.environ.get("FAKE_DATASET", "")
+if "show" in args:
+    if not dataset:
+        sys.exit(1)
+    print(dataset)
+sys.exit(0)
+"""
+SCRIPT_FILES = ("scripts/install.sh", "scripts/deploy.sh", "scripts/prepare.sh", "scripts/teardown.sh",
+                "scripts/lib/common.sh")
+
+
+def fake_env(tmp, **extra):
+    """PATH with the fake gcloud and bq; returns (env, log path)."""
+    bin_dir = os.path.join(tmp, "fakebin")
+    os.makedirs(bin_dir, exist_ok=True)
+    for name, body in (("gcloud", FAKE_GCLOUD), ("bq", FAKE_BQ)):
+        with open(os.path.join(bin_dir, name), "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(os.path.join(bin_dir, name), 0o755)
+    log = os.path.join(tmp, "calls.log")
+    env = dict(os.environ, PATH=f"{bin_dir}:{os.environ.get('PATH', '')}", FAKE_GCLOUD_LOG=log)
+    env.update(extra)
+    return env, log
+
+
+def run_script(script, args, env, cwd=None, stdin=None):
+    return subprocess.run(["bash", script, *args], cwd=cwd, input=stdin, capture_output=True, text=True, env=env,
+                          check=False)
+
+
+def parser_flags(rel):
+    """Every option of the script's `while [[ $# -gt 0 ]]` argument parser (case labels such as --a|--b)."""
+    text = read(rel)
+    start = text.index("while [[ $# -gt 0 ]]; do")
+    block = text[start:text.index("\ndone\n", start)]
+    flags = set()
+    for label in re.findall(r"(?m)^\s+((?:-{1,2}[a-z][a-z0-9-]*\|?)+)\)", block):
+        flags.update(f for f in label.split("|") if f)
+    return flags
+
+
+def documented(flag, text):
+    """True when the help text names the flag, also in the --[no-]flag shorthand."""
+    if flag in text:
+        return True
+    base = flag[len("--no-"):] if flag.startswith("--no-") else flag[2:]
+    return "--[no-]" + base in text
+
+
+class DeploySettingsParityTest(unittest.TestCase):
+    """Every flag deploy.sh accepts is in its help and accepted (and forwarded) by install.sh, every variable it reads
+    is in deploy.env.example, and flags win over deploy.env and the installer's per-project snapshot."""
+
+    def deploy(self, *args, config=None, expect_ok=True, **fake):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = fake_env(tmp, **fake)
+            cmd = []
+            if config is not None:
+                path = os.path.join(tmp, "deploy.env")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(config)
+                cmd += ["--config", path]
+            res = run_script(os.path.join(ROOT, "scripts/deploy.sh"), cmd + list(args) + ["--dry-run"], env)
+            calls = read_log(log)
+        if expect_ok:
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        return res, calls
+
+    def test_help_documents_every_flag_the_parser_accepts(self):
+        usage = run_script(os.path.join(ROOT, "scripts/deploy.sh"), ["--help"], dict(os.environ)).stdout
+        missing = sorted(f for f in parser_flags("scripts/deploy.sh") if not documented(f, usage))
+        self.assertEqual(missing, [])
+        # The whole header is printed (the old fixed line range cut new lines off).
+        self.assertIn("-h, --help", usage)
+        self.assertIn("deploy.env.example", usage)
+
+    def test_installer_accepts_and_documents_every_deploy_flag(self):
+        deploy_flags, install_flags = parser_flags("scripts/deploy.sh"), parser_flags("scripts/install.sh")
+        self.assertEqual(sorted(deploy_flags - install_flags), [])
+        # Everything the installer takes (except its own --prepare-only) can be passed on to deploy.sh.
+        self.assertEqual(sorted(install_flags - deploy_flags - {"--prepare-only"}), [])
+        usage = run_script(os.path.join(ROOT, "scripts/install.sh"), ["--help"], dict(os.environ)).stdout
+        self.assertEqual(sorted(f for f in install_flags if not documented(f, usage)), [])
+
+    def test_deploy_env_example_documents_every_variable_deploy_reads(self):
+        reads = set(re.findall(r"\$\{([A-Z][A-Z0-9_]*):-", read("scripts/deploy.sh")))
+        aliases_and_internal = {"INITIAL_ADMINS", "ADMINS", "ADMIN_EMAIL", "INITIAL_VIEWERS", "VIEWERS", "VIEWER_EMAILS",
+                                "LINKED_PROJECTS", "WORKSPACE_PROJECTS", "AUTO_DISCOVER_PROJECTS",
+                                "PRICING_SYNC_SCHEDULE", "IAP_OAUTH_CLIENT"}
+        example = read("deploy.env.example")
+        missing = sorted(v for v in reads - aliases_and_internal if not re.search(r"(?m)^%s=" % v, example))
+        self.assertEqual(missing, [])
+        modules = example[example.index("DISABLED_MODULES="):example.index("# ---", example.index("DISABLED_MODULES="))]
+        for module in config.MODULE_IDS:
+            self.assertIn(module, modules)
+
+    def test_example_file_deploys_as_is(self):
+        example = read("deploy.env.example").replace('PROJECT_ID="your-project-id"', 'PROJECT_ID="demo-hub-proj"')
+        res, _ = self.deploy(config=example)
+        self.assertIn("Deployment complete: demo-hub-proj", res.stdout)
+
+    def test_flags_win_over_the_config_file(self):
+        cfg = ('PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\nVPC_NETWORK="cfg-net"\n'
+               'VPC_SUBNET="cfg-subnet"\nMAINTENANCE_SCHEDULE="*/30 * * * *"\nENABLE_GOVERNANCE_ACTIONS="false"\n')
+        res, _ = self.deploy("--vpc-network", "cli-net", "--vpc-subnet", "cli-subnet", "--maintenance-schedule",
+                             "0 * * * *", "--no-read-only", config=cfg)
+        self.assertIn("--network cli-net --subnet cli-subnet", res.stderr)
+        self.assertNotIn("cfg-net", res.stderr + res.stdout)
+        self.assertIn("[dry-run] scheduler job ai-control-plane-maintenance: 0 * * * *", res.stdout)
+        self.assertIn("roles/resourcemanager.projectIamAdmin", res.stderr)  # --no-read-only beats the file
+        res, _ = self.deploy(config=cfg)
+        self.assertNotIn("roles/resourcemanager.projectIamAdmin", res.stderr)
+        res, _ = self.deploy(config=cfg + 'PREFLIGHT_STRICT="maybe"\n', expect_ok=False)
+        self.assertIn("PREFLIGHT_STRICT must be true or false", res.stderr)
+
+    def test_maintenance_schedule_can_be_turned_off_and_old_jobs_go(self):
+        base = 'PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\n'
+        res, _ = self.deploy("--no-maintenance-schedule", config=base)
+        self.assertIn("maintenance schedule: off (MAINTENANCE_SCHEDULE=off)", res.stdout)
+        res, _ = self.deploy(config=base + 'MAINTENANCE_SCHEDULE="none"\n',
+                             FAKE_EXISTING="ai-control-plane-maintenance")
+        self.assertIn("[dry-run] remove scheduler job ai-control-plane-maintenance (MAINTENANCE_SCHEDULE=off)",
+                      res.stdout)
+        res, _ = self.deploy(config=base + 'ACCESS_MODE="iap"\nIAP_MEMBERS="example.org"\n',
+                             FAKE_EXISTING="ai-control-plane-maintenance")
+        self.assertIn("[dry-run] remove scheduler job ai-control-plane-maintenance (IAP blocks Cloud Scheduler calls)",
+                      res.stdout)
+        # A legacy PRICING_SYNC_SCHEDULE="off" no longer overrides an explicit flag.
+        res, _ = self.deploy("--maintenance-schedule", "*/20 * * * *", config=base + 'PRICING_SYNC_SCHEDULE="off"\n')
+        self.assertIn("[dry-run] scheduler job ai-control-plane-maintenance: */20 * * * *", res.stdout)
+
+    def test_stale_web_enforcement_job_is_removed_when_no_schedule_applies(self):
+        base = 'PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\n'
+        for extra, args, why in (("", ("--no-enforcement-schedule",), "ENFORCEMENT_SCHEDULE off"),
+                                 ("", ("--read-only",), "read-only install"),
+                                 ('ACCESS_MODE="iap"\nIAP_MEMBERS="example.org"\n', (), "IAP access mode")):
+            res, _ = self.deploy(*args, config=base + extra, FAKE_EXISTING="ai-control-plane-enforce")
+            self.assertIn("[dry-run] remove scheduler job ai-control-plane-enforce (%s)" % why, res.stdout, args)
+        res, _ = self.deploy(config=base, FAKE_EXISTING="ai-control-plane-enforce")
+        self.assertNotIn("remove scheduler job ai-control-plane-enforce", res.stdout)
+        self.assertIn("scheduler jobs update http ai-control-plane-enforce", res.stderr)
+
+    def test_fresh_project_needs_scheduler_for_the_maintenance_tick_and_linked_traces(self):
+        deploy = read("scripts/deploy.sh")
+        self.assertRegex(deploy, r'\[\[ "\$MAINTENANCE_SCHEDULE" != "off" && "\$ACCESS_MODE" != "iap" \]\] && NEED_SCHED=1')
+        linked = deploy[deploy.index("LINKED_READ_ROLES=("):deploy.index(")", deploy.index("LINKED_READ_ROLES=("))]
+        self.assertIn("roles/cloudtrace.user", linked)
+        # Turning real-time enforcement off removes the sinks of the linked projects and the topic as well.
+        off = deploy[deploy.index('elif [[ "$DRY_RUN" != "1" ]]; then\n  # Real-time enforcement off'):]
+        off = off[:off.index("\nfi\n")]
+        self.assertIn('for sink_proj in "$PROJECT_ID" ${CLEAN_LINKED[@]+"${CLEAN_LINKED[@]}"}; do', off)
+        self.assertIn('gcloud pubsub topics delete "$USAGE_EVENTS_TOPIC"', off)
+        self.assertLess(off.index("subscriptions delete"), off.index("topics delete"))
+
+    def test_none_clears_linked_projects_and_viewers_of_the_config(self):
+        cfg = ('PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\nSCAN_PROJECTS="demo-spoke-a"\n'
+               'ALLOWED_USERS="viewer@example.org"\n')
+        res, _ = self.deploy(config=cfg)
+        self.assertIn("##ALLOWED_USERS=viewer@example.org", res.stderr)
+        self.assertIn("Linked scan   : demo-spoke-a", res.stdout)
+        res, _ = self.deploy("--link-projects", "none", "--viewers", "None", config=cfg)
+        self.assertNotIn("ALLOWED_USERS=", res.stderr)
+        self.assertNotIn("demo-spoke-a", res.stdout + res.stderr)
+        # "none" written in the file means the same; an empty flag value is still refused.
+        res, _ = self.deploy(config=cfg.replace('"demo-spoke-a"', '"none"'))
+        self.assertNotIn("Linked scan", res.stdout)
+        res, _ = self.deploy("--viewers", "", config=cfg, expect_ok=False)
+        self.assertIn("--viewers needs a value", res.stderr)
+
+    def test_enforcement_schedule_off_is_case_insensitive(self):
+        base = 'PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\n'
+        for value in ("OFF", "None"):
+            res, _ = self.deploy(config=base + 'ENFORCEMENT_SCHEDULE="%s"\n' % value)
+            self.assertNotIn("scheduler jobs create http ai-control-plane-enforce ", res.stderr, value)
+            self.assertNotIn("SCHEDULER_INVOKERS", res.stderr, value)
+            self.assertIn("enforcement schedule: on-demand from the dashboard (ENFORCEMENT_SCHEDULE off)", res.stdout)
+
+
+class ServiceEnvMatchesSetupTest(unittest.TestCase):
+    """The dashboard shows the enforcement schedule and the real-time push as configured from SCHEDULER_INVOKERS and
+    USAGE_EVENTS_SUBSCRIPTION, so the service keeps them only when the -enforce job and the push subscription exist. A
+    real run (no --dry-run) against the fake gcloud: the IAP fallback never sets them, and a failed Pub/Sub setup
+    takes the subscription out again with one extra revision."""
+
+    CONFIG = ('PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\nCREATE_LOG_SINK="false"\n'
+              'ENABLE_DATA_ACCESS_LOGS="false"\nENABLE_GE_OBSERVABILITY="false"\n'
+              'IMAGE="asia-northeast3-docker.pkg.dev/demo-hub-proj/acp/acp:test"\n'
+              # .invalid names never resolve, so the readiness probe ends at once without reaching any server.
+              'PUBLIC_BASE_URL="https://dashboard.invalid"\n')
+    SUBSCRIPTION = "USAGE_EVENTS_SUBSCRIPTION=projects/demo-hub-proj/subscriptions/ai-control-plane-agy-usage-push"
+
+    def deploy(self, **fake):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = fake_env(tmp, **fake)
+            path = os.path.join(tmp, "deploy.env")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self.CONFIG)
+            res = run_script(os.path.join(ROOT, "scripts/deploy.sh"), ["--config", path], env)
+            calls = read_log(log).splitlines()
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn("Deployment complete: demo-hub-proj", res.stdout)
+        return res, calls
+
+    @staticmethod
+    def service_deploys(calls):
+        return [c for c in calls if c.startswith("run deploy ai-control-plane --")]
+
+    @staticmethod
+    def updates(calls):
+        return [c for c in calls if c.startswith("run services update")]
+
+    def test_schedule_and_push_set_up_keep_both_without_another_revision(self):
+        res, calls = self.deploy()
+        deploys = self.service_deploys(calls)
+        self.assertEqual(len(deploys), 1, deploys)
+        self.assertIn("##SCHEDULER_INVOKERS=%s" % SCHEDULER_SA, deploys[0])
+        self.assertIn("##" + self.SUBSCRIPTION, deploys[0])
+        self.assertTrue([c for c in calls if c.startswith("scheduler jobs create http ai-control-plane-enforce ")])
+        self.assertEqual(self.updates(calls), [])
+        self.assertIn("Real-time caps: active", res.stdout)
+
+    def test_failed_pubsub_setup_takes_the_subscription_out_again(self):
+        res, calls = self.deploy(FAKE_FAIL="logging sinks create ai-control-plane-agy-usage ")
+        self.assertEqual(self.updates(calls), [
+            "run services update ai-control-plane --project demo-hub-proj --region asia-northeast3 "
+            "--remove-env-vars USAGE_EVENTS_SUBSCRIPTION --quiet"])
+        self.assertIn("removed USAGE_EVENTS_SUBSCRIPTION from ai-control-plane", res.stdout)
+        self.assertNotIn("Real-time caps: active", res.stdout)
+        # The -enforce job exists, so its variable stays.
+        self.assertIn("##SCHEDULER_INVOKERS=%s" % SCHEDULER_SA, self.service_deploys(calls)[0])
+        res, calls = self.deploy(FAKE_FAIL="logging sinks create ai-control-plane-agy-usage |run services update")
+        self.assertIn("could not remove USAGE_EVENTS_SUBSCRIPTION from ai-control-plane", res.stderr)
+        self.assertIn("--remove-env-vars USAGE_EVENTS_SUBSCRIPTION", res.stderr)
+
+    def test_iap_fallback_revision_never_announces_schedule_or_push(self):
+        res, calls = self.deploy(
+            FAKE_FAIL_RE=r"^run deploy ai-control-plane --.*( --no-invoker-iam-check | --allow-unauthenticated )")
+        deploys = self.service_deploys(calls)
+        self.assertEqual(len(deploys), 3, deploys)  # without invoker check, with allUsers, then behind IAP
+        self.assertIn("--iap --invoker-iam-check", deploys[-1])
+        for key in ("SCHEDULER_INVOKERS", "USAGE_EVENTS_SUBSCRIPTION"):
+            self.assertNotIn(key, deploys[-1])
+        self.assertEqual(self.updates(calls), [])
+        self.assertFalse([c for c in calls if c.startswith("scheduler jobs create http ai-control-plane-enforce ")])
+        self.assertFalse([c for c in calls if c.startswith("pubsub subscriptions create")])
+        self.assertIn("Organization policies block a public entry", res.stderr)
+
+
+class InstallerRerunTest(unittest.TestCase):
+    """install.sh forwards every setting, saves it in deploy.PROJECT_ID.env and keeps what earlier runs saved."""
+
+    def workspace(self, tmp):
+        ws = os.path.join(tmp, "ws")
+        copy_scripts(ws, *SCRIPT_FILES)
+        return ws
+
+    def install(self, ws, env, *args):
+        res = run_script(os.path.join(ws, "scripts/install.sh"), list(args) + ["--dry-run"], env, cwd=ws)
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        return res
+
+    def test_new_flags_are_forwarded_and_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.workspace(tmp)
+            env, _ = fake_env(tmp, ACP_SAVE_ENV_ON_DRY_RUN="1")
+            res = self.install(ws, env, "--project", "demo-hub-proj", "--admins", "admin@example.org",
+                               "--no-realtime-enforcement", "--no-maintenance-schedule", "--access-mode", "password",
+                               "--service-name", "acp-two", "--dataset-location", "US", "--org-name", "Example Org",
+                               "--enforcement-schedule", "*/10 * * * *")
+            with open(os.path.join(ws, "deploy.demo-hub-proj.env"), encoding="utf-8") as fh:
+                saved = fh.read()
+        self.assertIn("maintenance schedule: off", res.stdout)
+        self.assertNotIn("USAGE_EVENTS_SUBSCRIPTION=", res.stderr)
+        self.assertIn("Deploying acp-two to demo-hub-proj (asia-northeast3)", res.stdout)
+        for line in ('REALTIME_ENFORCEMENT="false"', 'MAINTENANCE_SCHEDULE="off"', 'ACCESS_MODE="password"',
+                     'SERVICE_NAME="acp-two"', 'DATASET_LOCATION="US"', 'ORGANIZATION_NAME="Example Org"',
+                     'ENFORCEMENT_SCHEDULE="*/10 * * * *"', 'ADMIN_EMAILS="admin@example.org"'):
+            self.assertIn(line, saved)
+        self.assertEqual(saved.count("DATASET_LOCATION="), 1)
+
+    def test_rerun_without_flags_keeps_saved_settings_and_hand_edits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.workspace(tmp)
+            env, _ = fake_env(tmp, ACP_SAVE_ENV_ON_DRY_RUN="1")
+            self.install(ws, env, "--project", "demo-hub-proj", "--region", "us-central1", "--admins",
+                         "lead@example.org", "--service-name", "acp-two", "--dataset-location", "US")
+            snapshot = os.path.join(ws, "deploy.demo-hub-proj.env")
+            with open(snapshot, "a", encoding="utf-8") as fh:
+                fh.write('BILLING_TABLE="gcp_billing_export_resource_v1_X"\n')
+            res = self.install(ws, env, "--project", "demo-hub-proj")
+            self.assertIn("Deploying acp-two to demo-hub-proj (us-central1)", res.stdout)
+            self.assertNotIn("--region asia-northeast3", res.stderr)
+            with open(snapshot, encoding="utf-8") as fh:
+                saved = fh.read()
+            for line in ('REGION="us-central1"', 'ADMIN_EMAILS="lead@example.org"', 'SERVICE_NAME="acp-two"',
+                         'BILLING_TABLE="gcp_billing_export_resource_v1_X"'):
+                self.assertIn(line, saved)
+            self.install(ws, env, "--project", "demo-hub-proj", "--region", "europe-west1",
+                         "--org-name", "It's $HOME")
+            with open(snapshot, encoding="utf-8") as fh:
+                saved = fh.read()
+            self.assertIn('REGION="europe-west1"', saved)
+            self.assertIn('DATASET_LOCATION="US"', saved)  # the dataset cannot move with the region
+            # Values bash would expand are quoted so that sourcing the file gives them back unchanged.
+            out = subprocess.run(["bash", "-c", 'source "$1"; printf "%s" "$ORGANIZATION_NAME"', "_", snapshot],
+                                 capture_output=True, text=True, check=False).stdout
+            self.assertEqual(out, "It's $HOME")
+
+    def test_prepare_only_passes_only_the_flags_prepare_takes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.workspace(tmp)
+            env, _ = fake_env(tmp)
+            res = self.install(ws, env, "--prepare-only", "--project", "demo-hub", "--read-only", "--access-mode",
+                               "iap", "--enforcement-backend", "iam_deny", "--no-realtime-enforcement",
+                               "--dataset", "ai_logs", "--no-log-prompts")
+        self.assertIn("Preparing demo-hub for AI Control Plane", res.stdout)
+        self.assertIn("demo-hub:ai_logs", res.stdout)
+        self.assertNotIn("unknown argument", res.stderr)
+
+    def test_clean_reclone_keeps_saved_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            upstream = os.path.join(tmp, "upstream")
+            copy_scripts(upstream, *SCRIPT_FILES)
+            git_env = dict(os.environ, GIT_AUTHOR_NAME="test", GIT_AUTHOR_EMAIL="test@example.org",
+                           GIT_COMMITTER_NAME="test", GIT_COMMITTER_EMAIL="test@example.org")
+            for cmd in (["git", "init", "-b", "main", upstream], ["git", "-C", upstream, "add", "."],
+                        ["git", "-C", upstream, "commit", "-m", "v1"]):
+                subprocess.run(cmd, check=True, capture_output=True, env=git_env)
+            install_dir = os.path.join(tmp, "home", "ai-control-plane")
+            os.makedirs(install_dir)  # no .git: the installer takes the clean re-clone path
+            with open(os.path.join(install_dir, "deploy.demo-kept-proj.env"), "w", encoding="utf-8") as fh:
+                fh.write('PROJECT_ID="demo-kept-proj"\nREGION="europe-west1"\nADMIN_EMAILS="admin@example.org"\n'
+                         '# kept by hand\n')
+            streamed = os.path.join(tmp, "streamed_install.sh")
+            copy = read("scripts/install.sh")
+            with open(streamed, "w", encoding="utf-8") as fh:
+                fh.write(copy)
+            env, _ = fake_env(tmp, HOME=os.path.join(tmp, "home"), ACP_REPO_URL=upstream, ACP_INSTALL_DIR=install_dir)
+            res = run_script(streamed, ["--project", "demo-kept-proj", "--dry-run"], env, cwd=tmp)
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("Downloading AI Control Plane", res.stdout)
+            self.assertIn("Deploying ai-control-plane to demo-kept-proj (europe-west1)", res.stdout)
+            with open(os.path.join(install_dir, "deploy.demo-kept-proj.env"), encoding="utf-8") as fh:
+                self.assertIn("# kept by hand", fh.read())
+            self.assertTrue(os.path.isdir(os.path.join(install_dir, ".git")))
+
+    def test_dataset_location_follows_the_region_unless_given(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.workspace(tmp)
+            env, _ = fake_env(tmp, ACP_SAVE_ENV_ON_DRY_RUN="1")
+            snapshot = os.path.join(ws, "deploy.demo-hub-proj.env")
+            self.install(ws, env, "--project", "demo-hub-proj")
+            with open(snapshot, encoding="utf-8") as fh:
+                self.assertNotIn("DATASET_LOCATION=", fh.read())
+            # The organization refused the first region: re-running with --region moves the dataset location too.
+            res = self.install(ws, env, "--project", "demo-hub-proj", "--region", "europe-west1")
+            self.assertIn("Audit dataset : demo-hub-proj:ge_analytics (europe-west1,", res.stdout)
+            # Earlier installers pinned DATASET_LOCATION to the region of their run: such a value follows a new region.
+            with open(snapshot, "a", encoding="utf-8") as fh:
+                fh.write('DATASET_LOCATION="europe-west1"\n')
+            res = self.install(ws, env, "--project", "demo-hub-proj", "--region", "us-central1")
+            self.assertIn("Audit dataset : demo-hub-proj:ge_analytics (us-central1,", res.stdout)
+            with open(snapshot, encoding="utf-8") as fh:
+                saved = fh.read()
+            self.assertIn('DATASET_LOCATION=""', saved)
+            self.assertIn('REGION="us-central1"', saved)
+            # An explicit location is saved and kept when the region changes.
+            self.install(ws, env, "--project", "demo-hub-proj", "--dataset-location", "US")
+            res = self.install(ws, env, "--project", "demo-hub-proj", "--region", "asia-northeast3")
+            self.assertIn("Audit dataset : demo-hub-proj:ge_analytics (US,", res.stdout)
+
+    def test_none_clears_saved_linked_projects_and_viewers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = self.workspace(tmp)
+            env, _ = fake_env(tmp, ACP_SAVE_ENV_ON_DRY_RUN="1")
+            snapshot = os.path.join(ws, "deploy.demo-hub-proj.env")
+            res = self.install(ws, env, "--project", "demo-hub-proj", "--link-projects", "demo-spoke-a",
+                               "--viewers", "viewer@example.org")
+            self.assertIn("Linked scan   : demo-spoke-a", res.stdout)
+            self.assertIn("##ALLOWED_USERS=viewer@example.org", res.stderr)
+            res = self.install(ws, env, "--project", "demo-hub-proj", "--link-projects", "NONE", "--viewers", "none")
+            with open(snapshot, encoding="utf-8") as fh:
+                saved = fh.read()
+            self.assertIn('SCAN_PROJECTS=""', saved)
+            self.assertIn('ALLOWED_USERS=""', saved)
+            self.assertNotIn("demo-spoke-a", saved)
+            self.assertNotIn("viewer@example.org", saved)
+            self.assertNotIn("Linked scan", res.stdout)
+            self.assertNotIn("ALLOWED_USERS=", res.stderr)
+            # Later runs keep them cleared; an empty value is still refused.
+            res = self.install(ws, env, "--project", "demo-hub-proj")
+            self.assertNotIn("demo-spoke-a", res.stdout + res.stderr)
+            self.assertNotIn("viewer@example.org", res.stdout + res.stderr)
+            bad = run_script(os.path.join(ws, "scripts/install.sh"), ["--project", "demo-hub-proj", "--viewers", "",
+                                                                       "--dry-run"], env, cwd=ws)
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("--viewers needs a value", bad.stderr)
+
+
+TEARDOWN_POLICY = json.dumps({"bindings": [
+    {"role": "projects/demo-hub-proj/roles/CustomAntigravityCapBlocked", "members": ["user:capped@example.com"]},
+    {"role": "projects/demo-hub-proj/roles/CustomAntigravityAdminBlocked", "members": []},
+    {"role": "roles/discoveryengine.agentspaceUser", "members": ["user:active@example.com"]}]})
+
+
+class TeardownCompletenessTest(unittest.TestCase):
+    """teardown.sh stops every enforcer before restoring people, follows the settings saved in the dashboard, removes
+    the dashboard's dataset access and deletes custom roles only when asked and only when nothing holds them."""
+
+    def teardown(self, *args, config='PROJECT_ID="demo-hub-proj"\n', **fake):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = fake_env(tmp, **fake)
+            path = os.path.join(tmp, "deploy.env")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(config)
+            res = run_script(os.path.join(ROOT, "scripts/teardown.sh"), ["--config", path, *args], env)
+            calls = read_log(log).splitlines()
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        return res, calls
+
+    @staticmethod
+    def first(calls, prefix):
+        return next(i for i, call in enumerate(calls) if call.startswith(prefix))
+
+    def test_enforcement_stops_before_anybody_is_restored(self):
+        res, calls = self.teardown("--yes", config='PROJECT_ID="demo-hub-proj"\nENFORCEMENT_BACKEND="iam_deny"\n',
+                                   FAKE_POLICY=TEARDOWN_POLICY)
+        restore = self.first(calls, "projects add-iam-policy-binding demo-hub-proj --member user:capped@example.com")
+        for prefix in ("scheduler jobs delete ai-control-plane-enforcer", "scheduler jobs delete ai-control-plane-enforce ",
+                       "scheduler jobs delete ai-control-plane-maintenance", "pubsub subscriptions delete",
+                       "run jobs delete ai-control-plane-enforcer", "run services delete ai-control-plane "):
+            self.assertLess(self.first(calls, prefix), restore, prefix)
+        self.assertLess(restore, self.first(calls, "iam policies delete ai-control-plane-caps"))
+        self.assertIn("restored user:capped@example.com", res.stdout)
+
+    def test_settings_saved_in_the_dashboard_decide_what_is_undone(self):
+        settings = json.dumps({"version": 1, "overrides": {
+            "workspace": {"projects": ["ui-added-proj", "Bad Project!"], "scope_type": "folder", "scope_ids": ["4455"]},
+            "governance": {"antigravity": {"cap_marker_role": "TeamCapRole", "access_role": "roles/discoveryengine.user",
+                                           "deny_policy_id": "ai-control-plane-team",
+                                           "enforcement_backend": "iam_deny"}}}})
+        policy = json.dumps({"bindings": [
+            {"role": "projects/demo-hub-proj/roles/TeamCapRole", "members": ["user:capped@example.com"]}]})
+        res, calls = self.teardown("--yes", FAKE_SETTINGS=settings, FAKE_POLICY=policy)
+        self.assertIn("projects add-iam-policy-binding demo-hub-proj --member user:capped@example.com --role "
+                      "roles/discoveryengine.user --condition=None --quiet", calls)
+        self.assertIn("projects remove-iam-policy-binding demo-hub-proj --member user:capped@example.com --role "
+                      "projects/demo-hub-proj/roles/TeamCapRole --condition=None --quiet", calls)
+        deletes = [c for c in calls if c.startswith("iam policies delete")]
+        for point in ("projects/demo-hub-proj", "projects/ui-added-proj", "folders/4455"):
+            self.assertIn("iam policies delete ai-control-plane-team --attachment-point=cloudresourcemanager."
+                          "googleapis.com/%s --kind=denypolicies --quiet" % point, deletes)
+        self.assertEqual(len(deletes), 3)  # the invalid project id is never used
+        res, calls = self.teardown("--dry-run", FAKE_SETTINGS=settings, FAKE_POLICY=policy)
+        self.assertIn("projects/ui-added-proj folders/4455", res.stdout)
+        self.assertFalse([c for c in calls if "delete" in c or "add-iam-policy-binding" in c])
+
+    def test_dashboard_access_to_the_kept_audit_dataset_is_removed(self):
+        dataset = json.dumps({"access": [
+            {"role": "WRITER", "userByEmail": "ai-control-plane-sa@demo-hub-proj.iam.gserviceaccount.com"},
+            {"role": "WRITER", "userByEmail": "service-123456789012@gcp-sa-logging.iam.gserviceaccount.com"}]})
+        res, calls = self.teardown("--yes", FAKE_DATASET=dataset)
+        self.assertTrue([c for c in calls if c.startswith("bq --project_id demo-hub-proj update --source")])
+        self.assertIn("removed ai-control-plane-sa@demo-hub-proj.iam.gserviceaccount.com from demo-hub-proj:ge_analytics",
+                      res.stdout)
+        self.assertFalse([c for c in calls if c.startswith("bq") and " rm " in c])  # the dataset itself stays
+
+    def test_custom_roles_are_deleted_only_when_asked_and_unused(self):
+        res, calls = self.teardown("--yes", FAKE_POLICY=TEARDOWN_POLICY)
+        self.assertFalse([c for c in calls if c.startswith("iam roles delete")])
+        self.assertIn("--delete-roles", res.stdout)
+        self.assertIn("gcloud iam roles delete CustomAntigravityCapBlocked --project demo-hub-proj", res.stdout)
+        res, calls = self.teardown("--yes", "--delete-roles", "--link-projects", "demo-spoke-a",
+                                   FAKE_POLICY=TEARDOWN_POLICY)
+        deleted = {c.split()[3] + "@" + c.split()[5] for c in calls if c.startswith("iam roles delete")}
+        self.assertEqual(deleted, {"CustomAntigravityRestrictedUser@demo-hub-proj",
+                                   "CustomAntigravityAdminBlocked@demo-hub-proj",
+                                   "CustomAiControlPlaneGatewayManager@demo-hub-proj",
+                                   "CustomAiControlPlaneLicenseReader@demo-hub-proj",
+                                   "CustomAiControlPlaneLicenseReader@demo-spoke-a"})
+        self.assertIn("kept projects/demo-hub-proj/roles/CustomAntigravityCapBlocked (1 member(s) still hold it)",
+                      res.stdout)
+        # Another deployment in the project still holds the license reader: its marker roles stay.
+        shared = json.loads(TEARDOWN_POLICY)
+        shared["bindings"].append({"role": "projects/demo-hub-proj/roles/CustomAiControlPlaneLicenseReader",
+                                   "members": ["serviceAccount:other-sa@demo-hub-proj.iam.gserviceaccount.com"]})
+        res, calls = self.teardown("--yes", "--delete-roles", FAKE_POLICY=json.dumps(shared))
+        self.assertFalse([c for c in calls if c.startswith("iam roles delete CustomAntigravity")])
+        self.assertIn("another AI Control Plane deployment in demo-hub-proj still uses the marker roles", res.stdout)
+
+    def test_enforcement_job_region_and_help(self):
+        _, calls = self.teardown("--yes", "--enforcement-job-region", "us-east1")
+        self.assertIn("scheduler jobs delete ai-control-plane-enforcer --project demo-hub-proj --location us-east1 "
+                      "--quiet", calls)
+        self.assertIn("run jobs delete ai-control-plane-enforcer --project demo-hub-proj --region us-east1 --quiet",
+                      calls)
+        usage = run_script(os.path.join(ROOT, "scripts/teardown.sh"), ["--help"], dict(os.environ)).stdout
+        missing = sorted(f for f in parser_flags("scripts/teardown.sh") if not documented(f, usage))
+        self.assertEqual(missing, [])
+
+    def test_link_projects_none_cleans_no_linked_project(self):
+        config = 'PROJECT_ID="demo-hub-proj"\nSCAN_PROJECTS="demo-spoke-a"\n'
+        _, calls = self.teardown("--yes", config=config)
+        self.assertTrue([c for c in calls if "demo-spoke-a" in c])
+        _, calls = self.teardown("--yes", "--link-projects", "none", config=config)
+        self.assertFalse([c for c in calls if "demo-spoke-a" in c])
+        self.assertFalse([c for c in calls if "--project none" in c or "projects/none" in c])
+
+
+RESTORE_GCLOUD = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_GCLOUD_LOG"], "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+mode = os.environ.get("FAKE_MODE", "ok")
+if args[:2] == ["projects", "get-iam-policy"]:
+    if mode == "garbage":
+        print("Updated property [core/project].")
+        sys.exit(0)
+    print(json.dumps({"bindings": [
+        {"role": "projects/demo/roles/TeamCap", "members": ["user:capped@example.com"]},
+        {"role": "projects/demo/roles/OldCap", "members": ["user:old@example.com"]},
+        {"role": "projects/demo/roles/TeamAdmin", "members": ["user:blocked@example.com"]}]}))
+    sys.exit(0)
+if args[:2] == ["projects", "add-iam-policy-binding"] and mode == "refuse":
+    sys.exit(1)
+sys.exit(0)
+"""
+
+
+class RestoreHelperTest(unittest.TestCase):
+    def restore(self, mode, call):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = os.path.join(tmp, "calls.log")
+            with open(os.path.join(tmp, "gcloud"), "w", encoding="utf-8") as fh:
+                fh.write(RESTORE_GCLOUD)
+            os.chmod(os.path.join(tmp, "gcloud"), 0o755)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}", FAKE_GCLOUD_LOG=log, FAKE_MODE=mode)
+            res = subprocess.run(["bash", "-c", 'set -euo pipefail; source "%s"; %s; echo after' % (
+                os.path.join(ROOT, "scripts/lib/common.sh"), call)], capture_output=True, text=True, env=env, check=False)
+            calls = read_log(log)
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn("after", res.stdout)  # never stops the caller (teardown runs under set -e)
+        return res, calls
+
+    def test_configured_marker_roles_are_restored(self):
+        res, calls = self.restore("ok", "restore_capped_users demo roles/discoveryengine.user false TeamCap,OldCap "
+                                        "TeamAdmin")
+        for member, role in (("capped", "TeamCap"), ("old", "OldCap")):
+            self.assertIn("projects add-iam-policy-binding demo --member user:%s@example.com --role "
+                          "roles/discoveryengine.user --condition=None" % member, calls)
+            self.assertIn("projects remove-iam-policy-binding demo --member user:%s@example.com --role "
+                          "projects/demo/roles/%s --condition=None" % (member, role), calls)
+        self.assertIn("kept administrator block: user:blocked@example.com", res.stdout)
+
+    def test_unreadable_policy_and_refusals_print_the_manual_commands(self):
+        res, _ = self.restore("garbage", "restore_capped_users demo")
+        self.assertIn("were not restored", res.stderr)
+        self.assertIn("gcloud projects add-iam-policy-binding demo --member=user:EMAIL", res.stderr)
+        res, calls = self.restore("refuse", "restore_capped_users demo roles/discoveryengine.user false TeamCap")
+        self.assertIn("marker role kept. Run: gcloud projects add-iam-policy-binding demo "
+                      "--member=user:capped@example.com --role=roles/discoveryengine.user --condition=None", res.stderr)
+        self.assertNotIn("remove-iam-policy-binding", calls)
+
+
+class TerraformAndTutorialTest(unittest.TestCase):
+    def test_terraform_realtime_push_names_the_public_url(self):
+        tf, variables = read("terraform/main.tf"), read("terraform/variables.tf")
+        self.assertIn('PUBLIC_BASE_URL = var.public_base_url != "" || local.realtime_enabled ? local.public_base_url : ""',
+                      tf)
+        push = tf[tf.index('resource "google_pubsub_subscription" "usage_events_push"'):]
+        self.assertIn('push_endpoint = "${local.run_url}${local.usage_event_path}"', push)
+        self.assertIn('audience              = "${local.public_base_url}${local.usage_event_path}"', push)
+        self.assertIn("(local.deny_enabled || var.enable_governance_actions)", tf)
+        for role in ("roles/logging.privateLogViewer", "roles/cloudtrace.user", "roles/modelarmor.viewer",
+                     "roles/networkservices.viewer", "roles/networksecurity.viewer"):
+            self.assertIn('"%s"' % role, tf[tf.index("read_roles = ["):tf.index("]", tf.index("read_roles = ["))])
+        for api in ("cloudtrace", "modelarmor", "networkservices", "networksecurity", "billingbudgets"):
+            self.assertIn('"%s.googleapis.com"' % api, tf)
+        for name in ("public_base_url", "enable_optional_apis"):
+            self.assertIn('variable "%s"' % name, variables)
+            self.assertRegex(read("terraform/terraform.tfvars.example"), r"(?m)^%s\s+=" % name)
+        self.assertIn("ai-control-plane:2.2.0", variables)
+        self.assertIn("ai-control-plane:2.2.0", read("terraform/terraform.tfvars.example"))
+        self.assertIn("Not created by this module", tf)
+
+    def test_tutorial_uses_flags_the_scripts_accept(self):
+        text = read("TUTORIAL.md")
+        self.assertIn("<walkthrough-project-setup", text)
+        self.assertIn("./scripts/install.sh --project {{project-id}}", text)
+        self.assertIn("./scripts/teardown.sh --project {{project-id}}", text)
+        known = parser_flags("scripts/install.sh") | parser_flags("scripts/teardown.sh")
+        used = set(re.findall(r"(?<![\w-])--[a-z][a-z0-9-]+", text))
+        self.assertEqual(sorted(used - known), [])
+
+    def test_owned_files_use_the_product_name_agent_platform(self):
+        for rel in ("scripts/install.sh", "scripts/deploy.sh", "scripts/prepare.sh", "scripts/teardown.sh",
+                    "scripts/test.sh", "scripts/lib/common.sh", "deploy.env.example", "terraform/main.tf",
+                    "terraform/variables.tf", "terraform/terraform.tfvars.example", "TUTORIAL.md"):
+            self.assertNotIn("Vertex" + " AI", read(rel), rel)
+
+    def test_comments_match_what_the_scripts_and_the_module_do(self):
+        # enable_data_access_logs configures 5 services; the comments used to promise 7.
+        for rel in ("scripts/prepare.sh", "deploy.env.example"):
+            text = read(rel)
+            self.assertNotIn("7 AI services", text, rel)
+            self.assertIn("5 AI services", text, rel)
+            self.assertIn("Gemini Data Analytics", text, rel)
+        # The example no longer pins the dataset location (empty = REGION, the same default as before).
+        self.assertRegex(read("deploy.env.example"), r'(?m)^DATASET_LOCATION=""')
+        # The module allows auth_mode iap/auto only, so real-time enforcement needs an external load balancer with IAP.
+        variables = read("terraform/variables.tf")
+        realtime = variables[variables.index('variable "realtime_enforcement"'):]
+        realtime = realtime[:realtime.index("\n}\n")]
+        self.assertIn("external HTTPS load balancer with IAP", realtime)
+        self.assertIn("enable_iap = false", realtime)
+
+
+# Answers `org-policies describe ... --effective` with FAKE_POLICIES (constraint name -> effective policy).
+PREFLIGHT_GCLOUD = """#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+if "describe" in args and "--effective" in args:
+    name = next(a for a in args if a.startswith("constraints/"))[len("constraints/"):]
+    policies = json.loads(os.environ.get("FAKE_POLICIES", "{}"))
+    print(json.dumps(policies.get(name, {"constraint": "constraints/" + name})))
+sys.exit(0)
+"""
+
+
+class LocationBlockerTest(unittest.TestCase):
+    """gcp.resourceLocations findings name the flag that fixes them: --region, or --dataset-location for a BigQuery
+    location set apart from the region."""
+
+    def preflight(self, region, dsloc, allowed):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "gcloud"), "w", encoding="utf-8") as fh:
+                fh.write(PREFLIGHT_GCLOUD)
+            os.chmod(os.path.join(tmp, "gcloud"), 0o755)
+            policies = {"gcp.resourceLocations": {"listPolicy": {"allowedValues": allowed}}}
+            # Only the fake gcloud and the system tools (no local docker), as in test_preflight.py.
+            env = dict(os.environ, PATH=tmp + os.pathsep + "/usr/bin:/bin", FAKE_POLICIES=json.dumps(policies))
+            script = 'set -euo pipefail; source "%s"; preflight_org_policies demo-hub-proj "%s" "%s"' % (
+                os.path.join(ROOT, "scripts/lib/common.sh"), region, dsloc)
+            res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, check=False)
+        return res, [l for l in res.stderr.splitlines() if "[중단] gcp.resourceLocations" in l]
+
+    def test_separate_bigquery_location_points_to_dataset_location(self):
+        res, blocks = self.preflight("asia-northeast3", "US", ["in:asia-northeast3-locations"])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertEqual(len(blocks), 1, res.stderr)
+        self.assertIn("BigQuery 위치 'us'", blocks[0])
+        self.assertIn("--dataset-location <허용 위치>", blocks[0])
+        self.assertNotIn("--region", blocks[0])
+
+    def test_same_location_is_one_finding_naming_both_flags(self):
+        res, blocks = self.preflight("asia-northeast3", "asia-northeast3", ["in:us-locations"])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertEqual(len(blocks), 1, res.stderr)
+        self.assertIn("리전·BigQuery 위치 'asia-northeast3'", blocks[0])
+        self.assertIn("--region <허용 리전>", blocks[0])
+        self.assertIn("--dataset-location <허용 위치>", blocks[0])
+
+    def test_allowed_separate_locations_pass(self):
+        res, blocks = self.preflight("asia-northeast3", "US", ["in:asia-northeast3-locations", "in:us-locations"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(blocks, [])
+        self.assertIn("asia-northeast3, us 허용", res.stdout + res.stderr)
+
+
+# get-iam-policy prints the policy file; set-iam-policy refuses FAKE_REFUSE (as projects without that service do) or
+# stores the new policy.
+AUDIT_GCLOUD = """#!/usr/bin/env python3
+import json, os, shutil, sys
+args = sys.argv[1:]
+path = os.environ["FAKE_POLICY_FILE"]
+if args[:2] == ["projects", "get-iam-policy"]:
+    print(open(path, encoding="utf-8").read())
+    sys.exit(0)
+if args[:2] == ["projects", "set-iam-policy"]:
+    services = {c.get("service") for c in json.load(open(args[3], encoding="utf-8")).get("auditConfigs", [])}
+    refused = os.environ.get("FAKE_REFUSE", "")
+    if refused and refused in services:
+        sys.stderr.write("ERROR: INVALID_ARGUMENT: Service %s does not exist or does not support service level "
+                         "configuration\\n" % refused)
+        sys.exit(1)
+    shutil.copyfile(args[3], path)
+sys.exit(0)
+"""
+
+
+class DataAccessLogsMessageTest(unittest.TestCase):
+    def enable(self, refuse=""):
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = os.path.join(tmp, "policy.json")
+            with open(policy, "w", encoding="utf-8") as fh:
+                fh.write('{"bindings": [], "etag": "Bw=="}\n')
+            with open(os.path.join(tmp, "gcloud"), "w", encoding="utf-8") as fh:
+                fh.write(AUDIT_GCLOUD)
+            os.chmod(os.path.join(tmp, "gcloud"), 0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ.get("PATH", ""), FAKE_POLICY_FILE=policy,
+                       FAKE_REFUSE=refuse)
+            res = subprocess.run(["bash", "-c", 'source "%s"; DRY_RUN=0; enable_data_access_logs demo-audit-proj' % (
+                os.path.join(ROOT, "scripts/lib/common.sh"))], capture_output=True, text=True, env=env, check=False)
+            with open(policy, encoding="utf-8") as fh:
+                saved = json.load(fh)
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        return res, {c["service"] for c in saved.get("auditConfigs", [])}
+
+    def test_message_names_the_five_services_it_configures(self):
+        res, services = self.enable()
+        self.assertEqual(services, {"aiplatform.googleapis.com", "discoveryengine.googleapis.com",
+                                    "modelarmor.googleapis.com", "businessaicode.googleapis.com",
+                                    "geminidataanalytics.googleapis.com"})
+        self.assertIn("(Agent Platform, Gemini Enterprise, NotebookLM, Model Armor, Antigravity, "
+                      "Gemini Data Analytics)", res.stdout)
+        res, services = self.enable(refuse="geminidataanalytics.googleapis.com")
+        self.assertNotIn("geminidataanalytics.googleapis.com", services)
+        self.assertIn("skipped: geminidataanalytics.googleapis.com", res.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

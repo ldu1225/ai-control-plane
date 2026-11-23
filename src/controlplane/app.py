@@ -24,9 +24,13 @@ from .services import base as svc_base
 from .services import access
 from .services import oauth_client
 from .services import agent_activity
+from .services import agent_detail
+from .services import agent_gateway
 from .services import (agents, analyst, finops, gateway, gemini_enterprise, governance, layouts, maintenance,
                        model_armor, models, notebooklm, overview, pricing_sync, system, telemetry, telemetry_routing,
                        users)
+from .services import budgets, chargeback, org_model, scope, spend_caps
+from .services import usage_events
 
 LOG = logging.getLogger("controlplane.app")
 
@@ -79,15 +83,56 @@ _route("GET", "/api/v1/models/usage", models.usage, module="model_usage", range=
 _route("GET", "/api/v1/models/catalog", models.catalog, module="model_usage", cache=True)
 _route("GET", "/api/v1/agent-platform/gateway", gateway.summary, module="agent_gateway", range=True, cache=True,
        mask={"ips": ("callerIp",)})
+# Agent Gateway (the product): gateways with their authorization policies, extensions, telemetry policies and
+# bound workloads; traffic from the gateway request log, access decisions and metrics. The POST routes create,
+# update and delete gateways and switch access authorization; each call is written to the governance audit log.
+_route("GET", "/api/v1/agent-platform/gateways", agent_gateway.inventory, module="agent_gateway", cache=True, ttl=60)
+_route("GET", "/api/v1/agent-platform/gateways/traffic", agent_gateway.traffic, module="agent_gateway", range=True,
+       cache=True)
+_route("GET", "/api/v1/agent-platform/gateways/operation", agent_gateway.operation, module="agent_gateway",
+       mask=False)
+_route("POST", "/api/v1/agent-platform/gateways", agent_gateway.create, module="agent_gateway", admin=True,
+       rate="governance", mask=False)
+_route("POST", "/api/v1/agent-platform/gateways/update", agent_gateway.update, module="agent_gateway", admin=True,
+       rate="governance", mask=False)
+_route("POST", "/api/v1/agent-platform/gateways/delete", agent_gateway.delete, module="agent_gateway", admin=True,
+       rate="governance", mask=False)
+_route("POST", "/api/v1/agent-platform/gateways/access", agent_gateway.access, module="agent_gateway", admin=True,
+       rate="governance", mask=False)
 _route("GET", "/api/v1/agent-platform/registry", agents.registry, module="agent_registry", range=True, cache=True)
 _route("GET", "/api/v1/agent-platform/deployments", agents.deployments, module="agent_deployments", range=True,
        cache=True)
+# One Agent Engine deployment: telemetry, models and tools, revisions, traces, topology, evaluation. Each route
+# resolves project, region and engine against the engines the workspace lists (agent_detail.target).
+_route("GET", "/api/v1/agent-platform/agent", agent_detail.overview, module="agent_deployments", cache=True, ttl=60)
+_route("GET", "/api/v1/agent-platform/agent/telemetry", agent_detail.telemetry, module="agent_deployments",
+       range=True, cache=True)
+_route("GET", "/api/v1/agent-platform/agent/models", agent_detail.models_tools, module="agent_deployments",
+       range=True, cache=True)
+_route("GET", "/api/v1/agent-platform/agent/revisions", agent_detail.revisions, module="agent_deployments",
+       cache=True, ttl=60)
+_route("GET", "/api/v1/agent-platform/agent/traces", agent_detail.traces, module="agent_deployments", range=True,
+       cache=True, ttl=30, mask={"restrict": ("userId",)})
+_route("GET", "/api/v1/agent-platform/agent/trace", agent_detail.trace, module="agent_deployments", cache=True,
+       ttl=300, mask={"restrict": ("userId",)})
+_route("GET", "/api/v1/agent-platform/agent/topology", agent_detail.topology, module="agent_deployments",
+       range=True, cache=True)
+_route("GET", "/api/v1/agent-platform/agent/evaluation", agent_detail.evaluation, module="agent_deployments",
+       range=True, cache=True)
+# Playground: an administrator sends a message to a deployed agent. It runs the agent (model and tool calls),
+# so it is an administrator action with the AI rate limit, and every call is written to the audit log.
+_route("POST", "/api/v1/agent-platform/agent/playground", agent_detail.playground, module="agent_deployments",
+       admin=True, rate="ai", mask=False)
 _route("GET", "/api/v1/model-armor/summary", model_armor.summary, module="model_armor", range=True, cache=True)
 _route("GET", "/api/v1/model-armor/events", model_armor.events, module="model_armor", range=True, cache=True,
        mask={"restrict": ("text",)})
 _route("GET", "/api/v1/users", users.list_users, module="users", range=True, cache=True)
+# Viewers get no access action flags (viewer_view, after the role-blind cache): they cannot act, and the flags tell
+# who is an administrator.
 _route("GET", "/api/v1/users/detail", users.detail, module="users", range=True, cache=True,
-       mask={"restrict": ("text", "fileName", "fileId")})
+       mask={"restrict": ("text", "fileName", "fileId")}, viewer_view=users.detail_viewer_view)
+_route("POST", "/api/v1/users/access-action", users.access_action, module="users", admin=True, rate="governance",
+       mask=False)
 _route("GET", "/api/v1/governance/antigravity/status", governance.status, module="antigravity", cache=True, ttl=60)
 _route("GET", "/api/v1/governance/antigravity/billing-report", governance.billing_report, module="antigravity",
        cache=True, ttl=300)
@@ -106,6 +151,19 @@ _route("POST", "/api/v1/governance/antigravity/exceptions", governance.exception
        admin=True, rate="governance")
 _route("POST", "/api/v1/governance/antigravity/exceptions/delete", governance.exception_delete,
        module="antigravity", admin=True, rate="governance")
+# Current and next cap periods for period settings being edited (computation only, no data).
+_route("GET", "/api/v1/governance/antigravity/period-preview", governance.period_preview, module="antigravity",
+       mask=False)
+# Pub/Sub push of every Antigravity inference log entry (real-time enforcement in automatic mode). Only a Google OIDC
+# token of the push subscription's service account is accepted (usage_events.handle refuses sessions); the route uses
+# its own rate bucket instead of the general one (one call per Antigravity request of every user).
+_route("POST", usage_events.PATH, usage_events.handle, module="antigravity", admin=True, scheduler=True,
+       general="usage_event", mask=False)
+# Enforcement method, deny policy attachment points, enforcement job and spend caps. Viewers and guests get only whether
+# spend caps are on (viewer_view, after the cache): budget names carry the billing account id, caps are keyed by project.
+# Cached like the status: the IAM policy API allows only 10 policy reads per minute per project by default.
+_route("GET", "/api/v1/governance/antigravity/enforcement", governance.enforcement_status, module="antigravity",
+       mask={"nulls": ("budget", "etag")}, cache=True, ttl=60, viewer_view=governance.enforcement_viewer_view)
 _route("GET", "/api/v1/governance/audit-log", governance.audit_log, module="antigravity", cache=True, ttl=30)
 _route("GET", "/api/v1/governance/antigravity/agent-activity", agent_activity.summary, module="antigravity", range=True,
        cache=True)
@@ -117,6 +175,28 @@ _route("POST", "/api/v1/finops/pricing/ack", pricing_sync.acknowledge_alerts, mo
        rate="governance")
 # guest=True: one of the few POST routes a guest may call (read-only AI analysis, rate limited).
 _route("POST", "/api/v1/finops/spikes/analyze", finops.analyze_spike, module="finops", rate="ai", guest=True)
+# Workspace scope: projects under the configured folder or organization (or the listed projects).
+_route("GET", "/api/v1/scope/projects", scope.scope_projects, cache=True, ttl=300, mask={"restrict": ("labels",)})
+# Organization chargeback: the organization tree from an HR CSV (dry run, then apply), usage cost by person, project
+# and organization unit, and the month close. The CSV import is the only route with a body above 64 KB.
+_route("GET", "/api/v1/org/tree", org_model.tree, module="chargeback", cache=True, ttl=60)
+_route("POST", "/api/v1/org/import", org_model.import_csv, module="chargeback", admin=True, rate="governance",
+       max_body=8 * 1024 * 1024)
+_route("GET", "/api/v1/chargeback/summary", chargeback.summary, module="chargeback", cache=True, ttl=300)
+_route("GET", "/api/v1/chargeback/report", chargeback.report, module="chargeback", cache=True, ttl=300)
+_route("POST", "/api/v1/chargeback/close", chargeback.close, module="chargeback", admin=True, rate="governance")
+# Monthly budgets of organization units and projects (5,000 budgets are about 850 KB) and the Google Cloud spend caps of
+# hard-capped projects. Spend cap budget names carry the billing account id, so only administrators read them.
+_route("GET", "/api/v1/budgets", budgets.get_budgets, module="chargeback", cache=True, ttl=60)
+_route("POST", "/api/v1/budgets", budgets.save_budgets, module="chargeback", admin=True, rate="governance",
+       max_body=2 * 1024 * 1024)
+_route("GET", "/api/v1/budgets/spend-caps", spend_caps.get_spend_caps, module="chargeback", admin_read=True)
+_route("POST", "/api/v1/budgets/spend-caps/apply", spend_caps.apply_spend_caps, module="chargeback", admin=True,
+       rate="governance")
+_route("POST", "/api/v1/budgets/spend-caps/lift", spend_caps.lift_spend_cap, module="chargeback", admin=True,
+       rate="governance")
+# Scope picker: projects, folders and organizations the service identity can see (administrators).
+_route("GET", "/api/v1/scope/candidates", scope.candidates, admin_read=True)
 _route("GET", "/api/v1/telemetry/discover", telemetry.discover, module="telemetry")
 _route("GET", "/api/v1/telemetry/connectors", telemetry.list_connectors, module="telemetry", cache=True, ttl=60)
 _route("POST", "/api/v1/telemetry/connectors", telemetry.save_connector, module="telemetry", admin=True)
@@ -196,7 +276,13 @@ class ControlPlaneHandler(BaseHandler):
         app = self.app
         if app.bridge is not None:
             raise ApiError("not_found", "Endpoint not found.")
-        raw = self.read_body_bytes() if method == "POST" else b""
+        # Routes with a larger body limit (max_body) read the body only after authentication, CSRF and the
+        # administrator check; their connection is not reused, so a rejection never leaves unread bytes behind.
+        hit = app.router.routes.get((method, path)) if method == "POST" else None
+        big = int((hit[1] if hit else {}).get("max_body") or 0)
+        if big:
+            self.close_connection = True
+        raw = self.read_body_bytes() if (method == "POST" and not big) else b""
         fn, opts = app.router.resolve(method, path)
         app.settings.maybe_reload()
         settings, version = app.settings.snapshot()
@@ -209,9 +295,9 @@ class ControlPlaneHandler(BaseHandler):
             identity = Identity("anonymous", "viewer", mode, "anon:%s" % self.client_ip())
         else:
             identity = authenticate(self.headers, self.client_ip(), settings, app.verifier, app.environ,
-                                    sessions=app.auth)
+                                    sessions=app.auth, settings_mgr=app.settings)
         guest = identity.auth_mode == GUEST_MODE
-        app.limiter.check(identity.rate_key, "general")
+        app.limiter.check(identity.rate_key, (opts.get("general") if bearer else None) or "general")
         if opts.get("admin_read") and not identity.is_admin:
             raise ApiError("forbidden", "Administrator privileges are required to view or manage access settings. "
                                         "Grant Administrator permissions to this account to proceed.")
@@ -224,8 +310,14 @@ class ControlPlaneHandler(BaseHandler):
             if opts.get("admin") and not identity.can_write:
                 raise ApiError("forbidden", "Administrator privileges are required to change settings or run controls. "
                                             "Grant the required Administrator / IAM permissions to proceed.")
+            if big:
+                if opts.get("rate"):
+                    app.limiter.check(identity.rate_key, opts["rate"])
+                if opts.get("module") and not settings["modules"].get(opts["module"], False):
+                    raise ApiError("module_disabled", "This module is disabled in the workspace settings.")
+                raw = self.read_body_bytes(limit=big)
             body = parse_json_object(raw)
-        if opts.get("rate"):
+        if opts.get("rate") and not big:
             app.limiter.check(identity.rate_key, opts["rate"])
         module = opts.get("module")
         if module:

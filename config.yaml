@@ -144,21 +144,26 @@ governance:
     legacy_marker_roles: ["CustomAntigravityRestrictedUser"]
     privileged_roles: ["roles/owner", "roles/editor", "roles/discoveryengine.admin"]
     extra_access_roles: []
-    period: "weekly"              # settlement period: daily | weekly | monthly | all (all = 90 days). Weekly matches
-                                  # how Gemini Enterprise enforces Antigravity credits (a shared pool per 7 days)
+    period: "monthly"             # settlement period of the fixed caps: daily | weekly | monthly | custom | all
+                                  # (all = 90 days). monthly = from reset_day to the end of the month: a person who
+                                  # uses up a cap on the 11th stays suspended until the month ends and is restored on
+                                  # the 1st of the next month (no weekly reset)
     window: "calendar"            # calendar (resets at reset_time in reset_timezone) | rolling
     reset_timezone: ""            # IANA zone of calendar period boundaries; empty = the workspace time zone
-    reset_weekday: 0              # weekly periods start on this day: 0 = Monday ... 6 = Sunday (set it to the
-                                  # day the project's Antigravity credit pool resets)
+    reset_day: 1                  # monthly periods start on this day (1 = the 1st to the last day of the month;
+                                  # shorter months start on their last day)
+    reset_weekday: 0              # weekly periods and the credit cycle start on this day: 0 = Monday ... 6 = Sunday
+                                  # (with credit caps, set it to the day the project's Antigravity credit pool resets)
     reset_time: "00:00"           # HH:MM at which daily / weekly / monthly periods start
     token_cap: 0                  # 0 = disabled (all caps are off until an administrator sets one)
     request_cap: 0                # 0 = disabled
     credit_per_user_month: 10     # Antigravity credit per licensed user and month in USD (Standard 10, Plus 15);
                                   # Gemini Enterprise enforces it per 7 days as credit / 4 per person
-    cap_model: ""                 # credit_budget = weekly free credit (Gemini models) + monthly paid budget per
-                                  # person in USD; period = the fixed token / request / cost caps per period;
-                                  # empty = credit_budget, except installations from before credit caps that already
-                                  # set fixed caps keep period until an administrator chooses (upgrades drop no caps)
+    cap_model: ""                 # period = the fixed token / request / cost caps per period (the default);
+                                  # credit_budget = weekly free credit (Gemini models) + monthly paid budget per
+                                  # person in USD; empty = period, except installations that relied on credit caps
+                                  # (a paid budget set, no fixed cap) keep credit_budget until an administrator
+                                  # chooses (upgrades drop no caps)
     paid_budget_month: -1         # USD per person and month beyond the free credit (Claude is always paid);
                                   # -1 = no limit, 0 = credits only. A person whose budget is spent is stopped only
                                   # while nothing is free and is restored at the next weekly reset or month start

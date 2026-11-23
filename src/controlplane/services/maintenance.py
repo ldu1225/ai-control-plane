@@ -4,7 +4,9 @@ MAINTENANCE_SCHEDULE in scripts/deploy.sh) and from an in-process monitor, alway
 - the daily official price and exchange-rate check at pricing.sync_time in pricing.sync_timezone (default: the
   workspace timezone), so the schedule is changed in Settings without touching Cloud Scheduler;
 - the telemetry route budget guard on every tick (pause routes over budget, resume them at the next local day);
-- once a day, after the price check: retention re-application and group following for telemetry routes.
+- once a day, after the price check: retention re-application and group following for telemetry routes;
+- with the iam_deny or notify_only enforcement method: the hand-over of marker roles left by iam_allow_swap
+  (governance.release_markers), so that switching the method never leaves anyone suspended.
 
 Each task is claimed in the maintenance document before it runs, so several instances and the in-process monitor
 never run the same task at the same time; a failed run is retried on a later tick.
@@ -29,6 +31,10 @@ STALE_RUN_SECONDS = 900
 # Ticks closer together than this skip the route budget guard (the scheduler and the in-process monitor overlap).
 GUARD_MIN_SECONDS = 300
 MONITOR_SECONDS = 300
+# Marker roles left by iam_allow_swap (governance.release_markers): checked hourly, and every 10 minutes while
+# someone is waiting for the current enforcement method or the last check failed.
+MARKERS_IDLE_SECONDS = 3600
+MARKERS_PENDING_SECONDS = 600
 
 
 def _now():
@@ -102,6 +108,34 @@ def _system_ctx(app, actor):
     return Ctx(app, settings, version, Identity(actor, "admin", "scheduler", "maintenance:%s" % actor))
 
 
+def _release_markers(app, settings, actor, trigger, out):
+    """Task antigravity_markers (governance.release_markers) when the enforcement method is not iam_allow_swap."""
+    from . import governance
+    if not (settings.get("modules") or {}).get("antigravity", True) or \
+            governance.enforcement_backend(settings) == "iam_allow_swap":
+        return
+
+    def due(rec):
+        if trigger == "manual":
+            return True
+        last = parse_rfc3339(rec.get("finishedAt"))
+        pending = rec.get("status") == "error" or bool((rec.get("summary") or {}).get("waiting"))
+        return last is None or (_now() - last).total_seconds() >= (MARKERS_PENDING_SECONDS if pending
+                                                                      else MARKERS_IDLE_SECONDS)
+
+    if not _claim(app, "antigravity_markers", due):
+        return
+    try:
+        res = governance.release_markers(_system_ctx(app, actor), trigger=trigger) or {}
+        summary = {key: res.get(key) for key in ("holders", "released", "waiting", "manual", "error")}
+        out["antigravity_markers"] = summary
+        _finish(app, "antigravity_markers", res.get("error") is None, summary, error=res.get("error"))
+    except Exception as err:  # pylint: disable=broad-except
+        LOG.warning("marker role release failed: %s", type(err).__name__)
+        out["antigravity_markers"] = {"error": type(err).__name__}
+        _finish(app, "antigravity_markers", False, error=type(err).__name__)
+
+
 def tick(app, actor="system:maintenance", trigger="scheduled"):
     """Runs every task that is due. Returns {task: summary or error}."""
     from . import pricing_sync, telemetry, telemetry_routing
@@ -122,6 +156,10 @@ def tick(app, actor="system:maintenance", trigger="scheduled"):
             LOG.warning("scheduled price sync failed: %s", type(err).__name__)
             out["pricing_sync"] = {"error": type(err).__name__}
             _finish(app, "pricing_sync", False, error=type(err).__name__)
+
+    # 1b. Marker roles left by the allow-policy method after a switch to the deny policy or notify only: hourly, every
+    #     tick while someone is waiting, and on every manual run (governance.release_markers).
+    _release_markers(app, settings, actor, trigger, out)
 
     if not (settings.get("modules") or {}).get("telemetry", True):
         return out

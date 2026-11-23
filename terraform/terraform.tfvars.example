@@ -3,7 +3,7 @@
 
 project_id      = "your-gcp-project-id"
 region          = "us-central1"
-container_image = "us-central1-docker.pkg.dev/your-gcp-project-id/ai-control-plane/ai-control-plane:2.0.0"
+container_image = "us-central1-docker.pkg.dev/your-gcp-project-id/ai-control-plane/ai-control-plane:2.2.0"
 
 audit_dataset_id   = "ge_analytics"
 billing_project_id = ""
@@ -27,8 +27,25 @@ admin_emails = ["admin@example.com"]
 ai_default_model = "gemini-3.8-flash"
 ai_location      = "global"
 
-# Grants roles/resourcemanager.projectIamAdmin, roles/logging.logWriter and roles/iam.roleAdmin.
+# Grants roles/resourcemanager.projectIamAdmin and roles/iam.roleAdmin (roles/logging.logWriter is always granted).
 enable_governance_actions = false
 
 # Optional: numeric organization id to detect inherited (folder/organization) grants.
 organization_id = ""
+
+# Antigravity cap enforcement (README 8.9). iam_deny adds the Cloud Run job ai-control-plane-enforcer, its service
+# account and a Cloud Scheduler job. Deny Admin / Deny Reviewer exist on organizations only: grant_org_roles needs
+# organization_id and Organization Administrator; otherwise the output organization_role_commands lists the commands.
+# Behind IAP, Cloud Scheduler cannot call the dashboard: iam_deny is the backend with scheduled restores at each reset.
+enforcement_backend    = "iam_allow_swap" # iam_allow_swap | iam_deny | notify_only
+deny_attachment        = "projects"       # iam_deny: projects | scope
+enforcement_job_region = ""               # iam_deny: empty = region
+enforcement_schedule   = "*/5 * * * *"    # iam_deny: "off" = runs only from the dashboard
+realtime_enforcement   = false            # true only behind an external HTTPS load balancer with IAP: enable_iap =
+#                                           false, iap_audience and public_base_url of the load balancer, and
+#                                           enable_governance_actions or iam_deny. Pub/Sub push for immediate suspension
+public_base_url        = ""               # dashboard URL users open; empty = the run.app URL
+grant_org_roles        = false
+
+# APIs of agent detail traces, Model Armor, Agent Gateway and Google spend caps; false when an organization restricts them.
+enable_optional_apis = true

@@ -407,12 +407,114 @@ def license_configs(ctx, location="global", project=None):
     return configs, purchased
 
 
+LICENSE_PAGE_SIZE = 500
+DEFAULT_LICENSE_MAX_PAGES = 200
+
+
+def license_max_pages(ctx):
+    """Pages of LICENSE_PAGE_SIZE user licenses read per project and location (workspace.license_max_pages)."""
+    try:
+        value = int(((ctx.settings or {}).get("workspace") or {}).get("license_max_pages")
+                    or DEFAULT_LICENSE_MAX_PAGES)
+    except (TypeError, ValueError, AttributeError):
+        value = DEFAULT_LICENSE_MAX_PAGES
+    return max(1, min(value, 1000))
+
+
 def user_licenses(ctx, location="global", project=None):
     project = project or ctx.project
     url = ("%s/v1alpha/projects/%s/locations/%s/userStores/default_user_store/userLicenses"
            % (discovery_host(location), project, location))
-    return ctx.gcp.paginate(url, quota_project=ctx.quota_project, items_key="userLicenses", page_size=500,
-                            max_pages=20)
+    return ctx.gcp.paginate(url, quota_project=ctx.quota_project, items_key="userLicenses",
+                            page_size=LICENSE_PAGE_SIZE, max_pages=license_max_pages(ctx))
+
+
+class LicenseIndex:
+    """Assigned Gemini Enterprise user licenses by person (identity.person_key), with the subscription tier of each
+    license configuration. ok: at least one user license list was read; truncated: a list hit license_max_pages."""
+
+    def __init__(self):
+        self.ok = False
+        self.truncated = False
+        self.people = {}   # person key -> [{"tier", "project", "location", "config"}]
+
+    def assignments(self, person):
+        return list(self.people.get(person) or ())
+
+    def tiers(self, person):
+        return sorted({a["tier"] for a in self.people.get(person) or () if a.get("tier")})
+
+
+def _config_id(name):
+    """Trailing licenseConfigs/<id> of a license configuration name (project id or number in front)."""
+    if not isinstance(name, str) or "/licenseConfigs/" not in name:
+        return ""
+    return name.rsplit("/licenseConfigs/", 1)[1].strip()
+
+
+def build_license_index(results, projects, locations):
+    """LicenseIndex from {("configs"|"users", project, location): (ok, value)} task results."""
+    from .. import identity
+    index = LicenseIndex()
+    tiers_by_place, tiers_by_id = {}, {}
+    for proj in projects:
+        for loc in locations:
+            ok, value = results.get(("configs", proj, loc), (False, None))
+            if not ok:
+                continue
+            for cfg in (value[0] if isinstance(value, tuple) else value) or []:
+                cid = _config_id(cfg.get("name"))
+                tier = cfg.get("subscriptionTier") or None
+                if cid and tier:
+                    tiers_by_place[(proj, loc, cid)] = tier
+                    tiers_by_id.setdefault(cid, tier)
+    for proj in projects:
+        for loc in locations:
+            ok, value = results.get(("users", proj, loc), (False, None))
+            if not ok:
+                continue
+            items, truncated = value
+            index.ok = True
+            index.truncated = index.truncated or bool(truncated)
+            for item in items or []:
+                if not isinstance(item, dict) or item.get("licenseAssignmentState") != "ASSIGNED":
+                    continue
+                person = identity.person_key(item.get("userPrincipal"))
+                if person is None:
+                    continue
+                cid = _config_id(item.get("licenseConfig"))
+                tier = tiers_by_place.get((proj, loc, cid)) or tiers_by_id.get(cid)
+                entry = {"tier": tier, "project": proj, "location": loc, "config": cid or None}
+                bucket = index.people.setdefault(person, [])
+                if entry not in bucket:
+                    bucket.append(entry)
+    return index
+
+
+LICENSE_INDEX_TTL = 600
+
+
+def license_index(ctx, projects=None):
+    """LicenseIndex over `projects` (default: every workspace project) and the configured locations. Cached for ten
+    minutes per application; never raises (an unreadable license API gives an index with ok=False)."""
+    projects = list(projects or getattr(ctx, "all_projects", None) or getattr(ctx, "projects", None)
+                    or [ctx.project])
+    locations = list(discovery_locations(ctx))
+
+    def compute():
+        tasks = {}
+        for proj in projects:
+            for loc in locations:
+                tasks[("configs", proj, loc)] = (lambda where=loc, p=proj: license_configs(ctx, where, p))
+                tasks[("users", proj, loc)] = (lambda where=loc, p=proj: user_licenses(ctx, where, p))
+        return build_license_index(ctx.run(tasks), projects, locations)
+
+    cache = getattr(getattr(ctx, "app", None), "cache", None)
+    if cache is None or not hasattr(cache, "get_or_compute"):
+        return compute()
+    key = ("ge_license_index", tuple(projects), tuple(locations), license_max_pages(ctx))
+    value, _ = cache.get_or_compute(key, LICENSE_INDEX_TTL, compute, cacheable=lambda v: v.ok)
+    return value
 
 
 def licenses(ctx):
@@ -466,7 +568,7 @@ def licenses(ctx):
             ctx.add_source("api:discoveryengine.userLicenses")
             if truncated and is_primary:
                 ctx.warn("api:discoveryengine.userLicenses", "truncated",
-                         "Only the first 10000 user licenses in %s are shown." % loc)
+                         "Only the first %d user licenses are shown." % (LICENSE_PAGE_SIZE * license_max_pages(ctx)))
             for item in items:
                 if not isinstance(item, dict):
                     continue

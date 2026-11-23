@@ -44,6 +44,7 @@ ERROR_STATUS = {
     "not_configured": 409,
     "rate_limited": 429,
     "upstream_error": 502,
+    "unavailable": 503,
     "internal": 500,
 }
 

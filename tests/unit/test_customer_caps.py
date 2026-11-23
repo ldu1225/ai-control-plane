@@ -56,7 +56,8 @@ class ResetAnchorTest(unittest.TestCase):
     def test_period_anchor_defaults_to_the_workspace_time_zone(self):
         settings = support.make_settings(governance={"reset_timezone": "", "reset_weekday": 2, "reset_time": "14:00"},
                                          workspace={"timezone": "Asia/Seoul"})
-        self.assertEqual(gov.period_anchor(settings), {"tz": "Asia/Seoul", "weekday": 2, "at": "14:00"})
+        self.assertEqual(gov.period_anchor(settings), {"tz": "Asia/Seoul", "weekday": 2, "at": "14:00", "day": 1,
+                                                       "cycle_days": 30, "cycle_start": ""})
 
     def test_settings_validation(self):
         self.assertEqual(config.VALIDATORS["governance.antigravity.reset_weekday"](6), 6)
@@ -72,10 +73,21 @@ class ResetAnchorTest(unittest.TestCase):
 class ShippedDefaultsTest(unittest.TestCase):
     def test_caps_are_off_until_an_administrator_sets_one(self):
         ag = config.DEFAULTS["governance"]["antigravity"]
-        self.assertEqual((ag["period"], ag["token_cap"], ag["request_cap"], ag["cost_cap"]), ("weekly", 0, 0, 0.0))
+        self.assertEqual((ag["period"], ag["token_cap"], ag["request_cap"], ag["cost_cap"]), ("monthly", 0, 0, 0.0))
         self.assertEqual(ag["enforcement_mode"], "manual")
         self.assertEqual(gov.cap_check(10 ** 9, 10 ** 6, ag["token_cap"], ag["request_cap"], 1e6, ag["cost_cap"]),
                          (False, 0.0, []))
+
+    def test_default_caps_are_fixed_per_month_from_the_1st(self):
+        # The code defaults and the shipped config.yaml (which overrides them) agree: fixed caps per period, monthly
+        # from the 1st at 00:00, so a cap used up mid-month holds until the month ends and nothing resets weekly.
+        shipped = config.validate_layer(config._read_yaml(os.path.join(config.repo_root(), "config.yaml")),
+                                        "config.yaml")
+        for ag in (config.DEFAULTS["governance"]["antigravity"],
+                   config.deep_merge(config.DEFAULTS, shipped)["governance"]["antigravity"]):
+            self.assertFalse(gov.credit_mode(ag))
+            self.assertEqual((ag["cap_model"], ag["period"], ag["window"], ag["reset_day"], ag["reset_time"]),
+                             ("", "monthly", "calendar", 1, "00:00"))
 
 
 def sample_usage_rec():

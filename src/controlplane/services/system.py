@@ -44,10 +44,15 @@ def bootstrap(ctx, handler):
                       "projectDetails": list(getattr(ctx, "project_details", None) or []),
                       "scanAllProjects": bool(ws.get("scan_all_projects", True)),
                       "groupingCriteria": {
-                          "mode": "primary_configured_and_crm_discovery" if ws.get("scan_all_projects", True)
+                          "mode": "%s_scope" % ws.get("scope_type")
+                          if ws.get("scope_type") in ("folder", "organization") and ws.get("scope_ids") else
+                          "primary_configured_and_crm_discovery" if ws.get("scan_all_projects", True)
                           else "primary_and_configured_only",
-                          "tiers": ["primary", "configured", "auto_discovered"],
+                          "tiers": ["primary", "configured", "scope"]
+                          if ws.get("scope_type") in ("folder", "organization") and ws.get("scope_ids") else
+                          ["primary", "configured", "auto_discovered"],
                       },
+                      "auditProject": ws.get("audit_project") or "",
                       "auditDataset": ws["audit_dataset"],
                       # The billing account ID is an administrator detail; viewers do not receive it.
                       "billing": {"projectId": config.billing_project(s), "dataset": ws["billing"]["dataset"],
@@ -177,7 +182,8 @@ def run_health(ctx):
     def bq_audit():
         if not configured:
             return unconfigured
-        groups = ctx.registry.tables(ctx.project, ctx.audit_dataset, ctx.quota_project, ctx.max_bytes)
+        groups = ctx.registry.tables(getattr(ctx, "central_audit_project", "") or ctx.project, ctx.audit_dataset,
+                                     ctx.quota_project, ctx.max_bytes)
         core = [t for t in groups if t.startswith(("cloudaudit_", "discoveryengine_", "modelarmor_", "businessaicode_"))]
         if not groups:
             return "ok", "Dataset %s reachable (0 tables yet; log sinks create tables on first event)" % ctx.audit_dataset
@@ -351,14 +357,37 @@ def settings_post(ctx):
     ctx.app.settings.update_section(section, values, ctx.identity.email, check=admin_guard(ctx.identity))
     ctx.app.on_settings_changed()
     LOG.info("settings updated section=%s", section if section in config.EDITABLE_SECTIONS else "invalid")
-    return settings_payload(ctx)
+    out = settings_payload(ctx)
+    if section == "governance" and isinstance(values, dict):
+        _apply_policy_change(ctx, list(values), out)
+    return out
 
 
 def settings_reset(ctx):
     ctx.app.settings.reset(ctx.body.get("section"), ctx.body.get("keys"), ctx.identity.email,
                            check=admin_guard(ctx.identity))
     ctx.app.on_settings_changed()
-    return settings_payload(ctx)
+    out = settings_payload(ctx)
+    keys = ctx.body.get("keys")
+    if ctx.body.get("section") == "governance":
+        _apply_policy_change(ctx, keys if isinstance(keys, list) and keys else ["enforcement_mode"], out)
+    return out
+
+
+def _apply_policy_change(ctx, keys, out):
+    """Saved cap policy settings take effect at once in automatic mode (governance.after_policy_change), with the
+    settings just saved. The settings stay saved whatever happens here; `out["enforcement"]` reports the run."""
+    from . import governance  # local import: governance is a large module that the settings page rarely needs
+    from .base import Ctx
+    settings, version = ctx.app.settings.snapshot()
+    fresh = Ctx(ctx.app, settings, version, ctx.identity, params={}, body={})
+    try:
+        result = governance.after_policy_change(fresh, [str(k) for k in keys if isinstance(k, str)])
+    except (ApiError, GcpError) as err:
+        LOG.warning("policy change not applied at once: %s", getattr(err, "code", None) or getattr(err, "kind", "error"))
+        result = {"via": None, "started": False, "error": "internal"}
+    if result is not None:
+        out["enforcement"] = result
 
 
 # ---------------------------------------------------------------------------

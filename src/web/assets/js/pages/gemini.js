@@ -83,7 +83,7 @@ function renderPage(ctx, body, d) {
         { key: 'lastActive', label: t('Last active'), render: (r) => (r.lastActive ? fmt.relative(r.lastActive) : DASH), value: (r) => r.lastActive },
       ],
       rows: d.topUsers, pageSize: 10, exportName: 'gemini-enterprise-top-users', initialSort: { key: 'prompts', dir: 'desc' },
-      onRowClick: (r) => r.uid && openUserDrawer(r.uid),
+      onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email }),
     }),
   }));
 
@@ -102,7 +102,7 @@ function renderPage(ctx, body, d) {
       ],
       rows: res.data.items === null ? null : items, pageSize: 10, exportName: 'gemini-enterprise-file-uploads',
       emptyText: t('No files were uploaded in this period.'),
-      onRowClick: (r) => r.uid && openUserDrawer(r.uid),
+      onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email }),
     })]);
   }, { skeletonKind: 'table', signal: ctx.signal });
   return null;

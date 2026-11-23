@@ -317,6 +317,106 @@ class EnforceTest(unittest.TestCase):
             gov.enforce(ctx_with(body={"dryRun": "yes"}))
 
 
+SEOUL = timeutil.get_zone("Asia/Seoul")
+
+
+class FixedMonthlyCapDefaultTest(unittest.TestCase):
+    """The shipped default caps (fixed caps per period, monthly from the 1st): a person who uses up the monthly cap on
+    the 11th stays suspended until the month ends and is restored on the 1st of the next month, never at a weekly
+    (Monday) reset."""
+    NOW = dt.datetime(2026, 11, 11, 14, 0, tzinfo=SEOUL)          # Wednesday the 11th
+    MONDAY = dt.datetime(2026, 11, 16, 0, 5, tzinfo=SEOUL)        # the weekly reset of the credit caps
+    MONTH_END = dt.datetime(2026, 12, 1, 0, 0, tzinfo=SEOUL)      # the period ends: 1st of the next month
+
+    def ctx(self, **governance):
+        shipped = config.DEFAULTS["governance"]["antigravity"]
+        # The shipped period settings (support.make_settings starts from daily test caps), with a monthly cost cap of
+        # 1,000,000 KRW. Every call costs 2,000,000 KRW per 1M tokens, so heavy@ (600,000 tokens) spent 1,200,000 KRW.
+        values = {key: shipped[key] for key in ("cap_model", "period", "window", "reset_day", "reset_time")}
+        values.update(reset_timezone="", token_cap=0, request_cap=0, cost_cap=1000000.0, currency="KRW",
+                      pricing_source="manual", output_price_per_million=2000000.0, enforcement_mode="auto")
+        values.update(governance)
+        ctx = support.FakeCtx(support.make_settings(governance=values, workspace={"timezone": "Asia/Seoul"}), body={})
+        ctx.app.settings = store()
+        ctx.identity = Identity("sched@demo-project.iam.gserviceaccount.com", "admin", "scheduler", "scheduler:x")
+        return ctx
+
+    @staticmethod
+    def at(moment):
+        return mock.patch.object(gov, "utcnow", return_value=moment.astimezone(UTC))
+
+    @staticmethod
+    def capped_policy():
+        """POLICY after heavy@ was suspended (access role swapped for the cap marker role)."""
+        capped = copy.deepcopy(POLICY)
+        capped["bindings"][0]["members"].remove("user:heavy@example.com")
+        next(b for b in capped["bindings"] if b["role"] == CAP_MARKER)["members"].append("user:heavy@example.com")
+        return capped
+
+    def test_cap_used_up_on_the_11th_suspends_until_the_month_ends(self):
+        ctx = self.ctx()
+        with Harness(usage=usage_with_cost()) as h, self.at(self.NOW):
+            heavy, payload = user_row(ctx, "heavy@example.com")
+            gov.enforce(ctx)
+        policy = payload["policy"]
+        self.assertEqual((policy["capModel"], policy["period"], policy["window"], policy["resetDay"]),
+                         ("period", "monthly", "calendar", 1))
+        self.assertEqual(policy["nextReset"], gov.iso(self.MONTH_END))
+        self.assertEqual((heavy["estimatedCost"], heavy["overCapReasons"]), (1200000.0, ["cost"]))
+        self.assertEqual(heavy["resetAt"], gov.iso(self.MONTH_END))
+        self.assertIn("user:heavy@example.com", members(h.written_policies()[0], CAP_MARKER))
+        record = next(s for s in ctx.app.settings.governance_state()["suspensions"]
+                      if s["email"] == "heavy@example.com")
+        self.assertEqual(record["until"], gov.iso(self.MONTH_END))
+
+        capped = self.capped_policy()
+        # The next Monday: the month's usage is still over the cap, so the suspension holds until the month ends.
+        with Harness(policies=[capped], usage=usage_with_cost()), self.at(self.MONDAY):
+            heavy, payload = user_row(ctx, "heavy@example.com")
+        self.assertEqual(heavy["state"], "CAPPED_BY_TOOL")
+        self.assertNotIn(heavy["uid"], payload["plan"]["restore"])
+        self.assertEqual(heavy["restoreAt"], gov.iso(self.MONTH_END))
+        # The 1st of the next month: a new period without usage yet, so the person is restored.
+        with Harness(policies=[capped], usage=make_usage([("light@example.com", 1000, 3)])), \
+                self.at(self.MONTH_END + dt.timedelta(minutes=5)):
+            heavy, payload = user_row(ctx, "heavy@example.com")
+        self.assertIn(heavy["uid"], payload["plan"]["restore"])
+
+    def test_a_suspension_from_the_weekly_policy_follows_the_monthly_period(self):
+        # Suspended under the earlier weekly policy (until the next Monday 00:00) and still over the monthly cap: access
+        # returns on the 1st, and the next run extends the record so that the Monday cannot restore early (for example
+        # when the usage query fails at that run).
+        mgr = store()
+        weekly_end = dt.datetime(2026, 11, 16, 0, 0, tzinfo=SEOUL)
+        mgr.mutate_governance(lambda s: s["suspensions"].append(
+            {"email": "heavy@example.com", "since": "2026-11-10T03:00:00Z", "until": gov.iso(weekly_end),
+             "trigger": "auto", "reasons": ["cost"]}), "t")
+        ctx = self.ctx()
+        ctx.app.settings = mgr
+        with Harness(policies=[self.capped_policy()], usage=usage_with_cost()), self.at(self.NOW):
+            heavy, payload = user_row(ctx, "heavy@example.com")
+            gov.enforce(ctx)
+        self.assertEqual(heavy["state"], "CAPPED_BY_TOOL")
+        self.assertNotIn(heavy["uid"], payload["plan"]["restore"])
+        self.assertEqual(heavy["restoreAt"], gov.iso(self.MONTH_END))
+        record = next(s for s in mgr.governance_state()["suspensions"] if s["email"] == "heavy@example.com")
+        self.assertEqual(record["until"], gov.iso(self.MONTH_END))
+        # Under the cap again (for example a higher individual cap): the record is never extended, only kept.
+        self.assertIsNone(gov.restore_at("CAPPED_BY_TOOL", {"until": gov.iso(weekly_end)}, False,
+                                         self.MONTH_END, weekly_end + dt.timedelta(minutes=1)))
+        self.assertEqual(gov.restore_at("CAPPED_BY_TOOL", {"until": gov.iso(weekly_end)}, False, self.MONTH_END,
+                                        self.NOW.astimezone(UTC)), gov.iso(weekly_end))
+
+    def test_credit_caps_report_the_saved_fixed_period_for_the_editor(self):
+        # Credit caps evaluate their weekly cycle; the editor starts fixed caps from the saved period instead.
+        ctx = self.ctx(cap_model="credit_budget", cost_cap=0.0)
+        with Harness(usage=usage_with_cost()), self.at(self.NOW):
+            _, payload = user_row(ctx, "heavy@example.com")
+        policy = payload["policy"]
+        self.assertEqual((policy["capModel"], policy["period"]), ("credit_budget", "weekly"))
+        self.assertEqual((policy["periodSetting"], policy["windowSetting"]), ("monthly", "calendar"))
+
+
 class ReviewTest(unittest.TestCase):
     def test_suspend_from_review_queue(self):
         ctx = ctx_with(body={"decision": "suspend", "uids": [uid_for("heavy@example.com"), uid_for("light@example.com")]})

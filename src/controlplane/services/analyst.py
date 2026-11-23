@@ -297,6 +297,9 @@ SEMANTIC_NOTES = [
 
 def allowlist(ctx):
     out = [(ctx.project, ctx.audit_dataset)]
+    central = getattr(ctx, "central_audit_project", "")
+    if isinstance(central, str) and central and (central, ctx.audit_dataset) not in out:
+        out.append((central, ctx.audit_dataset))
     if config.billing_configured(ctx.settings):
         out.append((config.billing_project(ctx.settings), ctx.ws["billing"]["dataset"]))
     for conn in ctx.settings["telemetry"].get("connectors") or []:
@@ -309,8 +312,10 @@ def allowlist(ctx):
 def schema_context(ctx):
     def build(c):
         lines = []
+        central = getattr(c, "central_audit_project", "")
+        audit_project = central if isinstance(central, str) and central else c.project
         try:
-            groups = c.registry.tables(c.project, c.audit_dataset, c.quota_project, c.max_bytes)
+            groups = c.registry.tables(audit_project, c.audit_dataset, c.quota_project, c.max_bytes)
         except GcpError:
             groups = {}
         for logical in CORE_TABLES:
@@ -318,13 +323,17 @@ def schema_context(ctx):
             if not info:
                 continue
             try:
-                meta = c.registry.schema(c.project, c.audit_dataset, info["latest"], c.quota_project)
+                meta = c.registry.schema(audit_project, c.audit_dataset, info["latest"], c.quota_project)
             except GcpError:
                 continue
-            name = "%s.%s.%s%s" % (c.project, c.audit_dataset, info["table"], "_*" if info["kind"] == "sharded" else "")
+            name = "%s.%s.%s%s" % (audit_project, c.audit_dataset, info["table"],
+                                   "_*" if info["kind"] == "sharded" else "")
             cols = ", ".join("%s %s" % (p, t) for p, t in meta["schema"].leaf_types(SCHEMA_PATHS_PER_TABLE))
             lines.append("Table `%s`%s: %s" % (name, " (date-sharded; filter _TABLE_SUFFIX)" if info["kind"] == "sharded"
                                                else "", cols))
+        if central and lines:
+            lines.append("These audit tables hold every project of the organization or folder; logName starts with "
+                         "projects/<project id>/ (filter on it for one project).")
         if config.billing_configured(c.settings):
             b = c.ws["billing"]
             try:

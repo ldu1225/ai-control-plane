@@ -333,6 +333,9 @@ class GoogleSignIn:
         password = str(password or "")
         if not username or not password or len(username) > 254 or len(password) > 256:
             raise ApiError("unauthenticated", "Invalid account ID or password.")
+        if username != "admin" and self.settings is not None and self.settings.is_blocked(username):
+            LOG.info("password sign-in rejected uid=%s reason=blocked", uid_for(username))
+            raise ApiError("forbidden", "Access to this workspace has been blocked by an administrator.")
         accounts = self._accounts()
         meta = accounts.get(username)
         sec = settings.get("security") or {}
@@ -373,8 +376,11 @@ class GoogleSignIn:
         issued_ms = claims.get("ims")
         if not isinstance(email, str) or not isinstance(issued_ms, int):
             return None
-        if self.settings is not None and issued_ms <= self.settings.revoked_at(email):
-            return None
+        if self.settings is not None:
+            if email != "admin" and self.settings.is_blocked(email):
+                return None
+            if issued_ms <= self.settings.revoked_at(email):
+                return None
         if claims.get("pw") is True:
             accounts = self._accounts()
             meta = accounts.get(email)
@@ -468,6 +474,12 @@ class GoogleSignIn:
         picture = claims.get("picture") if isinstance(claims.get("picture"), str) else ""
         if not picture.startswith("https://") or len(picture) > 500:
             picture = ""
+        if self.settings is not None and self.settings.is_blocked(email):
+            LOG.info("sign-in denied uid=%s reason=blocked", uid_for(email))
+            cookies.append(self._cookie(NOTICE_COOKIE, self.notices.sign({"email": email}, NOTICE_TTL), https,
+                                        NOTICE_TTL))
+            cookies.append(self._clear(SESSION_COOKIE, https))
+            return "/login?error=blocked", cookies
         if not is_approved(email, settings):
             LOG.info("sign-in denied uid=%s reason=not_approved", uid_for(email))
             self._record_request(email, name)

@@ -25,7 +25,7 @@ import threading
 import time
 import urllib.parse
 
-from . import config
+from . import config, identity
 from .httpkit import ApiError, now_iso
 
 LOG = logging.getLogger("controlplane.settings")
@@ -36,7 +36,7 @@ ACCOUNT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._@\-]{1,127}$")
 # its client secret (the secret value never enters the settings store).
 OAUTH_CLIENT_ID_RE = re.compile(r"^[0-9]{6,32}-[a-z0-9]{8,64}\.apps\.googleusercontent\.com$")
 SECRET_VERSION_RE = re.compile(r"^projects/[A-Za-z0-9._:-]{1,64}/secrets/[A-Za-z0-9_-]{1,255}/versions/[0-9]{1,12}$")
-EMPTY_AUTH = {"requests": [], "lastLogin": {}, "revoked": {}, "accounts": {}}
+EMPTY_AUTH = {"requests": [], "lastLogin": {}, "revoked": {}, "accounts": {}, "blocked": {}}
 EMPTY_GOVERNANCE = {"exceptions": [], "suspensions": [], "notified": {}, "lastRun": None, "lastScheduledRun": None}
 EMPTY_PRICING = {"syncedAt": None, "syncedBy": None, "trigger": None, "fx": None, "models": {}, "unitPrices": [],
                  "sources": [], "alerts": [], "lastError": None, "catalogServices": [], "storage": None}
@@ -47,12 +47,26 @@ MAX_AUTH_ENTRIES = 5000
 MAX_GOVERNANCE_ENTRIES = 5000
 REVOCATION_RETENTION_MS = 8 * 24 * 3600 * 1000  # longer than the maximum session lifetime (7 days)
 EXCEPTION_TYPES = ("allow", "block", "limit")
-SUSPENSION_TRIGGERS = ("auto", "review", "admin", "bulk")
-CAP_REASONS = ("tokens", "requests", "cost", "budget", "credit", "paid")
+SUSPENSION_TRIGGERS = ("auto", "review", "admin", "bulk", "unblock")
+CAP_REASONS = ("tokens", "requests", "cost", "budget", "credit", "paid", "unit_budget")
+MAX_DENY_ATTACHMENTS = 5000
+DENY_ATTACHMENT_RE = re.compile(r"^cloudresourcemanager\.googleapis\.com/(?:organizations/[0-9]{1,30}"
+                                r"|folders/[0-9]{1,30}|projects/[a-z0-9][a-z0-9.:\-]{4,99})$")
 
 
 def _valid_account_key(key):
     return isinstance(key, str) and bool(config.EMAIL_RE.match(key) or ACCOUNT_ID_RE.match(key))
+
+
+def _clean_roles(values, limit=40):
+    if not isinstance(values, list):
+        return []
+    out = []
+    for item in values[:limit]:
+        role = str(item or "").strip()
+        if config.ROLE_RE.match(role) and role not in out:
+            out.append(role)
+    return out
 
 
 def sanitize_auth(auth):
@@ -89,7 +103,19 @@ def sanitize_auth(auth):
         name = str(meta.get("name") or "")[:120]
         updated_at = str(meta.get("updatedAt") or "")[:40]
         accounts[key] = {"role": role, "passwordHash": pw_hash, "name": name, "updatedAt": updated_at}
-    out = {"requests": requests, "lastLogin": last_login, "revoked": revoked, "accounts": accounts}
+    blocked = {}
+    for email, meta in list((auth.get("blocked") or {}).items())[-MAX_AUTH_ENTRIES:]:
+        key = str(email or "").strip().lower()
+        if not _valid_account_key(key) or not isinstance(meta, dict):
+            continue
+        blocked[key] = {
+            "at": str(meta.get("at") or "")[:40],
+            "by": str(meta.get("by") or "")[:254],
+            "note": str(meta.get("note") or "")[:200],
+            "removedRoles": _clean_roles(meta.get("removedRoles")),
+            "restoreRoles": _clean_roles(meta.get("restoreRoles")),
+        }
+    out = {"requests": requests, "lastLogin": last_login, "revoked": revoked, "accounts": accounts, "blocked": blocked}
     oauth = auth.get("oauth")
     if isinstance(oauth, dict) and OAUTH_CLIENT_ID_RE.match(str(oauth.get("clientId") or "")) and \
             SECRET_VERSION_RE.match(str(oauth.get("secretVersion") or "")):
@@ -122,21 +148,52 @@ def _run_summary(run):
     return out if out["at"] else None
 
 
+def _person(value):
+    """A person key of the governance state: a Google Account e-mail or a workforce principal (identity.py), lower-cased;
+    "" for anything else."""
+    key = str(value or "").strip().lower()
+    return key if (config.EMAIL_RE.match(key) or identity.is_workforce_key(key)) and len(key) <= 600 else ""
+
+
+def _deny_record(raw):
+    """Where the managed deny policy was attached by the last iam_deny run: {"attachments", "policyId", "at",
+    "cleanupAt"}; None when absent or empty."""
+    if not isinstance(raw, dict):
+        return None
+    points = []
+    for item in raw.get("attachments") or []:
+        if isinstance(item, str) and DENY_ATTACHMENT_RE.fullmatch(item) and item not in points:
+            points.append(item)
+    policy_id = raw.get("policyId")
+    out = {"attachments": points[:MAX_DENY_ATTACHMENTS],
+           "policyId": policy_id if isinstance(policy_id, str) and config.DENY_POLICY_ID_RE.fullmatch(policy_id)
+           else None,
+           "at": _opt_str(raw.get("at")), "cleanupAt": _opt_str(raw.get("cleanupAt"))}
+    return out if (out["attachments"] or out["at"]) else None
+
+
 def sanitize_governance(state):
     """Bounded, type-checked copy of the internal Antigravity governance state:
     exceptions  per-user exception rules {email, type allow|block|limit, until, caps, note, createdBy, createdAt}
-    suspensions users suspended by the control plane {email, since, until, trigger, by, reasons, usage}
+    suspensions users suspended by the control plane {email, since, until, trigger, by, reasons, usage}; with the
+                iam_deny backend also approved (a review decision not applied yet) and hold (stays suspended until
+                the end)
     notified    {email: windowStart} users already announced to the webhook for the review queue
-    lastRun / lastScheduledRun  summaries of the latest enforcement runs."""
+    lastRun / lastScheduledRun  summaries of the latest enforcement runs
+    deny        where the managed deny policy was attached by the last iam_deny run (see _deny_record).
+    markers     counts of the last hand-over of marker roles left by iam_allow_swap (see _marker_record).
+    usageEvents real-time enforcement heartbeat: last usage event and last run it started (see _usage_events_record).
+    runRequest  why the dashboard started the next enforcement job execution (see _run_request).
+    "email" is a person key: an e-mail address or a workforce principal."""
     state = state if isinstance(state, dict) else {}
     exceptions = []
     seen = set()
     for item in state.get("exceptions") or []:
         if not isinstance(item, dict):
             continue
-        email = str(item.get("email") or "").strip().lower()
+        email = _person(item.get("email"))
         kind = item.get("type")
-        if not config.EMAIL_RE.match(email) or kind not in EXCEPTION_TYPES or email in seen:
+        if not email or kind not in EXCEPTION_TYPES or email in seen:
             continue
         seen.add(email)
         exceptions.append({
@@ -153,25 +210,79 @@ def sanitize_governance(state):
     for item in state.get("suspensions") or []:
         if not isinstance(item, dict):
             continue
-        email = str(item.get("email") or "").strip().lower()
-        if not config.EMAIL_RE.match(email) or email in seen:
+        email = _person(item.get("email"))
+        if not email or email in seen:
             continue
         seen.add(email)
         trigger = item.get("trigger") if item.get("trigger") in SUSPENSION_TRIGGERS else "admin"
-        suspensions.append({
+        record = {
             "email": email, "since": _opt_str(item.get("since")), "until": _opt_str(item.get("until")),
             "trigger": trigger, "by": str(item.get("by") or "")[:200],
-            "reasons": [r for r in item.get("reasons") or [] if r in CAP_REASONS][:6],
+            "reasons": [r for r in item.get("reasons") or [] if r in CAP_REASONS][:7],
             "tokens": _opt_num(item.get("tokens"), 0, 10 ** 15, integer=True),
             "requests": _opt_num(item.get("requests"), 0, 10 ** 12, integer=True),
-            "cost": _opt_num(item.get("cost"), 0, 1e12)})
+            "cost": _opt_num(item.get("cost"), 0, 1e12)}
+        for flag in ("approved", "hold"):
+            if item.get(flag) is True:
+                record[flag] = True
+        suspensions.append(record)
     notified = {}
     for email, when in list((state.get("notified") or {}).items())[-MAX_GOVERNANCE_ENTRIES:]:
-        if isinstance(email, str) and config.EMAIL_RE.match(email) and isinstance(when, str):
-            notified[email] = when[:40]
-    return {"exceptions": exceptions[-MAX_GOVERNANCE_ENTRIES:], "suspensions": suspensions[-MAX_GOVERNANCE_ENTRIES:],
-            "notified": notified, "lastRun": _run_summary(state.get("lastRun")),
-            "lastScheduledRun": _run_summary(state.get("lastScheduledRun"))}
+        key = _person(email)
+        if key and isinstance(when, str):
+            notified[key] = when[:40]
+    out = {"exceptions": exceptions[-MAX_GOVERNANCE_ENTRIES:], "suspensions": suspensions[-MAX_GOVERNANCE_ENTRIES:],
+           "notified": notified, "lastRun": _run_summary(state.get("lastRun")),
+           "lastScheduledRun": _run_summary(state.get("lastScheduledRun"))}
+    deny = _deny_record(state.get("deny"))
+    if deny is not None:
+        out["deny"] = deny
+    markers = _marker_record(state.get("markers"))
+    if markers is not None:
+        out["markers"] = markers
+    usage_events = _usage_events_record(state.get("usageEvents"))
+    if usage_events is not None:
+        out["usageEvents"] = usage_events
+    run_request = _run_request(state.get("runRequest"))
+    if run_request is not None:
+        out["runRequest"] = run_request
+    return out
+
+
+RUN_REQUEST_TRIGGERS = ("usage", "admin")
+
+
+def _usage_events_record(raw):
+    """Real-time enforcement (services/usage_events.py), counts and times only: {"lastEventAt", "lastTriggerAt",
+    "lastTriggerVia" job|run, "triggers"}; None when absent."""
+    if not isinstance(raw, dict):
+        return None
+    via = raw.get("lastTriggerVia")
+    out = {"lastEventAt": _opt_str(raw.get("lastEventAt")), "lastTriggerAt": _opt_str(raw.get("lastTriggerAt")),
+           "lastTriggerVia": via if via in ("job", "run") else None,
+           "triggers": _opt_num(raw.get("triggers"), 0, 10 ** 9, integer=True) or 0}
+    return out if (out["lastEventAt"] or out["lastTriggerAt"]) else None
+
+
+def _run_request(raw):
+    """Why the dashboard started the next enforcement job execution, which the job records as its trigger:
+    {"trigger" usage|admin, "at"}; None when absent."""
+    if not isinstance(raw, dict) or raw.get("trigger") not in RUN_REQUEST_TRIGGERS or not _opt_str(raw.get("at")):
+        return None
+    return {"trigger": raw["trigger"], "at": _opt_str(raw.get("at"))}
+
+
+def _marker_record(raw):
+    """Summary of the last release of marker roles left by iam_allow_swap (governance.release_markers): {"at",
+    "holders", "released", "waiting", "manual", "error"}, counts only; None when absent."""
+    if not isinstance(raw, dict) or not _opt_str(raw.get("at")):
+        return None
+    out = {"at": _opt_str(raw.get("at"))}
+    for key in ("holders", "released", "waiting", "manual"):
+        out[key] = _opt_num(raw.get(key), 0, 10 ** 7, integer=True) or 0
+    error = raw.get("error")
+    out["error"] = error[:40] if isinstance(error, str) and re.fullmatch(r"[a-z_]{1,40}", error) else None
+    return out
 
 
 def _sanitize_fx(fx_raw):
@@ -777,6 +888,17 @@ class SettingsManager:
     def auth_state(self):
         with self._lock:
             return copy.deepcopy(self._doc.get("auth") or EMPTY_AUTH)
+
+    def blocked_accounts(self):
+        with self._lock:
+            return copy.deepcopy(((self._doc.get("auth") or {}).get("blocked")) or {})
+
+    def is_blocked(self, email):
+        key = str(email or "").strip().lower()
+        if not key:
+            return False
+        with self._lock:
+            return key in (((self._doc.get("auth") or {}).get("blocked")) or {})
 
     def revoked_at(self, email):
         """Epoch (ms) before which sessions of this account are invalid; 0 when never revoked."""

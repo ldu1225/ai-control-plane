@@ -4,7 +4,7 @@
  * BigQuery routing cost controls, official prices and exchange rates), governance policy,
  * access control and deployment information.
  */
-import { h, mount, append } from '../core/dom.js';
+import { h, mount, append, debounce } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { t, getLocale } from '../core/i18n.js';
 import { fmt, isNum, DASH, initials } from '../core/format.js';
@@ -13,6 +13,7 @@ import { store, isAdmin, session, isModuleEnabled } from '../core/state.js';
 import {
   pageHeader, card, button, banner, badge, statusBadge, switchInput, selectInput, field, textInput, toast, setBusy, kv, chip,
   errorState, skeleton, confirmDialog, emptyState, dataTable, openDrawer, alertPermissionRequired, requireAdmin, codeBlock,
+  segmented, openModal, listCell, warningsNotice,
 } from '../core/components.js';
 import { errorText, serverText } from '../core/messages.js';
 import { fxRateText, fxSourceLabel, pricingSyncText } from './finops.js';
@@ -26,6 +27,7 @@ const TABS = [
   ['ai', 'AI engine', 'spark'],
   ['data-collection', 'Data collection and cost', 'gauge'],
   ['governance', 'Governance policy', 'sliders'],
+  ['chargeback', 'Chargeback', 'pie'],
   ['about', 'About', 'info'],
 ];
 
@@ -41,6 +43,7 @@ const MODULES = [
   ['users', 'Users & Access', 'Per-user activity across surfaces with IAM enforcement state.'],
   ['antigravity', 'Antigravity Controls', 'Usage caps enforced through IAM with safety gates.'],
   ['finops', 'Cost & FinOps', 'Spend, credits, SKUs and AI-assisted spike analysis.'],
+  ['chargeback', 'Chargeback', 'Usage cost by person, project and organization unit, with month close.'],
   ['telemetry', 'Telemetry Extensions', 'Auto-discovered telemetry sources and custom connectors.'],
   ['analyst', 'AI Analyst', 'Conversational analytics over governance datasets.'],
 ];
@@ -166,7 +169,7 @@ export default async function render(ctx) {
   if (data.persistence && data.persistence.durable === false) {
     panel.append(banner({ tone: 'warning', title: t('Settings are not persisted durably'), text: t('Changes are stored in {backend} and may be lost when the service restarts. Configure a Cloud Storage bucket (storage.gcs_bucket) for durable settings.', { backend: data.persistence.backend }) }));
   }
-  const view = { general, workspace, modules, models, ai, 'data-collection': dataCollection, governance, access, about }[tab];
+  const view = { general, workspace, modules, models, ai, 'data-collection': dataCollection, governance, chargeback: chargebackSettings, access, about }[tab];
   view(ctx, panel, data, editable);
   return null;
 }
@@ -178,11 +181,13 @@ export default async function render(ctx) {
  * fields: [{ path: ['key'] | ['billing','dataset'], label, help, type, options, mono, min, max, step }] or { heading }.
  * Types: text (default; optional suggestions and check), number (integer, range), switch, select, list (comma
  * separated), words (comma separated words in a text area), lines (one item per line, for values that may contain
- * commas), textarea, time, timezone, currency, prices (administrator model prices), color.
+ * commas), textarea, time, timezone, currency, prices (administrator model prices), color, custom (field-specific
+ * editor: render({ value, set, editable }) returns { el, validate?, focusInvalid? }).
  * resetKeys limits the reset button and the override check to part of a section (several cards share a section);
  * showDefaults adds the deployment default (data.defaults) to the help text of single-value fields.
+ * confirm(values) runs after validation and may resolve false to cancel the save.
  */
-function sectionForm(ctx, { title, subtitle, section, data, fields, editable, extraActions, sourceObj, resetKeys, showDefaults, intro, cls }) {
+function sectionForm(ctx, { title, subtitle, section, data, fields, editable, extraActions, sourceObj, resetKeys, showDefaults, intro, cls, confirm }) {
   const scoped = (doc) => (section === 'governance' ? getPath(doc, ['governance', 'antigravity']) : getPath(doc, [section])) || {};
   const effective = sourceObj || scoped(data.effective);
   const overrides = scoped(data.overrides);
@@ -255,6 +260,12 @@ function sectionForm(ctx, { title, subtitle, section, data, fields, editable, ex
         control = input;
         break;
       }
+      case 'date': {
+        const input = textInput({ value: cur || '', type: 'date', attrs: { disabled: !editable || null }, onInput: (v) => set(v.trim()) });
+        check = () => (!input.value.trim() || /^\d{4}-\d{2}-\d{2}$/.test(input.value.trim()) ? '' : t('Enter a valid start date (YYYY-MM-DD).'));
+        control = input;
+        break;
+      }
       case 'timezone': {
         if (!intlValues('timeZone').length) {
           const input = textInput({ value: cur || '', mono: true, attrs: { disabled: !editable || null, placeholder: f.emptyLabel || 'Area/City', maxlength: 64 }, onInput: (v) => set(v.trim()) });
@@ -283,6 +294,13 @@ function sectionForm(ctx, { title, subtitle, section, data, fields, editable, ex
         focusInvalid = () => editor.focusInvalid();
         if (f.focusModel && editable) onMounted = () => editor.reveal(f.focusModel);
         control = editor.el;
+        break;
+      }
+      case 'custom': {
+        const built = f.render({ value: cur, set, editable });
+        if (built.validate) check = () => built.validate();
+        if (built.focusInvalid) focusInvalid = () => built.focusInvalid();
+        control = built.el;
         break;
       }
       case 'color': {
@@ -352,6 +370,7 @@ function sectionForm(ctx, { title, subtitle, section, data, fields, editable, ex
       const ok = await confirmDialog({ title: t('Apply workspace change'), message: t('Data source and access settings affect every user and every module. Continue?'), confirmLabel: t('Apply') });
       if (!ok) return;
     }
+    if (confirm && !(await confirm(values))) return;
     setBusy(save, true, t('Saving'));
     try {
       await api.post('/api/v1/settings', { section, values });
@@ -392,6 +411,11 @@ function sectionForm(ctx, { title, subtitle, section, data, fields, editable, ex
 /** Deployment default of a single-value field as display text; null for lists and tables. */
 function defaultText(f, v) {
   if (v === undefined || v === null || ['list', 'words', 'lines', 'textarea', 'prices', 'color'].includes(f.type)) return null;
+  if (f.type === 'custom') {
+    if (typeof v === 'boolean') return v ? t('On') : t('Off');
+    const opt = (f.options || []).find((o) => String(o.value) === String(v));
+    return opt ? opt.label : null;
+  }
   if (f.type === 'switch') return v ? t('On') : t('Off');
   if (v === '') return f.emptyLabel || null;
   if (f.type === 'select') {
@@ -557,56 +581,15 @@ function workspace(ctx, panel, data, editable) {
       setBusy(testBtn, false);
     }
   });
-  const wsBoot = (store.boot && store.boot.workspace) || {};
-  const activeProjects = wsBoot.projects || [];
-  const projectDetails = Array.isArray(wsBoot.projectDetails) && wsBoot.projectDetails.length
-    ? wsBoot.projectDetails
-    : activeProjects.map((p) => ({
-      id: p,
-      name: p,
-      parent: null,
-      sameOrg: null,
-      source: p === getPath(data.effective, ['workspace', 'project_id']) ? 'primary' : 'configured',
-    }));
-  if (projectDetails.length > 0) {
-    const sourceBadge = (s) => {
-      if (s === 'primary') return badge(t('Primary'), 'info', { size: 'sm' });
-      if (s === 'configured') return badge(t('Explicitly linked'), 'accent', { size: 'sm' });
-      return badge(t('Auto-discovered'), 'success', { size: 'sm' });
-    };
-    panel.append(card({
-      title: t('Scanned Google Cloud projects ({n})', { n: projectDetails.length }),
-      subtitle: t('Unified multi-project scanning across Agent Registry, Deployments, Gemini Enterprise, BigQuery audit sinks, Cloud Monitoring, Cloud Logging and FinOps.'),
-      flush: true,
-      body: h('div', null,
-        dataTable({
-          columns: [
-            { key: 'id', label: t('Project ID'), render: (r) => h('span', { class: 'cell-mono fw-600' }, r.id) },
-            { key: 'name', label: t('Display name'), render: (r) => r.name || r.id },
-            { key: 'source', label: t('Grouping criteria'), render: (r) => sourceBadge(r.source) },
-            {
-              key: 'parent', label: t('Organization / Folder'),
-              render: (r) => h('div', { class: 'row wrap' },
-                h('span', { class: 'cell-mono muted' }, r.parent || DASH),
-                r.sameOrg ? badge(t('Same organization'), 'neutral', { size: 'sm' }) : null),
-            },
-          ],
-          rows: projectDetails,
-          searchable: projectDetails.length > 8,
-          pageSize: 10,
-          initialSort: { key: 'source', dir: 'asc' },
-        }),
-        h('div', { class: 'form-actions' },
-          h('span', { class: 'muted' }, t('Grouping rules: 1) Primary host project, 2) Explicitly linked projects below, 3) Active projects auto-discovered via Cloud Resource Manager (excluding auth bridge projects). Grant cross-project read IAM via scripts/deploy.sh --project {id} --link-projects projA,projB.', { id: getPath(data.effective, ['workspace', 'project_id']) || 'PROJECT_ID' })))),
-    }));
-  }
+  panel.append(scopeCard(ctx, data, editable));
+  panel.append(scopeProjectsCard(ctx, data));
   panel.append(sectionForm(ctx, {
     title: t('Google Cloud workspace'), subtitle: t('The project and datasets the control plane reads from.'), section: 'workspace', data, editable,
     extraActions: testBtn,
+    // The scope keys (projects, folders, organization, audit project) have their own card and reset button above.
+    resetKeys: ['project_id', 'quota_project_id', 'audit_dataset', 'timezone', 'default_range_days', 'billing', 'discovery_engine_locations', 'agent_engine_regions', 'telemetry_datasets'],
     fields: [
       { path: ['project_id'], label: t('Project ID'), mono: true },
-      { path: ['scan_all_projects'], label: t('Auto-discover organization projects'), type: 'switch', help: t('Automatically scan all accessible active Google Cloud projects in the organization.') },
-      { path: ['projects'], label: t('Additional projects to scan'), type: 'list', mono: true, help: t('Comma separated project IDs scanned alongside the workspace project.') },
       { path: ['quota_project_id'], label: t('Quota project'), help: t('Project billed for API quota. Empty uses the workspace project.'), mono: true },
       { path: ['audit_dataset'], label: t('Audit log dataset'), help: t('BigQuery dataset receiving the Log Router sink.'), mono: true },
       { path: ['timezone'], label: t('Reporting timezone'), type: 'timezone' },
@@ -622,6 +605,554 @@ function workspace(ctx, panel, data, editable) {
   }));
   panel.append(card({ title: t('Connection test'), subtitle: t('Runs every data source health check against the saved configuration.'), body: testHost }));
   mount(testHost, h('p', { class: 'muted' }, t('Select Test connections to verify access to BigQuery, Discovery Engine, Agent Engine, Cloud Monitoring, Cloud Logging and IAM.')));
+}
+
+/* ------------------------------------------------------------------ workspace scope */
+
+const SCOPE_TYPES = ['projects', 'folder', 'organization'];
+const SCOPE_KEYS = ['scope_type', 'scope_ids', 'projects', 'scan_all_projects', 'scope_max_projects', 'scope_filter', 'audit_project'];
+const PROJECT_ID_RE = /^[a-z][a-z0-9-]{4,61}[a-z0-9]$/;
+const MAX_SCOPE_IDS = 20;
+const MAX_LINKED_PROJECTS = 500;
+const SOURCE_ORDER = { primary: 0, configured: 1, scope: 2, auto_discovered: 3 };
+
+/** Project id as the settings accept it (domain-scoped ids such as example.com:project included). */
+function isProjectId(v) {
+  const s = String(v || '');
+  return s.length <= 100 && (PROJECT_ID_RE.test(s) || (s.includes(':') && /^[a-z0-9.:-]+$/.test(s)));
+}
+
+/** Numeric folder or organization id from "123", "folders/123" or "organizations/123"; null otherwise. */
+function scopeNumber(v) {
+  const m = /^(?:folders\/|organizations\/)?([0-9]{1,30})$/.exec(String(v === undefined || v === null ? '' : v).trim());
+  return m ? m[1] : null;
+}
+
+function sameList(a, b) {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+function scopeResource(kind, id) {
+  return `${kind === 'organization' ? 'organizations' : 'folders'}/${id}`;
+}
+
+function scopeTypeName(type) {
+  if (type === 'folder') return t('Folder');
+  if (type === 'organization') return t('Organization');
+  return t('Projects');
+}
+
+function scopeTypeHelp(type) {
+  if (type === 'folder') return t('Every active project under the folders you choose, nested folders included, up to the maximum below. Projects created there later join automatically.');
+  if (type === 'organization') return t('Every active project in the organization you choose, up to the maximum below. Projects created later join automatically.');
+  return t('The primary project and the projects you link below. Turn on Scan all visible projects to also include other active projects that the service account can see.');
+}
+
+/**
+ * The workspace scope the customer chooses: linked projects, or every project under folders or an organization, with
+ * the Gemini Enterprise filter, the discovery limit and the central audit project. Saves section workspace.
+ */
+function scopeCard(ctx, data, editable) {
+  const eff = getPath(data.effective, ['workspace']) || {};
+  const overrides = getPath(data.overrides, ['workspace']) || {};
+  const primary = typeof eff.project_id === 'string' ? eff.project_id : '';
+  const saved = {
+    type: SCOPE_TYPES.includes(eff.scope_type) ? eff.scope_type : 'projects',
+    ids: (Array.isArray(eff.scope_ids) ? eff.scope_ids : []).map(scopeNumber).filter(Boolean),
+    projects: (Array.isArray(eff.projects) ? eff.projects : []).map((p) => String(p).toLowerCase()),
+    scanAll: Boolean(eff.scan_all_projects),
+    max: isNum(eff.scope_max_projects) ? eff.scope_max_projects : 300,
+    filter: eff.scope_filter === 'none' ? 'none' : 'gemini_enterprise',
+    audit: typeof eff.audit_project === 'string' ? eff.audit_project : '',
+  };
+  // Folder and organization picks are kept apart, so switching the type back and forth loses nothing.
+  const state = {
+    type: saved.type,
+    ids: { folder: saved.type === 'folder' ? [...saved.ids] : [], organization: saved.type === 'organization' ? [...saved.ids] : [] },
+    projects: [...saved.projects],
+    scanAll: saved.scanAll,
+    filter: saved.filter,
+  };
+  const names = new Map();
+  const wsBoot = (store.boot && store.boot.workspace) || {};
+  (Array.isArray(wsBoot.projectDetails) ? wsBoot.projectDetails : []).forEach((d) => {
+    if (d && d.id && d.name) names.set(String(d.id), String(d.name));
+  });
+  const looked = new Set();
+
+  const err = h('div', { class: 'field-error', role: 'alert' });
+  const typeHelp = h('span');
+  const bodyHost = h('div', { class: 'stack' });
+  const maxIn = textInput({ value: String(saved.max), type: 'number', attrs: { min: 1, max: 5000, step: 1, inputmode: 'numeric', disabled: !editable || null } });
+  const filterSel = selectInput([
+    { value: 'gemini_enterprise', label: t('Only projects with Gemini Enterprise (recommended)') },
+    { value: 'none', label: t('Every active project') },
+  ], state.filter, (v) => { state.filter = v; }, { disabled: !editable || null });
+  const scanSwitch = switchInput({ checked: state.scanAll, disabled: !editable, label: t('Scan all visible projects'), onChange: (v) => { state.scanAll = v; } });
+  const auditIn = textInput({ value: saved.audit, mono: true, attrs: { placeholder: t('Empty: every project has its own audit dataset'), maxlength: 100, spellcheck: 'false', autocomplete: 'off', disabled: !editable || null } });
+  const auditPick = editable ? button({
+    label: t('Choose'), icon: 'search', size: 'sm',
+    onClick: () => openScopePicker({
+      kind: 'project', single: true,
+      onDone: (items) => {
+        const it = items[0];
+        if (!it) return;
+        auditIn.value = it.id;
+        if (it.name) names.set(it.id, it.name);
+      },
+    }),
+  }) : null;
+
+  // Names of chosen folders and organizations come from the candidate list (administrators only).
+  const lookupNames = (kind) => {
+    if (!editable || looked.has(kind) || !state.ids[kind].length) return;
+    looked.add(kind);
+    api.get('/api/v1/scope/candidates', { kind }, { signal: ctx.signal }).then((res) => {
+      const items = res.data && Array.isArray(res.data.items) ? res.data.items : [];
+      let found = false;
+      items.forEach((it) => {
+        const id = scopeNumber(it && it.id);
+        if (id && it.name && !names.has(id)) {
+          names.set(id, String(it.name));
+          found = true;
+        }
+      });
+      if (found && !ctx.signal.aborted && state.type === kind) renderBody();
+    }).catch(() => { /* ids are shown without names */ });
+  };
+
+  const removeButton = (label, onClick) => (editable ? button({ icon: 'trash', variant: 'ghost', size: 'sm', title: label, onClick }) : null);
+
+  const projectsBlock = () => {
+    const rows = state.projects.map((id) => ({ id, name: names.get(id) || '' }));
+    const add = editable ? button({
+      label: t('Add projects'), icon: 'plus', size: 'sm',
+      onClick: () => openScopePicker({
+        kind: 'project', taken: [primary, ...state.projects], max: MAX_LINKED_PROJECTS - state.projects.length,
+        onDone: (items) => {
+          items.forEach((it) => {
+            if (!state.projects.includes(it.id)) state.projects.push(it.id);
+            if (it.name) names.set(it.id, it.name);
+          });
+          renderBody();
+        },
+      }),
+    }) : null;
+    const table = dataTable({
+      columns: [
+        { key: 'id', label: t('Project ID'), render: (r) => h('span', { class: 'cell-mono fw-600' }, r.id) },
+        { key: 'name', label: t('Display name'), render: (r) => (r.name && r.name !== r.id ? r.name : h('span', { class: 'text-muted' }, DASH)) },
+        {
+          key: 'actions', label: '', actions: true, align: 'right',
+          render: (r) => removeButton(t('Remove {id}', { id: r.id }), () => {
+            state.projects = state.projects.filter((p) => p !== r.id);
+            renderBody();
+          }),
+        },
+      ],
+      rows, pageSize: 8, searchable: rows.length > 8,
+      emptyText: primary ? t('No linked projects. The primary project {id} is always included.', { id: primary }) : t('No linked projects yet.'),
+    });
+    return h('div', { class: 'stack' },
+      field({
+        label: t('Linked projects ({n})', { n: fmt.int(rows.length) }),
+        help: t('Scanned together with the primary project. The service account needs read access in each of them.'),
+        control: h('div', { class: 'stack-sm' }, table, add ? h('div', null, add) : null),
+      }),
+      field({
+        label: t('Scan all visible projects'),
+        help: t('Also include other active projects that the service account can see. They are listed as auto-discovered below.'),
+        control: h('div', { class: 'row' }, scanSwitch),
+      }));
+  };
+
+  const idsBlock = (kind) => {
+    const rows = state.ids[kind].map((id) => ({ id, name: names.get(id) || '' }));
+    const add = editable ? button({
+      label: kind === 'folder' ? t('Add folders') : t('Add organizations'), icon: kind === 'folder' ? 'folder' : 'globe', size: 'sm',
+      onClick: () => openScopePicker({
+        kind, taken: state.ids[kind], max: MAX_SCOPE_IDS - state.ids[kind].length,
+        onDone: (items) => {
+          items.forEach((it) => {
+            if (!state.ids[kind].includes(it.id)) state.ids[kind].push(it.id);
+            if (it.name) names.set(it.id, it.name);
+          });
+          renderBody();
+        },
+      }),
+    }) : null;
+    const table = dataTable({
+      columns: [
+        { key: 'name', label: t('Name'), render: (r) => (r.name ? h('span', { class: 'fw-600' }, r.name) : h('span', { class: 'text-muted' }, t('Name not loaded'))) },
+        { key: 'id', label: t('Resource'), render: (r) => h('span', { class: 'cell-mono' }, scopeResource(kind, r.id)) },
+        {
+          key: 'actions', label: '', actions: true, align: 'right',
+          render: (r) => removeButton(t('Remove {id}', { id: scopeResource(kind, r.id) }), () => {
+            state.ids[kind] = state.ids[kind].filter((x) => x !== r.id);
+            renderBody();
+          }),
+        },
+      ],
+      rows, pageSize: 8, searchable: rows.length > 8,
+      emptyText: kind === 'folder' ? t('No folder chosen yet.') : t('No organization chosen yet.'),
+    });
+    return h('div', { class: 'stack' },
+      field({
+        label: kind === 'folder' ? t('Folders ({n})', { n: fmt.int(rows.length) }) : t('Organizations ({n})', { n: fmt.int(rows.length) }),
+        help: t('Up to {n}. The service account needs Browser (roles/browser) on each of them to list their projects.', { n: MAX_SCOPE_IDS }),
+        control: h('div', { class: 'stack-sm' }, table, add ? h('div', null, add) : null),
+      }),
+      h('div', { class: 'field-row' },
+        field({ label: t('Maximum projects'), help: t('Discovery stops at this many projects (1 to 5,000). The list below says when it was cut short.'), control: maxIn }),
+        field({ label: t('Projects to keep'), help: t('Gemini Enterprise only keeps projects that have a Gemini Enterprise subscription (license configurations in a Gemini Enterprise location). A project whose subscription cannot be read is kept and marked unknown.'), control: filterSel })));
+  };
+
+  const renderBody = () => {
+    typeHelp.textContent = scopeTypeHelp(state.type);
+    mount(bodyHost, state.type === 'projects' ? projectsBlock() : idsBlock(state.type));
+    if (state.type !== 'projects') lookupNames(state.type);
+  };
+
+  const typeControl = editable
+    ? segmented(SCOPE_TYPES.map((v) => ({ value: v, label: scopeTypeName(v) })), state.type, (v) => {
+      state.type = v;
+      err.textContent = '';
+      renderBody();
+    }, { label: t('Scope type') })
+    : h('div', null, badge(scopeTypeName(state.type), 'info'));
+
+  const save = button({ label: t('Save scope'), variant: 'primary' });
+  save.addEventListener('click', async () => {
+    if (!editable) {
+      alertPermissionRequired({ action: `${t('Save changes')}: ${t('Workspace scope')}` });
+      return;
+    }
+    err.textContent = '';
+    const values = {};
+    if (state.type !== saved.type) values.scope_type = state.type;
+    if (state.type !== 'projects') {
+      const ids = state.ids[state.type];
+      if (!ids.length) {
+        err.textContent = state.type === 'folder'
+          ? t('Choose at least one folder, or switch the scope type to Projects.')
+          : t('Choose an organization, or switch the scope type to Projects.');
+        return;
+      }
+      if (ids.length > MAX_SCOPE_IDS) {
+        err.textContent = t('Choose at most {n} folders or organizations.', { n: MAX_SCOPE_IDS });
+        return;
+      }
+      if (!sameList(ids, saved.ids)) values.scope_ids = ids;
+      const raw = maxIn.value.trim();
+      const max = Number(raw);
+      if (!raw || !Number.isInteger(max) || max < 1 || max > 5000) {
+        err.textContent = t('Enter a whole number of projects from 1 to 5,000.');
+        maxIn.focus();
+        return;
+      }
+      if (max !== saved.max) values.scope_max_projects = max;
+      if (state.filter !== saved.filter) values.scope_filter = state.filter;
+    }
+    if (state.projects.length > MAX_LINKED_PROJECTS) {
+      err.textContent = t('Link at most {n} projects.', { n: MAX_LINKED_PROJECTS });
+      return;
+    }
+    if (!sameList(state.projects, saved.projects)) values.projects = state.projects;
+    if (state.scanAll !== saved.scanAll) values.scan_all_projects = state.scanAll;
+    const audit = auditIn.value.trim().toLowerCase();
+    if (audit && !isProjectId(audit)) {
+      err.textContent = t('"{value}" is not a valid project ID.', { value: audit });
+      auditIn.focus();
+      return;
+    }
+    if (audit !== saved.audit) values.audit_project = audit;
+    if (!Object.keys(values).length) { toast({ title: t('No changes to save'), tone: 'info', timeout: 2500 }); return; }
+    const ok = await confirmDialog({ title: t('Apply workspace change'), message: t('Data source and access settings affect every user and every module. Continue?'), confirmLabel: t('Apply') });
+    if (!ok) return;
+    setBusy(save, true, t('Saving'));
+    try {
+      await api.post('/api/v1/settings', { section: 'workspace', values });
+      toast({
+        title: t('Settings saved'),
+        text: state.type === 'projects' ? null : t('Projects in the scope are discovered in the background, so the list below can take a minute to fill.'),
+        tone: 'success', timeout: 6000,
+      });
+      await afterSave(ctx);
+    } catch (e) {
+      setBusy(save, false);
+      err.textContent = errorText(e);
+    }
+  });
+  const reset = editable && SCOPE_KEYS.some((k) => overrides[k] !== undefined) ? button({ label: t('Reset to defaults'), variant: 'ghost', icon: 'refresh' }) : null;
+  if (reset) {
+    reset.addEventListener('click', async () => {
+      const ok = await confirmDialog({ title: t('Reset section'), message: t('Customized values in this section will revert to the deployment defaults from config.yaml and environment variables.'), confirmLabel: t('Reset'), tone: 'danger' });
+      if (!ok) return;
+      try {
+        await api.post('/api/v1/settings/reset', { section: 'workspace', keys: SCOPE_KEYS });
+        toast({ title: t('Section reset to defaults'), tone: 'success' });
+        await afterSave(ctx);
+      } catch (e) {
+        toast({ title: t('Reset failed'), text: errorText(e), tone: 'danger' });
+      }
+    });
+  }
+  const c = card({
+    title: t('Workspace scope'),
+    subtitle: t('Choose the Google Cloud projects that the control plane covers. Every module, usage cap and report uses this scope.'),
+    bordered: true,
+    body: h('div', { class: 'form-grid' },
+      field({ label: t('Scope type'), help: typeHelp, control: typeControl }),
+      bodyHost,
+      field({
+        label: t('Central audit project'),
+        help: t('Project whose audit log dataset is filled by an organization or folder aggregated log sink. Leave it empty when every project has its own audit dataset (per-project sinks).'),
+        control: h('div', { class: 'input-group' }, auditIn, auditPick),
+      }),
+      err),
+  });
+  c.bodyEl.classList.add('flush');
+  c.append(h('div', { class: 'form-actions' }, h('span', { class: 'spacer' }), reset, save));
+  renderBody();
+  return c;
+}
+
+/**
+ * Searchable picker over GET /api/v1/scope/candidates (administrators). kind: project, folder or organization.
+ * onDone receives [{ id, name }]: project ids, or numeric folder / organization ids, never one of `taken`.
+ * IDs can also be typed, for projects the service account cannot list.
+ */
+function openScopePicker({ kind, single = false, taken = [], max = Infinity, onDone }) {
+  const takenSet = new Set(taken.filter(Boolean));
+  const picked = new Map();
+  const group = `scope-pick-${Math.random().toString(36).slice(2, 8)}`;
+  let seq = 0;
+  let controller = null;
+  let title = t('Add projects');
+  let subtitle = t('Projects that the dashboard service account can see. Search by project ID or name.');
+  if (kind === 'project' && single) title = t('Choose the central audit project');
+  if (kind === 'folder') {
+    title = t('Add folders');
+    subtitle = t('Folders that the dashboard service account can see. Search by folder name or ID.');
+  }
+  if (kind === 'organization') {
+    title = t('Add organizations');
+    subtitle = t('Organizations that the dashboard service account can see.');
+  }
+  const normalize = (raw) => {
+    if (kind !== 'project') return scopeNumber(raw);
+    const id = String(raw === undefined || raw === null ? '' : raw).trim().toLowerCase();
+    return isProjectId(id) ? id : null;
+  };
+  const list = h('div', { class: 'wb-pick-list', role: single ? 'radiogroup' : 'group', 'aria-label': title });
+  const status = h('div');
+  const count = h('span', { class: 'muted' });
+  const err = h('div', { class: 'field-error', role: 'alert' });
+  const search = textInput({ type: 'search', placeholder: t('Name or ID'), attrs: { autocomplete: 'off', spellcheck: 'false', maxlength: 100 } });
+  const manual = textInput({ mono: true, placeholder: kind === 'project' ? 'project-a, project-b' : '123456789012', attrs: { autocomplete: 'off', spellcheck: 'false', maxlength: 2000 } });
+  const syncCount = () => { count.textContent = picked.size ? t('{n} selected', { n: fmt.int(picked.size) }) : ''; };
+
+  const renderItems = (items, truncated) => {
+    const nodes = items.map((raw) => {
+      const id = normalize(raw && raw.id);
+      if (!id) return null;
+      const name = raw.name ? String(raw.name) : id;
+      const added = !single && takenSet.has(id);
+      const input = h('input', { type: single ? 'radio' : 'checkbox', name: group, value: id, checked: added || picked.has(id), disabled: added || null });
+      input.addEventListener('change', () => {
+        if (single) picked.clear();
+        if (input.checked) picked.set(id, name);
+        else picked.delete(id);
+        syncCount();
+      });
+      const what = [kind === 'project' ? id : scopeResource(kind, id), raw.parent ? t('in {parent}', { parent: String(raw.parent) }) : null].filter(Boolean).join(' \u00b7 ');
+      return h('label', { class: 'wb-pick' }, input, h('span', { class: 'wb-pick-text' },
+        h('span', { class: 'wb-pick-name' }, name, added ? badge(t('Already added'), 'neutral', { size: 'sm' }) : null),
+        h('span', { class: 'wb-pick-what' }, what)));
+    }).filter(Boolean);
+    mount(list, nodes.length ? nodes : emptyState({ icon: 'search', compact: true, title: t('Nothing found'), body: t('Try another name or ID, or enter IDs below.') }));
+    mount(status, truncated ? h('span', { class: 'field-help' }, t('More results exist. Type part of a name or ID to narrow the list.')) : null);
+  };
+
+  const loadItems = async (query) => {
+    seq += 1;
+    const mine = seq;
+    if (controller) controller.abort();
+    controller = new AbortController();
+    mount(list, skeleton('lines'));
+    mount(status);
+    try {
+      const res = await api.get('/api/v1/scope/candidates', { kind, query: query || null }, { signal: controller.signal });
+      if (mine !== seq) return;
+      const d = res.data || {};
+      renderItems(Array.isArray(d.items) ? d.items : [], Boolean(d.truncated));
+    } catch (e) {
+      if (isAbort(e) || mine !== seq) return;
+      mount(list);
+      mount(status, banner({ tone: 'warning', title: t('The list could not be loaded'), text: `${errorText(e)} ${t('You can still enter IDs below.')}` }));
+    }
+  };
+
+  const done = button({ label: single ? t('Use selected') : t('Add selected'), icon: 'check', variant: 'primary' });
+  const cancel = button({ label: t('Cancel') });
+  const m = openModal({
+    title,
+    subtitle,
+    wide: true,
+    body: (el) => append(el, [
+      field({ label: t('Search'), control: search }),
+      list,
+      status,
+      field({ label: kind === 'project' ? t('Or enter project IDs') : t('Or enter numeric IDs'), help: t('Separate several IDs with commas or spaces.'), control: manual }),
+      err]),
+    footer: (el) => append(el, [count, h('span', { class: 'spacer' }), cancel, done]),
+    onClose: () => { if (controller) controller.abort(); },
+  });
+  cancel.addEventListener('click', () => m.close());
+  done.addEventListener('click', () => {
+    err.textContent = '';
+    const out = new Map(picked);
+    const typed = String(manual.value || '').split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean);
+    for (const raw of typed) {
+      const id = normalize(raw);
+      if (!id) {
+        err.textContent = kind === 'project'
+          ? t('"{value}" is not a valid project ID.', { value: raw })
+          : t('"{value}" is not a numeric folder or organization ID.', { value: raw });
+        manual.focus();
+        return;
+      }
+      if (!out.has(id)) out.set(id, '');
+    }
+    if (!single) takenSet.forEach((id) => out.delete(id));
+    if (!out.size) { err.textContent = t('Select at least one item, or enter an ID.'); return; }
+    if (single && out.size > 1) { err.textContent = t('Choose one project.'); return; }
+    if (out.size > max) { err.textContent = t('You can add at most {n} more.', { n: fmt.int(Math.max(0, max)) }); return; }
+    m.close();
+    onDone([...out.entries()].map(([id, name]) => ({ id, name })));
+  });
+  search.addEventListener('input', debounce(() => loadItems(search.value.trim()), 300));
+  search.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      loadItems(search.value.trim());
+    }
+  });
+  loadItems('');
+  setTimeout(() => search.focus(), 30);
+}
+
+function scopeSourceBadge(s) {
+  if (s === 'primary') return badge(t('Primary'), 'info', { size: 'sm' });
+  if (s === 'configured') return badge(t('Explicitly linked'), 'accent', { size: 'sm' });
+  if (s === 'scope') return badge(t('In scope'), 'success', { size: 'sm' });
+  return badge(t('Auto-discovered'), 'success', { size: 'sm' });
+}
+
+function geBadge(ge) {
+  if (ge === true) return badge(t('Subscribed'), 'success', { size: 'sm' });
+  if (ge === false) return badge(t('No subscription'), 'neutral', { size: 'sm' });
+  return badge(t('Unknown'), 'warning', { size: 'sm', title: t('The Gemini Enterprise subscription of this project could not be read, so the project is kept.') });
+}
+
+function labelsCell(r) {
+  if (r.restricted && !r.labels) return h('span', { class: 'text-muted' }, t('Restricted'));
+  const labels = r.labels && typeof r.labels === 'object' && !Array.isArray(r.labels) ? Object.entries(r.labels) : [];
+  return listCell(labels.map(([k, v]) => (v ? `${k}=${v}` : k)), { mono: true });
+}
+
+function scopeSummary(d) {
+  const type = SCOPE_TYPES.includes(d.scopeType) ? d.scopeType : 'projects';
+  const ids = Array.isArray(d.scopeIds) ? d.scopeIds.join(', ') : '';
+  const parts = [];
+  if (type === 'folder') parts.push(t('Folders: {ids}', { ids: ids || DASH }));
+  else if (type === 'organization') parts.push(t('Organization: {ids}', { ids: ids || DASH }));
+  else parts.push(t('Linked projects'));
+  if (type !== 'projects') {
+    parts.push(d.filter === 'none' ? t('Every active project') : t('Gemini Enterprise projects only'));
+    if (isNum(d.maxProjects)) parts.push(t('At most {n} projects', { n: fmt.int(d.maxProjects) }));
+  }
+  if (d.auditProject) parts.push(t('Central audit project: {id}', { id: d.auditProject }));
+  return parts.join(' \u00b7 ');
+}
+
+/** The projects the saved scope covers now (GET /api/v1/scope/projects); the bootstrap list when that fails. */
+function scopeProjectsCard(ctx, data) {
+  const primary = getPath(data.effective, ['workspace', 'project_id']) || 'PROJECT_ID';
+  const host = h('div', null, skeleton('table'));
+  const c = card({
+    title: t('Scanned Google Cloud projects ({n})', { n: DASH }),
+    subtitle: t('Unified multi-project scanning across Agent Registry, Deployments, Gemini Enterprise, BigQuery audit sinks, Cloud Monitoring, Cloud Logging and FinOps.'),
+    flush: true,
+    body: host,
+  });
+  const titleEl = c.querySelector('.card-title');
+  const show = (d, warnings, problem) => {
+    const rows = (Array.isArray(d.projects) ? d.projects : []).filter((p) => p && p.id);
+    const type = SCOPE_TYPES.includes(d.scopeType) ? d.scopeType : 'projects';
+    const counts = d.counts || {};
+    const geColumn = type !== 'projects' && d.filter !== 'none';
+    if (titleEl) {
+      titleEl.textContent = t('Scanned Google Cloud projects ({n})', { n: fmt.int(rows.length) });
+      titleEl.title = titleEl.textContent;
+    }
+    const truncatedNotice = warnings.some((w) => w && w.code === 'truncated');
+    const geCount = isNum(counts.ge) ? counts.ge : rows.filter((r) => r.ge === true).length;
+    mount(host,
+      h('div', { class: 'card-body stack-sm' },
+        h('div', { class: 'row wrap' },
+          geColumn ? badge(t('Gemini Enterprise: {n}', { n: fmt.int(geCount) }), 'success', { size: 'sm' }) : null,
+          geColumn && counts.geUnknown ? badge(t('Subscription unknown: {n}', { n: fmt.int(counts.geUnknown) }), 'warning', { size: 'sm' }) : null,
+          h('span', { class: 'muted' }, scopeSummary(d))),
+        problem ? banner({ tone: 'warning', title: t('The project list could not be refreshed'), text: `${errorText(problem)} ${t('The last known list is shown.')}` }) : null,
+        d.truncated && !truncatedNotice ? banner({ tone: 'warning', title: t('Not every project in the scope is listed'), text: t('Discovery stopped at {n} projects. Raise the maximum or narrow the scope.', { n: fmt.int(d.maxProjects) }) }) : null,
+        warningsNotice(warnings)),
+      dataTable({
+        columns: [
+          { key: 'id', label: t('Project ID'), render: (r) => h('span', { class: 'cell-mono fw-600' }, r.id) },
+          { key: 'name', label: t('Display name'), render: (r) => r.name || r.id },
+          { key: 'source', label: t('Grouping criteria'), render: (r) => scopeSourceBadge(r.source), value: (r) => (r.source in SOURCE_ORDER ? SOURCE_ORDER[r.source] : 9), csv: (r) => r.source || '' },
+          geColumn ? {
+            key: 'ge', label: t('Gemini Enterprise'), render: (r) => geBadge(r.ge),
+            value: (r) => (r.ge === true ? 0 : (r.ge === false ? 2 : 1)),
+            csv: (r) => (r.ge === null || r.ge === undefined ? '' : String(r.ge)),
+          } : null,
+          {
+            key: 'parent', label: t('Organization / Folder'),
+            render: (r) => h('div', { class: 'row wrap' },
+              h('span', { class: 'cell-mono muted' }, r.parent || DASH),
+              r.sameOrg ? badge(t('Same organization'), 'neutral', { size: 'sm' }) : null),
+          },
+          {
+            key: 'labels', label: t('Labels'), sortable: false, render: labelsCell,
+            csv: (r) => (r.labels && typeof r.labels === 'object' ? Object.entries(r.labels).map(([k, v]) => `${k}=${v}`).join('|') : ''),
+          },
+        ].filter(Boolean),
+        rows,
+        searchable: rows.length > 8,
+        pageSize: 10,
+        initialSort: { key: 'source', dir: 'asc' },
+        exportName: 'workspace-projects',
+        emptyText: t('No project is in the scope yet.'),
+      }),
+      h('div', { class: 'form-actions' },
+        h('span', { class: 'muted' }, t('Order: 1) the primary project, 2) linked projects, 3) projects found in the folder or organization scope, or auto-discovered projects. The service account needs read access in every project: grant it once on the folder or organization, or run scripts/deploy.sh --project {id} --link-projects projA,projB.', { id: primary }))));
+  };
+  api.get('/api/v1/scope/projects', null, { signal: ctx.signal }).then((res) => {
+    if (!ctx.signal.aborted) show(res.data || {}, (res.meta && res.meta.warnings) || []);
+  }).catch((e) => {
+    if (isAbort(e) || ctx.signal.aborted) return;
+    const ws = (store.boot && store.boot.workspace) || {};
+    const details = Array.isArray(ws.projectDetails) && ws.projectDetails.length
+      ? ws.projectDetails
+      : (ws.projects || []).map((p) => ({ id: p, name: p, parent: null, source: p === primary ? 'primary' : 'configured' }));
+    if (!details.length) {
+      mount(host, h('div', { class: 'card-body' }, errorState(e, { compact: true, onRetry: () => ctx.rerender() })));
+      return;
+    }
+    show({ projects: details, scopeType: getPath(data.effective, ['workspace', 'scope_type']) }, [], e);
+  });
+  return c;
 }
 
 function modules(ctx, panel, data, editable) {
@@ -717,38 +1248,47 @@ async function ai(ctx, panel, data, editable) {
 
 function governance(ctx, panel, data, editable) {
   const workspaceTz = getPath(data.effective, ['workspace', 'timezone']) || 'UTC';
+  const capFields = [
+    { path: ['enforcement_mode'], label: t('Enforcement mode'), type: 'select', options: [{ value: 'manual', label: t('Manual review') }, { value: 'auto', label: t('Automatic suspension') }], help: t('Automatic suspends users over their cap until the period resets; manual waits for an administrator decision.') },
+    { path: ['cap_model'], label: t('Caps'), type: 'select', options: [{ value: '', label: t('Automatic: fixed caps per period, or the credit caps an earlier version already set') }, { value: 'period', label: t('Fixed caps per period') }, { value: 'credit_budget', label: t('Weekly free credit + monthly paid budget') }], help: t('Set the amounts on the Antigravity Controls page (Edit policy).') },
+    { path: ['credit_per_user_month'], label: t('Antigravity credit per user and month (USD)'), type: 'number', min: 0, step: 0.5, help: t('Gemini Enterprise Standard 10, Plus 15. Used by the credit-based cap and the monthly usage report.') },
+    { path: ['paid_budget_month'], label: t('Paid budget per person per month (USD)'), type: 'number', min: -1, step: 'any', help: t('-1 = no limit, 0 = credits only.') },
+    { path: ['org_paid_budget_month'], label: t('Paid budget for everyone per month (USD)'), type: 'number', min: -1, step: 'any', help: t('-1 = no limit.') },
+    { path: ['token_cap'], label: t('Token cap per user'), type: 'number', min: 0, step: 1000, help: t('0 disables the token cap.') },
+    { path: ['request_cap'], label: t('Request cap per user'), type: 'number', min: 0, step: 10, help: t('0 disables the request cap.') },
+    { path: ['cost_cap'], label: t('Cost cap per person'), type: 'number', min: 0, step: 'any', help: t('Amount in the currency below. 0 disables it. Individual amounts are set on the Antigravity Controls page.') },
+    { path: ['currency'], label: t('Currency'), type: 'currency', emptyLabel: t('Billing account currency'), help: t('Cost caps and estimates are shown in this currency') },
+    { path: ['pricing_source'], label: t('Token prices'), type: 'select', options: [{ value: 'auto', label: t('Automatic (recommended)') }, { value: 'manual', label: t('Enter prices') }], help: t('Automatic uses what your billing account paid per token, then the public Google price list.') },
+    { path: ['input_price_per_million'], label: t('Input price per 1M tokens'), type: 'number', min: 0, step: 0.01, help: t('Used only when token prices are entered') },
+    { path: ['output_price_per_million'], label: t('Output price per 1M tokens'), type: 'number', min: 0, step: 0.01, help: t('Used only when token prices are entered') },
+    { path: ['period'], label: t('Settlement period'), type: 'select', options: [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['custom', 'Custom cycle'], ['all', 'Last 90 days']].map(([v, l]) => ({ value: v, label: t(l) })) },
+    { path: ['window'], label: t('Window'), type: 'select', options: [{ value: 'calendar', label: t('Calendar (fixed reset)') }, { value: 'rolling', label: t('Rolling') }] },
+    { path: ['reset_timezone'], label: t('Reset time zone'), type: 'timezone', keep: [workspaceTz], help: t('Empty uses the workspace time zone') },
+    { path: ['reset_weekday'], label: t('Weekly reset day'), type: 'select', numeric: true, options: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].map((d, i) => ({ value: String(i), label: t(d) })), help: t('Used for weekly fixed caps or credit caps (every 7 days).') },
+    { path: ['reset_day'], label: t('Monthly start day'), type: 'number', min: 1, max: 31, integer: true, help: t('Day of the month (1-31) when monthly cap periods begin. Shorter months use their last day.') },
+    { path: ['cycle_days'], label: t('Cycle length (days)'), type: 'number', min: 1, max: 92, integer: true, help: t('Used when the settlement period is Custom cycle (1-92 days).') },
+    { path: ['cycle_start'], label: t('Custom cycle start date'), type: 'date', help: t('Anchor date (YYYY-MM-DD) for custom cycles.') },
+    { path: ['reset_time'], label: t('Reset time'), mono: true, placeholder: '00:00', help: t('HH:MM in the reset time zone') },
+    { path: ['change_budget_min'], label: t('Change budget minimum'), type: 'number', min: 1, help: t('Most people suspended in one run: the larger of this value and the ratio below. The rest follow in the next runs; restores are never limited.') },
+    { path: ['change_budget_ratio'], label: t('Change budget ratio'), type: 'number', min: 0, max: 1, step: 0.05 },
+    { path: ['usage_source'], label: t('Usage source'), type: 'select', options: [{ value: 'auto', label: t('Automatic') }, { value: 'bigquery', label: t('BigQuery log sink') }, { value: 'logging', label: t('Cloud Logging API') }] },
+    { path: ['max_log_entries'], label: t('Maximum log entries per evaluation'), type: 'number', min: 1000, step: 1000 },
+    { path: ['access_role'], label: t('Access role'), mono: true },
+    { path: ['cap_marker_role'], label: t('Cap marker role'), mono: true },
+    { path: ['admin_marker_role'], label: t('Admin marker role'), mono: true },
+    { path: ['privileged_roles'], label: t('Privileged roles'), type: 'list', mono: true },
+    { path: ['extra_access_roles'], label: t('Other access roles'), type: 'list', mono: true, help: t('Custom roles that also grant Antigravity access.') },
+    { path: ['webhook_url'], label: t('Notification webhook'), mono: true, help: t('HTTPS Slack or Google Chat webhook for enforcement notifications.'), placeholder: 'https://chat.googleapis.com/...' },
+  ];
   panel.append(sectionForm(ctx, {
     title: t('Antigravity cap policy'), subtitle: t('Defaults for cap evaluation and enforcement cycles.'), section: 'governance', data, editable,
-    fields: [
-      { path: ['enforcement_mode'], label: t('Enforcement mode'), type: 'select', options: [{ value: 'manual', label: t('Manual review') }, { value: 'auto', label: t('Automatic suspension') }], help: t('Automatic suspends users over their cap until the period resets; manual waits for an administrator decision.') },
-      { path: ['cap_model'], label: t('Caps'), type: 'select', options: [{ value: '', label: t('Automatic: credit caps, or the fixed caps an earlier version already set') }, { value: 'credit_budget', label: t('Weekly free credit + monthly paid budget (recommended)') }, { value: 'period', label: t('Fixed caps per period') }], help: t('Set the amounts on the Antigravity Controls page (Edit policy).') },
-      { path: ['credit_per_user_month'], label: t('Antigravity credit per user and month (USD)'), type: 'number', min: 0, step: 0.5, help: t('Gemini Enterprise Standard 10, Plus 15. Used by the credit-based cap and the monthly usage report.') },
-      { path: ['paid_budget_month'], label: t('Paid budget per person per month (USD)'), type: 'number', min: -1, step: 'any', help: t('-1 = no limit, 0 = credits only.') },
-      { path: ['org_paid_budget_month'], label: t('Paid budget for everyone per month (USD)'), type: 'number', min: -1, step: 'any', help: t('-1 = no limit.') },
-      { path: ['token_cap'], label: t('Token cap per user'), type: 'number', min: 0, step: 1000, help: t('0 disables the token cap.') },
-      { path: ['request_cap'], label: t('Request cap per user'), type: 'number', min: 0, step: 10, help: t('0 disables the request cap.') },
-      { path: ['cost_cap'], label: t('Cost cap per person'), type: 'number', min: 0, step: 'any', help: t('Amount in the currency below. 0 disables it. Individual amounts are set on the Antigravity Controls page.') },
-      { path: ['currency'], label: t('Currency'), type: 'currency', emptyLabel: t('Billing account currency'), help: t('Cost caps and estimates are shown in this currency') },
-      { path: ['pricing_source'], label: t('Token prices'), type: 'select', options: [{ value: 'auto', label: t('Automatic (recommended)') }, { value: 'manual', label: t('Enter prices') }], help: t('Automatic uses what your billing account paid per token, then the public Google price list.') },
-      { path: ['input_price_per_million'], label: t('Input price per 1M tokens'), type: 'number', min: 0, step: 0.01, help: t('Used only when token prices are entered') },
-      { path: ['output_price_per_million'], label: t('Output price per 1M tokens'), type: 'number', min: 0, step: 0.01, help: t('Used only when token prices are entered') },
-      { path: ['period'], label: t('Settlement period'), type: 'select', options: [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['all', 'Last 90 days']].map(([v, l]) => ({ value: v, label: t(l) })) },
-      { path: ['window'], label: t('Window'), type: 'select', options: [{ value: 'calendar', label: t('Calendar (fixed reset)') }, { value: 'rolling', label: t('Rolling') }] },
-      { path: ['reset_timezone'], label: t('Reset time zone'), type: 'timezone', keep: [workspaceTz], help: t('Empty uses the workspace time zone') },
-      { path: ['reset_weekday'], label: t('Weekly reset day'), type: 'select', numeric: true, options: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].map((d, i) => ({ value: String(i), label: t(d) })), help: t('Match the day Gemini Enterprise resets the Antigravity credit pool (every 7 days from the first request in the project).') },
-      { path: ['reset_time'], label: t('Reset time'), mono: true, placeholder: '00:00', help: t('HH:MM in the reset time zone') },
-      { path: ['change_budget_min'], label: t('Change budget minimum'), type: 'number', min: 1, help: t('Most people suspended in one run: the larger of this value and the ratio below. The rest follow in the next runs; restores are never limited.') },
-      { path: ['change_budget_ratio'], label: t('Change budget ratio'), type: 'number', min: 0, max: 1, step: 0.05 },
-      { path: ['usage_source'], label: t('Usage source'), type: 'select', options: [{ value: 'auto', label: t('Automatic') }, { value: 'bigquery', label: t('BigQuery log sink') }, { value: 'logging', label: t('Cloud Logging API') }] },
-      { path: ['max_log_entries'], label: t('Maximum log entries per evaluation'), type: 'number', min: 1000, step: 1000 },
-      { path: ['access_role'], label: t('Access role'), mono: true },
-      { path: ['cap_marker_role'], label: t('Cap marker role'), mono: true },
-      { path: ['admin_marker_role'], label: t('Admin marker role'), mono: true },
-      { path: ['privileged_roles'], label: t('Privileged roles'), type: 'list', mono: true },
-      { path: ['extra_access_roles'], label: t('Other access roles'), type: 'list', mono: true, help: t('Custom roles that also grant Antigravity access.') },
-      { path: ['webhook_url'], label: t('Notification webhook'), mono: true, help: t('HTTPS Slack or Google Chat webhook for enforcement notifications.'), placeholder: 'https://chat.googleapis.com/...' },
-    ],
+    // Three cards share the governance section: this one resets its own keys and the cap keys that no card shows,
+    // never the credit or enforcement settings below.
+    resetKeys: capFields.map((f) => f.path.join('.')).concat(['model_prices', 'credit_model_prefixes', 'legacy_marker_roles', 'inference_log', 'audit_log_name']),
+    fields: capFields,
   }));
+  panel.append(creditForm(ctx, data, editable));
+  panel.append(enforcementForm(ctx, data, editable));
   panel.append(sectionForm(ctx, {
     title: t('Agent lifecycle'), subtitle: t('Thresholds used to classify agents in the registry.'), section: 'agent_lifecycle', data, editable,
     fields: [
@@ -774,6 +1314,292 @@ function governance(ctx, panel, data, editable) {
       { path: ['max_rows'], label: t('Maximum rows returned'), type: 'number', min: 10, max: 5000 },
       { path: ['allow_viewers'], label: t('Allow viewers to use AI Analyst'), type: 'switch',
         help: t('Query results can include free text, such as prompts, that the dashboards hide from viewers. Off by default.') },
+    ],
+  }));
+}
+
+/* ------------------------------------------------------------------ enforcement, credit and chargeback settings */
+
+const BACKENDS = ['iam_allow_swap', 'iam_deny', 'notify_only'];
+const ENFORCEMENT_KEYS = ['enforcement_backend', 'deny_attachment', 'deny_ge_app', 'deny_agent_platform', 'surge_guard_min', 'surge_guard_ratio', 'spend_caps'];
+const KNOWN_TIERS = ['SUBSCRIPTION_TIER_ENTERPRISE', 'SUBSCRIPTION_TIER_SEARCH_AND_ASSISTANT', 'SUBSCRIPTION_TIER_ENTERPRISE_EMERGING', 'SUBSCRIPTION_TIER_CONSUMPTION_ONLY'];
+const TIER_RE = /^SUBSCRIPTION_TIER_[A-Z0-9_]{1,60}$/;
+const OTHER_TIER = 'other';
+const LABEL_KEY_RE = /^([a-z][a-z0-9_-]{0,62})?$/;
+const DATASET_REF_RE = /^(?:[a-z][a-z0-9-]{4,61}[a-z0-9][.:])?[A-Za-z0-9_]{1,1024}$/;
+
+function backendOptions() {
+  return [
+    {
+      value: 'iam_allow_swap', label: t('Allow policy swap'),
+      desc: t('Replaces the direct role binding of the person with a marker role in the allow policy of the primary project. One project only, and only for people who were granted access directly, not through a group or an inherited role.'),
+    },
+    {
+      value: 'iam_deny', label: t('IAM deny policy'),
+      desc: t('Lists suspended people in one deny policy at each attachment point. Works for many projects and also stops access granted through groups, folders, the organization or a workforce identity provider.'),
+    },
+    {
+      value: 'notify_only', label: t('Notify only'),
+      desc: t('Plans suspensions and sends notifications, but never changes access. Use it to try a policy first.'),
+    },
+  ];
+}
+
+function denyWarning() {
+  return banner({
+    tone: 'warning',
+    title: t('Before you use the deny policy'),
+    text: h('ul', { class: 'stack-sm' },
+      h('li', null, t('The identity that applies suspensions needs Deny Admin (roles/iam.denyAdmin) on the organization: the service account of the enforcement job, or the dashboard service account when no job is set. Google grants this role only on the organization.')),
+      h('li', null, t('To show the deny policy state on the Antigravity Controls page, the dashboard service account needs Deny Reviewer (roles/iam.denyReviewer) on the organization.')),
+      h('li', null, t('A deny policy lists at most 2,500 people per attachment point.')),
+      h('li', null, t('Changes take a few minutes to reach every Google Cloud service.'))),
+  });
+}
+
+/** Enforcement method as radio cards with a plain explanation of each, plus the deny policy requirements. */
+function backendChooser({ value, set, editable }) {
+  const group = `backend-${Math.random().toString(36).slice(2, 8)}`;
+  let current = BACKENDS.includes(value) ? value : 'iam_allow_swap';
+  const denyBox = h('div', { hidden: current !== 'iam_deny' ? true : null }, denyWarning());
+  const notifyBox = h('div', { hidden: current !== 'notify_only' ? true : null },
+    banner({ tone: 'info', text: t('Nobody is suspended with Notify only: enforcement runs plan, notify and record what they would do.') }));
+  const options = backendOptions().map((o) => {
+    const input = h('input', { type: 'radio', name: group, value: o.value, checked: o.value === current, disabled: !editable || null });
+    input.addEventListener('change', () => {
+      if (!input.checked) return;
+      current = o.value;
+      denyBox.hidden = current !== 'iam_deny';
+      notifyBox.hidden = current !== 'notify_only';
+      set(current);
+    });
+    return h('label', { class: 'wb-pick' }, input, h('span', { class: 'wb-pick-text' },
+      h('span', { class: 'wb-pick-name' }, o.label),
+      h('span', { class: 'wb-pick-what' }, o.desc)));
+  });
+  return { el: h('div', { class: 'stack-sm' }, h('div', { class: 'wb-pick-list', role: 'radiogroup', 'aria-label': t('Enforcement method') }, options), denyBox, notifyBox) };
+}
+
+function geAppToggle({ value, set, editable }) {
+  const warn = h('div', { hidden: value ? null : true }, banner({
+    tone: 'warning',
+    text: t('Suspended people also lose the Gemini Enterprise assistant (the web app), not only Antigravity. Turn this on only after checking it with a test user in one project.'),
+  }));
+  const sw = switchInput({ checked: Boolean(value), disabled: !editable, label: t('Also deny the Gemini Enterprise app'), onChange: (v) => { warn.hidden = !v; set(v); } });
+  return { el: h('div', { class: 'stack-sm' }, h('div', { class: 'row' }, sw), warn) };
+}
+
+function agentPlatformToggle({ value, set, editable }) {
+  const warn = h('div', { hidden: value ? null : true }, banner({
+    tone: 'warning',
+    text: t('Suspended people also lose every Agent Platform model call at the attachment points (for example their own scripts and apps), not only Antigravity. Turn this on only after checking it with a test user in one project.'),
+  }));
+  const sw = switchInput({ checked: Boolean(value), disabled: !editable, label: t('Also deny Agent Platform model calls'), onChange: (v) => { warn.hidden = !v; set(v); } });
+  return { el: h('div', { class: 'stack-sm' }, h('div', { class: 'row' }, sw), warn) };
+}
+
+function enforcementForm(ctx, data, editable) {
+  const ag = getPath(data.effective, ['governance', 'antigravity']) || {};
+  const job = typeof ag.enforcement_job === 'string' ? ag.enforcement_job : '';
+  const policyId = typeof ag.deny_policy_id === 'string' ? ag.deny_policy_id : '';
+  const usageSub = typeof ag.usage_events_subscription === 'string' ? ag.usage_events_subscription : '';
+  const intro = h('div', { class: 'form-status' },
+    h('span', { class: 'form-status-text' }, icon('server', { size: 14 }), h('span', null, t('Enforcement job')),
+      job ? h('span', { class: 'cell-mono' }, job) : h('span', { class: 'muted' }, t('Not set: the dashboard service applies suspensions itself'))),
+    h('span', { class: 'form-status-text' }, icon('shield', { size: 14 }), h('span', null, t('Deny policy ID')), h('span', { class: 'cell-mono' }, policyId || DASH)),
+    h('span', { class: 'form-status-text' }, icon('zap', { size: 14 }), h('span', null, t('Real-time usage events')),
+      usageSub ? h('span', { class: 'cell-mono' }, usageSub) : h('span', { class: 'muted' }, t('Schedule only (not set)'))),
+    h('span', { class: 'muted' }, t('These are set at deployment (config.yaml or environment variables).')));
+  return sectionForm(ctx, {
+    title: t('Enforcement'),
+    subtitle: t('How a suspension reaches a person, where it is applied and the guards around it. Applies to the Antigravity usage caps.'),
+    section: 'governance', data, editable, showDefaults: true, intro, resetKeys: ENFORCEMENT_KEYS,
+    confirm: async (values) => {
+      if (values.enforcement_backend === undefined) return true;
+      const opt = backendOptions().find((o) => o.value === values.enforcement_backend);
+      return confirmDialog({
+        title: t('Change the enforcement method'),
+        message: t('From the next enforcement run, suspensions are applied with {method}. Check the requirements shown with the option before you continue.', { method: opt ? opt.label : values.enforcement_backend }),
+        confirmLabel: t('Apply'),
+        tone: values.enforcement_backend === 'iam_deny' ? 'danger' : 'primary',
+      });
+    },
+    fields: [
+      { path: ['enforcement_backend'], label: t('Enforcement method'), type: 'custom', wide: true, options: backendOptions(), render: backendChooser },
+      {
+        path: ['deny_attachment'], label: t('Deny policy attachment'), type: 'select',
+        options: [
+          { value: 'projects', label: t('Every workspace project') },
+          { value: 'scope', label: t('The folders or organization of the workspace scope') },
+        ],
+        help: t('Used with the IAM deny policy. The folder or organization choice attaches one policy there, inherited by every project below; without a folder or organization scope it falls back to every project.'),
+      },
+      { path: ['deny_ge_app'], label: t('Also deny the Gemini Enterprise app'), type: 'custom', render: geAppToggle, help: t('Used with the IAM deny policy. Off: only Antigravity is denied.') },
+      { path: ['deny_agent_platform'], label: t('Also deny Agent Platform model calls'), type: 'custom', render: agentPlatformToggle, help: t('Used with the IAM deny policy. Antigravity signed in with Application Default Credentials or pay-as-you-go calls Agent Platform models directly, which the Antigravity permission does not stop. On: suspended people are denied aiplatform.googleapis.com/endpoints.predict as well.') },
+      { heading: t('Surge guard (gate G7)') },
+      { path: ['surge_guard_min'], label: t('Minimum new suspensions'), type: 'number', min: 1, max: 100000, integer: true, range: true, help: t('A run that would newly suspend at least this many people, and at least the share below of everyone evaluated, suspends nobody and asks for an administrator review.') },
+      { path: ['surge_guard_ratio'], label: t('Minimum share of people'), type: 'number', min: 0.01, max: 1, step: 0.01, range: true, help: t('From 0.01 to 1, for example 0.5 for half of everyone evaluated.') },
+      { heading: t('Project hard caps') },
+      { path: ['spend_caps'], label: t('Manage Google spend caps'), type: 'switch', help: t('Lets project budgets set to Hard cap (Chargeback > Monthly budgets) create a Google Cloud spend cap. A spend cap stops the Agent Platform usage of one project when its budget is spent; it counts list prices and is not instant. Needs the billing account ID (Workspace settings) and budget permissions on the billing account.') },
+    ],
+  });
+}
+
+function tierName(tier) {
+  switch (tier) {
+    case 'SUBSCRIPTION_TIER_ENTERPRISE': return t('Standard edition');
+    case 'SUBSCRIPTION_TIER_SEARCH_AND_ASSISTANT': return t('Plus edition');
+    case 'SUBSCRIPTION_TIER_ENTERPRISE_EMERGING': return t('Standard edition (emerging markets)');
+    case 'SUBSCRIPTION_TIER_CONSUMPTION_ONLY': return t('Pay-as-you-go');
+    default: return tier;
+  }
+}
+
+/**
+ * Rows of 'SUBSCRIPTION_TIER_X=amount' (credit_by_tier, seat_prices): a license edition and an amount in USD per
+ * month. Custom field of sectionForm; entries are sent exactly as typed and validated by the server as well.
+ */
+function tierAmountEditor({ value, set, editable, unit }) {
+  const rows = [];
+  let invalidTarget = null;
+  const list = h('div', { class: 'price-rows' });
+  // The header row sits in a plain div: the grid display of .price-row would override the hidden attribute.
+  const head = h('div', null, h('div', { class: ['price-row', 'price-head'], 'aria-hidden': 'true' },
+    h('span', null, t('License edition')), h('span', null, t('Edition ID')), h('span', null, unit), h('span'), h('span')));
+  const empty = h('div', { class: 'price-empty' }, t('No editions listed.'));
+  const tierOf = (r) => (r.choice === OTHER_TIER ? r.idIn.value.trim().toUpperCase() : r.choice);
+  const collect = () => rows.map((r) => `${tierOf(r)}=${r.amountIn.value.trim()}`);
+  const emit = () => set(collect());
+  const sync = () => {
+    empty.hidden = rows.length > 0;
+    head.hidden = rows.length === 0;
+  };
+  const addRow = (item = {}) => {
+    const free = KNOWN_TIERS.find((k) => !rows.some((x) => tierOf(x) === k));
+    const r = { choice: item.tier ? (KNOWN_TIERS.includes(item.tier) ? item.tier : OTHER_TIER) : (free || OTHER_TIER) };
+    r.idIn = textInput({
+      value: item.tier || (r.choice !== OTHER_TIER ? r.choice : ''), mono: true,
+      attrs: { 'aria-label': t('Edition ID'), placeholder: 'SUBSCRIPTION_TIER_...', maxlength: 80, spellcheck: 'false', autocomplete: 'off', disabled: !editable || r.choice !== OTHER_TIER || null },
+    });
+    const options = KNOWN_TIERS.map((k) => ({ value: k, label: tierName(k) })).concat([{ value: OTHER_TIER, label: t('Other edition') }]);
+    r.sel = selectInput(options, r.choice, (v) => {
+      r.choice = v;
+      r.idIn.disabled = !editable || v !== OTHER_TIER;
+      r.idIn.value = v === OTHER_TIER ? '' : v;
+      r.el.classList.remove('invalid');
+      if (v === OTHER_TIER) r.idIn.focus();
+      emit();
+    }, { disabled: !editable || null, 'aria-label': t('License edition') });
+    r.amountIn = textInput({ value: isNum(item.amount) ? String(item.amount) : '', type: 'number', attrs: { min: 0, max: 1000000, step: 'any', inputmode: 'decimal', 'aria-label': unit, disabled: !editable || null } });
+    const remove = editable ? button({ icon: 'trash', variant: 'ghost', size: 'sm', title: t('Remove') }) : h('span');
+    r.el = h('div', { class: 'price-row' }, r.sel, r.idIn, r.amountIn, h('span', { class: 'muted' }, unit), remove);
+    if (editable) {
+      remove.addEventListener('click', () => {
+        rows.splice(rows.indexOf(r), 1);
+        r.el.remove();
+        sync();
+        emit();
+      });
+    }
+    [r.idIn, r.amountIn].forEach((x) => x.addEventListener('input', () => { r.el.classList.remove('invalid'); emit(); }));
+    rows.push(r);
+    list.append(r.el);
+    sync();
+    return r;
+  };
+  (Array.isArray(value) ? value : []).forEach((entry) => {
+    const [left, right] = String(entry).split('=');
+    const amount = right === undefined || String(right).trim() === '' ? NaN : Number(right);
+    addRow({ tier: String(left || '').trim().toUpperCase(), amount: Number.isFinite(amount) ? amount : null });
+  });
+  sync();
+  const validate = () => {
+    invalidTarget = null;
+    rows.forEach((r) => r.el.classList.remove('invalid'));
+    const seen = new Set();
+    for (let i = 0; i < rows.length; i += 1) {
+      const r = rows[i];
+      const n = i + 1;
+      const tier = tierOf(r);
+      const raw = r.amountIn.value.trim();
+      const amount = Number(raw);
+      const fail = (msg, target) => {
+        r.el.classList.add('invalid');
+        invalidTarget = target;
+        return msg;
+      };
+      if (!TIER_RE.test(tier)) return fail(t('Row {n}: enter an edition ID such as SUBSCRIPTION_TIER_ENTERPRISE.', { n }), r.idIn);
+      if (seen.has(tier)) return fail(t('Row {n}: {tier} is listed more than once.', { n, tier: tierName(tier) }), r.sel.querySelector('select'));
+      seen.add(tier);
+      if (raw === '' || !Number.isFinite(amount) || amount < 0 || amount > 1e6) return fail(t('Row {n}: enter an amount from 0 to 1,000,000.', { n }), r.amountIn);
+    }
+    return rows.length > 30 ? t('Enter at most {n} items.', { n: 30 }) : '';
+  };
+  const addBtn = editable ? button({ label: t('Add edition'), icon: 'plus', size: 'sm', onClick: () => { addRow(); emit(); } }) : null;
+  return {
+    el: h('div', { class: 'price-editor' }, head, list, empty, addBtn ? h('div', null, addBtn) : null),
+    validate,
+    focusInvalid: () => { if (invalidTarget) invalidTarget.focus(); },
+  };
+}
+
+function creditForm(ctx, data, editable) {
+  return sectionForm(ctx, {
+    title: t('Antigravity credit per person'),
+    subtitle: t('The free monthly credit each person can use before usage counts as paid, by license edition.'),
+    section: 'governance', data, editable, showDefaults: true, resetKeys: ['credit_source', 'credit_by_tier'],
+    fields: [
+      {
+        path: ['credit_source'], label: t('Credit source'), type: 'select',
+        options: [
+          { value: 'license', label: t('License edition of each person (recommended)') },
+          { value: 'fixed', label: t('The same credit for everyone') },
+        ],
+        help: t('License edition: the credit follows the edition of the Gemini Enterprise license assigned to each person, with the amounts below. People without a known license, and everyone with the same credit, get the credit per user and month of the cap policy. Individual rules always win.'),
+      },
+      {
+        path: ['credit_by_tier'], label: t('Credit by license edition'), type: 'custom', wide: true,
+        render: (o) => tierAmountEditor({ ...o, unit: t('USD per month') }),
+        help: t('Standard 10 and Plus 15 by default. Editions not listed get the credit per user and month.'),
+      },
+    ],
+  });
+}
+
+function chargebackSettings(ctx, panel, data, editable) {
+  const on = isModuleEnabled('chargeback');
+  if (!on) {
+    panel.append(banner({ tone: 'info', title: t('The Chargeback module is off'), text: t('These settings apply once the module is turned on in Modules.') }));
+  }
+  panel.append(sectionForm(ctx, {
+    title: t('Chargeback'),
+    subtitle: t('How usage cost is divided between people, projects and organization units.'),
+    section: 'chargeback', data, editable, showDefaults: true,
+    extraActions: on ? button({ label: t('Open Chargeback'), icon: 'pie', variant: 'ghost', onClick: () => ctx.navigate('#/chargeback') }) : null,
+    fields: [
+      {
+        path: ['allocation_mode'], label: t('Allocation'), type: 'select',
+        options: [
+          { value: 'credit_share', label: t('Beyond the free credit of each person (recommended)') },
+          { value: 'list', label: t('Full list cost, without credit') },
+        ],
+        help: t('Beyond the free credit: each person is charged what they used beyond their weekly free credit share, the same ledger as the Antigravity caps. Full list cost: usage at unit prices, without any credit.'),
+      },
+      {
+        path: ['project_unit_label'], label: t('Project label for the unit'), mono: true, placeholder: 'cost-center', maxlength: 63,
+        check: (v) => (LABEL_KEY_RE.test(v) ? '' : t('Use a lowercase label key: letters, digits, "_" or "-", starting with a letter.')),
+        help: t('Label whose value on a project names an organization unit (its cost center or unit ID). Usage in that project is charged to that unit. Empty = not used.'),
+      },
+      {
+        path: ['seat_prices'], label: t('Seat price by license edition'), type: 'custom', wide: true,
+        render: (o) => tierAmountEditor({ ...o, unit: t('USD per seat and month') }),
+        help: t('Monthly price of each assigned license seat, in USD. Empty = seats are not charged back.'),
+      },
+      {
+        path: ['close_dataset'], label: t('Month close copy (BigQuery dataset)'), mono: true, placeholder: 'project.dataset',
+        check: (v) => (!v || DATASET_REF_RE.test(v) ? '' : t('Enter dataset or project.dataset, or leave it empty.')),
+        help: t('Optional BigQuery dataset (dataset or project.dataset) that receives a copy of every month close.'),
+      },
     ],
   }));
 }

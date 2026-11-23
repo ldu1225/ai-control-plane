@@ -1,12 +1,14 @@
 /**
  * Agent Registry: unified agent catalog with lifecycle (idle / deprecation) detection.
  */
-import { h, mount } from '../core/dom.js';
+import { h, mount, append } from '../core/dom.js';
 import { t } from '../core/i18n.js';
 import { fmt, isNum, DASH } from '../core/format.js';
-import { pageHeader, kpi, card, dataTable, badge, statusBadge, chip, openDrawer, kv, banner, userCell } from '../core/components.js';
+import { isModuleEnabled } from '../core/state.js';
+import { pageHeader, kpi, card, dataTable, badge, statusBadge, chip, openDrawer, kv, banner, userCell, button } from '../core/components.js';
 import { barChart, fromTimeline, TONES } from '../core/charts.js';
 import { pageFlow, fetchRange, rangeText, chartCard, mountCharts } from './_shared.js';
+import { agentHash } from './agent.js';
 
 const PLATFORM_LABELS = {
   agent_engine: 'Agent Engine',
@@ -23,11 +25,11 @@ export default async function render(ctx) {
     header,
     kpiCount: 5,
     fetcher: () => fetchRange(ctx, '/api/v1/agent-platform/registry'),
-    render: (body, d) => renderPage(body, d),
+    render: (body, d) => renderPage(body, d, ctx),
   });
 }
 
-function renderPage(body, d) {
+function renderPage(body, d, ctx) {
   const k = d.kpis || {};
   const th = d.thresholds || { idleDays: 14, deprecationDays: 50 };
   body.append(h('div', { class: 'kpi-grid' },
@@ -77,7 +79,7 @@ function renderPage(body, d) {
       ],
       rows: d.agents === null ? null : rows, pageSize: 12, exportName: 'agent-registry', initialSort: { key: 'daysIdle', dir: 'desc' },
       emptyText: t('No agents match the selected filters.'),
-      onRowClick: (a) => openAgent(a, th),
+      onRowClick: (a) => openAgent(a, th, ctx),
     }));
   };
   renderChips();
@@ -111,13 +113,20 @@ function renderPage(body, d) {
   mountCharts(row, [trend, creators]);
 }
 
-function openAgent(a, th) {
-  openDrawer({
+function openAgent(a, th, ctx) {
+  // Agent Engine deployments have a details page (telemetry, traces, revisions and more) under Deployments.
+  const engine = a.platform === 'agent_engine' && a.project && a.region ? String(a.id || '').split('/').pop() : '';
+  const drawer = openDrawer({
     title: a.name || a.id,
     subtitle: t(PLATFORM_LABELS[a.platform] || a.platform),
     width: 680,
+    actions: engine && isModuleEnabled('agent_deployments') ? button({
+      label: t('Open agent details'), icon: 'arrow-right', size: 'sm', variant: 'primary',
+      onClick: () => { drawer.close(); ctx.navigate(agentHash(a.project, a.region, engine)); },
+    }) : null,
     content: (body) => {
-      body.append(
+      // append() skips the entries that do not apply; the native body.append(null) writes the text "null".
+      append(body, [
         h('div', { class: 'row wrap' }, statusBadge(a.status), a.project ? badge(a.project, 'neutral') : null, a.type ? badge(a.type, 'neutral') : null, a.region ? badge(a.region, 'neutral') : null),
         a.description ? h('p', { class: 'muted' }, a.description) : null,
         card({
@@ -142,7 +151,7 @@ function openAgent(a, th) {
             [t('Updated'), a.updateTime ? fmt.dateTime(a.updateTime) : null],
           ]),
         }),
-        a.status === 'deprecation_candidate' ? banner({ tone: 'warning', title: t('Recommended action'), text: t('Confirm the owner still needs this agent. If not, delete the deployment and revoke its service identity.') }) : null);
+        a.status === 'deprecation_candidate' ? banner({ tone: 'warning', title: t('Recommended action'), text: t('Confirm the owner still needs this agent. If not, delete the deployment and revoke its service identity.') }) : null]);
     },
   });
 }

@@ -11,12 +11,15 @@ import { fmt, isNum, DASH } from '../core/format.js';
 import { api, isAbort } from '../core/api.js';
 import { isAdmin, rangeParams, store } from '../core/state.js';
 import {
-  pageHeader, kpi, card, dataTable, badge, statusBadge, button, banner, segmented, selectInput, progress, userCell, confirmDialog, openModal,
-  toast, setBusy, field, textInput, emptyState, warningsNotice, errorState, skeleton, load, kv, listCell, requireAdmin,
+  pageHeader, kpi, card, dataTable, badge, statusBadge, button, banner, segmented, selectInput, tabs, progress, userCell, confirmDialog, openModal,
+  toast, setBusy, field, textInput, emptyState, warningsNotice, errorState, skeleton, load, kv, requireAdmin,
 } from '../core/components.js';
 import { abortReasonText, errorText, serverText } from '../core/messages.js';
 import { proportionBar } from '../core/charts.js';
-import { IAM_STATE_COLORS, IAM_STATE_LABELS, REMEDIATION, reasonLabel, openUserDrawer, pageSkeleton, rangeText } from './_shared.js';
+import {
+  IAM_STATE_COLORS, IAM_STATE_LABELS, REMEDIATION, reasonLabel, openUserDrawer, pageSkeleton, rangeText,
+  modelCostCell, costShareCell, filteredCostSummary, capRuleText, capPeriodText, removeExceptionRule, ruleTag,
+} from './_shared.js';
 
 const GATE_TEXT = {
   G1_POLICY_READABLE: ['Policy readable', 'The project IAM policy can be read. Failure aborts the run.'],
@@ -24,14 +27,19 @@ const GATE_TEXT = {
   G3_TELEMETRY_HEALTHY: ['Telemetry healthy', 'Usage telemetry returned records. When degraded, automatic restores are withheld.'],
   G4_CHANGE_BUDGET: ['Change budget', 'At most this many people are suspended in one run (circuit breaker); the rest follow in the next runs. Restores are never limited.'],
   G5_NON_USER_GRANT_ABSENT: ['No group or domain grants', 'Access is not granted through groups or domains. Affected users require manual action.'],
+  G6_DENY_CAPACITY: ['Deny policy capacity', 'An attachment point lists at most 2,500 people. A warning starts at 2,000, and new suspensions that would go over the limit wait.'],
+  G7_SURGE_GUARD: ['Surge guard', 'When one run would newly suspend at least the number and the share of people set in Settings, nobody is suspended and the run asks for a review.'],
+  // G1 as the IAM deny policy method checks it (the gate id stays G1_POLICY_READABLE).
+  G1_DENY_POLICY_READABLE: ['Deny policies readable', 'The deny policy can be read at every attachment point. Failure aborts the run.'],
 };
 
-const PERIODS = [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['all', 'Last 90 days']];
+const PERIODS = [['daily', 'Daily'], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['custom', 'Custom cycle'], ['all', 'Last 90 days']];
 const REASON_LABELS = {
   tokens: 'Tokens', requests: 'Requests', cost: 'Estimated cost',
   budget: 'Paid budget spent', credit: 'Weekly free credit used up', paid: 'Paid usage this week',
+  unit_budget: 'Organization unit budget used up',
 };
-const TRIGGER_LABELS = { auto: 'Automatic', review: 'Review approval', bulk: 'Bulk apply', admin: 'Administrator', scheduler: 'Scheduler' };
+const TRIGGER_LABELS = { auto: 'Automatic', usage: 'Real-time usage', review: 'Review approval', bulk: 'Bulk apply', admin: 'Administrator', scheduler: 'Scheduler', unblock: 'Block lifted' };
 const RULE_HINTS = {
   allow: 'The user is never suspended for exceeding a cap. A suspended user is restored now.',
   limit: 'The user is evaluated against these caps instead of the default policy. Empty fields keep the default cap.',
@@ -39,16 +47,27 @@ const RULE_HINTS = {
 };
 const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
 const SUSPENDED = 'CAPPED_BY_TOOL';
+let activeTab = 'usage';
 
 export default async function render(ctx) {
   const admin = isAdmin();
   let status = null;
+  // Shared with the enforcement status card: its latest data, its refresh and a callback for the gates card.
+  const hooks = { enforcement: null, refresh: null, onEnforcement: null };
+  const policyBtn = button({
+    label: t('Edit policy'),
+    icon: 'edit',
+    onClick: () => {
+      if (!requireAdmin(t('Edit policy'))) return;
+      if (status) editPolicy(ctx, status.policy || {});
+    },
+  });
   const dryBtn = button({
     label: t('Dry run'),
     icon: 'play',
     onClick: () => {
       if (!requireAdmin(t('Dry run'), 'resourcemanager.projects.getIamPolicy')) return;
-      if (status) runEnforce(ctx, status, true, dryBtn);
+      if (status) runEnforce(ctx, status, true, dryBtn, hooks);
     },
   });
   const runBtn = button({
@@ -57,17 +76,17 @@ export default async function render(ctx) {
     variant: 'primary',
     onClick: () => {
       if (!requireAdmin(t('Run enforcement now'), 'resourcemanager.projects.setIamPolicy')) return;
-      if (status) runEnforce(ctx, status, false, runBtn);
+      if (status) runEnforce(ctx, status, false, runBtn, hooks);
     },
   });
   const header = pageHeader({
     title: t('Antigravity Controls'),
-    desc: t('Per-user caps on tokens, requests and estimated cost within a settlement period. Users over their cap are suspended through project IAM until the period resets, automatically or after administrator review, with exception rules for specific users.'),
-    actions: [dryBtn, runBtn],
+    desc: t('Per-user model usage, estimated costs, spending caps and access control.'),
+    actions: [policyBtn, dryBtn, runBtn],
   });
   const body = h('div', { class: 'stack-lg' });
   mount(ctx.root, header, body);
-  mount(body, pageSkeleton(6, 2));
+  mount(body, pageSkeleton(4, 2));
 
   try {
     const res = await api.get('/api/v1/governance/antigravity/status', null, { signal: ctx.signal });
@@ -82,15 +101,11 @@ export default async function render(ctx) {
     return null;
   }
 
-  if (isCredit(status.policy)) {
-    const desc = header.querySelector('.page-desc');
-    if (desc) desc.textContent = t('Everyone can use the weekly free Antigravity credit (Gemini models). Paid usage (Claude, and Gemini beyond the free share) has a monthly budget per person in USD. A person whose budget is spent is stopped only while nothing is free, and is restored automatically at the weekly reset and on the 1st of the month.');
-  }
   if (admin && status.plan && status.plan.aborted) {
     runBtn.disabled = true;
     runBtn.title = t('A safety gate failed. Resolve it before running enforcement.');
   }
-  renderStatus(ctx, body, status);
+  renderStatus(ctx, body, status, hooks);
   return null;
 }
 
@@ -101,8 +116,10 @@ function ccyOf(policy) {
 }
 
 function periodLabel(policy) {
-  const label = t((PERIODS.find((p) => p[0] === policy.period) || [null, policy.period || DASH])[1]);
-  if (policy.period === 'all') return label;
+  if (policy.period === 'all') return t('Last 90 days');
+  const label = policy.period === 'custom'
+    ? t('Every {days} days', { days: fmt.int(isNum(policy.cycleDays) && policy.cycleDays >= 1 ? policy.cycleDays : 30) })
+    : t((PERIODS.find((p) => p[0] === policy.period) || [null, policy.period || DASH])[1]);
   return `${label} \u00b7 ${policy.window === 'rolling' ? t('Rolling') : t('Calendar')}`;
 }
 
@@ -114,7 +131,47 @@ function resetText(policy) {
   const time = policy.resetTime || '00:00';
   if (policy.period === 'daily') return t('Resets every day at {time} ({tz})', { time, tz });
   if (policy.period === 'weekly') return t('Resets every {day} at {time} ({tz})', { day: t(WEEKDAYS[policy.resetWeekday || 0] || 'Monday'), time, tz });
-  return t('Resets on the 1st of every month at {time} ({tz})', { time, tz });
+  if (policy.period === 'custom') {
+    const days = fmt.int(isNum(policy.cycleDays) && policy.cycleDays >= 1 ? policy.cycleDays : 30);
+    const start = policy.cycleStart && policy.cycleStart !== '1970-01-01' ? policy.cycleStart : '';
+    return start
+      ? t('Resets every {days} days from {start} at {time} ({tz})', { days, start, time, tz })
+      : t('Resets every {days} days at {time} ({tz})', { days, time, tz });
+  }
+  const day = isNum(policy.resetDay) && policy.resetDay >= 1 && policy.resetDay <= 31 ? policy.resetDay : 1;
+  if (day === 1) return t('Resets on the 1st of every month at {time} ({tz})', { time, tz });
+  if (day >= 29) return t('Resets on day {day} of every month (last day in shorter months) at {time} ({tz})', { day: fmt.int(day), time, tz });
+  return t('Resets on day {day} of every month at {time} ({tz})', { day: fmt.int(day), time, tz });
+}
+
+function enforcementRunNote(run) {
+  if (!run) return null;
+  if (run.started && run.via === 'job') return t('Enforcement job started to apply the change. The status updates in about a minute.');
+  if (run.started && run.via === 'run' && (run.suspended || run.restored)) {
+    return t('Applied immediately: {s} suspended \u00b7 {r} restored.', { s: fmt.int(run.suspended), r: fmt.int(run.restored) });
+  }
+  if (run.error) return t('Saved, but immediate enforcement could not start; the next scheduled run applies it.');
+  return null;
+}
+
+function scheduleJobRefresh(ctx, run) {
+  if (!run || !run.started || run.via !== 'job') return;
+  [30000, 75000].forEach((ms) => {
+    setTimeout(() => {
+      if (window.location.hash.startsWith('#/antigravity') && !document.querySelector('dialog[open]')) ctx.rerender();
+    }, ms);
+  });
+}
+
+function realtimeSub(rt) {
+  if (!rt || !rt.configured) return t('Schedule only. Redeploy with REALTIME_ENFORCEMENT=true to trigger enforcement as soon as usage logs arrive.');
+  const parts = [];
+  if (rt.lastEventAt) parts.push(t('Last usage event {when}', { when: fmt.relative(rt.lastEventAt) }));
+  if (rt.lastTriggerAt) {
+    parts.push(t('Last triggered {when} ({n} total)', { when: fmt.relative(rt.lastTriggerAt), n: fmt.int(rt.triggers || 0) }));
+  }
+  if (!parts.length) return t('Listening for Antigravity usage logs. Scheduled runs remain the safety net for period resets.');
+  return parts.join(' \u00b7 ');
 }
 
 /** Weekly per-person cap that keeps everyone inside the Antigravity credit pool: the monthly credit per licensed
@@ -213,11 +270,17 @@ function capValue(value, cap, format) {
     isNum(cap) && cap > 0 ? h('span', { class: 'cell-sub' }, t('of {cap}', { cap: format(cap) })) : null);
 }
 
-function ruleBadge(rule) {
+/** The kind of rule only; where it matters the end is shown next to it (Expires column) or by ruleTag. */
+function ruleTypeBadge(rule) {
   if (!rule) return h('span', { class: 'text-muted' }, DASH);
   if (rule.type === 'block') return badge(t('Always block'), 'danger', { size: 'sm' });
   if (rule.type === 'limit') return badge(t('Individual cap'), 'accent', { size: 'sm' });
-  return badge(rule.scope === 'period' ? t('Allowed this period') : t('Always allow'), 'success', { size: 'sm' });
+  return badge(rule.until ? t('Allow') : t('Always allow'), 'success', { size: 'sm' });
+}
+
+/** When an "allow" decision made now ends: the end of the current cap period (the next reset, or one rolling window). */
+function allowEndOf(policy) {
+  return (policy && (policy.periodEnd || policy.nextReset)) || null;
 }
 
 function ruleDetail(rule, ccy) {
@@ -228,11 +291,10 @@ function ruleDetail(rule, ccy) {
     if (isNum(rule.costCap)) parts.push(t('Cost {v}', { v: fmt.currency(rule.costCap, ccy) }));
     if (isNum(rule.paidBudget)) parts.push(t('Paid budget {v}', { v: budgetText(rule.paidBudget) }));
     if (isNum(rule.creditMonth)) parts.push(t('Credit {v} a month', { v: usd(rule.creditMonth) }));
-    const caps = parts.join(' \u00b7 ');
-    return rule.until ? `${caps} \u00b7 ${t('Until {time}', { time: fmt.dateTime(rule.until) })}` : caps;
+    return parts.join(' \u00b7 ');
   }
   if (rule.type === 'block') return t('Antigravity access removed until the rule is deleted');
-  return rule.until ? t('Until {time}', { time: fmt.dateTime(rule.until) }) : t('No expiry');
+  return t('Not suspended for going over the cap');
 }
 
 /* ------------------------------------------------------------------ page */
@@ -241,9 +303,11 @@ function gateTone(s) {
   return s === 'pass' ? 'pass' : s === 'warn' ? 'warn' : 'fail';
 }
 
-function gateList(gates) {
+/** Safety gates; with the IAM deny policy method, G1 is about the deny policies at every attachment point. */
+function gateList(gates, backend) {
   return h('div', { class: 'gate-list' }, (gates || []).map((g) => {
-    const txt = GATE_TEXT[g.id] || [g.id, ''];
+    const key = g.id === 'G1_POLICY_READABLE' && backend === 'iam_deny' ? 'G1_DENY_POLICY_READABLE' : g.id;
+    const txt = GATE_TEXT[key] || [g.id, ''];
     const tone = gateTone(g.status);
     return h('div', { class: ['gate', tone] },
       h('span', { class: 'gate-icon' }, icon(tone === 'pass' ? 'check' : tone === 'warn' ? 'alert-triangle' : 'x', { size: 15 })),
@@ -254,15 +318,78 @@ function gateList(gates) {
   }));
 }
 
-function renderStatus(ctx, body, s) {
+function compactControlBar(ctx, s) {
+  const policy = s.policy || {};
+  const enforcement = s.enforcement || {};
+  const rt = enforcement.realtime || {};
+  const mode = policy.enforcementMode || 'manual';
+  const credit = isCredit(policy);
+  const last = enforcement.lastRun;
+  const control = segmented([
+    { value: 'manual', label: t('Manual review'), title: t('Over-cap users wait for an administrator decision') },
+    {
+      value: 'auto',
+      label: t('Automatic suspension'),
+      title: rt.configured
+        ? t('Over-cap users are suspended as soon as a usage log arrives (IAM takes a few minutes to apply)')
+        : t('Over-cap users are suspended by every enforcement run'),
+    },
+  ], mode, (v) => {
+    if (!requireAdmin(t('Enforcement mode'))) { ctx.rerender(); return; }
+    setMode(ctx, v, rt.configured);
+  }, { label: t('Enforcement mode') });
+  const fact = (label, value, title = null) => h('div', { class: 'agy-control-fact', title },
+    h('span', { class: 'agy-control-fact-label' }, label),
+    h('span', { class: 'agy-control-fact-value' }, value));
+  const capSummary = credit
+    ? t('{w}/wk free \u00b7 {b}/mo paid', { w: usd(policy.creditPerWeek), b: budgetText(policy.paidBudgetMonth) })
+    : capsText(policy);
+  const periodValue = capPeriodText(policy) || DASH;
+  const periodTitle = policy.nextReset ? `${resetText(policy)} \u00b7 ${fmt.relative(policy.nextReset)}` : resetText(policy);
+  const methodValue = rt.configured && mode === 'auto'
+    ? `${backendLabel(backendOf(s))} \u00b7 ${t('Real-time')}`
+    : backendLabel(backendOf(s));
+  const methodTitle = rt.configured ? `${backendSub(backendOf(s)) || ''} ${realtimeSub(rt)}`.trim() : backendSub(backendOf(s));
+  const lastRunText = last ? `${fmt.relative(last.at)} \u00b7 ${t(statusLabel(last.result))}` : t('Not run yet');
+  return h('div', { class: 'agy-control-bar' },
+    h('div', { class: 'agy-control-facts' },
+      fact(t('Cap policy'), capSummary, credit ? resetText(policy) : `${periodLabel(policy)} \u00b7 ${resetText(policy)}`),
+      fact(t('Cap period'), periodValue, periodTitle),
+      fact(t('Enforcement method'), methodValue, methodTitle),
+      fact(t('Last run'), lastRunText, last ? runSummary(last) : null)),
+    control);
+}
+
+function userStatusCell(u, ctx, s) {
+  const tz = s && s.policy ? s.policy.resetTimezone : null;
+  const b = statusBadge(u.state, { size: 'sm' });
+  if (u.reason) b.title = reasonLabel(u.reason);
+  else if (u.restoreAt) b.title = t('Restored at {time}', { time: fmt.dateTimeDay(u.restoreAt, tz) });
+  const planned = u.plannedAction && u.plannedAction !== 'none' ? statusBadge(u.plannedAction, { size: 'sm' }) : null;
+  const canRevoke = Boolean(ctx && u.exception && u.exception.type === 'allow');
+  return h('div', { class: 'status-cell' },
+    h('div', { class: 'status-cell-row' }, b, planned),
+    u.exception ? ruleTag(u.exception, {
+      email: u.email,
+      onRevoke: canRevoke ? () => removeException(ctx, s, { ...u.exception, email: u.email }) : null,
+    }) : null,
+    u.restoreAt ? h('span', { class: 'cell-sub' }, t('Back {time}', { time: fmt.dateTimeDay(u.restoreAt, tz) })) : null);
+}
+
+function renderStatus(ctx, body, s, hooks) {
   const policy = s.policy || {};
   const pop = s.population || { byState: {} };
   const plan = s.plan || {};
   const totals = s.totals || {};
   const enforcement = s.enforcement || {};
+  const rt = enforcement.realtime || {};
   const mode = policy.enforcementMode || 'manual';
   const ccy = ccyOf(policy);
-  const admin = isAdmin();
+  const credit = isCredit(policy);
+  const usageUnavailable = s.usageSource === 'unavailable';
+  const prereq = s.prerequisites || {};
+  const metaLog = prereq.metadataLogging || {};
+  const missingMetaLocs = metaLog.missingLocations || [];
 
   if (plan.aborted) {
     body.append(banner({ tone: 'danger', title: t('Enforcement would abort'), text: abortReasonText(plan.abortReason) || t('A safety gate failed. No IAM changes will be applied until the gate passes.') }));
@@ -272,114 +399,90 @@ function renderStatus(ctx, body, s) {
   if ((plan.deferredBlocks || []).length) {
     body.append(banner({ tone: 'warning', title: t('Suspensions spread over several runs'), text: t('{n} more people are over their limits than the change budget allows in one run ({m} per run). The people furthest over are suspended first and the rest in the next runs, every few minutes. Restores are never limited.', { n: fmt.int(plan.deferredBlocks.length), m: fmt.int(plan.changeBudget) }) }));
   }
-  const credit = isCredit(policy);
-  const usageUnavailable = s.usageSource === 'unavailable';
-  const prereq = s.prerequisites || {};
   if (usageUnavailable) {
     body.append(banner({ tone: 'warning', title: t('Antigravity usage could not be read'), text: t('The inference log query failed. Grant the service identity roles/logging.viewer (or read access to the BigQuery sink table) and check the data source notices above.') }));
+  } else if (missingMetaLocs.length) {
+    body.append(banner({ tone: 'warning', title: t('Metadata logging is off in an active location'), text: t('AI developer tools is turned on in {missing}, but Metadata logging is off there. Antigravity calls routed to that location (for example global for Gemini 4 and preview models) do not write {log}. Open Gemini Enterprise > Settings > AI developer tools > Compliance, switch the location to each listed region, and turn on Metadata logging.', { missing: formatLocationList(missingMetaLocs), log: prereq.inferenceLog || t('set in Settings') }) }));
   } else if (prereq.telemetryDetected === false) {
     body.append(banner({ tone: 'info', title: t('No Antigravity token usage logs in this project'), text: t('Turn on Metadata logging in Gemini Enterprise > Settings > AI developer tools > Compliance (off by default). From then on every Antigravity call writes {log} with the user and token counts, and usage, cost and caps appear here.', { log: prereq.inferenceLog || t('set in Settings') }) }));
   }
   if (enforcement.durable === false) {
     body.append(banner({ tone: 'warning', title: t('Exception rules are not stored durably'), text: t('Settings are kept in memory on this deployment, so exception rules and suspension records are lost when the service restarts. Configure a settings bucket (SETTINGS_BUCKET).') }));
   }
-  // Restores happen only inside an enforcement run: a schedule that stopped leaves suspended users waiting.
   if ((enforcement.scheduler || {}).stale) {
     const lastAt = ((enforcement.scheduler || {}).lastRun || {}).at;
     body.append(banner({ tone: 'danger', title: t('Scheduled enforcement stopped'), text: t('The enforcement schedule last ran {when}. Suspended users are not restored at the period reset until it runs again. Check the Cloud Scheduler job {job} or select Run enforcement now.', { when: lastAt ? fmt.relative(lastAt) : DASH, job: 'ai-control-plane-enforce' }) }));
   }
-  // Restores happen only inside an enforcement run, so suspended users without a schedule wait for an administrator.
   if (isNum(totals.suspended) && totals.suspended > 0 && (enforcement.scheduler || {}).configured === false) {
     body.append(banner({ tone: 'warning', title: t('No enforcement schedule'), text: t('{n} users are suspended, but no enforcement schedule is configured. Their access returns only when an enforcement run happens after the settlement period resets. Select Run enforcement now after each reset, or set ENFORCEMENT_SCHEDULE and redeploy.', { n: fmt.int(totals.suspended) }) }));
   }
 
-  body.append(enforcementCard(ctx, s));
-
+  const usersList = Array.isArray(s.users) ? s.users : [];
   const plannedBlocks = (plan.block || []).length;
-  const queueKpi = kpi({
-    label: mode === 'manual' ? t('Awaiting review') : t('Suspended at next run'),
-    value: fmt.int(mode === 'manual' ? totals.review : plannedBlocks),
-    meta: h('span', null, mode === 'manual' ? t('Administrator decision required') : t('Applied by the next enforcement run')),
-  });
-  const coverageKpi = kpi({ label: t('Enforceable coverage'), value: fmt.pct(pop.enforceableCoverage), meta: isNum(pop.enforceableCoverage) ? progress(pop.enforceableCoverage, pop.enforceableCoverage >= 0.8 ? 'success' : 'warning') : null });
-  if (credit) body.append(h('div', { class: 'kpi-grid' },
-    kpi({ label: t('People this month'), value: usageUnavailable ? DASH : fmt.int(pop.total), meta: h('span', null, t('This week: {range}', { range: windowText(policy) })) }),
-    kpi({
-      label: t('Paid this month'), value: isNum(totals.paidMonth) ? usd(totals.paidMonth) : DASH,
+  const reviewCount = mode === 'manual' ? (isNum(totals.review) ? totals.review : 0) : plannedBlocks;
+  const suspendedCount = isNum(totals.suspended) ? totals.suspended : 0;
+  const gateIssues = (s.gates || []).filter((g) => g.status && g.status !== 'pass').length;
+
+  let tabBar = null;
+  const goTab = (id) => { if (tabBar) tabBar.setActive(id); };
+
+  const costKpi = credit
+    ? kpi({
+      label: t('Paid this month'),
+      value: isNum(totals.paidMonth) ? usd(totals.paidMonth) : DASH,
       meta: h('span', null, isNum(policy.orgPaidBudgetMonth) ? t('Organization budget {v}', { v: budgetText(policy.orgPaidBudgetMonth) }) : t('Free credit applied {v}', { v: usd(totals.freeMonth) })),
       tip: t('Claude usage and Gemini usage beyond each person\'s weekly free share, priced per token. Google bills the project and applies the credit as a shared pool, so the invoice can be lower than this sum.'),
-    }),
-    kpi({ label: t('Budget spent: credits only'), value: fmt.int(totals.budgetUsedUp), meta: h('span', null, t('They use the free credit again after each weekly reset')) }),
-    queueKpi,
-    kpi({ label: t('Suspended now'), value: fmt.int(totals.suspended), meta: h('span', null, policy.nextReset ? t('Weekly reset {time}', { time: fmt.dateTime(policy.nextReset) }) : DASH) }),
-    coverageKpi));
-  else body.append(h('div', { class: 'kpi-grid' },
-    kpi({ label: t('Users in period'), value: usageUnavailable ? DASH : fmt.int(pop.total), meta: h('span', null, windowText(policy)) }),
-    kpi({ label: t('Over cap'), value: fmt.int(totals.overCap), meta: h('span', null, capsText(policy)) }),
-    queueKpi,
-    kpi({ label: t('Suspended now'), value: fmt.int(totals.suspended), meta: h('span', null, policy.nextReset ? t('Restored at {time}', { time: fmt.dateTime(policy.nextReset) }) : t('Restored when usage falls below the cap')) }),
-    kpi({
-      label: t('Estimated cost'), value: isNum(totals.estimatedCost) ? fmt.currency(totals.estimatedCost, ccy) : DASH,
+    })
+    : kpi({
+      label: t('Estimated cost'),
+      value: isNum(totals.estimatedCost) ? fmt.currency(totals.estimatedCost, ccy) : DASH,
       meta: h('span', null, costBasis(policy.pricing)),
       tip: t('Per-user cost is estimated from each person\'s tokens per model and the price per token: what your billing account actually paid, or the public Google price list. Billing exports do not break cost down by user.'),
+    });
+
+  let queueLabel = t('Awaiting review');
+  let queueMeta = t('Administrator decision required');
+  if (mode === 'auto') {
+    queueLabel = rt.configured ? t('Pending auto-suspension') : t('Suspended at next run');
+    queueMeta = rt.configured
+      ? t('Suspends immediately on usage events (IAM takes a few minutes)')
+      : t('Applied by the next enforcement run');
+  }
+
+  body.append(h('div', { class: 'kpi-grid' },
+    kpi({
+      label: credit ? t('People this month') : t('Users in period'),
+      value: usageUnavailable ? DASH : fmt.int(pop.total),
+      meta: h('span', null, windowText(policy)),
+      onClick: () => goTab('usage'),
     }),
-    coverageKpi));
-
-  body.append(queueCard(ctx, s));
-  body.append(suspendedCard(ctx, s));
-  body.append(exceptionsCard(ctx, s));
-
-  const row1 = h('div', { class: 'grid' });
-  const pricing = policy.pricing || {};
-  const policyCard = card({
-    title: t('Cap policy'), subtitle: credit ? t('Default limits per person, in USD') : t('Default caps per user and settlement period'),
-    actions: button({
-      label: t('Edit policy'), icon: 'edit', size: 'sm',
-      onClick: () => {
-        if (!requireAdmin(t('Edit policy'))) return;
-        editPolicy(ctx, policy);
-      },
+    costKpi,
+    kpi({
+      label: queueLabel,
+      value: fmt.int(reviewCount),
+      meta: h('span', null, queueMeta),
+      onClick: () => goTab('review'),
     }),
-    body: credit ? kv([
-      [t('Caps'), t('Weekly free credit + monthly paid budget')],
-      [t('Credit per person'), t('{m} a month ({w} a week, Gemini models only)', { m: usd(policy.creditPerUserMonth), w: usd(policy.creditPerWeek) })],
-      [t('Paid budget per person'), budgetText(policy.paidBudgetMonth)],
-      [t('Organization paid budget'), isNum(policy.orgPaidBudgetMonth) ? t('{v} ({used} used this month)', { v: usd(policy.orgPaidBudgetMonth), used: usd(policy.orgPaidMonth) }) : t('No limit')],
-      [t('Weekly reset'), resetText(policy)],
-      [t('Budget month'), t('From the 1st at 00:00 ({tz})', { tz: policy.resetTimezone || 'UTC' })],
-      policy.tokenCap || policy.requestCap ? [t('Weekly token and request caps'), weeklyCapsText(policy)] : null,
-      [t('Token prices'), pricingSummary(pricing, 'USD')],
-      [t('Change budget'), t('At most {n} suspensions per run', { n: fmt.int(policy.changeBudget) })],
-      [t('Usage source'), { bigquery: t('BigQuery log sink'), logging: t('Cloud Logging API'), unavailable: t('Unavailable') }[s.usageSource] || s.usageSource],
-    ]) : kv([
-      [t('Token cap'), policy.tokenCap ? fmt.int(policy.tokenCap) : t('Disabled')],
-      [t('Request cap'), policy.requestCap ? fmt.int(policy.requestCap) : t('Disabled')],
-      [t('Cost cap per person'), policy.costCap ? h('span', null, fmt.currency(policy.costCap, ccy), pricing.configured ? null : h('span', { class: 'text-warning' }, ` \u00b7 ${t('no token prices')}`)) : t('Disabled')],
-      [t('Token prices'), pricingSummary(pricing, ccy)],
-      [t('Settlement period'), periodLabel(policy)],
-      [t('Period reset'), resetText(policy)],
-      [t('Change budget'), t('At most {n} suspensions per run', { n: fmt.int(policy.changeBudget) })],
-      [t('Usage source'), { bigquery: t('BigQuery log sink'), logging: t('Cloud Logging API'), unavailable: t('Unavailable') }[s.usageSource] || s.usageSource],
-    ]),
-  });
-  const priceTable = usedPriceTable(pricing, ccy);
-  if (priceTable) policyCard.bodyEl.append(h('div', { class: 'policy-prices' }, priceTable));
-  policyCard.classList.add('span-4');
-  const gatesCard = card({ title: t('Safety gates'), subtitle: t('Evaluated before any IAM change'), body: gateList(s.gates) });
-  gatesCard.classList.add('span-8');
-  row1.append(policyCard, gatesCard);
-  body.append(row1);
+    kpi({
+      label: t('Suspended now'),
+      value: fmt.int(suspendedCount),
+      meta: h('span', null, policy.nextReset ? t('Restored at {time}', { time: fmt.dateTimeDay(policy.nextReset, policy.resetTimezone) }) : t('Restored when usage falls below the cap')),
+      onClick: () => goTab('review'),
+    })));
 
-  const segments = Object.keys(IAM_STATE_LABELS).map((st) => ({ label: t(IAM_STATE_LABELS[st]), value: (pop.byState || {})[st] || 0, color: IAM_STATE_COLORS[st] }));
-  body.append(card({
-    title: t('Access state population'), subtitle: t('Users with usage in the window or a direct binding on the access or marker roles'),
-    body: pop.byState ? h('div', null, proportionBar(segments), h('div', { class: 'state-legend' }, segments.map((sg) => {
-      const sw = h('span', { class: 'swatch round' });
-      sw.style.setProperty('background', sg.color);
-      return h('div', { class: 'sl-row' }, sw, h('span', null, sg.label), h('strong', null, fmt.int(sg.value)));
-    }))) : emptyState({ icon: 'alert-triangle', tone: 'warning', compact: true, title: t('Population unknown'), body: t('Usage and IAM data could not be read, so the user population is unknown.') }),
-  }));
+  body.append(compactControlBar(ctx, s));
 
+  const validTabs = ['usage', 'review', 'report', 'operations'];
+  if (!validTabs.includes(activeTab)) activeTab = 'usage';
+
+  const panels = {
+    usage: h('div', { id: 'agy-panel-usage', class: ['agy-tab-panel', 'stack-lg'], role: 'tabpanel', 'aria-labelledby': 'agy-tab-usage' }),
+    review: h('div', { id: 'agy-panel-review', class: ['agy-tab-panel', 'stack-lg'], role: 'tabpanel', 'aria-labelledby': 'agy-tab-review' }),
+    report: h('div', { id: 'agy-panel-report', class: ['agy-tab-panel', 'stack-lg'], role: 'tabpanel', 'aria-labelledby': 'agy-tab-report' }),
+    operations: h('div', { id: 'agy-panel-operations', class: ['agy-tab-panel', 'stack-lg'], role: 'tabpanel', 'aria-labelledby': 'agy-tab-operations' }),
+  };
+
+  /* ---- Tab 1: Users & model costs ---- */
   const budgetCell = (u) => {
     const own = u.exception && u.exception.type === 'limit' && isNum(u.exception.paidBudget);
     const b = u.credit ? u.credit.budget : (u.caps ? u.caps.paidBudget : null);
@@ -389,113 +492,332 @@ function renderStatus(ctx, body, s) {
   };
   const creditColumns = [
     { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
+    {
+      key: 'models', label: t('Models & cost'), sortable: false,
+      render: (u) => modelCostCell(u.byModel, 'USD'),
+      csv: (u) => (u.byModel || []).map((m) => `${m.model}:${isNum(m.cost) ? m.cost : m.tokens}`).join('|'),
+    },
     { key: 'estimatedCost', label: t('This week'), align: 'num', value: (u) => u.estimatedCost, render: (u) => h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600', title: u.costPartial ? t('Some models have no unit price') : null }, usd(u.estimatedCost), u.costPartial ? ' *' : ''), h('span', { class: 'cell-sub' }, isNum(u.tokens) ? t('{n} tokens', { n: fmt.compact(u.tokens) }) : DASH)) },
     { key: 'freeWeek', label: t('Free credit this week'), align: 'num', value: (u) => (u.credit ? u.credit.freeUsedWeek : null), render: (u) => creditWeekCell(u.credit), csv: (u) => (u.credit ? u.credit.freeUsedWeek : '') },
     { key: 'paidMonth', label: t('Paid this month'), align: 'num', value: (u) => (u.credit ? u.credit.paidMonth : null), render: (u) => paidMonthCell(u.credit), csv: (u) => (u.credit ? u.credit.paidMonth : '') },
     { key: 'budget', label: t('Paid budget'), align: 'num', value: (u) => (u.credit ? u.credit.budget : null), render: budgetCell, csv: (u) => (u.credit && isNum(u.credit.budget) ? u.credit.budget : '') },
-    { key: 'models', label: t('Models'), sortable: false, render: (u) => listCell(u.models, { mono: true }), csv: (u) => (u.models || []).join('|') },
-    { key: 'exception', label: t('Rule'), render: (u) => ruleBadge(u.exception), value: (u) => (u.exception ? u.exception.type : ''), csv: (u) => (u.exception ? u.exception.type : '') },
-    { key: 'state', label: t('Access state'), render: (u) => { const b = statusBadge(u.state, { size: 'sm' }); if (u.reason) b.title = reasonLabel(u.reason); else if (u.restoreAt) b.title = t('Restored at {time}', { time: fmt.dateTime(u.restoreAt) }); return h('div', { class: 'cell-stack' }, b, u.restoreAt ? h('span', { class: 'cell-sub' }, t('Back {time}', { time: fmt.dateTime(u.restoreAt) })) : null); } },
-    { key: 'plannedAction', label: t('Planned action'), render: (u) => statusBadge(u.plannedAction || 'none', { size: 'sm' }) },
+    { key: 'state', label: t('Status'), render: (u) => userStatusCell(u, ctx, s), value: (u) => u.state || '' },
   ];
-  body.append(card({
-    title: credit ? t('People and limits') : t('Usage against cap'),
-    subtitle: credit ? t('This week {range} \u00b7 paid this month from the 1st', { range: windowText(policy) }) : windowText(policy),
-    flush: true, source: prereq.inferenceLog || undefined,
-    body: dataTable({
-      columns: credit ? creditColumns : [
-        { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
-        { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
-        { key: 'tokens', label: t('Tokens'), align: 'num', render: (u) => (isNum(u.tokens) ? h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600' }, fmt.compact(u.tokens)), h('span', { class: 'cell-sub' }, t('{p} in \u00b7 {c} out', { p: fmt.compact(u.promptTokens), c: fmt.compact(u.candidateTokens) }))) : h('span', { class: 'text-muted' }, DASH)), value: (u) => u.tokens },
-        { key: 'estimatedCost', label: t('Estimated cost'), align: 'num', render: (u) => h('span', { title: u.costPartial ? t('Some models have no unit price') : null }, money(u.estimatedCost, ccy), u.costPartial ? ' *' : ''), value: (u) => u.estimatedCost },
-        { key: 'models', label: t('Models'), sortable: false, render: (u) => listCell(u.models, { mono: true }), csv: (u) => (u.models || []).join('|') },
-        { key: 'capUsage', label: t('Cap usage'), align: 'num', value: (u) => u.capUsage, render: (u) => capUsageCell(u.capUsage) },
-        {
-          key: 'costCap', label: t('Cost cap'), align: 'num', value: (u) => (u.caps ? u.caps.costCap : null),
-          render: (u) => {
-            const own = u.exception && u.exception.type === 'limit' && isNum(u.exception.costCap);
-            const capValue = u.caps ? u.caps.costCap : null;
-            const label = h('div', { class: 'cell-stack' },
-              h('span', { class: own ? 'fw-600' : '' }, isNum(capValue) && capValue > 0 ? fmt.currency(capValue, ccy) : t('None')),
-              h('span', { class: 'cell-sub' }, own ? t('Individual') : t('Default')));
-            return h('div', { class: 'row nowrap cap-cell' }, label, button({
-              icon: 'edit', size: 'sm', title: t('Change cost cap'),
-              onClick: () => {
-                if (!requireAdmin(t('Change cost cap'))) return;
-                editPersonCap(ctx, s, u);
-              },
-            }));
+  const periodColumns = [
+    { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
+    {
+      key: 'models', label: t('Models & cost'), sortable: false,
+      render: (u) => modelCostCell(u.byModel, ccy),
+      csv: (u) => (u.byModel || []).map((m) => `${m.model}:${isNum(m.cost) ? m.cost : m.tokens}`).join('|'),
+    },
+    {
+      key: 'tokens', label: t('Tokens'), align: 'num',
+      render: (u) => (isNum(u.tokens)
+        ? h('div', { class: 'cell-stack' },
+          h('span', { class: 'fw-600' }, fmt.compact(u.tokens)),
+          h('span', { class: 'cell-sub' }, t('{n} requests', { n: fmt.int(u.requests) })))
+        : h('span', { class: 'text-muted' }, DASH)),
+      value: (u) => u.tokens,
+    },
+    {
+      key: 'estimatedCost', label: t('Estimated cost'), align: 'num',
+      render: (u) => h('span', { class: 'fw-600', title: u.costPartial ? t('Some models have no unit price') : null }, money(u.estimatedCost, ccy), u.costPartial ? ' *' : ''),
+      value: (u) => u.estimatedCost,
+    },
+    { key: 'capUsage', label: t('Cap usage'), align: 'num', value: (u) => u.capUsage, render: (u) => capUsageCell(u.capUsage) },
+    {
+      key: 'costCap', label: t('Cost cap'), align: 'num', value: (u) => (u.caps ? u.caps.costCap : null),
+      render: (u) => {
+        const own = u.exception && u.exception.type === 'limit' && isNum(u.exception.costCap);
+        const capVal = u.caps ? u.caps.costCap : null;
+        const label = h('div', { class: 'cell-stack' },
+          h('span', { class: own ? 'fw-600' : '' }, isNum(capVal) && capVal > 0 ? fmt.currency(capVal, ccy) : t('None')),
+          h('span', { class: 'cell-sub' }, own ? t('Individual') : t('Default')));
+        return h('div', { class: 'row nowrap cap-cell' }, label, button({
+          icon: 'edit', size: 'sm', title: t('Change cost cap'),
+          onClick: () => {
+            if (!requireAdmin(t('Change cost cap'))) return;
+            editPersonCap(ctx, s, u);
           },
-          csv: (u) => (u.caps ? u.caps.costCap : ''),
-        },
-        { key: 'exception', label: t('Rule'), render: (u) => ruleBadge(u.exception), value: (u) => (u.exception ? u.exception.type : ''), csv: (u) => (u.exception ? u.exception.type : '') },
-        { key: 'state', label: t('Access state'), render: (u) => { const b = statusBadge(u.state, { size: 'sm' }); if (u.reason) b.title = reasonLabel(u.reason); else if (u.restoreAt) b.title = t('Restored at {time}', { time: fmt.dateTime(u.restoreAt) }); return b; } },
-        { key: 'plannedAction', label: t('Planned action'), render: (u) => statusBadge(u.plannedAction || 'none', { size: 'sm' }) },
-      ],
-      rows: s.users, pageSize: 15, exportName: 'antigravity-usage', initialSort: credit ? { key: 'paidMonth', dir: 'desc' } : { key: 'capUsage', dir: 'desc' },
+        }));
+      },
+      csv: (u) => (u.caps ? u.caps.costCap : ''),
+    },
+    { key: 'state', label: t('Status'), render: (u) => userStatusCell(u, ctx, s), value: (u) => u.state || '' },
+  ];
+  const peopleState = { view: 'user', user: 'all', model: 'all' };
+  const peopleHost = h('div');
+  const flatPeopleModels = flattenUserModels(usersList);
+  const renderPeopleCard = () => {
+    if (peopleState.view === 'models') {
+      mount(peopleHost, userModelBreakdownTable(ctx, flatPeopleModels, {
+        state: peopleState,
+        onFilter: renderPeopleCard,
+        ccy: credit ? 'USD' : ccy,
+        showCreditTag: credit,
+        exportName: 'antigravity-user-models',
+      }));
+      return;
+    }
+    mount(peopleHost, dataTable({
+      columns: credit ? creditColumns : periodColumns,
+      rows: s.users, pageSize: 15, exportName: 'antigravity-usage',
+      initialSort: credit ? { key: 'paidMonth', dir: 'desc' } : { key: 'estimatedCost', dir: 'desc' },
       emptyText: t('No Antigravity usage was recorded in this window.'),
       unavailableText: t('Usage and IAM data could not be read, so the user population is unknown.'),
-      onRowClick: (u) => u.uid && openUserDrawer(u.uid, { onChanged: () => ctx.rerender() }),
-    }),
+      onRowClick: (u) => u.uid && openUserDrawer(u.uid, { email: u.email, onChanged: () => ctx.rerender() }),
+    }));
+  };
+  const peopleToggle = segmented(
+    [{ value: 'user', label: t('By user') }, { value: 'models', label: t('By user & model') }],
+    'user', (v) => { peopleState.view = v; renderPeopleCard(); }, { label: t('View by') });
+  renderPeopleCard();
+  panels.usage.append(card({
+    title: t('Users & model costs'),
+    subtitle: credit
+      ? t('This week {range} \u00b7 paid this month from the 1st', { range: capPeriodText(policy) || windowText(policy) })
+      : t('Cap period {range} \u00b7 usage as of {time}', { range: capPeriodText(policy) || DASH, time: fmt.dateTime(policy.windowEnd) }),
+    actions: peopleToggle,
+    flush: true, source: prereq.inferenceLog || undefined,
+    body: peopleHost,
   }));
 
+  /* ---- Tab 2: Review & access ---- */
+  panels.review.append(queueCard(ctx, s), suspendedCard(ctx, s), exceptionsCard(ctx, s));
   const manual = s.manualActions || [];
-  let manualBody;
-  if (s.manualActions === null || s.manualActions === undefined) {
-    manualBody = emptyState({ icon: 'alert-triangle', tone: 'warning', title: t('Cannot be determined'), body: t('Manual actions are computed only when both the IAM policy and the usage telemetry can be read.'), compact: true });
-  } else if (manual.length) {
-    manualBody = dataTable({
+  if (s.manualActions === null || s.manualActions === undefined || manual.length) {
+    const manualBody = (s.manualActions === null || s.manualActions === undefined)
+      ? emptyState({ icon: 'alert-triangle', tone: 'warning', title: t('Cannot be determined'), body: t('Manual actions are computed only when both the IAM policy and the usage telemetry can be read.'), compact: true })
+      : dataTable({
+        columns: [
+          { key: 'email', label: t('User'), render: (r) => userCell(r.email) },
+          { key: 'state', label: t('State'), render: (r) => statusBadge(r.state, { size: 'sm' }) },
+          { key: 'reason', label: t('Reason'), render: (r) => badge(reasonLabel(r.reason) || DASH, 'info', { size: 'sm' }) },
+          { key: 'remediation', label: t('Remediation'), sortable: false, wrap: true, render: (r) => h('span', { class: 'cell-sub' }, t(REMEDIATION[r.reason] || r.remediation || '')) },
+        ],
+        rows: manual, pageSize: 8, exportName: 'antigravity-manual-actions', searchable: manual.length > 8,
+      });
+    panels.review.append(card({
+      title: t('Manual action required'), subtitle: t('Users whose access cannot be enforced through individual project bindings'), flush: true,
+      body: manualBody,
+    }));
+  }
+
+  /* ---- Tab 3 (lazy): Monthly report & cloud agent activity ---- */
+  let reportMounted = false;
+  const mountReportTab = () => {
+    if (reportMounted) return;
+    reportMounted = true;
+    panels.report.append(billingReportCard(ctx), agentActivityCard(ctx));
+  };
+
+  /* ---- Tab 4 (lazy): Policy, enforcement job, gates, audit log & prerequisites ---- */
+  let opsMounted = false;
+  const mountOpsTab = () => {
+    if (opsMounted) return;
+    opsMounted = true;
+    const row1 = h('div', { class: 'grid' });
+    const pricing = policy.pricing || {};
+    const policyCard = card({
+      title: t('Cap policy'), subtitle: credit ? t('Default limits per person, in USD') : t('Default caps per user and settlement period'),
+      actions: button({
+        label: t('Edit policy'), icon: 'edit', size: 'sm',
+        onClick: () => {
+          if (!requireAdmin(t('Edit policy'))) return;
+          editPolicy(ctx, policy);
+        },
+      }),
+      body: credit ? kv([
+        [t('Caps'), t('Weekly free credit + monthly paid budget')],
+        [t('Credit per person'), t('{m} a month ({w} a week, Gemini models only)', { m: usd(policy.creditPerUserMonth), w: usd(policy.creditPerWeek) })],
+        [t('Paid budget per person'), budgetText(policy.paidBudgetMonth)],
+        [t('Organization paid budget'), isNum(policy.orgPaidBudgetMonth) ? t('{v} ({used} used this month)', { v: usd(policy.orgPaidBudgetMonth), used: usd(policy.orgPaidMonth) }) : t('No limit')],
+        [t('Weekly reset'), resetText(policy)],
+        [t('Budget month'), t('From the 1st at 00:00 ({tz})', { tz: policy.resetTimezone || 'UTC' })],
+        policy.tokenCap || policy.requestCap ? [t('Weekly token and request caps'), weeklyCapsText(policy)] : null,
+        [t('Token prices'), pricingSummary(pricing, 'USD')],
+        [t('Change budget'), t('At most {n} suspensions per run', { n: fmt.int(policy.changeBudget) })],
+        [t('Usage source'), { bigquery: t('BigQuery log sink'), logging: t('Cloud Logging API'), unavailable: t('Unavailable') }[s.usageSource] || s.usageSource],
+      ]) : kv([
+        [t('Caps'), t('Fixed caps per period')],
+        [t('Token cap'), policy.tokenCap ? fmt.int(policy.tokenCap) : t('Disabled')],
+        [t('Request cap'), policy.requestCap ? fmt.int(policy.requestCap) : t('Disabled')],
+        [t('Cost cap per person'), policy.costCap ? h('span', null, fmt.currency(policy.costCap, ccy), pricing.configured ? null : h('span', { class: 'text-warning' }, ` \u00b7 ${t('no token prices')}`)) : t('Disabled')],
+        [t('Token prices'), pricingSummary(pricing, ccy)],
+        [t('Settlement period'), periodLabel(policy)],
+        [t('Period reset'), resetText(policy)],
+        [t('Change budget'), t('At most {n} suspensions per run', { n: fmt.int(policy.changeBudget) })],
+        [t('Usage source'), { bigquery: t('BigQuery log sink'), logging: t('Cloud Logging API'), unavailable: t('Unavailable') }[s.usageSource] || s.usageSource],
+      ]),
+    });
+    const priceTable = usedPriceTable(pricing, ccy);
+    if (priceTable) policyCard.bodyEl.append(h('div', { class: 'policy-prices' }, priceTable));
+    policyCard.classList.add('span-5');
+    const gatesCard = card({ title: t('Safety gates'), subtitle: t('Evaluated before any IAM change'), body: gateList(s.gates, backendOf(s)) });
+    gatesCard.classList.add('span-7');
+    if (hooks && !backendOf(s)) {
+      hooks.onEnforcement = (e) => { if (e && e.backend) mount(gatesCard.bodyEl, gateList(s.gates, e.backend)); };
+      if (hooks.enforcement) hooks.onEnforcement(hooks.enforcement);
+    }
+    row1.append(policyCard, gatesCard);
+    panels.operations.append(row1);
+    panels.operations.append(enforcementStatusCard(ctx, s, hooks));
+
+    const segments = Object.keys(IAM_STATE_LABELS).map((st) => ({ label: t(IAM_STATE_LABELS[st]), value: (pop.byState || {})[st] || 0, color: IAM_STATE_COLORS[st] }));
+    panels.operations.append(card({
+      title: t('Access state population'), subtitle: t('Users with usage in the window or a direct binding on the access or marker roles'),
+      body: pop.byState ? h('div', null, proportionBar(segments), h('div', { class: 'state-legend' }, segments.map((sg) => {
+        const sw = h('span', { class: 'swatch round' });
+        sw.style.setProperty('background', sg.color);
+        return h('div', { class: 'sl-row' }, sw, h('span', null, sg.label), h('strong', null, fmt.int(sg.value)));
+      }))) : emptyState({ icon: 'alert-triangle', tone: 'warning', compact: true, title: t('Population unknown'), body: t('Usage and IAM data could not be read, so the user population is unknown.') }),
+    }));
+
+    const row3 = h('div', { class: 'grid' });
+    const auditHost = h('div');
+    const auditCard = card({ title: t('Administrative audit log'), subtitle: t('Actions by this control plane and agy-admin'), flush: true, body: auditHost, source: 'logs/agy-admin%2Fadmin_actions' });
+    auditCard.classList.add('span-8');
+    const prereqCard = card({ title: t('Enforcement prerequisites'), subtitle: t('Marker roles, permissions and telemetry'), body: prerequisites(ctx, s.prerequisites || {}) });
+    prereqCard.classList.add('span-4');
+    row3.append(auditCard, prereqCard);
+    panels.operations.append(row3);
+
+    load(auditHost, () => api.get('/api/v1/governance/audit-log', { limit: 50 }, { signal: ctx.signal }), (res) => {
+      const raw = res.data.items;
+      const items = raw || [];
+      const auditWarnings = warningsNotice(res.meta && res.meta.warnings);
+      let content;
+      if (raw === null || raw === undefined) {
+        content = emptyState({ icon: 'alert-triangle', tone: 'warning', title: t('Audit log unavailable'), body: t('The administrative audit log could not be read. Grant the service identity roles/logging.viewer.'), compact: true });
+      } else if (items.length) {
+        content = dataTable({
+          columns: [
+            { key: 'time', label: t('Time'), render: (r) => fmt.dateTime(r.time, true), value: (r) => r.time },
+            { key: 'actor', label: t('Actor'), render: (r) => h('span', { class: 'truncate' }, r.actor || DASH) },
+            { key: 'action', label: t('Action'), render: (r) => h('span', { class: 'cell-mono' }, r.action) },
+            { key: 'target', label: t('Target'), render: (r) => h('span', { class: 'truncate' }, r.target || DASH) },
+            { key: 'tool', label: t('Source'), render: (r) => badge(r.tool || DASH, r.tool === 'control-plane' ? 'accent' : 'neutral', { size: 'sm' }) },
+            { key: 'result', label: t('Result'), render: (r) => statusBadge(r.result, { size: 'sm' }) },
+          ],
+          rows: items, pageSize: 8, searchable: false, exportName: 'antigravity-audit-log',
+        });
+      } else {
+        content = emptyState({ icon: 'file-text', title: t('No administrative actions'), body: t('Enforcement runs, review decisions, exception rules and allow or disallow actions are recorded here.'), compact: true });
+      }
+      append(auditHost, [auditWarnings && raw ? h('div', { class: 'card-body flush-top' }, auditWarnings) : null, content]);
+    }, { skeletonKind: 'table', signal: ctx.signal });
+  };
+
+  const syncTabs = (id) => {
+    activeTab = id;
+    Object.entries(panels).forEach(([k, p]) => { p.hidden = k !== id; });
+    if (id === 'report') mountReportTab();
+    if (id === 'operations') mountOpsTab();
+  };
+
+  const opsIssues = gateIssues + (missingMetaLocs.length ? 1 : 0);
+  tabBar = tabs([
+    { id: 'usage', tabId: 'agy-tab-usage', controls: 'agy-panel-usage', label: t('Users & model costs'), count: usersList.length },
+    {
+      id: 'review', tabId: 'agy-tab-review', controls: 'agy-panel-review', label: t('Review & access'),
+      count: reviewCount + suspendedCount + (s.exceptions || []).length, tone: reviewCount > 0 ? 'warning' : '',
+    },
+    { id: 'report', tabId: 'agy-tab-report', controls: 'agy-panel-report', label: t('Monthly report') },
+    {
+      id: 'operations', tabId: 'agy-tab-operations', controls: 'agy-panel-operations', label: t('Policy & operations'),
+      count: opsIssues > 0 ? opsIssues : null, tone: opsIssues > 0 ? 'warning' : '',
+    },
+  ], activeTab, syncTabs);
+  tabBar.classList.add('agy-tabs');
+  syncTabs(activeTab);
+
+  body.append(tabBar, panels.usage, panels.review, panels.report, panels.operations);
+}
+
+function flattenUserModels(users) {
+  const out = [];
+  (users || []).forEach((u) => {
+    const models = Array.isArray(u.byModel) ? u.byModel : [];
+    const totalCost = models.reduce((acc, m) => acc + (isNum(m.cost) ? m.cost : 0), 0);
+    models.forEach((m) => {
+      const share = isNum(m.costShare) ? m.costShare : (isNum(m.cost) && totalCost > 0 ? m.cost / totalCost : null);
+      out.push({
+        uid: u.uid,
+        email: u.email,
+        model: m.model,
+        requests: m.requests,
+        promptTokens: m.promptTokens,
+        cachedTokens: m.cachedTokens,
+        outputTokens: m.outputTokens,
+        tokens: m.tokens,
+        cost: m.cost,
+        costPartial: m.costPartial,
+        costShare: share,
+        credit: m.credit,
+      });
+    });
+  });
+  return out;
+}
+
+function userModelBreakdownTable(ctx, allRows, { state, onFilter, ccy, showCreditTag, exportName }) {
+  const emails = Array.from(new Set(allRows.map((r) => r.email).filter(Boolean))).sort();
+  const models = Array.from(new Set(allRows.map((r) => r.model).filter(Boolean))).sort();
+  if (state.user !== 'all' && !emails.includes(state.user)) state.user = 'all';
+  if (state.model !== 'all' && !models.includes(state.model)) state.model = 'all';
+  const rows = allRows.filter((r) => (state.user === 'all' || r.email === state.user)
+    && (state.model === 'all' || r.model === state.model));
+  const toolbar = h('div', { class: 'row wrap' },
+    selectInput(
+      [{ value: 'all', label: t('All users') }, ...emails.map((em) => ({ value: em, label: em }))],
+      state.user, (v) => { state.user = v; onFilter(); }, { 'aria-label': t('Filter by user') }),
+    selectInput(
+      [{ value: 'all', label: t('All models') }, ...models.map((m) => ({ value: m, label: m }))],
+      state.model, (v) => { state.model = v; onFilter(); }, { 'aria-label': t('Filter by model') }));
+  return h('div', null,
+    filteredCostSummary(rows, ccy),
+    dataTable({
       columns: [
         { key: 'email', label: t('User'), render: (r) => userCell(r.email) },
-        { key: 'state', label: t('State'), render: (r) => statusBadge(r.state, { size: 'sm' }) },
-        { key: 'reason', label: t('Reason'), render: (r) => badge(reasonLabel(r.reason) || DASH, 'info', { size: 'sm' }) },
-        { key: 'remediation', label: t('Remediation'), sortable: false, wrap: true, render: (r) => h('span', { class: 'cell-sub' }, t(REMEDIATION[r.reason] || r.remediation || '')) },
+        {
+          key: 'model',
+          label: t('Model'),
+          render: (r) => h('div', { class: 'row wrap' },
+            h('span', { class: 'cell-mono' }, r.model || DASH),
+            showCreditTag && r.credit === false ? badge(t('Paid model'), 'warning', { size: 'sm' }) : null),
+          value: (r) => r.model || '',
+          csv: (r) => r.model || '',
+        },
+        { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
+        { key: 'promptTokens', label: t('Input tokens'), align: 'num', format: fmt.compact, csv: (r) => r.promptTokens },
+        { key: 'cachedTokens', label: t('From cache'), align: 'num', format: fmt.compact, csv: (r) => r.cachedTokens },
+        { key: 'outputTokens', label: t('Output tokens'), align: 'num', format: fmt.compact, csv: (r) => r.outputTokens },
+        { key: 'tokens', label: t('Total tokens'), align: 'num', render: (r) => h('span', { class: 'fw-600' }, fmt.compact(r.tokens)), value: (r) => r.tokens, csv: (r) => r.tokens },
+        {
+          key: 'cost',
+          label: t('Estimated cost'),
+          align: 'num',
+          render: (r) => h('span', { class: 'fw-600', title: r.costPartial ? t('Some models have no unit price') : null }, money(r.cost, ccy), r.costPartial ? ' *' : ''),
+          value: (r) => r.cost,
+          csv: (r) => (isNum(r.cost) ? r.cost : ''),
+        },
+        {
+          key: 'costShare',
+          label: t('Cost share'),
+          align: 'num',
+          render: (r) => costShareCell(r.costShare),
+          value: (r) => r.costShare,
+          csv: (r) => (isNum(r.costShare) ? r.costShare : ''),
+        },
       ],
-      rows: manual, pageSize: 8, exportName: 'antigravity-manual-actions', searchable: manual.length > 8,
-    });
-  } else {
-    manualBody = emptyState({ icon: 'check-circle', title: t('No manual actions'), body: t('Every user with usage can be enforced automatically.'), compact: true });
-  }
-  body.append(card({
-    title: t('Manual action required'), subtitle: t('Users whose access cannot be enforced through individual project bindings'), flush: true,
-    body: manualBody,
-  }));
-
-  body.append(billingReportCard(ctx));
-  body.append(agentActivityCard(ctx));
-
-  const row3 = h('div', { class: 'grid' });
-  const auditHost = h('div');
-  const auditCard = card({ title: t('Administrative audit log'), subtitle: t('Actions by this control plane and agy-admin'), flush: true, body: auditHost, source: 'logs/agy-admin%2Fadmin_actions' });
-  auditCard.classList.add('span-8');
-  const prereqCard = card({ title: t('Enforcement prerequisites'), subtitle: t('Marker roles, permissions and telemetry'), body: prerequisites(ctx, s.prerequisites || {}) });
-  prereqCard.classList.add('span-4');
-  row3.append(auditCard, prereqCard);
-  body.append(row3);
-  load(auditHost, () => api.get('/api/v1/governance/audit-log', { limit: 50 }, { signal: ctx.signal }), (res) => {
-    const raw = res.data.items;
-    const items = raw || [];
-    const auditWarnings = warningsNotice(res.meta && res.meta.warnings);
-    let content;
-    if (raw === null || raw === undefined) {
-      content = emptyState({ icon: 'alert-triangle', tone: 'warning', title: t('Audit log unavailable'), body: t('The administrative audit log could not be read. Grant the service identity roles/logging.viewer.'), compact: true });
-    } else if (items.length) {
-      content = dataTable({
-        columns: [
-          { key: 'time', label: t('Time'), render: (r) => fmt.dateTime(r.time, true), value: (r) => r.time },
-          { key: 'actor', label: t('Actor'), render: (r) => h('span', { class: 'truncate' }, r.actor || DASH) },
-          { key: 'action', label: t('Action'), render: (r) => h('span', { class: 'cell-mono' }, r.action) },
-          { key: 'target', label: t('Target'), render: (r) => h('span', { class: 'truncate' }, r.target || DASH) },
-          { key: 'tool', label: t('Source'), render: (r) => badge(r.tool || DASH, r.tool === 'control-plane' ? 'accent' : 'neutral', { size: 'sm' }) },
-          { key: 'result', label: t('Result'), render: (r) => statusBadge(r.result, { size: 'sm' }) },
-        ],
-        rows: items, pageSize: 8, searchable: false, exportName: 'antigravity-audit-log',
-      });
-    } else {
-      content = emptyState({ icon: 'file-text', title: t('No administrative actions'), body: t('Enforcement runs, review decisions, exception rules and allow or disallow actions are recorded here.'), compact: true });
-    }
-    append(auditHost, [auditWarnings && raw ? h('div', { class: 'card-body flush-top' }, auditWarnings) : null, content]);
-  }, { skeletonKind: 'table', signal: ctx.signal });
+      rows,
+      pageSize: 15,
+      exportName,
+      initialSort: { key: 'cost', dir: 'desc' },
+      toolbar,
+      emptyText: t('No per-user model usage was recorded in this window.'),
+      onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email, onChanged: () => ctx.rerender() }),
+    }));
 }
 
 /* ------------------------------------------------------------------ monthly usage report (chargeback) */
@@ -515,66 +837,90 @@ function monthOptions(count = 6) {
 
 function billingReportCard(ctx) {
   const months = monthOptions();
-  const state = { month: months[0], credit: true };
+  const state = { month: months[0], credit: true, view: 'user', user: 'all', model: 'all' };
+  let lastRes = null;
   const host = h('div');
   const monthSel = selectInput(months.map((m) => ({ value: m, label: m })), state.month, (v) => { state.month = v; refresh(); }, { 'aria-label': t('Month') });
-  const creditSeg = segmented([{ value: 'yes', label: t('Deduct credit') }, { value: 'no', label: t('Full amount') }], 'yes', (v) => { state.credit = v === 'yes'; refresh(); });
+  const creditSeg = segmented([{ value: 'yes', label: t('Deduct credit') }, { value: 'no', label: t('Full amount') }], 'yes', (v) => { state.credit = v === 'yes'; renderBody(); });
+  const viewSeg = segmented([{ value: 'user', label: t('By user') }, { value: 'models', label: t('By user & model') }], 'user', (v) => { state.view = v; renderBody(); }, { label: t('View by') });
   const out = card({
     title: t('Monthly usage report'),
     subtitle: t('Per-person Antigravity tokens and cost for chargeback'),
-    actions: h('div', { class: 'row' }, monthSel, creditSeg),
+    actions: h('div', { class: 'row wrap' }, monthSel, viewSeg, creditSeg),
     flush: true,
     body: host,
   });
+  function renderBody() {
+    if (!lastRes) return;
+    const r = lastRes.data || {};
+    const ccy = r.currency || 'USD';
+    const rows = r.users || [];
+    const notice = warningsNotice(lastRes.meta && lastRes.meta.warnings);
+    const amount = (u) => (state.credit ? u.chargeable : u.cost);
+    const creditCaps = r.capModel === 'credit_budget';
+    let content;
+    if (!rows.length) {
+      content = emptyState({ icon: 'file-text', compact: true, title: t('No Antigravity usage in {month}', { month: r.month || state.month }), body: t('Usage appears when Antigravity for organizations writes its inference log with Metadata logging turned on.') });
+    } else if (state.view === 'models') {
+      content = userModelBreakdownTable(ctx, flattenUserModels(rows), {
+        state,
+        onFilter: renderBody,
+        ccy,
+        showCreditTag: creditCaps,
+        exportName: `antigravity-usage-${r.month || state.month}-by-model`,
+      });
+    } else {
+      content = dataTable({
+        columns: creditCaps ? [
+          { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
+          {
+            key: 'models', label: t('Models & cost'), sortable: false,
+            render: (u) => modelCostCell(u.byModel, 'USD'),
+            csv: (u) => (u.byModel || []).map((m) => `${m.model}:${isNum(m.cost) ? m.cost : m.tokens}`).join('|'),
+          },
+          { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
+          { key: 'tokens', label: t('Tokens'), align: 'num', format: fmt.compact, csv: (u) => u.tokens },
+          { key: 'gemini', label: t('Gemini'), align: 'num', render: (u) => usd(u.gemini), value: (u) => u.gemini },
+          { key: 'other', label: t('Claude and other models'), align: 'num', render: (u) => usd(u.other), value: (u) => u.other },
+          { key: 'credit', label: t('Free credit'), align: 'num', render: (u) => (state.credit ? usd(u.credit) : h('span', { class: 'text-muted' }, DASH)), value: (u) => (state.credit ? u.credit : null) },
+          { key: 'chargeable', label: state.credit ? t('Amount to charge') : t('Cost'), align: 'num', render: (u) => h('span', { class: 'fw-600', title: u.costPartial ? t('Some models have no unit price') : null }, usd(amount(u)), u.costPartial ? ' *' : ''), value: (u) => amount(u) },
+          { key: 'budget', label: t('Paid budget'), align: 'num', render: (u) => budgetText(u.budget), value: (u) => u.budget, csv: (u) => (isNum(u.budget) ? u.budget : '') },
+        ] : [
+          { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
+          {
+            key: 'models', label: t('Models & cost'), sortable: false,
+            render: (u) => modelCostCell(u.byModel, ccy),
+            csv: (u) => (u.byModel || []).map((m) => `${m.model}:${isNum(m.cost) ? m.cost : m.tokens}`).join('|'),
+          },
+          { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
+          { key: 'promptTokens', label: t('Input tokens'), align: 'num', format: fmt.compact, csv: (u) => u.promptTokens },
+          { key: 'cachedTokens', label: t('From cache'), align: 'num', format: fmt.compact, csv: (u) => u.cachedTokens },
+          { key: 'outputTokens', label: t('Output tokens'), align: 'num', format: fmt.compact, csv: (u) => u.outputTokens },
+          { key: 'cost', label: t('Cost'), align: 'num', render: (u) => h('span', { title: u.costPartial ? t('Some models have no unit price') : null }, money(u.cost, ccy), u.costPartial ? ' *' : ''), value: (u) => u.cost },
+          { key: 'credit', label: t('Credit'), align: 'num', render: (u) => (state.credit ? money(u.credit, ccy) : h('span', { class: 'text-muted' }, DASH)), value: (u) => (state.credit ? u.credit : null) },
+          { key: 'chargeable', label: state.credit ? t('Amount to charge') : t('Cost'), align: 'num', render: (u) => h('span', { class: 'fw-600' }, money(amount(u), ccy)), value: (u) => amount(u) },
+        ],
+        rows, pageSize: 10, searchable: rows.length > 10, exportName: `antigravity-usage-${r.month || state.month}`,
+        initialSort: { key: 'chargeable', dir: 'desc' },
+        onRowClick: (u) => u.uid && openUserDrawer(u.uid, { email: u.email, onChanged: () => ctx.rerender() }),
+      });
+    }
+    const totals = r.totals || {};
+    const foot = h('div', { class: 'card-body stack-sm' },
+      h('div', { class: 'row wrap' },
+        h('span', { class: 'fw-600' }, t('Total {v}', { v: money(state.credit ? totals.chargeable : totals.cost, ccy) })),
+        h('span', { class: 'text-muted' }, t('{n} people \u00b7 {month} ({tz})', { n: fmt.int(rows.length), month: r.month || state.month, tz: r.timezone || '' })),
+        r.complete === false ? badge(t('Month in progress'), 'warning', { size: 'sm' }) : null),
+      h('p', { class: 'muted' }, t('Tokens are what Google logged for each call (businessaicode.googleapis.com/inference_response). Cost = tokens x unit price of each model; prompt tokens served from cache use the cache price. Google bills the project, not people, so this is how the project\'s usage is divided between people.')),
+      creditCaps
+        ? h('p', { class: 'muted' }, t('Free credit: {w} per person per week ({m} a month / 4), for Gemini models only; unused credit does not carry over. Claude is always paid. Amount to charge = Claude + Gemini beyond the weekly free share. Google bills the project and applies the credit as a shared pool, so the invoice can be lower than the sum.', { w: usd(r.creditPerWeek), m: usd(r.creditPerUserMonthUsd) }))
+        : (state.credit ? h('p', { class: 'muted' }, t('Credit: {v} per person per month (Gemini Enterprise Antigravity credit, Settings > Governance).', { v: money(r.creditPerUser, ccy) })) : null));
+    append(host, [notice ? h('div', { class: 'card-body flush-top' }, notice) : null, content, foot]);
+  }
   function refresh() {
     load(host, () => api.get('/api/v1/governance/antigravity/billing-report', { month: state.month }, { signal: ctx.signal }), (res) => {
-      const r = res.data || {};
-      const ccy = r.currency || 'USD';
-      const rows = r.users || [];
-      const notice = warningsNotice(res.meta && res.meta.warnings);
-      const amount = (u) => (state.credit ? u.chargeable : u.cost);
-      const creditCaps = r.capModel === 'credit_budget';
-      let content;
-      if (!rows.length) {
-        content = emptyState({ icon: 'file-text', compact: true, title: t('No Antigravity usage in {month}', { month: r.month || state.month }), body: t('Usage appears when Antigravity for organizations writes its inference log with Metadata logging turned on.') });
-      } else {
-        content = dataTable({
-          columns: creditCaps ? [
-            { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
-            { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
-            { key: 'tokens', label: t('Tokens'), align: 'num', format: fmt.compact, csv: (u) => u.tokens },
-            { key: 'gemini', label: t('Gemini'), align: 'num', render: (u) => usd(u.gemini), value: (u) => u.gemini },
-            { key: 'other', label: t('Claude and other models'), align: 'num', render: (u) => usd(u.other), value: (u) => u.other },
-            { key: 'credit', label: t('Free credit'), align: 'num', render: (u) => (state.credit ? usd(u.credit) : h('span', { class: 'text-muted' }, DASH)), value: (u) => (state.credit ? u.credit : null) },
-            { key: 'chargeable', label: state.credit ? t('Amount to charge') : t('Cost'), align: 'num', render: (u) => h('span', { class: 'fw-600', title: u.costPartial ? t('Some models have no unit price') : null }, usd(amount(u)), u.costPartial ? ' *' : ''), value: (u) => amount(u) },
-            { key: 'budget', label: t('Paid budget'), align: 'num', render: (u) => budgetText(u.budget), value: (u) => u.budget, csv: (u) => (isNum(u.budget) ? u.budget : '') },
-            { key: 'models', label: t('Models'), sortable: false, render: (u) => listCell((u.byModel || []).map((m) => m.model), { mono: true }), csv: (u) => (u.byModel || []).map((m) => `${m.model}:${m.tokens}`).join('|') },
-          ] : [
-            { key: 'email', label: t('User'), render: (u) => userCell(u.email) },
-            { key: 'requests', label: t('Requests'), align: 'num', format: fmt.int },
-            { key: 'promptTokens', label: t('Input tokens'), align: 'num', format: fmt.compact, csv: (u) => u.promptTokens },
-            { key: 'cachedTokens', label: t('From cache'), align: 'num', format: fmt.compact, csv: (u) => u.cachedTokens },
-            { key: 'outputTokens', label: t('Output tokens'), align: 'num', format: fmt.compact, csv: (u) => u.outputTokens },
-            { key: 'cost', label: t('Cost'), align: 'num', render: (u) => h('span', { title: u.costPartial ? t('Some models have no unit price') : null }, money(u.cost, ccy), u.costPartial ? ' *' : ''), value: (u) => u.cost },
-            { key: 'credit', label: t('Credit'), align: 'num', render: (u) => (state.credit ? money(u.credit, ccy) : h('span', { class: 'text-muted' }, DASH)), value: (u) => (state.credit ? u.credit : null) },
-            { key: 'chargeable', label: state.credit ? t('Amount to charge') : t('Cost'), align: 'num', render: (u) => h('span', { class: 'fw-600' }, money(amount(u), ccy)), value: (u) => amount(u) },
-            { key: 'models', label: t('Models'), sortable: false, render: (u) => listCell((u.byModel || []).map((m) => m.model), { mono: true }), csv: (u) => (u.byModel || []).map((m) => `${m.model}:${m.tokens}`).join('|') },
-          ],
-          rows, pageSize: 10, searchable: rows.length > 10, exportName: `antigravity-usage-${r.month || state.month}`,
-          initialSort: { key: 'chargeable', dir: 'desc' },
-        });
-      }
-      const totals = r.totals || {};
-      const foot = h('div', { class: 'card-body stack-sm' },
-        h('div', { class: 'row wrap' },
-          h('span', { class: 'fw-600' }, t('Total {v}', { v: money(state.credit ? totals.chargeable : totals.cost, ccy) })),
-          h('span', { class: 'text-muted' }, t('{n} people \u00b7 {month} ({tz})', { n: fmt.int(rows.length), month: r.month || state.month, tz: r.timezone || '' })),
-          r.complete === false ? badge(t('Month in progress'), 'warning', { size: 'sm' }) : null),
-        h('p', { class: 'muted' }, t('Tokens are what Google logged for each call (businessaicode.googleapis.com/inference_response). Cost = tokens x unit price of each model; prompt tokens served from cache use the cache price. Google bills the project, not people, so this is how the project\'s usage is divided between people.')),
-        creditCaps
-          ? h('p', { class: 'muted' }, t('Free credit: {w} per person per week ({m} a month / 4), for Gemini models only; unused credit does not carry over. Claude is always paid. Amount to charge = Claude + Gemini beyond the weekly free share. Google bills the project and applies the credit as a shared pool, so the invoice can be lower than the sum.', { w: usd(r.creditPerWeek), m: usd(r.creditPerUserMonthUsd) }))
-          : (state.credit ? h('p', { class: 'muted' }, t('Credit: {v} per person per month (Gemini Enterprise Antigravity credit, Settings > Governance).', { v: money(r.creditPerUser, ccy) })) : null));
-      append(host, [notice ? h('div', { class: 'card-body flush-top' }, notice) : null, content, foot]);
+      lastRes = res;
+      renderBody();
     }, { skeletonKind: 'table', signal: ctx.signal });
   }
   refresh();
@@ -600,73 +946,53 @@ function statusLabel(result) {
   return { success: 'Success', partial: 'Partial', failed: 'Failed', aborted: 'Aborted', dry_run: 'Dry run' }[result] || result || DASH;
 }
 
-function enforcementCard(ctx, s) {
-  const policy = s.policy || {};
-  const enforcement = s.enforcement || {};
-  const mode = policy.enforcementMode || 'manual';
-  const last = enforcement.lastRun;
-  const sched = enforcement.scheduler || {};
-  const control = segmented([
-    { value: 'manual', label: t('Manual review'), title: t('Over-cap users wait for an administrator decision') },
-    { value: 'auto', label: t('Automatic suspension'), title: t('Over-cap users are suspended by every enforcement run') },
-  ], mode, (v) => {
-    if (!requireAdmin(t('Enforcement mode'))) { ctx.rerender(); return; }
-    setMode(ctx, v);
-  }, { label: t('Enforcement mode') });
-  let schedSub;
-  if (sched.lastRun) schedSub = t('Last scheduled run {when}', { when: fmt.relative(sched.lastRun.at) });
-  else if (sched.configured) schedSub = t('Waiting for the first scheduled run');
-  else schedSub = t('Runs only when an administrator selects Run enforcement now');
-  return card({
-    title: t('Enforcement'),
-    subtitle: isCredit(policy)
-      ? (mode === 'auto'
-        ? t('Automatic: a person whose paid budget is spent is stopped by the next run once nothing is free (the week\'s free credit is used up or they pay again), and restored at the weekly reset or on the 1st of the month.')
-        : t('Manual: people whose paid budget is spent wait in the review queue. Suspensions end automatically at the weekly reset or on the 1st of the month.'))
-      : (mode === 'auto'
-        ? t('Automatic: users over their cap are suspended by each enforcement run and restored when the settlement period resets.')
-        : t('Manual: users over their cap wait in the review queue. An administrator suspends them until the period resets or allows them for the rest of the period.')),
-    actions: control,
-    body: h('div', { class: 'enf-grid' },
-      isCredit(policy)
-        ? enfItem(t('Free credit cycle'), t('{w} per person per week', { w: usd(policy.creditPerWeek) }), resetText(policy))
-        : enfItem(t('Settlement period'), periodLabel(policy), resetText(policy)),
-      enfItem(t('Next reset'), policy.nextReset ? fmt.dateTime(policy.nextReset) : t('No fixed reset'), policy.nextReset ? fmt.relative(policy.nextReset) : t('Suspended users are restored when their usage falls below the cap')),
-      enfItem(t('Last run'), last ? fmt.dateTime(last.at) : t('Not run yet'), last ? runSummary(last) : t('Select Run enforcement now or configure the scheduler')),
-      enfItem(t('Scheduler'), sched.configured ? t('Configured') : t('Not configured'), schedSub)),
-  });
-}
-
-async function setMode(ctx, next) {
+async function setMode(ctx, next, realtime = false) {
+  const autoMsg = realtime
+    ? t('Users already over their cap are evaluated right away, and new over-cap usage triggers suspension automatically as soon as usage logs arrive (IAM takes a few minutes to apply). Access returns automatically when the period resets. Exception rules and safety gates still apply.')
+    : t('Users already over their cap are evaluated right away, and every enforcement run suspends over-cap users until the settlement period resets. Exception rules and safety gates still apply.');
   const ok = await confirmDialog({
     title: next === 'auto' ? t('Turn on automatic suspension') : t('Switch to manual review'),
     message: next === 'auto'
-      ? t('Every enforcement run will suspend users over their cap until the settlement period resets. Exception rules and safety gates still apply.')
+      ? autoMsg
       : t('Enforcement runs will no longer suspend anyone. Users over their cap wait in the review queue for an administrator decision. Suspensions still end when the period resets.'),
     confirmLabel: next === 'auto' ? t('Turn on') : t('Switch'),
     tone: next === 'auto' ? 'danger' : 'primary',
   });
   if (!ok) { ctx.rerender(); return; }
   try {
-    await api.post('/api/v1/settings', { section: 'governance', values: { enforcement_mode: next } });
-    toast({ title: next === 'auto' ? t('Automatic suspension is on') : t('Manual review is on'), tone: 'success' });
+    const res = await api.post('/api/v1/settings', { section: 'governance', values: { enforcement_mode: next } });
+    const run = res && res.data && res.data.enforcement;
+    const note = enforcementRunNote(run);
+    toast({
+      title: next === 'auto' ? t('Automatic suspension is on') : t('Manual review is on'),
+      text: note,
+      tone: run && run.error ? 'warning' : 'success',
+      timeout: note ? 9000 : 4800,
+    });
+    scheduleJobRefresh(ctx, run);
   } catch (err) {
     toast({ title: t('Save failed'), text: errorText(err), tone: 'danger' });
   }
   ctx.rerender();
 }
 
-async function runEnforce(ctx, s, dry, btn) {
+async function runEnforce(ctx, s, dry, btn, hooks) {
   const mode = (s.policy || {}).enforcementMode || 'manual';
+  const known = (hooks && hooks.enforcement) || {};
+  const backend = backendOf(s) || known.backend || 'iam_allow_swap';
+  const changes = mode === 'auto' && backend !== 'notify_only';
   if (!dry) {
+    let message;
+    if (mode !== 'auto') message = t('Manual review mode: nobody is suspended by this run. Suspensions whose period ended are restored and exception rules are applied; users over their cap stay in the review queue.');
+    else if (backend === 'iam_deny') message = t('People over their limits are added to the deny policy at every attachment point until the settlement period resets, people whose suspension ended are removed from it and exception rules are applied. Changes take a few minutes to take effect.');
+    else if (backend === 'notify_only') message = t('Notify only: no access is changed. The run records and notifies what it would do.');
+    else message = t('IAM bindings are changed in one atomic update: users over their cap are suspended until the settlement period resets, suspensions whose period ended are restored and exception rules are applied. Users that are not enforceable are never modified.');
     const ok = await confirmDialog({
       title: t('Run enforcement now'),
-      message: mode === 'auto'
-        ? t('IAM bindings are changed in one atomic update: users over their cap are suspended until the settlement period resets, suspensions whose period ended are restored and exception rules are applied. Users that are not enforceable are never modified.')
-        : t('Manual review mode: nobody is suspended by this run. Suspensions whose period ended are restored and exception rules are applied; users over their cap stay in the review queue.'),
+      message: known.job && known.job.configured ? `${message} ${t('The enforcement job applies the changes with its own service account.')}` : message,
       confirmLabel: t('Run now'),
-      tone: mode === 'auto' ? 'danger' : 'primary',
-      requireText: mode === 'auto' ? 'APPLY' : null,
+      tone: changes ? 'danger' : 'primary',
+      requireText: changes ? 'APPLY' : null,
     });
     if (!ok) return;
   }
@@ -674,14 +1000,17 @@ async function runEnforce(ctx, s, dry, btn) {
   try {
     const res = await api.post('/api/v1/governance/antigravity/enforce', dry ? { dryRun: true } : {});
     setBusy(btn, false);
-    showResult(ctx, res.data);
+    const r = res.data || {};
+    // With an enforcement job the request only starts an execution; the job applies the changes.
+    if (r.triggered) jobStarted(ctx, r, hooks);
+    else showResult(ctx, r, backend);
   } catch (err) {
     setBusy(btn, false);
     toast({ title: dry ? t('Dry run failed') : t('Enforcement failed'), text: errorText(err), tone: 'danger', timeout: 9000 });
   }
 }
 
-function showResult(ctx, r) {
+function showResult(ctx, r, backend) {
   const plan = r.plan || {};
   const changes = r.changes || [];
   const applied = changes.filter((c) => c.status === 'applied').length;
@@ -698,7 +1027,7 @@ function showResult(ctx, r) {
         statBox(t('Block (rule)'), (plan.disallow || []).length),
         statBox(t('Awaiting review'), (plan.review || []).length),
         statBox(t('Manual action'), (plan.manual || []).length)),
-      gateList(r.gates),
+      gateList(r.gates, backend),
       changes.length ? dataTable({
         columns: [
           { key: 'email', label: t('User'), render: (c) => userCell(c.email) },
@@ -717,12 +1046,323 @@ function showResult(ctx, r) {
   });
 }
 
+/* ------------------------------------------------------------------ enforcement method, deny policy and job */
+
+function backendOf(s) {
+  const e = (s && s.enforcement) || {};
+  const p = (s && s.policy) || {};
+  return e.backend || p.enforcementBackend || null;
+}
+
+function backendLabel(backend) {
+  switch (backend) {
+    case 'iam_deny': return t('IAM deny policy');
+    case 'notify_only': return t('Notify only');
+    case 'iam_allow_swap': return t('Allow policy swap');
+    default: return backend ? String(backend) : DASH;
+  }
+}
+
+function backendSub(backend) {
+  switch (backend) {
+    case 'iam_deny': return t('Suspended people are listed in a deny policy, which also stops access through groups and inherited roles.');
+    case 'notify_only': return t('Runs plan and notify only; nobody loses access.');
+    case 'iam_allow_swap': return t('The direct role binding is swapped for a marker role in the primary project.');
+    default: return null;
+  }
+}
+
+function attachmentLabel(a) {
+  if (a === 'scope') return t('The folders or organization of the workspace scope');
+  if (a === 'projects') return t('Every workspace project');
+  return a ? String(a) : DASH;
+}
+
+/** Last path segment of a resource name or of an object's name (executions, operations, jobs). */
+function shortName(v) {
+  const s = String((v && typeof v === 'object' ? v.name : v) || '');
+  return s.slice(s.lastIndexOf('/') + 1) || s;
+}
+
+/** Attachment point without the service prefix: cloudresourcemanager.googleapis.com/projects/p -> projects/p. */
+function attachmentText(v) {
+  let s = String(v || '');
+  if (/%2F/i.test(s)) {
+    try { s = decodeURIComponent(s); } catch (e) { /* shown as received */ }
+  }
+  return s.replace(/^(?:\/\/)?cloudresourcemanager\.googleapis\.com\//, '');
+}
+
+function capacityRatio(a) {
+  if (isNum(a.ratio)) return a.ratio;
+  return isNum(a.count) && isNum(a.limit) && a.limit > 0 ? a.count / a.limit : null;
+}
+
+function capacityCell(a) {
+  const ratio = capacityRatio(a);
+  if (!isNum(a.count) && !isNum(ratio)) return h('span', { class: 'text-muted' }, DASH);
+  const tone = ratio >= 1 ? 'danger' : ratio >= 0.8 ? 'warning' : 'success';
+  const text = isNum(a.limit) ? t('{n} of {limit}', { n: fmt.int(a.count), limit: fmt.int(a.limit) }) : fmt.int(a.count);
+  return h('div', { class: 'rt-budget-bar' }, progress(Math.min(1, isNum(ratio) ? ratio : 0), tone), h('span', { class: 'tabular nowrap' }, text));
+}
+
+function attachmentState(a) {
+  const ratio = capacityRatio(a);
+  const out = [];
+  if (a.exists === false) out.push(badge(t('No deny policy'), 'neutral', { size: 'sm' }));
+  if (a.foreign) {
+    out.push(badge(t('Changed outside the dashboard'), 'warning', {
+      size: 'sm', title: t('This deny policy has content that the dashboard did not write, so the dashboard does not change it. Review it in Google Cloud IAM.'),
+    }));
+  }
+  if (isNum(ratio) && ratio >= 1) out.push(badge(t('At the limit'), 'danger', { size: 'sm' }));
+  else if (isNum(ratio) && ratio >= 0.8) out.push(badge(t('Near the limit'), 'warning', { size: 'sm' }));
+  if (!out.length && !a.error) out.push(badge(t('Within the limit'), 'success', { size: 'sm' }));
+  return h('div', { class: 'chips' }, out);
+}
+
+/**
+ * Sentence for an error code of the enforcement status (GcpError kinds of gcp.py, invalid_response, internal and
+ * internal_error); a code without a sentence goes through serverText.
+ */
+function gcpErrorText(code) {
+  switch (code) {
+    case 'denied':
+    case 'access_denied':
+    case 'permission_denied':
+      return t('Access was denied for the service identity. Check the IAM roles of the runtime service account.');
+    case 'not_found': return t('The resource was not found.');
+    case 'credentials':
+    case 'credentials_unavailable':
+      return t('Google Cloud credentials are unavailable.');
+    case 'timeout': return t('The request timed out.');
+    case 'unavailable':
+    case 'upstream_unavailable':
+    case 'network':
+      return t('The service is temporarily unavailable.');
+    case 'invalid':
+    case 'http':
+      return t('The request was rejected by the service.');
+    case 'conflict':
+    case 'precondition':
+      return t('The request conflicts with the current state. Reload and try again.');
+    case 'invalid_response':
+    case 'internal':
+    case 'internal_error':
+      return t('The data could not be processed.');
+    default: return serverText(code);
+  }
+}
+
+function denyErrorText(code) {
+  switch (code) {
+    case 'denied':
+    case 'access_denied':
+    case 'permission_denied':
+      return t('Access denied. Grant the dashboard service account Deny Reviewer (roles/iam.denyReviewer) on the organization.');
+    case 'not_found': return t('The attachment point was not found.');
+    default: return gcpErrorText(code);
+  }
+}
+
+function executionBadge(x) {
+  const raw = String((x && x.state) || '').toUpperCase().replace(/^EXECUTION_/, '');
+  let key = raw;
+  if ((!key || key === 'UNKNOWN') && x) {
+    if (x.runningCount > 0) key = 'RUNNING';
+    else if (x.failedCount > 0) key = 'FAILED';
+    else if (x.cancelledCount > 0) key = 'CANCELLED';
+    else if (x.succeededCount > 0) key = 'SUCCEEDED';
+  }
+  if (['RUNNING', 'PENDING', 'STARTED', 'IN_PROGRESS', 'QUEUED'].includes(key)) return badge(t('Running'), 'info', { dot: true, size: 'sm' });
+  if (['SUCCEEDED', 'SUCCESS', 'COMPLETED', 'DONE'].includes(key)) return badge(t('Succeeded'), 'success', { dot: true, size: 'sm' });
+  if (['FAILED', 'ERROR'].includes(key)) return badge(t('Failed'), 'danger', { dot: true, size: 'sm' });
+  if (['CANCELLED', 'CANCELED', 'CANCELLING'].includes(key)) return badge(t('Cancelled'), 'warning', { dot: true, size: 'sm' });
+  return badge(!raw || raw === 'UNKNOWN' ? t('Unknown') : raw, 'neutral', { size: 'sm' });
+}
+
+function executionSub(x) {
+  const parts = [shortName(x.name)].filter(Boolean);
+  const started = x.startTime || x.createTime;
+  if (started) parts.push(t('Started {when}', { when: fmt.relative(started) }));
+  if (x.completionTime) parts.push(t('Finished {time}', { time: fmt.dateTime(x.completionTime) }));
+  if (isNum(x.succeededCount) && x.succeededCount > 0) parts.push(t('{n} succeeded', { n: fmt.int(x.succeededCount) }));
+  if (isNum(x.failedCount) && x.failedCount > 0) parts.push(t('{n} failed', { n: fmt.int(x.failedCount) }));
+  if (isNum(x.cancelledCount) && x.cancelledCount > 0) parts.push(t('{n} cancelled', { n: fmt.int(x.cancelledCount) }));
+  if (isNum(x.runningCount) && x.runningCount > 0) parts.push(t('{n} running', { n: fmt.int(x.runningCount) }));
+  return parts.join(' \u00b7 ');
+}
+
+/** Google's state of a spend cap (spendCap.outputState, else the requested inputState). */
+function spendCapState(r) {
+  if (r.exists === false) return badge(t('Not created yet'), 'neutral', { size: 'sm' });
+  switch (r.outputState || r.inputState) {
+    case 'CONFIGURED': return badge(t('Configured'), 'success', { size: 'sm' });
+    case 'ENFORCED': return badge(t('Usage paused'), 'danger', { dot: true, size: 'sm' });
+    case 'AWAITING_NEXT_PERIOD': return badge(t('Lifted until next month'), 'info', { size: 'sm' });
+    default: {
+      const s = r.outputState || r.inputState;
+      return s && s !== 'STATE_UNSPECIFIED' ? badge(String(s), 'neutral', { size: 'sm' }) : h('span', { class: 'text-muted' }, DASH);
+    }
+  }
+}
+
+/**
+ * Spend cap rows of the enforcement status: {items: [...]}, or the spend caps status of services/spend_caps.py
+ * ({desired: {project: amount}, caps: {project: cap}, currency}).
+ */
+function spendCapItems(sc) {
+  if (Array.isArray(sc.items)) return sc.items.filter((x) => x && typeof x === 'object');
+  const caps = sc.caps && typeof sc.caps === 'object' && !Array.isArray(sc.caps) ? sc.caps : {};
+  const desired = sc.desired && typeof sc.desired === 'object' && !Array.isArray(sc.desired) ? sc.desired : {};
+  return [...new Set([...Object.keys(desired), ...Object.keys(caps)])].sort().map((project) => {
+    const c = caps[project] && typeof caps[project] === 'object' ? caps[project] : null;
+    if (!c) return { project, amount: isNum(desired[project]) ? desired[project] : null, currency: 'USD', exists: false };
+    return { project, amount: isNum(c.amount) ? c.amount : null, currency: c.currency || sc.currency || 'USD', inputState: c.inputState || null, outputState: c.outputState || null };
+  });
+}
+
+function denySection(e) {
+  const deny = e.deny;
+  if (!deny) {
+    return e.backend === 'iam_deny' ? h('p', { class: 'muted' }, t('The deny policy state is not available yet.')) : null;
+  }
+  const rows = Array.isArray(deny.attachments) ? deny.attachments.filter(Boolean) : [];
+  return h('div', { class: 'stack-sm' },
+    deny.readable === false ? banner({
+      tone: 'warning', title: t('Deny policies could not be read'),
+      text: t('Grant the dashboard service account Deny Reviewer (roles/iam.denyReviewer) on the organization to show the deny policy state here.'),
+    }) : null,
+    rows.length ? dataTable({
+      title: t('Attachment points'),
+      searchable: rows.length > 8, pageSize: 8,
+      columns: [
+        { key: 'attachment', label: t('Attachment point'), render: (a) => h('span', { class: 'cell-mono truncate', title: attachmentText(a.attachment) }, attachmentText(a.attachment)), value: (a) => attachmentText(a.attachment) },
+        { key: 'count', label: t('People listed'), width: '240px', value: (a) => capacityRatio(a), render: capacityCell, csv: (a) => (isNum(a.count) ? a.count : '') },
+        { key: 'state', label: t('State'), sortable: false, render: attachmentState, csv: (a) => (a.foreign ? 'foreign' : '') },
+        { key: 'error', label: t('Detail'), sortable: false, wrap: true, render: (a) => (a.error ? h('span', { class: 'cell-sub text-danger' }, denyErrorText(a.error)) : h('span', { class: 'text-muted' }, DASH)), csv: (a) => a.error || '' },
+      ],
+      rows,
+    }) : h('p', { class: 'muted' }, t('No attachment point yet. Save a workspace scope and run enforcement once.')));
+}
+
+function spendCapSection(sc) {
+  if (!sc || typeof sc !== 'object') return null;
+  if (sc.enabled === false) {
+    return h('p', { class: 'muted' }, t('Google spend caps are off. Turn them on in Settings > Governance policy > Enforcement to apply project hard caps.'));
+  }
+  const items = spendCapItems(sc);
+  let notice = null;
+  if (sc.accountConfigured === false) {
+    notice = banner({ tone: 'warning', title: t('The billing account ID is missing'), text: t('Spend caps are set on the billing account. Enter its ID in Settings > Workspace and data sources > Google Cloud workspace.') });
+  } else if (sc.ok === false || sc.error) {
+    notice = banner({ tone: 'warning', title: t('Spend caps could not be read'), text: sc.error ? serverText(sc.error) : null });
+  }
+  // Viewers get the on/off state only: the caps name the billing account and the projects (server viewer view).
+  if (sc.adminOnly) return h('div', { class: 'stack-sm' }, notice, h('p', { class: 'muted' }, t('Only administrators see the project spend caps.')));
+  return h('div', { class: 'stack-sm' },
+    notice,
+    items.length ? dataTable({
+      title: t('Project spend caps'), searchable: false, pageSize: 8,
+      columns: [
+        { key: 'project', label: t('Project'), render: (r) => h('span', { class: 'cell-mono' }, r.project || DASH) },
+        { key: 'amount', label: t('Monthly cap'), align: 'num', render: (r) => (isNum(r.amount) ? fmt.currency(r.amount, r.currency || 'USD') : DASH), value: (r) => r.amount },
+        { key: 'outputState', label: t('Google state'), render: spendCapState, value: (r) => r.outputState || r.inputState || '' },
+      ],
+      rows: items,
+    }) : h('p', { class: 'muted' }, t('No project has a hard cap. Set one in Chargeback > Monthly budgets.')),
+    items.length ? h('p', { class: 'muted' }, t('Change the amounts or lift a paused cap in Chargeback > Monthly budgets.')) : null);
+}
+
+function renderEnforcementStatus(host, e, warnings, fallbackRealtime = null) {
+  const backend = e.backend || null;
+  const job = e.job || {};
+  const rt = e.realtime || fallbackRealtime || {};
+  const latest = job.latest || null;
+  const perms = Array.isArray(e.permissions) ? e.permissions.filter(Boolean) : [];
+  let where = DASH;
+  let whereSub = null;
+  if (backend === 'iam_deny') {
+    where = attachmentLabel(e.attachment);
+    whereSub = e.policyId ? t('Deny policy {id}', { id: e.policyId }) : null;
+  } else if (backend === 'iam_allow_swap') {
+    where = t('Primary project');
+  }
+  let lastValue = job.configured ? t('Not run yet') : DASH;
+  if (latest) lastValue = executionBadge(latest);
+  const rtBadge = rt.configured
+    ? badge(t('Active'), 'success', { dot: true, size: 'sm' })
+    : badge(t('Schedule only'), 'neutral', { size: 'sm' });
+  append(host, [
+    warningsNotice(warnings),
+    h('div', { class: 'stack' },
+      h('div', { class: 'enf-grid' },
+        enfItem(t('Enforcement method'), backendLabel(backend), backendSub(backend)),
+        enfItem(t('Applied at'), where, whereSub),
+        enfItem(t('Applied by'), job.configured ? t('Enforcement job') : t('Dashboard service'), job.configured ? (shortName(job.job) || null) : t('No enforcement job is set, so the dashboard applies suspensions itself.')),
+        enfItem(t('Latest job run'), lastValue, latest ? executionSub(latest) : null),
+        enfItem(t('Real-time detection'), rtBadge, realtimeSub(rt))),
+      backend === 'iam_deny' && (perms.length || e.geApp || e.agentPlatform) ? h('div', { class: 'row wrap' },
+        h('span', { class: 'muted' }, t('Denied permissions')),
+        h('div', { class: 'chips' }, perms.map((p) => h('span', { class: 'chip cell-mono' }, p))),
+        e.geApp ? badge(t('Gemini Enterprise app also denied'), 'warning', { size: 'sm' }) : null,
+        e.agentPlatform ? badge(t('Agent Platform model calls also denied'), 'warning', { size: 'sm' }) : null) : null,
+      job.error ? banner({ tone: 'warning', title: t('The enforcement job could not be read'), text: gcpErrorText(job.error) }) : null,
+      denySection(e),
+      spendCapSection(e.spendCaps)),
+  ]);
+}
+
+/** Method, attachment points with their capacity, the enforcement job and project spend caps (GET .../enforcement). */
+function enforcementStatusCard(ctx, s, hooks) {
+  const host = h('div', null, skeleton('lines'));
+  const refreshBtn = button({ icon: 'refresh', size: 'sm', title: t('Refresh') });
+  const out = card({
+    title: t('Enforcement method and job'),
+    subtitle: t('How suspensions are applied, where, and the latest run of the enforcement job'),
+    actions: refreshBtn,
+    body: host,
+  });
+  const refresh = () => load(host, () => api.get('/api/v1/governance/antigravity/enforcement', null, { signal: ctx.signal }), (res) => {
+    const e = res.data || {};
+    if (hooks) {
+      hooks.enforcement = e;
+      if (hooks.onEnforcement) hooks.onEnforcement(e);
+    }
+    renderEnforcementStatus(host, e, (res.meta && res.meta.warnings) || [], (s && s.enforcement && s.enforcement.realtime) || null);
+  }, { skeletonKind: 'lines', signal: ctx.signal });
+  refreshBtn.addEventListener('click', () => refresh());
+  if (hooks) hooks.refresh = refresh;
+  refresh();
+  return out;
+}
+
+/** Run now with an enforcement job: the request starts an execution and the job applies the changes later. */
+function jobStarted(ctx, r, hooks) {
+  const exec = shortName(r.execution) || shortName(r.operation);
+  toast({
+    title: t('Enforcement job started'),
+    text: exec
+      ? t('Execution {name} applies the changes with the service account of the job. The status here updates in about a minute.', { name: exec })
+      : t('The enforcement job applies the changes with its own service account. The status here updates in about a minute.'),
+    tone: 'success',
+    timeout: 9000,
+  });
+  const later = (ms, fn) => setTimeout(() => { if (!ctx.signal.aborted) fn(); }, ms);
+  if (hooks && hooks.refresh) later(10000, () => hooks.refresh());
+  later(60000, () => { if (!document.querySelector('dialog[open]')) ctx.rerender(); });
+}
+
 /* ------------------------------------------------------------------ review queue */
 
 function queueCard(ctx, s) {
   const policy = s.policy || {};
+  const tz = policy.resetTimezone;
+  const rt = (s.enforcement && s.enforcement.realtime) || {};
   const manual = (policy.enforcementMode || 'manual') === 'manual';
   const ccy = ccyOf(policy);
+  const allowEnd = allowEndOf(policy);
+  const allowLabel = allowEnd ? t('Allow until {time}', { time: fmt.dateTimeDay(allowEnd, tz) }) : t('Allow');
   const rows = manual ? s.reviewQueue : (Array.isArray(s.users) ? s.users.filter((u) => u.plannedAction === 'block') : null);
   let content;
   if (rows === null || rows === undefined) {
@@ -748,42 +1388,65 @@ function queueCard(ctx, s) {
       columns.push({
         key: 'actions', label: '', actions: true,
         render: (r) => h('div', { class: 'row nowrap' },
-          button({ label: t('Suspend'), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => { if (requireAdmin(t('Suspend'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, [r], 'suspend'); } }),
-          button({ label: t('Allow this period'), size: 'sm', onClick: () => { if (requireAdmin(t('Allow this period'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, [r], 'allow'); } })),
+          button({ label: t('Suspend'), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => { if (requireAdmin(t('Suspend'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, [r], 'suspend', backendOf(s), policy); } }),
+          button({ label: allowLabel, size: 'sm', onClick: () => { if (requireAdmin(allowLabel, 'resourcemanager.projects.setIamPolicy')) decide(ctx, [r], 'allow', backendOf(s), policy); } })),
       });
     }
     content = dataTable({
       columns, rows, pageSize: 8, searchable: rows.length > 8, initialSort: { key: 'capUsage', dir: 'desc' },
       exportName: manual ? 'antigravity-review-queue' : 'antigravity-planned-suspensions',
-      onRowClick: (r) => r.uid && openUserDrawer(r.uid, { onChanged: () => ctx.rerender() }),
+      onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email, onChanged: () => ctx.rerender() }),
     });
   }
   const bulk = manual && rows && rows.length > 1 ? h('div', { class: 'row' },
-    button({ label: t('Suspend all ({n})', { n: rows.length }), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => { if (requireAdmin(t('Suspend'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, rows, 'suspend'); } }),
-    button({ label: t('Allow all this period'), size: 'sm', onClick: () => { if (requireAdmin(t('Allow this period'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, rows, 'allow'); } })) : null;
-  return card({
-    title: manual ? t('Review queue') : t('Suspended at the next run'),
-    subtitle: isCredit(policy)
-      ? t('Paid budget spent and nothing free right now. A suspension ends automatically at the weekly reset or on the 1st of the month.')
-      : (manual
-        ? t('Users over their cap in this period. A suspension ends automatically when the settlement period resets.')
-        : t('Automatic mode: these users are over their cap and will be suspended by the next enforcement run.')),
-    actions: bulk, flush: true, body: content,
-  });
+    button({ label: t('Suspend all ({n})', { n: rows.length }), icon: 'lock', size: 'sm', variant: 'danger', onClick: () => { if (requireAdmin(t('Suspend'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, rows, 'suspend', backendOf(s), policy); } }),
+    button({ label: allowEnd ? t('Allow all until {time}', { time: fmt.dateTimeDay(allowEnd, tz) }) : t('Allow all'), size: 'sm', onClick: () => { if (requireAdmin(allowLabel, 'resourcemanager.projects.setIamPolicy')) decide(ctx, rows, 'allow', backendOf(s), policy); } })) : null;
+  let title = t('Review queue');
+  if (!manual) title = rt.configured ? t('Pending auto-suspension') : t('Suspended at the next run');
+  let subtitle;
+  if (isCredit(policy)) {
+    subtitle = t('Paid budget spent and nothing free right now. A suspension ends automatically at the weekly reset or on the 1st of the month.');
+  } else if (manual) {
+    subtitle = policy.nextReset
+      ? t('Users over their cap in the cap period {range}. A suspension ends automatically at {time}.', { range: capPeriodText(policy), time: fmt.dateTimeDay(policy.nextReset, tz) })
+      : t('Users over their cap in this period. A suspension ends automatically when the settlement period resets.');
+  } else if (rt.configured) {
+    subtitle = t('Automatic mode (real-time): enforcement runs as soon as a usage log exceeds the cap; IAM changes take a few minutes to take effect.');
+  } else {
+    subtitle = t('Automatic mode: these users are over their cap and will be suspended by the next enforcement run.');
+  }
+  return card({ title, subtitle, actions: bulk, flush: true, body: content });
 }
 
-async function decide(ctx, rows, decision) {
+async function decide(ctx, rows, decision, backend, policy = {}) {
+  const tz = policy.resetTimezone;
   const emails = rows.map((r) => r.email);
   const many = rows.length > 1;
   const suspend = decision === 'suspend';
+  const allowEnd = allowEndOf(policy);
+  const until = allowEnd ? fmt.dateTimeDay(allowEnd, tz) : null;
+  const reset = policy.nextReset ? fmt.dateTimeDay(policy.nextReset, tz) : null;
   let title;
   if (suspend) title = many ? t('Suspend {n} users', { n: rows.length }) : t('Suspend {email}', { email: emails[0] });
+  else if (until) title = many ? t('Allow {n} users until {time}', { n: rows.length, time: until }) : t('Allow {email} until {time}', { email: emails[0], time: until });
   else title = many ? t('Allow {n} users for this period', { n: rows.length }) : t('Allow {email} for this period', { email: emails[0] });
+  let message = until
+    ? t('Antigravity access stays on until {time} ({relative}), even above the cap, and a suspended user is restored now. The allow rule then ends by itself and the default cap applies again. To end it earlier, select Revoke next to the user.', { time: until, relative: fmt.relative(allowEnd) })
+    : t('The user keeps Antigravity access until the settlement period ends, even above the cap. A suspended user is restored now.');
+  if (suspend) {
+    if (reset) {
+      message = backend === 'iam_deny'
+        ? t('Antigravity access is removed now (deny policy) and restored automatically at {time}.', { time: reset })
+        : t('Antigravity access is removed now (cap marker role) and restored automatically at {time}.', { time: reset });
+    } else {
+      message = backend === 'iam_deny'
+        ? t('Antigravity access is removed now (deny policy) and restored automatically when the settlement period resets.')
+        : t('Antigravity access is removed now (cap marker role) and restored automatically when the settlement period resets.');
+    }
+  }
   const ok = await confirmDialog({
     title,
-    message: suspend
-      ? t('Antigravity access is removed now (cap marker role) and restored automatically when the settlement period resets.')
-      : t('The user keeps Antigravity access until the settlement period ends, even above the cap. A suspended user is restored now.'),
+    message,
     details: many ? h('p', { class: 'cell-sub' }, emails.join(', ')) : null,
     confirmLabel: suspend ? t('Suspend') : t('Allow'),
     tone: suspend ? 'danger' : 'primary',
@@ -793,12 +1456,26 @@ async function decide(ctx, rows, decision) {
     const res = await api.post('/api/v1/governance/antigravity/review', { decision, uids: rows.map((r) => r.uid) });
     const results = res.data.results || [];
     const done = results.filter((r) => r.status === 'applied').length;
-    const other = results.filter((r) => r.status !== 'applied');
+    // queued: recorded; the enforcement job (or the next run) applies it.
+    const queued = results.filter((r) => r.status === 'queued');
+    const other = results.filter((r) => r.status !== 'applied' && r.status !== 'queued');
+    let heading;
+    if (suspend) heading = reset ? t('{n} users suspended until {time}', { n: done, time: reset }) : t('{n} users suspended until the period resets', { n: done });
+    else heading = until ? t('{n} users allowed until {time}', { n: done, time: until }) : t('{n} users allowed for this period', { n: done });
+    if (queued.length && !done) heading = t('{n} decisions recorded; the enforcement job applies them', { n: queued.length });
+    const notes = queued.length ? [serverText(queued[0].message)] : [];
     toast({
-      title: suspend ? t('{n} users suspended until the period resets', { n: done }) : t('{n} users allowed for this period', { n: done }),
-      text: other.map((r) => `${r.email || r.uid}: ${serverText(r.message)}`).join(' ') || null,
-      tone: other.length ? 'warning' : 'success', timeout: other.length ? 9000 : 4800,
+      title: heading,
+      text: notes.concat(other.map((r) => `${r.email || r.uid}: ${serverText(r.message)}`)).join(' ') || null,
+      tone: other.length ? 'warning' : 'success', timeout: other.length || queued.length ? 9000 : 4800,
     });
+    if (queued.length) {
+      [30000, 90000, 150000].forEach((ms) => {
+        setTimeout(() => {
+          if (window.location.hash.startsWith('#/antigravity') && !document.querySelector('dialog[open]')) ctx.rerender();
+        }, ms);
+      });
+    }
     ctx.rerender();
   } catch (err) {
     toast({ title: t('Action refused'), text: errorText(err), tone: 'danger', timeout: 9000 });
@@ -809,6 +1486,7 @@ async function decide(ctx, rows, decision) {
 
 function suspendedCard(ctx, s) {
   const policy = s.policy || {};
+  const tz = policy.resetTimezone;
   const ccy = ccyOf(policy);
   const rows = Array.isArray(s.users) ? s.users.filter((u) => u.state === SUSPENDED) : null;
   let content;
@@ -824,7 +1502,7 @@ function suspendedCard(ctx, s) {
         key: 'restoreAt', label: t('Access returns'),
         render: (u) => {
           if (u.plannedAction === 'restore') return badge(t('At the next run'), 'success', { size: 'sm' });
-          if (u.restoreAt) return h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600' }, fmt.dateTime(u.restoreAt)), h('span', { class: 'cell-sub' }, fmt.relative(u.restoreAt)));
+          if (u.restoreAt) return h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600' }, fmt.dateTimeDay(u.restoreAt, tz)), h('span', { class: 'cell-sub' }, fmt.relative(u.restoreAt)));
           return h('span', { class: 'cell-sub' }, t('When usage falls below the cap'));
         },
         value: (u) => u.restoreAt,
@@ -832,9 +1510,9 @@ function suspendedCard(ctx, s) {
       { key: 'reasons', label: t('Cap reached'), sortable: false, render: (u) => reasonBadges((u.suspension && u.suspension.reasons && u.suspension.reasons.length) ? u.suspension.reasons : u.overCapReasons) },
       { key: 'trigger', label: t('Suspended by'), render: (u) => (u.suspension ? h('div', { class: 'cell-stack' }, h('span', null, t(TRIGGER_LABELS[u.suspension.trigger] || u.suspension.trigger || DASH)), u.suspension.by ? h('span', { class: 'cell-sub truncate' }, u.suspension.by) : null) : h('span', { class: 'text-muted' }, DASH)), value: (u) => (u.suspension ? u.suspension.trigger : '') },
       { key: 'usage', label: t('Usage now'), align: 'num', render: (u) => h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600' }, isNum(u.tokens) ? fmt.compact(u.tokens) : DASH), isNum(u.estimatedCost) ? h('span', { class: 'cell-sub' }, money(u.estimatedCost, ccy)) : null), value: (u) => u.tokens },
-      { key: 'actions', label: '', actions: true, render: (u) => button({ label: t('Restore now'), icon: 'unlock', size: 'sm', onClick: () => { if (requireAdmin(t('Restore now'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, [u], 'allow'); } }) },
+      { key: 'actions', label: '', actions: true, render: (u) => button({ label: t('Restore now'), icon: 'unlock', size: 'sm', onClick: () => { if (requireAdmin(t('Restore now'), 'resourcemanager.projects.setIamPolicy')) decide(ctx, [u], 'allow', backendOf(s), policy); } }) },
     ];
-    content = dataTable({ columns, rows, pageSize: 8, searchable: rows.length > 8, exportName: 'antigravity-suspended', initialSort: { key: 'restoreAt', dir: 'asc' }, onRowClick: (u) => u.uid && openUserDrawer(u.uid, { onChanged: () => ctx.rerender() }) });
+    content = dataTable({ columns, rows, pageSize: 8, searchable: rows.length > 8, exportName: 'antigravity-suspended', initialSort: { key: 'restoreAt', dir: 'asc' }, onRowClick: (u) => u.uid && openUserDrawer(u.uid, { email: u.email, onChanged: () => ctx.rerender() }) });
   }
   return card({ title: t('Suspended users'), subtitle: resetText(policy), flush: true, body: content });
 }
@@ -843,6 +1521,7 @@ function suspendedCard(ctx, s) {
 
 function exceptionsCard(ctx, s) {
   const policy = s.policy || {};
+  const tz = policy.resetTimezone;
   const ccy = ccyOf(policy);
   const rows = s.exceptions || [];
   const add = button({ label: t('Add rule'), icon: 'plus', size: 'sm', onClick: () => { if (requireAdmin(t('Add rule'), 'resourcemanager.projects.setIamPolicy')) editException(ctx, s, null); } });
@@ -850,23 +1529,51 @@ function exceptionsCard(ctx, s) {
   if (!rows.length) {
     content = emptyState({ icon: 'shield', compact: true, title: t('No exception rules'), body: t('Add a rule to always allow a user, always block a user, or give a user an individual cap. Rules apply in both enforcement modes.') });
   } else {
+    const added = (r) => [r.createdAt ? t('Added {time}', { time: fmt.dateTime(r.createdAt) }) : null, r.createdBy].filter(Boolean).join(' \u00b7 ');
     const columns = [
-      { key: 'email', label: t('User'), render: (r) => userCell(r.email) },
-      { key: 'type', label: t('Rule'), render: (r) => ruleBadge(r) },
-      { key: 'detail', label: t('Detail'), sortable: false, wrap: true, render: (r) => h('span', { class: 'cell-sub' }, ruleDetail(r, ccy)), csv: (r) => ruleDetail(r, ccy) },
-      { key: 'note', label: t('Note'), sortable: false, wrap: true, render: (r) => h('span', { class: 'cell-sub' }, r.note ? serverText(r.note) : DASH), csv: (r) => r.note || '' },
-      { key: 'createdAt', label: t('Added'), render: (r) => h('div', { class: 'cell-stack' }, h('span', null, r.createdAt ? fmt.dateTime(r.createdAt) : DASH), r.createdBy ? h('span', { class: 'cell-sub truncate' }, r.createdBy) : null), value: (r) => r.createdAt },
+      { key: 'email', label: t('User'), render: (r) => userCell(r.email, null, { compact: true }) },
+      {
+        key: 'type', label: t('Rule'),
+        render: (r) => (r.type === 'limit'
+          ? h('div', { class: 'cell-stack' }, ruleTypeBadge(r), h('span', { class: 'cell-sub' }, ruleDetail(r, ccy)))
+          : ruleTypeBadge(r)),
+        value: (r) => r.type || '',
+        csv: (r) => (r.type === 'limit' ? `${capRuleText(r)} (${ruleDetail(r, ccy)})` : capRuleText(r)),
+      },
+      {
+        key: 'until', label: t('Expires'),
+        render: (r) => (r.until
+          ? h('div', { class: 'cell-stack' }, h('span', { class: 'fw-600' }, fmt.dateTimeDay(r.until, tz)), h('span', { class: 'cell-sub' }, fmt.relative(r.until)))
+          : h('span', { class: 'cell-sub' }, r.type === 'block' ? t('Until removed') : t('No expiry'))),
+        // Soonest end first; rules without an end last.
+        value: (r) => r.until || '9999',
+        csv: (r) => r.until || '',
+      },
+      {
+        key: 'note', label: t('Note'), sortable: false, wrap: true,
+        render: (r) => h('div', { class: 'cell-stack' },
+          h('span', null, r.note ? serverText(r.note) : DASH),
+          added(r) ? h('span', { class: 'cell-sub' }, added(r)) : null),
+        csv: (r) => [r.note || '', added(r)].filter(Boolean).join(' \u00b7 '),
+      },
       { key: 'state', label: t('Access state'), render: (r) => statusBadge(r.state, { size: 'sm' }) },
       {
         key: 'actions', label: '', actions: true,
         render: (r) => h('div', { class: 'row nowrap' },
           button({ icon: 'edit', size: 'sm', title: t('Edit rule'), onClick: () => { if (requireAdmin(t('Edit rule'), 'resourcemanager.projects.setIamPolicy')) editException(ctx, s, r); } }),
-          button({ icon: 'trash', size: 'sm', title: t('Remove rule'), onClick: () => { if (requireAdmin(t('Remove rule'), 'resourcemanager.projects.setIamPolicy')) removeException(ctx, r); } })),
+          button({ label: t('Revoke'), size: 'sm', onClick: () => removeException(ctx, s, r) })),
       },
     ];
-    content = dataTable({ columns, rows, pageSize: 8, searchable: rows.length > 8, exportName: 'antigravity-exception-rules', initialSort: { key: 'createdAt', dir: 'desc' } });
+    content = dataTable({
+      columns, rows, pageSize: 8, searchable: rows.length > 8, exportName: 'antigravity-exception-rules', initialSort: { key: 'until', dir: 'asc' },
+      onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email, onChanged: () => ctx.rerender() }),
+    });
   }
-  return card({ title: t('Exception rules'), subtitle: t('Per-user rules that take precedence over the default cap policy'), actions: add, flush: true, body: content });
+  return card({
+    title: t('Exception rules'),
+    subtitle: t('Per-user rules that take precedence over the default cap policy. A rule with an expiry ends by itself at that time; Revoke ends it now.'),
+    actions: add, flush: true, body: content,
+  });
 }
 
 function numberOrNull(input, integer) {
@@ -901,9 +1608,13 @@ async function editException(ctx, s, existing) {
     h('div', { class: 'field-row' },
       field({ label: credit ? t('Token cap per week') : t('Token cap'), control: tokenIn }),
       field({ label: credit ? t('Request cap per week') : t('Request cap'), control: reqIn })));
+  const periodEnd = allowEndOf(policy);
   const scopeField = field({
     label: t('Duration'),
-    control: selectInput([{ value: 'permanent', label: t('No expiry') }, { value: 'period', label: t('This settlement period only') }], state.scope, (v) => { state.scope = v; }),
+    control: selectInput([
+      { value: 'permanent', label: t('No expiry') },
+      { value: 'period', label: periodEnd ? t('Until the cap period ends ({time})', { time: fmt.dateTimeDay(periodEnd, policy.resetTimezone) }) : t('This settlement period only') },
+    ], state.scope, (v) => { state.scope = v; }),
   });
   const hint = h('p', { class: 'muted' });
   const err = h('div', { class: 'field-error' });
@@ -951,11 +1662,18 @@ async function editException(ctx, s, existing) {
     try {
       const res = await api.post('/api/v1/governance/antigravity/exceptions', payload);
       const ch = res.data.change;
+      const run = res.data.run;
+      const runNote = enforcementRunNote(run);
+      const text = ch
+        ? `${email}: ${t(IAM_STATE_LABELS[ch.previousState] || ch.previousState)} \u2192 ${t(IAM_STATE_LABELS[ch.newState] || ch.newState)}`
+        : runNote;
       toast({
         title: t('Exception rule saved'),
-        text: ch ? `${email}: ${t(IAM_STATE_LABELS[ch.previousState] || ch.previousState)} \u2192 ${t(IAM_STATE_LABELS[ch.newState] || ch.newState)}` : null,
-        tone: 'success',
+        text,
+        tone: run && run.error ? 'warning' : 'success',
+        timeout: text ? 9000 : 4800,
       });
+      scheduleJobRefresh(ctx, run);
       m.close();
       ctx.rerender();
     } catch (e) {
@@ -965,33 +1683,44 @@ async function editException(ctx, s, existing) {
   });
 }
 
-async function removeException(ctx, r) {
-  const block = r.type === 'block';
-  const ok = await confirmDialog({
-    title: t('Remove exception rule'),
-    message: block
-      ? t('The rule is removed and Antigravity access is restored for {email}. The default cap policy applies again.', { email: r.email })
-      : t('The rule is removed for {email}. The default cap policy applies again from the next evaluation.', { email: r.email }),
-    confirmLabel: t('Remove'),
-    tone: block ? 'primary' : 'danger',
-  });
-  if (!ok) return;
-  try {
-    const res = await api.post('/api/v1/governance/antigravity/exceptions/delete', { email: r.email });
-    const ch = res.data.change;
-    toast({ title: t('Exception rule removed'), text: ch ? `${r.email}: ${t(IAM_STATE_LABELS[ch.previousState] || ch.previousState)} \u2192 ${t(IAM_STATE_LABELS[ch.newState] || ch.newState)}` : null, tone: 'success' });
-    ctx.rerender();
-  } catch (err) {
-    toast({ title: t('Action refused'), text: errorText(err), tone: 'danger', timeout: 9000 });
-  }
+/** Removes one exception rule after a confirmation that says what happens next (see removeExceptionRule). */
+async function removeException(ctx, s, r) {
+  const user = (s.users || []).find((u) => u.email === r.email) || null;
+  const removed = await removeExceptionRule({ email: r.email, rule: r, user, period: s.policy || {} });
+  if (removed) ctx.rerender();
 }
 
 /* ------------------------------------------------------------------ prerequisites and policy */
+
+function formatLocationList(entries) {
+  const byProject = new Map();
+  (entries || []).forEach((e) => {
+    if (!e || !e.project || !e.location) return;
+    if (!byProject.has(e.project)) byProject.set(e.project, []);
+    byProject.get(e.project).push(e.location);
+  });
+  return Array.from(byProject.entries()).map(([proj, locs]) => `${proj} (${locs.join(', ')})`).join(', ');
+}
 
 function prerequisites(ctx, p) {
   const items = [];
   (p.markerRoles || []).forEach((r) => items.push([r.exists, t('Marker role {role}', { role: r.role }), r.exists ? t('Present in project') : t('Missing')]));
   Object.entries(p.permissions || {}).forEach(([perm, ok]) => items.push([ok, perm, ok ? t('Granted') : t('Not granted to the control plane identity')]));
+  const ml = p.metadataLogging || {};
+  if (ml.checked) {
+    const missing = ml.missingLocations || [];
+    const enabled = ml.enabledLocations || [];
+    if (missing.length) {
+      const parts = [t('Off in {missing}', { missing: formatLocationList(missing) })];
+      if (enabled.length) parts.push(t('On in {enabled}', { enabled: formatLocationList(enabled) }));
+      items.push([false, t('Metadata logging (by location)'), parts.join(' \u00b7 '),
+        t('Metadata logging is configured per location (global, us, eu) in Gemini Enterprise > Settings > AI developer tools > Compliance.')]);
+    } else if (enabled.length) {
+      items.push([true, t('Metadata logging (by location)'), t('On in {enabled}', { enabled: formatLocationList(enabled) })]);
+    } else {
+      items.push([false, t('Metadata logging (by location)'), t('AI developer tools not enabled in any scanned project')]);
+    }
+  }
   items.push([p.telemetryDetected, t('Antigravity inference telemetry'), p.telemetryDetected ? t('Detected') : t('Not detected'),
     p.telemetryDetected ? null : t('Counted only when Antigravity for organizations writes businessaicode.googleapis.com/inference_response logs in a scanned project. Antigravity used with a personal account writes no such log.')]);
   const missingRoles = (p.markerRoles || []).some((r) => !r.exists);
@@ -1158,8 +1887,8 @@ function usedPriceTable(pricing, ccy) {
 
 function capModelSelect(value, onChange) {
   return selectInput([
-    { value: 'credit_budget', label: t('Weekly free credit + monthly paid budget (recommended)') },
-    { value: 'period', label: t('Fixed caps per period') },
+    { value: 'period', label: t('Fixed caps per period (default)') },
+    { value: 'credit_budget', label: t('Weekly free credit + monthly paid budget') },
   ], value, onChange, { 'aria-label': t('Caps') });
 }
 
@@ -1173,6 +1902,26 @@ function priceInfoBlock(pricing, ccy) {
     h('p', { class: 'muted' }, pricing.source === 'manual'
       ? t('Entered token prices from Settings > Governance policy are used.')
       : t('Prices are found automatically: what your billing account actually paid per token in the last 30 days, and the public Google Cloud price list for models without billed usage. Amounts are converted with the Google exchange rate.')));
+}
+
+function todayIsoInZone(tz) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz || 'UTC', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
+    const get = (type) => (parts.find((p) => p.type === type) || {}).value || '';
+    const iso = `${get('year')}-${get('month')}-${get('day')}`;
+    return /^\d{4}-\d{2}-\d{2}$/.test(iso) ? iso : new Date().toISOString().slice(0, 10);
+  } catch (e) {
+    return new Date().toISOString().slice(0, 10);
+  }
+}
+
+function monthDayOptions() {
+  return Array.from({ length: 31 }, (_, i) => {
+    const d = i + 1;
+    if (d === 1) return { value: '1', label: t('Day 1 (1st to month end)') };
+    if (d >= 29) return { value: String(d), label: t('Day {d} (last day in shorter months)', { d: fmt.int(d) }) };
+    return { value: String(d), label: t('Day {d}', { d: fmt.int(d) }) };
+  });
 }
 
 /** Credit caps: monthly credit (weekly free share for Gemini), a monthly paid budget per person and optionally one for
@@ -1216,7 +1965,20 @@ async function editCreditPolicy(ctx, policy) {
     subtitle: t('Amounts are in USD, like the Antigravity credit. Give specific people a different budget from the Paid budget column or with exception rules.'),
     wide: true,
     body: (el) => append(el, [
-      field({ label: t('Caps'), control: capModelSelect(state.model, (v) => { state.model = v; }) }),
+      field({
+        label: t('Caps'),
+        control: capModelSelect(state.model, (v) => {
+          state.model = v;
+          if (v === 'period') {
+            m.close();
+            // Credit caps report their weekly cycle as `period`; fixed caps start from the saved period (monthly by
+            // default), never from the weekly credit reset.
+            editPolicy(ctx, {
+              ...policy, capModel: 'period', period: policy.periodSetting || 'monthly', window: policy.windowSetting || 'calendar',
+            });
+          }
+        }),
+      }),
       h('div', { class: 'field-row' },
         field({ label: t('Credit per person per month (USD)'), help: t('Gemini Enterprise Standard 10, Plus 15. Google applies a quarter of it every 7 days.'), control: h('div', { class: 'stack-sm' }, creditIn, h('div', { class: 'row' }, preset(t('Standard {v}', { v: '$10' }), 10), preset(t('Plus {v}', { v: '$15' }), 15)), weeklyNote) }),
         field({ label: t('Paid budget per person per month (USD)'), help: t('Claude and Gemini beyond the free credit. Credits only = no paid usage.'), control: h('div', { class: 'stack-sm' }, budgetSeg, budgetIn) })),
@@ -1261,8 +2023,16 @@ async function editCreditPolicy(ctx, policy) {
     };
     setBusy(save, true, t('Saving'));
     try {
-      await api.post('/api/v1/settings', { section: 'governance', values });
-      toast({ title: t('Cap policy saved'), tone: 'success' });
+      const res = await api.post('/api/v1/settings', { section: 'governance', values });
+      const run = res && res.data && res.data.enforcement;
+      const note = enforcementRunNote(run);
+      toast({
+        title: t('Cap policy saved'),
+        text: note,
+        tone: run && run.error ? 'warning' : 'success',
+        timeout: note ? 9000 : 4800,
+      });
+      scheduleJobRefresh(ctx, run);
       m.close();
       ctx.rerender();
     } catch (e) {
@@ -1272,16 +2042,27 @@ async function editCreditPolicy(ctx, policy) {
   });
 }
 
-/** Default caps. The administrator sets amounts only; token prices are found automatically. */
+/** Default fixed caps per configurable period (daily, weekly, monthly from any day 1-31, or custom N-day cycle). */
 async function editPolicy(ctx, policy) {
   if (isCredit(policy)) { editCreditPolicy(ctx, policy); return; }
   const pricing = policy.pricing || {};
   const workspaceTz = (store.boot && store.boot.workspace && store.boot.workspace.timezone) || 'UTC';
   const saved = typeof policy.currencySetting === 'string' ? policy.currencySetting : ccyOf(policy);
+  const initialTz = policy.resetTimezone || workspaceTz;
+  const savedCycleStart = policy.cycleStart && policy.cycleStart !== '1970-01-01' ? policy.cycleStart : '';
   const state = {
-    period: policy.period || 'weekly', window: policy.window || 'calendar', tz: policy.resetTimezone || workspaceTz, currency: saved,
-    weekday: isNum(policy.resetWeekday) ? policy.resetWeekday : 0, at: policy.resetTime || '00:00', model: 'period',
+    period: policy.period || 'monthly',
+    window: policy.window || 'calendar',
+    tz: initialTz,
+    currency: saved,
+    weekday: isNum(policy.resetWeekday) ? policy.resetWeekday : 0,
+    day: isNum(policy.resetDay) && policy.resetDay >= 1 && policy.resetDay <= 31 ? policy.resetDay : 1,
+    cycleDays: isNum(policy.cycleDays) && policy.cycleDays >= 1 && policy.cycleDays <= 92 ? policy.cycleDays : 30,
+    cycleStart: savedCycleStart || todayIsoInZone(initialTz),
+    at: policy.resetTime || '00:00',
+    model: 'period',
   };
+  const uid = `agy-pol-${Date.now()}`;
   const shownCcy = () => state.currency || (saved ? 'USD' : ccyOf(policy));
   const num = (v, step, min = 0) => textInput({ value: isNum(v) ? String(v) : '0', type: 'number', attrs: { min, step } });
   const tokenIn = num(policy.tokenCap, 1000);
@@ -1296,12 +2077,256 @@ async function editPolicy(ctx, policy) {
   const billingLabel = saved ? t('Billing account currency') : t('Billing account currency ({ccy})', { ccy: ccyOf(policy) });
   const currencyOptions = [{ value: '', label: billingLabel }, ...currencyCodes(saved).map((c) => ({ value: c, label: c }))];
   const currencySel = selectInput(currencyOptions, state.currency, (v) => { state.currency = v; renderCost(); }, { 'aria-label': t('Currency') });
-  const periodSel = selectInput(PERIODS.map(([v, l]) => ({ value: v, label: t(l) })), state.period, (v) => { state.period = v; });
-  const windowSel = selectInput([{ value: 'calendar', label: t('Calendar (fixed reset)') }, { value: 'rolling', label: t('Rolling') }], state.window, (v) => { state.window = v; });
-  const weekdaySel = selectInput(WEEKDAYS.map((d, i) => ({ value: String(i), label: t(d) })), String(state.weekday), (v) => { state.weekday = Number(v); });
-  const timeIn = textInput({ value: state.at, attrs: { placeholder: '00:00', maxlength: 5, inputmode: 'numeric' } });
-  // Credit-based cap: each person may use their share of the weekly Antigravity credit pool, so the pool is never
-  // exceeded and nothing is billed as pay-as-you-go above quota.
+
+  /* ---- Period chooser (native radio cards: 4 exclusive options) ---- */
+  const periodChoices = [
+    { value: 'daily', label: t('Daily'), desc: t('Resets every day') },
+    { value: 'weekly', label: t('Weekly'), desc: t('Choose reset weekday') },
+    { value: 'monthly', label: t('Monthly'), desc: t('Choose start day (e.g., 1st–month end)') },
+    { value: 'custom', label: t('Custom cycle'), desc: t('Every N days from a start date') },
+  ];
+  const periodRadios = new Map();
+  let syncPeriodUI = () => {};
+  let schedulePreview = () => {};
+
+  const periodFieldset = h('fieldset', { class: 'period-fieldset' },
+    h('legend', { class: 'field-label' }, t('Reset period')),
+    h('div', { class: 'period-grid' }, periodChoices.map((c) => {
+      const id = `${uid}-p-${c.value}`;
+      const radio = h('input', {
+        id, type: 'radio', name: `${uid}-period`, value: c.value,
+        checked: state.period === c.value ? true : null,
+      });
+      radio.addEventListener('change', () => {
+        if (!radio.checked) return;
+        state.period = c.value;
+        if (state.period === 'custom' && !state.cycleStart) state.cycleStart = todayIsoInZone(state.tz);
+        syncPeriodUI();
+        schedulePreview();
+      });
+      periodRadios.set(c.value, radio);
+      return h('label', { class: ['wb-pick', 'period-card'], for: id },
+        radio,
+        h('span', { class: 'wb-pick-text' },
+          h('span', { class: 'wb-pick-name' }, c.label),
+          h('span', { class: 'wb-pick-what' }, c.desc)));
+    })));
+
+  /* ---- Contextual period controls ---- */
+  const weekdaySel = selectInput(
+    WEEKDAYS.map((d, i) => ({ value: String(i), label: t(d) })),
+    String(state.weekday),
+    (v) => { state.weekday = Number(v); schedulePreview(); },
+    { 'aria-label': t('Reset weekday') });
+  const monthDaySel = selectInput(
+    monthDayOptions(),
+    String(state.day),
+    (v) => { state.day = Number(v); schedulePreview(); },
+    { 'aria-label': t('Monthly start day') });
+  const cycleDaysIn = textInput({
+    value: String(state.cycleDays),
+    type: 'number',
+    attrs: { min: 1, max: 92, step: 1, inputmode: 'numeric', 'aria-label': t('Cycle length (days)') },
+    onInput: (v) => {
+      const n = Number(v);
+      if (Number.isInteger(n) && n >= 1 && n <= 92) {
+        state.cycleDays = n;
+        syncCycleChips();
+        schedulePreview();
+      }
+    },
+  });
+  const cycleChipsHost = h('div', { class: 'chips' });
+  function syncCycleChips() {
+    mount(cycleChipsHost, [7, 14, 30].map((d) => h('button', {
+      type: 'button',
+      class: 'chip',
+      'aria-pressed': state.cycleDays === d ? 'true' : 'false',
+      onclick: () => {
+        state.cycleDays = d;
+        cycleDaysIn.value = String(d);
+        syncCycleChips();
+        schedulePreview();
+      },
+    }, t('{n} days', { n: fmt.int(d) }))));
+  }
+  syncCycleChips();
+
+  const cycleStartIn = textInput({
+    value: state.cycleStart,
+    type: 'date',
+    attrs: { 'aria-label': t('Start date') },
+    onInput: (v) => {
+      state.cycleStart = String(v || '').trim();
+      schedulePreview();
+    },
+  });
+  const timeIn = textInput({
+    value: state.at,
+    attrs: { placeholder: '00:00', maxlength: 5, inputmode: 'numeric', 'aria-label': t('Reset time') },
+    onInput: (v) => {
+      state.at = String(v || '').trim();
+      schedulePreview();
+    },
+  });
+  const tzSel = selectInput(tzChoices(workspaceTz, state.tz), state.tz, (v) => {
+    state.tz = v;
+    schedulePreview();
+  }, { 'aria-label': t('Reset time zone') });
+
+  const weekdayField = field({ label: t('Reset weekday'), help: t('The day of the week each new cap period begins.'), control: weekdaySel });
+  const monthDayField = field({ label: t('Monthly start day'), help: t('If a month has fewer days (e.g., Feb), the period starts on its last day.'), control: monthDaySel });
+  const cycleDaysField = field({ label: t('Cycle length (days)'), help: t('From 1 to 92 days.'), control: h('div', { class: 'stack-sm' }, cycleDaysIn, cycleChipsHost) });
+  const cycleStartField = field({ label: t('Start date'), help: t('Cycles repeat every N days anchored to this date.'), control: cycleStartIn });
+  const timeField = field({ label: t('Reset time'), help: t('HH:MM in the reset time zone'), control: timeIn });
+  const tzField = field({ label: t('Reset time zone'), control: tzSel });
+
+  const scheduleControls = h('div', { class: 'period-controls' },
+    weekdayField, monthDayField, cycleDaysField, cycleStartField, timeField, tzField);
+
+  /* ---- Advanced window disclosure (Rolling / Legacy 90-day) ---- */
+  const windowChoices = [
+    { value: 'calendar', label: t('Calendar (fixed reset)'), desc: t('Usage resets cleanly on schedule; over-cap users stay blocked until reset and resume automatically.') },
+    { value: 'rolling', label: t('Rolling'), desc: t('Continuous trailing window; usage drops off continuously with no fixed reset time.') },
+  ];
+  const windowRadios = new Map();
+  const rolling90Radio = h('input', {
+    id: `${uid}-w-all`, type: 'radio', name: `${uid}-window`, value: 'all',
+    checked: state.period === 'all' ? true : null,
+  });
+  rolling90Radio.addEventListener('change', () => {
+    if (!rolling90Radio.checked) return;
+    state.period = 'all';
+    state.window = 'rolling';
+    periodRadios.forEach((r) => { r.checked = false; });
+    syncPeriodUI();
+    schedulePreview();
+  });
+  const advancedDetails = h('details', { class: 'period-advanced', open: (state.window === 'rolling' || state.period === 'all') ? true : null },
+    h('summary', { class: 'period-advanced-summary' }, t('Advanced window options')),
+    h('div', { class: 'period-advanced-body' },
+      h('fieldset', { class: 'period-fieldset' },
+        h('legend', { class: 'field-label' }, t('Window calculation')),
+        h('div', { class: 'period-window-list' },
+          ...windowChoices.map((w) => {
+            const id = `${uid}-w-${w.value}`;
+            const radio = h('input', {
+              id, type: 'radio', name: `${uid}-window`, value: w.value,
+              checked: state.period !== 'all' && state.window === w.value ? true : null,
+            });
+            radio.addEventListener('change', () => {
+              if (!radio.checked) return;
+              if (state.period === 'all') {
+                state.period = 'monthly';
+                const monthlyRadio = periodRadios.get('monthly');
+                if (monthlyRadio) monthlyRadio.checked = true;
+              }
+              state.window = w.value;
+              syncPeriodUI();
+              schedulePreview();
+            });
+            windowRadios.set(w.value, radio);
+            return h('label', { class: ['wb-pick', 'period-card'], for: id },
+              radio,
+              h('span', { class: 'wb-pick-text' },
+                h('span', { class: 'wb-pick-name' }, w.label),
+                h('span', { class: 'wb-pick-what' }, w.desc)));
+          }),
+          h('label', { class: ['wb-pick', 'period-card'], for: `${uid}-w-all` },
+            rolling90Radio,
+            h('span', { class: 'wb-pick-text' },
+              h('span', { class: 'wb-pick-name' }, t('Last 90 days (rolling)')),
+              h('span', { class: 'wb-pick-what' }, t('Evaluate usage across the trailing 90 days with no fixed reset.'))))))));
+
+  /* ---- Live Period Preview (aria-live="polite", debounced 250ms, no interstitial "Loading...") ---- */
+  const previewBox = h('div', { class: 'period-preview', role: 'status', 'aria-live': 'polite' });
+  let previewTimer = null;
+  let previewAbort = null;
+
+  function previewDraftPolicy() {
+    return {
+      period: state.period,
+      window: state.window,
+      resetTimezone: state.tz,
+      resetWeekday: state.weekday,
+      resetDay: state.day,
+      cycleDays: state.cycleDays,
+      cycleStart: state.cycleStart,
+      resetTime: state.at,
+    };
+  }
+
+  function renderPreview(data) {
+    const draft = previewDraftPolicy();
+    const rows = [];
+    rows.push(h('div', { class: 'period-preview-head' }, resetText(draft)));
+    const list = (data && Array.isArray(data.periods)) ? data.periods : [];
+    const zone = (data && data.timezone) || state.tz;
+    if (data && data.rolling) {
+      if (list[0] && list[0].start) {
+        rows.push(h('div', { class: 'period-preview-row' },
+          h('span', { class: 'period-preview-label' }, t('Current window')),
+          h('span', { class: 'period-preview-val' }, `${fmt.dateTimeDay(list[0].start, zone)} \u2013 ${t('Now')}`)));
+      }
+      rows.push(h('div', { class: 'period-preview-note' }, t('Rolling window: access resumes once usage in the trailing window drops below the cap.')));
+    } else {
+      if (list[0] && list[0].start && list[0].end) {
+        rows.push(h('div', { class: 'period-preview-row' },
+          h('span', { class: 'period-preview-label' }, t('Current period')),
+          h('span', { class: 'period-preview-val' }, `${fmt.dateTimeDay(list[0].start, zone)} \u2013 ${fmt.dateTimeDay(list[0].end, zone)}`)));
+      }
+      if (list[1] && list[1].start && list[1].end) {
+        rows.push(h('div', { class: 'period-preview-row' },
+          h('span', { class: 'period-preview-label' }, t('Next period')),
+          h('span', { class: 'period-preview-val' }, `${fmt.dateTimeDay(list[1].start, zone)} \u2013 ${fmt.dateTimeDay(list[1].end, zone)}`)));
+      }
+      rows.push(h('div', { class: 'period-preview-note' }, t('When a user reaches the cap, access is suspended until the next reset and restored automatically then.')));
+    }
+    mount(previewBox, rows);
+  }
+
+  async function fetchPreview() {
+    if (previewAbort) previewAbort.abort();
+    const at = String(state.at || '').trim();
+    if (!/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(at)) return;
+    if (state.period === 'custom' && state.window === 'calendar' && state.cycleStart && !/^\d{4}-\d{2}-\d{2}$/.test(state.cycleStart)) return;
+    previewAbort = new AbortController();
+    const params = {
+      period: state.period,
+      window: state.window,
+      tz: state.tz,
+      at,
+      weekday: String(state.weekday),
+      day: String(state.day),
+      cycleDays: String(state.cycleDays),
+      cycleStart: state.cycleStart || '',
+    };
+    try {
+      const res = await api.get('/api/v1/governance/antigravity/period-preview', params, { signal: previewAbort.signal });
+      if (res && res.data) renderPreview(res.data);
+    } catch (e) {
+      if (!isAbort(e)) renderPreview(null);
+    }
+  }
+
+  schedulePreview = () => {
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(fetchPreview, 250);
+  };
+
+  syncPeriodUI = () => {
+    const cal = state.window === 'calendar' && state.period !== 'all';
+    weekdayField.hidden = !(cal && state.period === 'weekly');
+    monthDayField.hidden = !(cal && state.period === 'monthly');
+    cycleDaysField.hidden = state.period !== 'custom';
+    cycleStartField.hidden = !(cal && state.period === 'custom');
+    timeField.hidden = !cal;
+    tzField.hidden = !cal;
+    scheduleControls.hidden = !cal && state.period !== 'custom';
+  };
+  syncPeriodUI();
+
+  // Credit-based cap preset: weekly share of the Antigravity credit pool.
   const creditUsd = weeklyCreditUsd(policy);
   const creditBtn = button({
     label: t('Set from Antigravity credits ({v} per week)', { v: fmt.currency(creditUsd, 'USD', { precise: true }) }), icon: 'dollar', size: 'sm',
@@ -1320,42 +2345,51 @@ async function editPolicy(ctx, policy) {
       }
       state.period = 'weekly';
       state.window = 'calendar';
-      periodSel.querySelector('select').value = 'weekly';
-      windowSel.querySelector('select').value = 'calendar';
+      const weeklyRadio = periodRadios.get('weekly');
+      if (weeklyRadio) weeklyRadio.checked = true;
+      const calRadio = windowRadios.get('calendar');
+      if (calRadio) calRadio.checked = true;
+      rolling90Radio.checked = false;
+      syncPeriodUI();
+      schedulePreview();
       renderCost(amount);
     },
   });
-  const priceInfo = h('div', { class: 'stack-sm' },
-    h('div', { class: pricing.configured ? 'fw-600' : 'fw-600 text-warning' }, pricingSummary(pricing, ccyOf(policy))),
-    h('p', { class: 'muted' }, pricing.source === 'manual'
-      ? t('Entered token prices from Settings > Governance policy are used.')
-      : t('Prices are found automatically: what your billing account actually paid per token in the last 30 days, and the public Google Cloud price list for models without billed usage. Amounts are converted with the Google exchange rate.')));
-  const tzOptions = [...new Set([workspaceTz, state.tz, 'UTC', ...intlValues('timeZone')].filter(Boolean))].map((z) => ({ value: z, label: z === workspaceTz ? `${z} (${t('workspace')})` : z }));
+  const priceInfo = priceInfoBlock(pricing, ccyOf(policy));
   const err = h('div', { class: 'field-error' });
   const save = button({ label: t('Save policy'), variant: 'primary' });
   renderCost();
+  fetchPreview();
   const m = openModal({
     title: t('Edit cap policy'),
-    subtitle: t('Caps apply to each person within the settlement period. Give specific people a different amount from the Cost cap column of the usage table or with exception rules.'),
+    subtitle: t('Caps apply to each person within the configured cap period. Give specific people a different amount from the Cost cap column of the usage table or with exception rules.'),
     wide: true,
     body: (el) => append(el, [
-      field({ label: t('Caps'), help: t('Choose the credit caps to give everyone the weekly free credit and a monthly paid budget in USD.'), control: capModelSelect(state.model, (v) => { state.model = v; }) }),
+      field({
+        label: t('Caps'),
+        help: t('Choose the credit caps to give everyone the weekly free credit and a monthly paid budget in USD.'),
+        control: capModelSelect(state.model, (v) => {
+          state.model = v;
+          if (v === 'credit_budget') {
+            m.close();
+            editCreditPolicy(ctx, { ...policy, capModel: 'credit_budget' });
+          }
+        }),
+      }),
       h('div', { class: 'field-row' },
         field({ label: t('Cost cap per person'), help: t('Users above this estimated cost are suspended (automatic mode) or queued for review.'), control: h('div', { class: 'stack-sm' }, costHost, creditBtn) }),
         field({ label: t('Currency'), help: t('Cost caps and estimates are shown in this currency'), control: currencySel })),
       h('div', { class: 'field-row' },
         field({ label: t('Token cap per user'), help: t('Total tokens within the period. 0 disables it.'), control: tokenIn }),
         field({ label: t('Request cap per user'), help: t('Inference requests within the period. 0 disables it.'), control: reqIn })),
-      h('div', { class: 'field-row' },
-        field({ label: t('Settlement period'), control: periodSel }),
-        field({ label: t('Window'), control: windowSel }),
-        field({ label: t('Reset time zone'), control: selectInput(tzOptions, state.tz, (v) => { state.tz = v; }) })),
-      h('div', { class: 'field-row' },
-        field({ label: t('Weekly reset day'), help: t('Match the day Gemini Enterprise resets the Antigravity credit pool (every 7 days from the first request in the project).'), control: weekdaySel }),
-        field({ label: t('Reset time'), help: t('HH:MM in the reset time zone'), control: timeIn })),
+      h('div', { class: 'stack-sm' }, periodFieldset, scheduleControls, previewBox, advancedDetails),
       field({ label: t('Token prices'), control: priceInfo }),
       err]),
     footer: (el) => append(el, [button({ label: t('Cancel'), onClick: () => m.close() }), save]),
+    onClose: () => {
+      clearTimeout(previewTimer);
+      if (previewAbort) previewAbort.abort();
+    },
   });
   save.addEventListener('click', async () => {
     err.textContent = '';
@@ -1365,15 +2399,35 @@ async function editPolicy(ctx, policy) {
     if (!cost.valid()) { err.textContent = t('The cost cap must be a number of zero or more.'); return; }
     const at = String(timeIn.value || '').trim();
     if (!/^([01][0-9]|2[0-3]):[0-5][0-9]$/.test(at)) { err.textContent = t('Enter the reset time as HH:MM, for example 09:00.'); return; }
+    const cDays = Number(cycleDaysIn.value);
+    if (state.period === 'custom' && (!Number.isInteger(cDays) || cDays < 1 || cDays > 92)) {
+      err.textContent = t('Enter a cycle length from 1 to 92 days.');
+      return;
+    }
+    const cStart = String(cycleStartIn.value || '').trim();
+    if (state.period === 'custom' && state.window === 'calendar' && cStart && !/^\d{4}-\d{2}-\d{2}$/.test(cStart)) {
+      err.textContent = t('Enter a valid start date (YYYY-MM-DD).');
+      return;
+    }
     const values = {
       token_cap: tc, request_cap: rc, cost_cap: cost.read() || 0, currency: state.currency,
-      period: state.period, window: state.window, reset_timezone: state.tz, reset_weekday: state.weekday, reset_time: at,
-      cap_model: state.model,
+      period: state.period, window: state.window, reset_timezone: state.tz, reset_weekday: state.weekday,
+      reset_day: state.day, cycle_days: Number.isInteger(cDays) && cDays >= 1 && cDays <= 92 ? cDays : state.cycleDays,
+      cycle_start: state.period === 'custom' ? cStart : (savedCycleStart || ''),
+      reset_time: at, cap_model: state.model,
     };
     setBusy(save, true, t('Saving'));
     try {
-      await api.post('/api/v1/settings', { section: 'governance', values });
-      toast({ title: t('Cap policy saved'), tone: 'success' });
+      const res = await api.post('/api/v1/settings', { section: 'governance', values });
+      const run = res && res.data && res.data.enforcement;
+      const note = enforcementRunNote(run);
+      toast({
+        title: t('Cap policy saved'),
+        text: note,
+        tone: run && run.error ? 'warning' : 'success',
+        timeout: note ? 9000 : 4800,
+      });
+      scheduleJobRefresh(ctx, run);
       m.close();
       ctx.rerender();
     } catch (e) {
@@ -1411,7 +2465,7 @@ async function editPersonBudget(ctx, s, user) {
     title: t('Paid budget for {email}', { email: user.email }),
     subtitle: t('Default for everyone: {v}', { v: budgetText(policy.paidBudgetMonth) }),
     body: (el) => append(el, [
-      rule && !isLimit ? banner({ tone: 'info', text: t('This person has an exception rule ({rule}). Saving an individual budget replaces it.', { rule: ruleBadge(rule).textContent }) }) : null,
+      rule && !isLimit ? banner({ tone: 'info', text: t('This person has an exception rule ({rule}). Saving an individual budget replaces it.', { rule: capRuleText(rule) }) }) : null,
       field({ label: t('Paid budget per month (USD)'), help: usage, control: h('div', { class: 'stack-sm' }, seg, amountIn) }),
       err]),
     footer: (el) => append(el, [button({ label: t('Cancel'), onClick: () => m.close() }), save]),
@@ -1427,17 +2481,27 @@ async function editPersonBudget(ctx, s, user) {
     setBusy(save, true, t('Saving'));
     try {
       const keepOther = isLimit && (isNum(rule.tokenCap) || isNum(rule.requestCap) || isNum(rule.creditMonth) || isNum(rule.costCap));
+      let res = null;
       if (amount === null && !keepOther) {
-        if (isLimit) await api.post('/api/v1/governance/antigravity/exceptions/delete', { email: user.email });
+        if (isLimit) res = await api.post('/api/v1/governance/antigravity/exceptions/delete', { email: user.email });
       } else {
-        await api.post('/api/v1/governance/antigravity/exceptions', {
+        res = await api.post('/api/v1/governance/antigravity/exceptions', {
           email: user.email, type: 'limit', scope: isLimit && rule.scope === 'period' ? 'period' : 'permanent',
           tokenCap: isLimit ? rule.tokenCap : null, requestCap: isLimit ? rule.requestCap : null,
           costCap: isLimit ? rule.costCap : null, creditMonth: isLimit ? rule.creditMonth : null, paidBudget: amount,
           note: isLimit && rule.note ? rule.note : t('Individual paid budget'),
         });
       }
-      toast({ title: t('Paid budget saved'), text: amount === null ? t('{email} uses the default budget.', { email: user.email }) : t('{email}: {v}', { email: user.email, v: budgetText(amount) }), tone: 'success' });
+      const run = res && res.data && res.data.run;
+      const baseText = amount === null ? t('{email} uses the default budget.', { email: user.email }) : t('{email}: {v}', { email: user.email, v: budgetText(amount) });
+      const runNote = enforcementRunNote(run);
+      toast({
+        title: t('Paid budget saved'),
+        text: runNote ? `${baseText} ${runNote}` : baseText,
+        tone: run && run.error ? 'warning' : 'success',
+        timeout: runNote ? 9000 : 4800,
+      });
+      scheduleJobRefresh(ctx, run);
       m.close();
       ctx.rerender();
     } catch (e) {
@@ -1457,12 +2521,18 @@ async function editPersonCap(ctx, s, user) {
   const picker = amountPicker({ value: ownCost || 0, currency: ccy, pricing: policy.pricing, allowDefault: true, isDefault: ownCost === null, defaultLabel: defaultCostLabel(policy, ccy) });
   const err = h('div', { class: 'field-error' });
   const save = button({ label: t('Save'), variant: 'primary' });
-  const usage = isNum(user.estimatedCost) ? t('Estimated cost this period: {v}', { v: money(user.estimatedCost, ccy) }) : t('No estimated cost this period');
+  const range = capPeriodText(policy);
+  let usage = t('No estimated cost this period');
+  if (isNum(user.estimatedCost)) {
+    usage = range
+      ? t('Estimated cost in the cap period {range}: {v}', { range, v: money(user.estimatedCost, ccy) })
+      : t('Estimated cost this period: {v}', { v: money(user.estimatedCost, ccy) });
+  }
   const m = openModal({
     title: t('Cost cap for {email}', { email: user.email }),
     subtitle: t('Default for everyone: {v}', { v: policy.costCap ? fmt.currency(policy.costCap, ccy) : t('no cost cap') }),
     body: (el) => append(el, [
-      rule && !isLimit ? banner({ tone: 'info', text: t('This person has an exception rule ({rule}). Saving an individual cost cap replaces it.', { rule: ruleBadge(rule).textContent }) }) : null,
+      rule && !isLimit ? banner({ tone: 'info', text: t('This person has an exception rule ({rule}). Saving an individual cost cap replaces it.', { rule: capRuleText(rule) }) }) : null,
       field({ label: t('Cost cap for this person'), help: usage, control: picker }),
       err]),
     footer: (el) => append(el, [button({ label: t('Cancel'), onClick: () => m.close() }), save]),
@@ -1474,16 +2544,26 @@ async function editPersonCap(ctx, s, user) {
     setBusy(save, true, t('Saving'));
     try {
       const keepOther = isLimit && (isNum(rule.tokenCap) || isNum(rule.requestCap));
+      let res = null;
       if (amount === null && !keepOther) {
-        if (isLimit) await api.post('/api/v1/governance/antigravity/exceptions/delete', { email: user.email });
+        if (isLimit) res = await api.post('/api/v1/governance/antigravity/exceptions/delete', { email: user.email });
       } else {
-        await api.post('/api/v1/governance/antigravity/exceptions', {
+        res = await api.post('/api/v1/governance/antigravity/exceptions', {
           email: user.email, type: 'limit', scope: isLimit && rule.scope === 'period' ? 'period' : 'permanent',
           tokenCap: isLimit ? rule.tokenCap : null, requestCap: isLimit ? rule.requestCap : null, costCap: amount,
           note: isLimit && rule.note ? rule.note : t('Individual cost cap'),
         });
       }
-      toast({ title: t('Cost cap saved'), text: amount === null ? t('{email} uses the default cap.', { email: user.email }) : t('{email}: {v}', { email: user.email, v: amount ? fmt.currency(amount, ccy) : t('no cost cap') }), tone: 'success' });
+      const run = res && res.data && res.data.run;
+      const baseText = amount === null ? t('{email} uses the default cap.', { email: user.email }) : t('{email}: {v}', { email: user.email, v: amount ? fmt.currency(amount, ccy) : t('no cost cap') });
+      const runNote = enforcementRunNote(run);
+      toast({
+        title: t('Cost cap saved'),
+        text: runNote ? `${baseText} ${runNote}` : baseText,
+        tone: run && run.error ? 'warning' : 'success',
+        timeout: runNote ? 9000 : 4800,
+      });
+      scheduleJobRefresh(ctx, run);
       m.close();
       ctx.rerender();
     } catch (e) {
@@ -1532,7 +2612,7 @@ function agentActivityCard(ctx) {
             { key: 'lastSeen', label: t('Last call'), render: (r) => (r.lastSeen ? fmt.relative(r.lastSeen) : DASH), value: (r) => r.lastSeen },
           ],
           rows: d.byUser, initialSort: { key: 'calls', dir: 'desc' },
-          onRowClick: (r) => r.uid && openUserDrawer(r.uid),
+          onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email }),
         })),
         h('div', { class: 'span-6' }, dataTable({
           title: t('Most called APIs'), searchable: false, pageSize: 6,

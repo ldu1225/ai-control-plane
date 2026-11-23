@@ -9,8 +9,8 @@
 #   1. Enable all AI, Logging, BigQuery, Monitoring, Discovery Engine, Agent Platform and Model Armor APIs.
 #   2. Create the BigQuery dataset (asia-northeast3 by default) and the Log Router sink for AI logs.
 #   3. Turn on observability (usage + prompt/user identity logs) for every Gemini Enterprise app.
-#   4. Enable Cloud Audit Data Access logs across all 7 AI services (Agent Platform, Gemini Enterprise,
-#      Model Armor, Antigravity, NotebookLM, Gemini Data Analytics and Gemini API).
+#   4. Enable Cloud Audit Data Access logs for 5 AI services: Agent Platform, Discovery Engine (Gemini Enterprise and
+#      NotebookLM), Model Armor, Antigravity (businessaicode) and Gemini Data Analytics.
 #   5. Report which sources already have log entries.
 #
 # Options

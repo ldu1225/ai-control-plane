@@ -10,31 +10,56 @@
 #   cp deploy.env.example deploy.env
 #   scripts/deploy.sh [--config deploy.env] [--dry-run]
 #
+# Running it again updates the deployment in place. With --project and no --config, the settings that
+# scripts/install.sh saved in deploy.PROJECT_ID.env are read first; flags on the command line win.
+#
 # Options
 #   --project ID            Google Cloud project ID to deploy into
 #   --projects ID1,ID2      Deploy sequentially into multiple Google Cloud projects in one run
 #   --link-projects ID1,ID2 Link secondary GCP projects for unified multi-project scanning, log routing & read IAM
-#   --no-prepare-linked-projects  Skip onboarding log sinks/APIs on --link-projects secondary projects
-#   --no-auto-discover-projects   Disable automatic discovery of readable projects in the same GCP Organization
+#                           (alias --scan-projects; "none" clears the list deploy.env or a saved snapshot holds)
+#   --prepare-linked-projects / --no-prepare-linked-projects  Onboard log sinks/APIs on the linked projects (default)
+#                           or skip it
+#   --auto-discover-projects / --no-auto-discover-projects  Discover readable projects of the same organization
+#                           automatically (default) or not
 #   --region REGION         Cloud Run, Artifact Registry & bucket region (default: asia-northeast3)
-#   --admins EMAILS         Comma-separated admin emails or *@domain (default: active gcloud account)
-#   --viewers EMAILS        Comma-separated viewer emails or *@domain
+#   --admins EMAILS         Comma-separated admin emails or *@domain (default: active gcloud account; alias --admin)
+#   --viewers EMAILS        Comma-separated viewer emails or *@domain; "none" clears them (aliases --viewer,
+#                           --allowed-users)
 #   --org-name NAME         Organization display name (default: auto-detected from GCP Org / Project)
 #   --access-mode MODE      google | iap | password | google_oauth (default: google)
 #   --service-name NAME     Cloud Run service name (default: ai-control-plane)
 #   --billing-account ID    Cloud Billing account ID to link if the project is unbilled
 #   --read-only             Skip IAM governance write roles (ENABLE_GOVERNANCE_ACTIONS=false)
+#   --no-read-only          Grant them again (ENABLE_GOVERNANCE_ACTIONS=true, the default)
 #   --enforcement-schedule CRON  Antigravity cap enforcement runs (default */5 * * * *: restores suspended
 #                           users at each reset; suspends over-cap users only in automatic mode)
 #   --no-enforcement-schedule    No scheduled runs (enforce from the dashboard after every period reset)
-#   --no-data-access-logs   Skip enabling Data Access audit logs
-#   --no-log-prompts        Turn on Gemini Enterprise usage logs without prompt/response logging (sensitiveLoggingEnabled)
-#   --dataset NAME / --dataset-location LOC / --ge-locations LIST   Audit dataset, its location, GE locations
+#   --realtime-enforcement / --no-realtime-enforcement  Pub/Sub push for immediate automatic cap enforcement
+#                           (default on; off in IAP mode, with notify_only and with --read-only unless iam_deny)
+#   --maintenance-schedule CRON  Cloud Scheduler tick for the daily price check, the telemetry route budget guard and
+#                           the marker role hand-over (default */15 * * * *; not created in IAP mode)
+#   --no-maintenance-schedule    No maintenance job (run the price check from the FinOps page)
+#   --enforcement-backend MODE   iam_allow_swap (default: swap direct bindings) | iam_deny (IAM deny policy applied
+#                           by a dedicated Cloud Run job) | notify_only (plan and notify, never change access)
+#   --deny-attachment MODE  iam_deny: projects (default: every workspace project) | scope (its folders/organization)
+#   --enforcement-job-region REGION  Region of the enforcement job and its schedule (default: --region)
+#   --grant-org-roles / --no-grant-org-roles  iam_deny: grant Deny Admin / Deny Reviewer on the organization, or
+#                           print the commands for an organization administrator (default)
+#   --data-access-logs / --no-data-access-logs  Enable Data Access audit logs (default) or leave them unchanged
+#   --log-prompts / --no-log-prompts  Gemini Enterprise usage logs with prompt/response logging (default) or without
+#                           (sensitiveLoggingEnabled)
+#   --dataset NAME / --dataset-location LOC / --ge-locations LIST   Audit dataset, its location (default: --region),
+#                           Gemini Enterprise locations
 #   --vpc-network NAME      Send Cloud Run egress through this VPC (needed when run.allowedVPCEgress forces it)
 #   --vpc-subnet NAME       Subnet for --vpc-network (enable Private Google Access on it)
 #   --skip-preflight-blockers  Continue even when the organization policy preflight finds blockers
 #   --config FILE           Read settings from FILE (CLI flags override FILE values)
 #   --dry-run               Print commands that would run without changing anything
+#   -y, --yes               Accepted for scripts/install.sh compatibility (deploy.sh never prompts)
+#   -h, --help              Show this help
+#
+# Every setting can also be put in deploy.env (see deploy.env.example for the full list).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -60,12 +85,22 @@ CLI_DATA_ACCESS_LOGS=""
 CLI_PREPARE_LINKED=""
 CLI_SCAN_ALL=""
 CLI_ENFORCEMENT_SCHEDULE=""
+CLI_REALTIME_ENFORCEMENT=""
 CLI_LOG_PROMPTS=""
 CLI_DATASET=""
 CLI_DATASET_LOCATION=""
 CLI_GE_LOCATIONS=""
+CLI_ENFORCEMENT_BACKEND=""
+CLI_DENY_ATTACHMENT=""
+CLI_ENFORCEMENT_JOB_REGION=""
+CLI_GRANT_ORG_ROLES=""
+CLI_MAINTENANCE_SCHEDULE=""
+CLI_VPC_NETWORK=""
+CLI_VPC_SUBNET=""
+CLI_PREFLIGHT_STRICT=""
 
-usage() { sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+# Prints the comment block at the top of this file (every line after the shebang up to `set -euo pipefail`).
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit "${1:-0}"; }
 need_arg() { [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 needs a value"; }
 
 normalize_cli_args "$@"
@@ -85,8 +120,18 @@ while [[ $# -gt 0 ]]; do
     --service-name) need_arg "$@"; CLI_SERVICE_NAME="$2"; shift 2 ;;
     --billing-account) need_arg "$@"; CLI_BILLING_ACCOUNT="$2"; shift 2 ;;
     --read-only) CLI_READ_ONLY="1"; shift ;;
+    --no-read-only) CLI_READ_ONLY="0"; shift ;;
     --enforcement-schedule) need_arg "$@"; CLI_ENFORCEMENT_SCHEDULE="$2"; shift 2 ;;
     --no-enforcement-schedule) CLI_ENFORCEMENT_SCHEDULE="off"; shift ;;
+    --realtime-enforcement) CLI_REALTIME_ENFORCEMENT="true"; shift ;;
+    --no-realtime-enforcement) CLI_REALTIME_ENFORCEMENT="false"; shift ;;
+    --maintenance-schedule) need_arg "$@"; CLI_MAINTENANCE_SCHEDULE="$2"; shift 2 ;;
+    --no-maintenance-schedule) CLI_MAINTENANCE_SCHEDULE="off"; shift ;;
+    --enforcement-backend) need_arg "$@"; CLI_ENFORCEMENT_BACKEND="$2"; shift 2 ;;
+    --deny-attachment) need_arg "$@"; CLI_DENY_ATTACHMENT="$2"; shift 2 ;;
+    --enforcement-job-region) need_arg "$@"; CLI_ENFORCEMENT_JOB_REGION="$2"; shift 2 ;;
+    --grant-org-roles) CLI_GRANT_ORG_ROLES="true"; shift ;;
+    --no-grant-org-roles) CLI_GRANT_ORG_ROLES="false"; shift ;;
     --data-access-logs) CLI_DATA_ACCESS_LOGS="true"; shift ;;
     --no-data-access-logs) CLI_DATA_ACCESS_LOGS="false"; shift ;;
     --log-prompts) CLI_LOG_PROMPTS="true"; shift ;;
@@ -96,9 +141,9 @@ while [[ $# -gt 0 ]]; do
     --ge-locations) need_arg "$@"; CLI_GE_LOCATIONS="$2"; shift 2 ;;
     --prepare-linked-projects) CLI_PREPARE_LINKED="true"; shift ;;
     --no-prepare-linked-projects) CLI_PREPARE_LINKED="false"; shift ;;
-    --vpc-network) need_arg "$@"; VPC_NETWORK="$2"; shift 2 ;;
-    --vpc-subnet) need_arg "$@"; VPC_SUBNET="$2"; shift 2 ;;
-    --skip-preflight-blockers) PREFLIGHT_STRICT="false"; shift ;;
+    --vpc-network) need_arg "$@"; CLI_VPC_NETWORK="$2"; shift 2 ;;
+    --vpc-subnet) need_arg "$@"; CLI_VPC_SUBNET="$2"; shift 2 ;;
+    --skip-preflight-blockers) CLI_PREFLIGHT_STRICT="false"; shift ;;
     --auto-discover-projects) CLI_SCAN_ALL="true"; shift ;;
     --no-auto-discover-projects) CLI_SCAN_ALL="false"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -168,16 +213,31 @@ SCAN_ALL_PROJECTS="${SCAN_ALL_PROJECTS:-${AUTO_DISCOVER_PROJECTS:-}}"
 [[ -n "$CLI_SERVICE_NAME" ]] && SERVICE_NAME="$CLI_SERVICE_NAME"
 [[ -n "$CLI_BILLING_ACCOUNT" ]] && BILLING_ACCOUNT_ID="$CLI_BILLING_ACCOUNT"
 [[ "$CLI_READ_ONLY" == "1" ]] && ENABLE_GOVERNANCE_ACTIONS="false"
+[[ "$CLI_READ_ONLY" == "0" ]] && ENABLE_GOVERNANCE_ACTIONS="true"
 [[ -n "$CLI_DATA_ACCESS_LOGS" ]] && ENABLE_DATA_ACCESS_LOGS="$CLI_DATA_ACCESS_LOGS"
 [[ -n "$CLI_LOG_PROMPTS" ]] && GE_PROMPT_LOGGING="$CLI_LOG_PROMPTS"
 [[ -n "$CLI_PREPARE_LINKED" ]] && PREPARE_LINKED_PROJECTS="$CLI_PREPARE_LINKED"
 [[ -n "$CLI_SCAN_ALL" ]] && SCAN_ALL_PROJECTS="$CLI_SCAN_ALL"
 [[ -n "$CLI_ENFORCEMENT_SCHEDULE" ]] && ENFORCEMENT_SCHEDULE="$CLI_ENFORCEMENT_SCHEDULE"
+[[ -n "$CLI_REALTIME_ENFORCEMENT" ]] && REALTIME_ENFORCEMENT="$CLI_REALTIME_ENFORCEMENT"
+[[ -n "$CLI_ENFORCEMENT_BACKEND" ]] && ENFORCEMENT_BACKEND="$CLI_ENFORCEMENT_BACKEND"
+[[ -n "$CLI_DENY_ATTACHMENT" ]] && DENY_ATTACHMENT="$CLI_DENY_ATTACHMENT"
+[[ -n "$CLI_ENFORCEMENT_JOB_REGION" ]] && ENFORCEMENT_JOB_REGION="$CLI_ENFORCEMENT_JOB_REGION"
+[[ -n "$CLI_GRANT_ORG_ROLES" ]] && GRANT_ORG_ROLES="$CLI_GRANT_ORG_ROLES"
 # Flags the one-command installer forwards (install.sh); the installer's env snapshot cannot override them.
 [[ -n "$CLI_LOG_PROMPTS" ]] && GE_PROMPT_LOGGING="$CLI_LOG_PROMPTS"
 [[ -n "$CLI_DATASET" ]] && AUDIT_DATASET="$CLI_DATASET"
 [[ -n "$CLI_DATASET_LOCATION" ]] && DATASET_LOCATION="$CLI_DATASET_LOCATION"
 [[ -n "$CLI_GE_LOCATIONS" ]] && DISCOVERY_ENGINE_LOCATIONS="$CLI_GE_LOCATIONS"
+[[ -n "$CLI_MAINTENANCE_SCHEDULE" ]] && MAINTENANCE_SCHEDULE="$CLI_MAINTENANCE_SCHEDULE"
+[[ -n "$CLI_VPC_NETWORK" ]] && VPC_NETWORK="$CLI_VPC_NETWORK"
+[[ -n "$CLI_VPC_SUBNET" ]] && VPC_SUBNET="$CLI_VPC_SUBNET"
+[[ -n "$CLI_PREFLIGHT_STRICT" ]] && PREFLIGHT_STRICT="$CLI_PREFLIGHT_STRICT"
+# "none" is an explicit empty list (--link-projects none, --viewers none): it clears what deploy.env or the installer's
+# snapshot holds, where an empty flag value would be refused as a likely mistake.
+is_none() { [[ "$(trim_ws "${1:-}" | tr '[:upper:]' '[:lower:]')" == "none" ]]; }
+is_none "${SCAN_PROJECTS:-}" && SCAN_PROJECTS=""
+is_none "${ALLOWED_USERS:-}" && ALLOWED_USERS=""
 
 for tool in gcloud bq python3; do command -v "$tool" >/dev/null || die "$tool is required"; done
 ACCOUNT="$(ensure_gcloud_auth)"
@@ -234,12 +294,33 @@ ENFORCEMENT_SCHEDULE_EXPLICIT=0
 [[ -n "$(trim_ws "${ENFORCEMENT_SCHEDULE:-}")" ]] && ENFORCEMENT_SCHEDULE_EXPLICIT=1
 ENFORCEMENT_SCHEDULE="$(trim_ws "${ENFORCEMENT_SCHEDULE:-}")"
 [[ -n "$ENFORCEMENT_SCHEDULE" ]] || ENFORCEMENT_SCHEDULE="*/5 * * * *"
-case "$ENFORCEMENT_SCHEDULE" in off|none) ENFORCEMENT_SCHEDULE="" ;; esac
+case "$(printf '%s' "$ENFORCEMENT_SCHEDULE" | tr '[:upper:]' '[:lower:]')" in off|none) ENFORCEMENT_SCHEDULE="" ;; esac
+# Real-time Antigravity cap enforcement: routes businessaicode.googleapis.com/inference_response to a Pub/Sub push
+# subscription posting to /api/v1/governance/antigravity/usage-event so automatic mode triggers suspension right away
+# instead of waiting for the next scheduled run. The schedule stays the safety net for period resets.
+REALTIME_ENFORCEMENT_EXPLICIT=0
+[[ -n "$(trim_ws "${REALTIME_ENFORCEMENT:-}")" ]] && REALTIME_ENFORCEMENT_EXPLICIT=1
+REALTIME_ENFORCEMENT="$(trim_ws "${REALTIME_ENFORCEMENT:-true}" | tr '[:upper:]' '[:lower:]')"
+# How suspensions are applied (governance.antigravity.enforcement_backend, README 8.9). iam_allow_swap: the web service
+# swaps direct bindings in the primary project's allow policy. iam_deny: suspended people are listed in an IAM deny
+# policy (deny is evaluated before allow, so group, inherited and workforce access stop too), applied by the Cloud Run
+# job <service>-enforcer whose service account alone gets Deny Admin on the organization (GRANT_ORG_ROLES=true grants
+# it, otherwise the commands are printed); ENFORCEMENT_SCHEDULE then runs that job. notify_only: plans and
+# notifications only. The backend can also be switched in the dashboard (Settings > Governance policy).
+ENFORCEMENT_BACKEND="$(trim_ws "${ENFORCEMENT_BACKEND:-iam_allow_swap}" | tr '[:upper:]' '[:lower:]')"
+DENY_ATTACHMENT="$(trim_ws "${DENY_ATTACHMENT:-projects}" | tr '[:upper:]' '[:lower:]')"
+ENFORCEMENT_JOB_REGION="$(trim_ws "${ENFORCEMENT_JOB_REGION:-}")"
+GRANT_ORG_ROLES="$(trim_ws "${GRANT_ORG_ROLES:-false}" | tr '[:upper:]' '[:lower:]')"
 # Scheduler tick for scheduled work: the daily official price and exchange-rate check (at pricing.sync_time, default
-# 00:00 in the workspace timezone; a setting, not a cron here) and the telemetry route budget guard. "off" disables it.
+# 00:00 in the workspace timezone; a setting, not a cron here), the telemetry route budget guard and the hand-over of
+# marker roles when the enforcement method changes. "off" (or "none") disables it.
 MAINTENANCE_SCHEDULE="$(trim_ws "${MAINTENANCE_SCHEDULE:-*/15 * * * *}")"
-# Earlier releases had a fixed-time price job (PRICING_SYNC_SCHEDULE); "off"/"none" there still turns scheduling off.
-case "$(trim_ws "${PRICING_SYNC_SCHEDULE:-}")" in off|none) MAINTENANCE_SCHEDULE="off" ;; esac
+# Earlier releases had a fixed-time price job (PRICING_SYNC_SCHEDULE); "off"/"none" there still turns scheduling off
+# unless --maintenance-schedule is given.
+if [[ -z "$CLI_MAINTENANCE_SCHEDULE" ]]; then
+  case "$(trim_ws "${PRICING_SYNC_SCHEDULE:-}")" in off|none) MAINTENANCE_SCHEDULE="off" ;; esac
+fi
+case "$(printf '%s' "$MAINTENANCE_SCHEDULE" | tr '[:upper:]' '[:lower:]')" in off|none) MAINTENANCE_SCHEDULE="off" ;; esac
 PRICING_SYNC_TIME="$(trim_ws "${PRICING_SYNC_TIME:-}")"
 PRICING_CURRENCY="$(trim_ws "${PRICING_CURRENCY:-}" | tr '[:lower:]' '[:upper:]')"
 TELEMETRY_AI_MODEL="$(trim_ws "${TELEMETRY_AI_MODEL:-}")"
@@ -308,10 +389,25 @@ if [[ "$MAINTENANCE_SCHEDULE" != "off" ]]; then
   read -r -a _cron_fields <<<"$MAINTENANCE_SCHEDULE"
   [[ "${#_cron_fields[@]}" -eq 5 ]] || die "MAINTENANCE_SCHEDULE must be a 5-field cron expression (for example */15 * * * *) or off"
 fi
+case "$ENFORCEMENT_BACKEND" in
+  iam_allow_swap|iam_deny|notify_only) ;;
+  *) die "ENFORCEMENT_BACKEND must be iam_allow_swap, iam_deny or notify_only" ;;
+esac
+case "$DENY_ATTACHMENT" in
+  projects|scope) ;;
+  *) die "DENY_ATTACHMENT must be projects or scope" ;;
+esac
+[[ -n "$ENFORCEMENT_JOB_REGION" ]] || ENFORCEMENT_JOB_REGION="$REGION"
+[[ "$ENFORCEMENT_JOB_REGION" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] \
+  || die "invalid ENFORCEMENT_JOB_REGION '${ENFORCEMENT_JOB_REGION}' (for example 'asia-northeast3')"
 if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
   read -r -a _cron_fields <<<"$ENFORCEMENT_SCHEDULE"
   [[ "${#_cron_fields[@]}" -eq 5 ]] || die "ENFORCEMENT_SCHEDULE must be a 5-field cron expression (for example */5 * * * *) or off"
-  if [[ "$ENABLE_GOVERNANCE_ACTIONS" != "true" ]]; then
+  if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
+    # Cloud Scheduler runs the enforcement job through the Cloud Run Admin API: the call never passes IAP and the
+    # web service account needs no write role, so every access mode and read-only installs keep the schedule.
+    :
+  elif [[ "$ENABLE_GOVERNANCE_ACTIONS" != "true" && "$ENFORCEMENT_BACKEND" != "notify_only" ]]; then
     [[ "$ENFORCEMENT_SCHEDULE_EXPLICIT" == "1" ]] && die "ENFORCEMENT_SCHEDULE needs ENABLE_GOVERNANCE_ACTIONS=true"
     ENFORCEMENT_SCHEDULE=""  # read-only install: nothing is ever suspended, so there is nothing to restore
   elif [[ "$ACCESS_MODE" == "iap" ]]; then
@@ -320,9 +416,21 @@ if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
     ENFORCEMENT_SCHEDULE=""
   fi
 fi
-for flag in CREATE_LOG_SINK ENABLE_DATA_ACCESS_LOGS ENABLE_GE_OBSERVABILITY GE_PROMPT_LOGGING ENABLE_GOVERNANCE_ACTIONS PREPARE_LINKED_PROJECTS; do
+PREFLIGHT_STRICT="$(trim_ws "${PREFLIGHT_STRICT:-true}" | tr '[:upper:]' '[:lower:]')"
+ENABLE_LINKED_TELEMETRY_ROUTING="$(trim_ws "${ENABLE_LINKED_TELEMETRY_ROUTING:-true}" | tr '[:upper:]' '[:lower:]')"
+for flag in CREATE_LOG_SINK ENABLE_DATA_ACCESS_LOGS ENABLE_GE_OBSERVABILITY GE_PROMPT_LOGGING ENABLE_GOVERNANCE_ACTIONS PREPARE_LINKED_PROJECTS GRANT_ORG_ROLES REALTIME_ENFORCEMENT PREFLIGHT_STRICT ENABLE_LINKED_TELEMETRY_ROUTING; do
   [[ "${!flag}" == "true" || "${!flag}" == "false" ]] || die "$flag must be true or false"
 done
+if [[ "$REALTIME_ENFORCEMENT" == "true" ]]; then
+  if [[ "$ENFORCEMENT_BACKEND" == "notify_only" ]] \
+      || [[ "$ENFORCEMENT_BACKEND" != "iam_deny" && "$ENABLE_GOVERNANCE_ACTIONS" != "true" ]]; then
+    REALTIME_ENFORCEMENT="false"
+  elif [[ "$ACCESS_MODE" == "iap" ]]; then
+    [[ "$REALTIME_ENFORCEMENT_EXPLICIT" == "1" ]] \
+      && warn "IAP access mode: real-time Pub/Sub push is off (IAP blocks Pub/Sub OIDC tokens); scheduled runs still apply"
+    REALTIME_ENFORCEMENT="false"
+  fi
+fi
 if [[ -n "$SCAN_ALL_PROJECTS" ]]; then
   SCAN_ALL_PROJECTS="$(printf '%s' "$SCAN_ALL_PROJECTS" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
   [[ "$SCAN_ALL_PROJECTS" == "true" || "$SCAN_ALL_PROJECTS" == "false" ]] || die "SCAN_ALL_PROJECTS must be true or false"
@@ -333,7 +441,7 @@ DISCOVERY_ENGINE_LOCATIONS="$(printf '%s' "$DISCOVERY_ENGINE_LOCATIONS" | tr -d 
 
 # Keep this list in sync with MODULE_IDS in src/controlplane/config.py (checked by the unit tests).
 MODULE_IDS=(overview gemini_enterprise notebooklm model_usage agent_gateway agent_registry agent_deployments
-  model_armor users antigravity finops telemetry analyst)
+  model_armor users antigravity finops chargeback telemetry analyst)
 DISABLED_MODULES="$(printf '%s' "${DISABLED_MODULES:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 IFS=',' read -r -a disabled_list <<<"$DISABLED_MODULES"
 for module in ${disabled_list[@]+"${disabled_list[@]}"}; do
@@ -378,11 +486,27 @@ SCHEDULER_SA="${SCHEDULER_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 BRIDGE_SA_ID="${SERVICE_NAME:0:23}-signin"
 BRIDGE_SA="${BRIDGE_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 ENFORCE_URL="${BASE_URL}/api/v1/governance/antigravity/enforce"
+# iam_deny: the Cloud Run job that applies suspensions, its own service account and the scheduler job that runs it.
+ENFORCER_SA_ID="${SERVICE_NAME:0:21}-enforcer"
+ENFORCER_SA="${ENFORCER_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+ENFORCER_JOB="${SERVICE_NAME}-enforcer"
+ENFORCER_SCHED_JOB="${SERVICE_NAME}-enforcer"
+ENFORCEMENT_JOB_NAME="projects/${PROJECT_ID}/locations/${ENFORCEMENT_JOB_REGION}/jobs/${ENFORCER_JOB}"
+ENFORCER_RUN_URI="https://run.googleapis.com/v2/${ENFORCEMENT_JOB_NAME}:run"
+# Real-time Antigravity usage events: Log Router sink -> Pub/Sub topic -> push subscription -> dashboard endpoint.
+USAGE_EVENTS_TOPIC="${SERVICE_NAME}-agy-usage"
+USAGE_EVENTS_SUB_ID="${SERVICE_NAME}-agy-usage-push"
+USAGE_EVENTS_SUB_NAME="projects/${PROJECT_ID}/subscriptions/${USAGE_EVENTS_SUB_ID}"
+USAGE_EVENTS_SINK="${SERVICE_NAME}-agy-usage"
+USAGE_EVENT_URL="${BASE_URL}/api/v1/governance/antigravity/usage-event"
+PUBSUB_AGENT="service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com"
 
 NEED_BUILD=0; [[ -z "$IMAGE" ]] && NEED_BUILD=1
 NEED_SINK=0; [[ "$CREATE_LOG_SINK" == "true" ]] && NEED_SINK=1
 NEED_IAP=0; [[ "$ACCESS_MODE" == "google" || "$ACCESS_MODE" == "iap" ]] && NEED_IAP=1
 NEED_SCHED=0; [[ -n "$ENFORCEMENT_SCHEDULE" ]] && NEED_SCHED=1
+# The maintenance tick is a Cloud Scheduler job as well (not created in IAP mode, where the scheduler cannot call in).
+[[ "$MAINTENANCE_SCHEDULE" != "off" && "$ACCESS_MODE" != "iap" ]] && NEED_SCHED=1
 NEED_AUDIT=0; [[ "$ENABLE_DATA_ACCESS_LOGS" == "true" ]] && NEED_AUDIT=1
 
 log "Deploying ${SERVICE_NAME} to ${PROJECT_ID} (${REGION}) as ${ACCOUNT}"
@@ -429,6 +553,11 @@ SID_APIS=(
   logging.googleapis.com
   bigquery.googleapis.com
 )
+if [[ "$REALTIME_ENFORCEMENT" == "true" ]]; then
+  run gcloud services enable pubsub.googleapis.com --project "$PROJECT_ID" --quiet >/dev/null 2>&1 \
+    || warn "could not enable pubsub.googleapis.com (real-time enforcement push will be skipped)"
+  SID_APIS+=(pubsub.googleapis.com)
+fi
 ensure_service_identities "$PROJECT_ID" "$PROJECT_NUMBER" "${SID_APIS[@]}"
 
 # ------------------------------------------------------------------------------- 2. settings bucket
@@ -456,6 +585,10 @@ fi
 if [[ -z "$IMAGE" ]]; then
   ensure_sa "$BUILD_SA_ID" "$BUILD_SA" "AI Control Plane image builder" \
     "Least-privilege Cloud Build identity for ${SERVICE_NAME}"
+fi
+if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
+  ensure_sa "$ENFORCER_SA_ID" "$ENFORCER_SA" "AI Control Plane enforcement job" \
+    "Identity of the ${ENFORCER_JOB} Cloud Run job: applies Antigravity cap suspensions with an IAM deny policy"
 fi
 
 gcloud projects get-iam-policy "$PROJECT_ID" --format=json >"$IAM_CACHE" 2>/dev/null || echo "{}" >"$IAM_CACHE"
@@ -512,6 +645,8 @@ RUNTIME_ROLES=(
 OPTIONAL_RUNTIME_ROLES=(
   roles/modelarmor.viewer
   roles/cloudtrace.user
+  roles/networkservices.viewer
+  roles/networksecurity.viewer
 )
 GOVERNANCE_ROLES=(roles/resourcemanager.projectIamAdmin roles/iam.roleAdmin)
 for role in "${RUNTIME_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$role"; done
@@ -541,6 +676,27 @@ if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
   # Marker roles for per-user Antigravity caps (Gemini Enterprise User without businessaicode.*), created now so
   # suspensions work right after installation without the "Create marker roles" step.
   ensure_antigravity_marker_roles "$PROJECT_ID"
+  # Least-privilege custom role for managing Agent Gateway resources, IAP authorization extensions and policies.
+  GATEWAY_MANAGER_ROLE_ID="CustomAiControlPlaneGatewayManager"
+  GATEWAY_MANAGER_ROLE="projects/${PROJECT_ID}/roles/${GATEWAY_MANAGER_ROLE_ID}"
+  GATEWAY_MANAGER_PERMS="networkservices.agentGateways.create,networkservices.agentGateways.update,networkservices.agentGateways.delete,networkservices.agentGateways.get,networkservices.agentGateways.list,networkservices.agentGateways.use,networkservices.authzExtensions.create,networkservices.authzExtensions.update,networkservices.authzExtensions.delete,networkservices.authzExtensions.get,networkservices.authzExtensions.list,networkservices.authzExtensions.use,networkservices.operations.get,networksecurity.authzPolicies.create,networksecurity.authzPolicies.delete,networksecurity.authzPolicies.get,networksecurity.authzPolicies.list,networksecurity.operations.get"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] custom role ${GATEWAY_MANAGER_ROLE} -> ${SA_EMAIL}"
+  else
+    gcloud iam roles undelete "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" --quiet >/dev/null 2>&1 || true
+    if gcloud iam roles describe "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" >/dev/null 2>&1; then
+      gcloud iam roles update "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" --permissions "$GATEWAY_MANAGER_PERMS" --quiet >/dev/null 2>&1 || true
+      grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$GATEWAY_MANAGER_ROLE"
+    elif gcloud iam roles create "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" \
+        --title "AI Control Plane Agent Gateway Manager" \
+        --description "Manage Agent Gateway resources, authorization extensions and policies" \
+        --permissions "$GATEWAY_MANAGER_PERMS" --stage GA --quiet >/dev/null 2>&1; then
+      grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$GATEWAY_MANAGER_ROLE"
+    else
+      grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/networkservices.editor"
+      grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/networksecurity.editor"
+    fi
+  fi
 else
   info "governance write roles skipped (ENABLE_GOVERNANCE_ACTIONS=false): dashboards and simulations only"
 fi
@@ -548,6 +704,26 @@ fi
 grant_optional_role "$PROJECT_ID" "serviceAccount:${RUN_SERVICE_AGENT}" "roles/run.serviceAgent"
 run retry gcloud storage buckets add-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
   --member "serviceAccount:${SA_EMAIL}" --role roles/storage.objectAdmin >/dev/null
+# iam_deny enforcement job: the read access the runtime uses for usage (inference logs, BigQuery sink tables and the
+# billing export for prices), logs and licenses, audit entries (logging.logEntries.create) and the settings object,
+# which it reads the administrators' policy from and records suspensions and runs in. Nothing else at project level:
+# its only IAM write access is Deny Admin on the organization (step 8).
+ENFORCER_ROLES=(
+  roles/bigquery.dataViewer
+  roles/bigquery.jobUser
+  roles/discoveryengine.viewer
+  roles/logging.viewer
+  roles/logging.privateLogViewer
+  roles/logging.logWriter
+  roles/serviceusage.serviceUsageConsumer
+)
+ENFORCER_LINKED_ROLES=(roles/bigquery.dataViewer roles/logging.viewer roles/logging.privateLogViewer roles/discoveryengine.viewer)
+if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
+  for role in "${ENFORCER_ROLES[@]}"; do grant_member "$PROJECT_ID" "serviceAccount:${ENFORCER_SA}" "$role"; done
+  grant_optional_role "$PROJECT_ID" "serviceAccount:${ENFORCER_SA}" "$LICENSE_READER_ROLE"
+  run retry gcloud storage buckets add-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
+    --member "serviceAccount:${ENFORCER_SA}" --role roles/storage.objectAdmin >/dev/null
+fi
 
 # Auto-discover BigQuery Billing Export table when BILLING_TABLE is not configured.
 BILLING_SCAN_PROJECT="${BILLING_PROJECT_ID:-$PROJECT_ID}"
@@ -577,6 +753,16 @@ if [[ -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" ]]; the
     warn "no caller access on external billing dataset ${BILLING_PROJECT_ID}:${BILLING_DATASET} (continuing deployment normally; FinOps can be connected later by granting BigQuery Data Viewer on that dataset to ${SA_EMAIL})"
   fi
 fi
+if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" && -n "$BILLING_PROJECT_ID" && "$BILLING_PROJECT_ID" != "$PROJECT_ID" \
+      && -n "$BILLING_DATASET" ]]; then
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] grant BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} -> ${ENFORCER_SA} (this dataset only)"
+  elif grant_dataset_role "$BILLING_PROJECT_ID" "$BILLING_DATASET" READER "$ENFORCER_SA"; then
+    info "granted BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} to ${ENFORCER_SA} (this dataset only)"
+  else
+    warn "could not grant BigQuery Data Viewer on ${BILLING_PROJECT_ID}:${BILLING_DATASET} to ${ENFORCER_SA}; the enforcement job then prices tokens from the public price list"
+  fi
+fi
 
 # Linked secondary projects (--link-projects / SCAN_PROJECTS): grant read-only multi-project scanning IAM.
 NORMALIZED_SCAN_PROJECTS=""
@@ -591,6 +777,9 @@ if [[ -n "$SCAN_PROJECTS" ]]; then
     roles/discoveryengine.viewer
     roles/iam.securityReviewer
     roles/modelarmor.viewer
+    roles/networkservices.viewer
+    roles/networksecurity.viewer
+    roles/cloudtrace.user   # agent detail page: traces of Agent Engine deployments in the linked project
   )
   # Telemetry routes of a linked project's logs are Log Router sinks in that project (cost-controlled from the hub).
   [[ "${ENABLE_LINKED_TELEMETRY_ROUTING:-true}" == "true" ]] && LINKED_READ_ROLES+=(roles/logging.configWriter)
@@ -620,6 +809,19 @@ if [[ -n "$SCAN_PROJECTS" ]]; then
     # Gemini Enterprise seats of the linked project: the same read-only custom role as in the hub, because
     # roles/discoveryengine.viewer cannot list license configs or user licenses (best effort, honors DRY_RUN).
     grant_license_reader "$lp" "$SA_EMAIL" "$LICENSE_READER_ROLE_ID" "$LICENSE_READER_PERMS"
+    # iam_deny: the enforcement job reads usage, logs and licenses of every workspace project (read roles only).
+    if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
+      if [[ "$DRY_RUN" == "1" ]]; then
+        info "[dry-run] grant enforcement job read roles on ${lp} -> ${ENFORCER_SA}"
+      else
+        for lrole in "${ENFORCER_LINKED_ROLES[@]}"; do
+          gcloud projects add-iam-policy-binding "$lp" --member "serviceAccount:${ENFORCER_SA}" \
+            --role "$lrole" --condition=None --quiet >/dev/null 2>&1 \
+            || warn "could not grant ${lrole} on linked project ${lp} to ${ENFORCER_SA}"
+        done
+      fi
+      grant_license_reader "$lp" "$ENFORCER_SA" "$LICENSE_READER_ROLE_ID" "$LICENSE_READER_PERMS"
+    fi
   done
   if [[ ${#CLEAN_LINKED[@]} -gt 0 ]]; then
     NORMALIZED_SCAN_PROJECTS="$(IFS=','; echo "${CLEAN_LINKED[*]}")"
@@ -912,8 +1114,11 @@ if [[ "$GUEST_ACCESS" == "true" ]]; then
   add_env GUEST_REDACT_TERMS "$GUEST_REDACT_TERMS"
   warn "guest access is on: anyone with the link can browse read-only, identifiers hidden (demo use only)"
 fi
-[[ -n "$ENFORCEMENT_SCHEDULE" ]] && add_env SCHEDULER_INVOKERS "$SCHEDULER_SA"
-# The maintenance tick authenticates as this deployment's own service account.
+# How suspensions are applied (README 8.9). With iam_deny the dashboard's "Run now" asks Cloud Run to run the job.
+add_env ENFORCEMENT_BACKEND "$ENFORCEMENT_BACKEND"
+add_env DENY_ATTACHMENT "$DENY_ATTACHMENT"
+[[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]] && add_env ENFORCEMENT_JOB "$ENFORCEMENT_JOB_NAME"
+# The maintenance tick and real-time usage-event push authenticate as this deployment's own service account.
 add_env RUNTIME_SERVICE_ACCOUNT "$SA_EMAIL"
 add_env PRICING_SYNC_TIME "$PRICING_SYNC_TIME"
 add_env PRICING_CURRENCY "$PRICING_CURRENCY"
@@ -925,6 +1130,18 @@ add_env TELEMETRY_DATASET_LOCATION "$DATASET_LOCATION"   # routed telemetry stay
 IAP_ORG_DOMAIN="$(iap_org_domain "$PROJECT_ID")"
 [[ -n "$IAP_ORG_DOMAIN" ]] && info "organization domain: ${IAP_ORG_DOMAIN}"
 add_env IAP_ORG_DOMAIN "$IAP_ORG_DOMAIN"
+# The dashboard shows the enforcement schedule and the real-time push as configured from these two variables:
+# SCHEDULER_INVOKERS (Cloud Scheduler's account may call the enforcement endpoint) and USAGE_EVENTS_SUBSCRIPTION (the
+# push subscription). Both are set up in step 8, after this deployment, so they stay out of ENV_VARS: the Direct Cloud
+# Run IAP fallback leaves them out (neither call passes IAP), the enforcement job does not need them, and step 8 takes
+# out again whatever it could not set up.
+LIVE_ENV=""; LIVE_SCHED_ENV=0; LIVE_RT_ENV=0
+if [[ -n "$ENFORCEMENT_SCHEDULE" && "$ENFORCEMENT_BACKEND" != "iam_deny" ]]; then
+  LIVE_ENV+="##SCHEDULER_INVOKERS=${SCHEDULER_SA}"; LIVE_SCHED_ENV=1
+fi
+if [[ "$REALTIME_ENFORCEMENT" == "true" ]]; then
+  LIVE_ENV+="##USAGE_EVENTS_SUBSCRIPTION=${USAGE_EVENTS_SUB_NAME}"; LIVE_RT_ENV=1
+fi
 COMMON=(--image "$IMAGE" --project "$PROJECT_ID" --region "$REGION" --cpu-boost --quiet)
 [[ -n "$ORGPOL_BINAUTHZ" ]] && COMMON+=(--binary-authorization "$ORGPOL_BINAUTHZ")
 [[ -n "$VPC_NETWORK" ]] && COMMON+=(--network "$VPC_NETWORK" --subnet "$VPC_SUBNET" --vpc-egress all-traffic)
@@ -967,11 +1184,13 @@ deploy_main_resilient() {
     return 0
   fi
   warn "organization policy blocks unauthenticated Cloud Run entry; automatically switching ${SERVICE_NAME} to Direct Cloud Run IAP..."
+  # Neither Cloud Scheduler's nor Pub/Sub's token passes IAP: the schedule and push variables (LIVE_ENV) stay out.
   local iap_env="${ENV_VARS}##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
   retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
     --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
     --set-env-vars "$iap_env" --set-secrets "$MAIN_SECRETS" \
     || die "Cloud Run deployment failed under all access modes for ${PROJECT_ID}"
+  LIVE_SCHED_ENV=0; LIVE_RT_ENV=0
   retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
     --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
   configure_iap_access "$PROJECT_ID" "$PROJECT_NUMBER" "$REGION" "$SERVICE_NAME" gate "$IAP_MEMBERS"
@@ -1023,19 +1242,19 @@ case "$ACCESS_MODE" in
       # creates such clients (IAP's OAuth Admin API is shut down).
       configure_iap_access "$PROJECT_ID" "$PROJECT_NUMBER" "$REGION" "$BRIDGE_NAME" bridge "$BRIDGE_MEMBERS"
       grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/iap.admin"
-      MAIN_ENV="${ENV_VARS}##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
+      MAIN_ENV="${ENV_VARS}${LIVE_ENV}##AUTH_MODE=google##SIGN_IN_BRIDGE_URL=${BRIDGE_URL}##PUBLIC_BASE_URL=${BASE_URL}"
       MAIN_ENV+="##IAP_ACCESS_RESOURCE=projects/${PROJECT_NUMBER}/iap_web/cloud_run-${REGION}/services/${BRIDGE_NAME}"
       [[ -n "${IAP_OAUTH_CLIENT:-}" ]] && MAIN_ENV+="##IAP_OAUTH_CLIENT=${IAP_OAUTH_CLIENT}"
     else
-      MAIN_ENV="${ENV_VARS}##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
+      MAIN_ENV="${ENV_VARS}${LIVE_ENV}##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
     fi
     deploy_main_resilient "$MAIN_ENV"
     ;;
   password)
-    deploy_main_resilient "${ENV_VARS}##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
+    deploy_main_resilient "${ENV_VARS}${LIVE_ENV}##AUTH_MODE=google##PUBLIC_BASE_URL=${BASE_URL}"
     ;;
   google_oauth)
-    deploy_main_resilient "${ENV_VARS}##AUTH_MODE=google##GOOGLE_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}##PUBLIC_BASE_URL=${BASE_URL}"
+    deploy_main_resilient "${ENV_VARS}${LIVE_ENV}##AUTH_MODE=google##GOOGLE_OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID}##PUBLIC_BASE_URL=${BASE_URL}"
     ;;
   iap)
     IAP_ENV="${ENV_VARS}##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
@@ -1049,31 +1268,180 @@ case "$ACCESS_MODE" in
     ;;
 esac
 
+# iam_deny: the enforcement job. The same image runs one enforcement cycle per execution as the enforcer service
+# account, with the dashboard's configuration and settings bucket (README 8.9). It serves no requests and nobody signs
+# in to it, so it gets no secrets and no LIVE_ENV; PYTHONPATH makes `python -m controlplane.enforce_job` find the
+# package in /app/src.
+if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
+  JOB_DEPLOY=(--image "$IMAGE" --project "$PROJECT_ID" --region "$ENFORCEMENT_JOB_REGION"
+    --service-account "$ENFORCER_SA" --command python --args=-m,controlplane.enforce_job
+    --tasks 1 --max-retries 0 --task-timeout 600s --memory "$MEMORY" --cpu "$CPU"
+    --set-env-vars "${ENV_VARS}##PUBLIC_BASE_URL=${BASE_URL}##PYTHONPATH=/app/src"
+    --labels app=ai-control-plane --quiet)
+  [[ -n "$ORGPOL_BINAUTHZ" ]] && JOB_DEPLOY+=(--binary-authorization "$ORGPOL_BINAUTHZ")
+  [[ -n "$VPC_NETWORK" ]] && JOB_DEPLOY+=(--network "$VPC_NETWORK" --subnet "$VPC_SUBNET" --vpc-egress all-traffic)
+  info "enforcement job ${ENFORCER_JOB} (${ENFORCEMENT_JOB_REGION}) runs as ${ENFORCER_SA}"
+  run retry gcloud run jobs deploy "$ENFORCER_JOB" "${JOB_DEPLOY[@]}" \
+    || die "could not deploy the enforcement job ${ENFORCER_JOB}; fix the error above and re-run, or deploy with ENFORCEMENT_BACKEND=iam_allow_swap"
+fi
+
 # ------------------------------------------------------------------------------- 8. scheduler & live readiness probe
 log "8/8 Schedule & readiness check"
-if [[ -n "$ENFORCEMENT_SCHEDULE" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
+remove_scheduler_job() {  # remove_scheduler_job NAME LOCATION WHY: deletes a scheduler job of an earlier deployment
+  gcloud scheduler jobs describe "$1" --project "$PROJECT_ID" --location "$2" >/dev/null 2>&1 || return 0
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] remove scheduler job $1 ($3)"
+  elif gcloud scheduler jobs delete "$1" --project "$PROJECT_ID" --location "$2" --quiet >/dev/null 2>&1; then
+    info "removed scheduler job $1 ($3)"
+  else
+    warn "could not remove scheduler job $1 ($3); delete it in Cloud Scheduler"
+  fi
+  return 0
+}
+ensure_scheduler_sa() {
   if ! gcloud iam service-accounts describe "$SCHEDULER_SA" --project "$PROJECT_ID" >/dev/null 2>&1; then
     run gcloud iam service-accounts create "$SCHEDULER_SA_ID" --project "$PROJECT_ID" \
       --display-name "AI Control Plane enforcement scheduler"
   fi
-  JOB="${SERVICE_NAME}-enforce"
-  JOB_ARGS=(--project "$PROJECT_ID" --location "$REGION" --schedule "$ENFORCEMENT_SCHEDULE"
-    --time-zone "$WORKSPACE_TIMEZONE" --uri "$ENFORCE_URL" --http-method POST --message-body '{}'
-    --oidc-service-account-email "$SCHEDULER_SA" --oidc-token-audience "$ENFORCE_URL"
-    --attempt-deadline 300s --max-retry-attempts 1 --quiet)
-  if gcloud scheduler jobs describe "$JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
-    run retry gcloud scheduler jobs update http "$JOB" "${JOB_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null
+}
+WEB_SCHED_READY=0   # 1 once the -enforce job that calls the dashboard exists (SCHEDULER_INVOKERS is kept only then)
+if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
+  # Who may run the enforcement job, on this job only: the dashboard's service account ("Run now", and reading the job
+  # and its executions for the status card) and the scheduler's service account (scheduled runs).
+  # `gcloud run jobs add-iam-policy-binding` takes no --condition flag (job policies have no conditional bindings).
+  for role in roles/run.jobsExecutor roles/run.viewer; do
+    run retry gcloud run jobs add-iam-policy-binding "$ENFORCER_JOB" --project "$PROJECT_ID" \
+      --region "$ENFORCEMENT_JOB_REGION" --member "serviceAccount:${SA_EMAIL}" --role "$role" \
+      --quiet >/dev/null
+  done
+  if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
+    ensure_scheduler_sa
+    run retry gcloud run jobs add-iam-policy-binding "$ENFORCER_JOB" --project "$PROJECT_ID" \
+      --region "$ENFORCEMENT_JOB_REGION" --member "serviceAccount:${SCHEDULER_SA}" --role roles/run.jobsExecutor \
+      --quiet >/dev/null
+    # Cloud Scheduler calls the Cloud Run Admin API with an OAuth token (not the dashboard, so IAP never applies).
+    SCHED_ARGS=(--project "$PROJECT_ID" --location "$ENFORCEMENT_JOB_REGION" --schedule "$ENFORCEMENT_SCHEDULE"
+      --time-zone "$WORKSPACE_TIMEZONE" --uri "$ENFORCER_RUN_URI" --http-method POST --message-body '{}'
+      --oauth-service-account-email "$SCHEDULER_SA" --attempt-deadline 180s --max-retry-attempts 1 --quiet)
+    if gcloud scheduler jobs describe "$ENFORCER_SCHED_JOB" --project "$PROJECT_ID" --location "$ENFORCEMENT_JOB_REGION" >/dev/null 2>&1; then
+      run retry gcloud scheduler jobs update http "$ENFORCER_SCHED_JOB" "${SCHED_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null
+    else
+      run retry gcloud scheduler jobs create http "$ENFORCER_SCHED_JOB" "${SCHED_ARGS[@]}" --headers Content-Type=application/json >/dev/null
+    fi
+    info "job ${ENFORCER_SCHED_JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> Cloud Run job ${ENFORCER_JOB} (${ENFORCEMENT_JOB_REGION})"
   else
-    run retry gcloud scheduler jobs create http "$JOB" "${JOB_ARGS[@]}" --headers Content-Type=application/json >/dev/null
+    remove_scheduler_job "$ENFORCER_SCHED_JOB" "$ENFORCEMENT_JOB_REGION" "ENFORCEMENT_SCHEDULE off"
+    info "enforcement schedule: on-demand from the dashboard (Run enforcement now runs ${ENFORCER_JOB})"
   fi
-  info "job ${JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> ${ENFORCE_URL}"
-  # When the organization requires IAM invoker checks (run.managed.requireInvokerIam) the service is not public and
-  # Cloud Run would reject the scheduler's OIDC call before the app sees it; restores would then never run.
-  run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
-    --member "serviceAccount:${SCHEDULER_SA}" --role roles/run.invoker --condition=None --quiet >/dev/null \
-    || warn "could not grant roles/run.invoker on ${SERVICE_NAME} to ${SCHEDULER_SA}; if the service requires IAM invoker checks, scheduled enforcement (and automatic restores) will fail"
+  # One enforcer at a time: the web endpoint's scheduler of an earlier deployment is removed, and with it the
+  # scheduler's right to call the web service.
+  remove_scheduler_job "${SERVICE_NAME}-enforce" "$REGION" "enforcement moved to the Cloud Run job ${ENFORCER_JOB}"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    gcloud run services remove-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+      --member "serviceAccount:${SCHEDULER_SA}" --role roles/run.invoker --condition=None --quiet >/dev/null 2>&1 || true
+  fi
+  grant_org_deny_roles "$PROJECT_ID" "$ENFORCER_SA" "$SA_EMAIL" "$GRANT_ORG_ROLES"
 else
-  info "enforcement schedule: on-demand from the dashboard (ENFORCEMENT_SCHEDULE off)"
+  if [[ -n "$ENFORCEMENT_SCHEDULE" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
+    ensure_scheduler_sa
+    JOB="${SERVICE_NAME}-enforce"
+    JOB_ARGS=(--project "$PROJECT_ID" --location "$REGION" --schedule "$ENFORCEMENT_SCHEDULE"
+      --time-zone "$WORKSPACE_TIMEZONE" --uri "$ENFORCE_URL" --http-method POST --message-body '{}'
+      --oidc-service-account-email "$SCHEDULER_SA" --oidc-token-audience "$ENFORCE_URL"
+      --attempt-deadline 300s --max-retry-attempts 1 --quiet)
+    if gcloud scheduler jobs describe "$JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
+      run retry gcloud scheduler jobs update http "$JOB" "${JOB_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null
+    else
+      run retry gcloud scheduler jobs create http "$JOB" "${JOB_ARGS[@]}" --headers Content-Type=application/json >/dev/null
+    fi
+    WEB_SCHED_READY=1
+    info "job ${JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> ${ENFORCE_URL}"
+    # When the organization requires IAM invoker checks (run.managed.requireInvokerIam) the service is not public and
+    # Cloud Run would reject the scheduler's OIDC call before the app sees it; restores would then never run.
+    run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+      --member "serviceAccount:${SCHEDULER_SA}" --role roles/run.invoker --condition=None --quiet >/dev/null \
+      || warn "could not grant roles/run.invoker on ${SERVICE_NAME} to ${SCHEDULER_SA}; if the service requires IAM invoker checks, scheduled enforcement (and automatic restores) will fail"
+  else
+    # No scheduled runs (ENFORCEMENT_SCHEDULE off, a read-only install or IAP): the job of an earlier deployment would
+    # keep calling the dashboard on the old schedule, so it is removed with the scheduler's right to call the service.
+    if [[ "$EFFECTIVE_ACCESS_MODE" == "iap" ]]; then SCHED_OFF_WHY="IAP access mode"
+    elif [[ "$ENABLE_GOVERNANCE_ACTIONS" != "true" && "$ENFORCEMENT_BACKEND" != "notify_only" ]]; then SCHED_OFF_WHY="read-only install"
+    else SCHED_OFF_WHY="ENFORCEMENT_SCHEDULE off"; fi
+    remove_scheduler_job "${SERVICE_NAME}-enforce" "$REGION" "$SCHED_OFF_WHY"
+    if [[ "$DRY_RUN" != "1" ]]; then
+      gcloud run services remove-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+        --member "serviceAccount:${SCHEDULER_SA}" --role roles/run.invoker --condition=None --quiet >/dev/null 2>&1 || true
+    fi
+    info "enforcement schedule: on-demand from the dashboard (${SCHED_OFF_WHY})"
+  fi
+  # Leaving iam_deny: the job's schedule of an earlier deployment is removed (one enforcer at a time). The job and its
+  # service account are kept until removed by hand (README 8.9), so a managed deny policy can still be cleaned up.
+  remove_scheduler_job "$ENFORCER_SCHED_JOB" "$ENFORCEMENT_JOB_REGION" "ENFORCEMENT_BACKEND=${ENFORCEMENT_BACKEND}"
+fi
+
+# Real-time Antigravity cap enforcement (services/usage_events.py): routes each Antigravity inference log entry
+# through Pub/Sub push to POST /api/v1/governance/antigravity/usage-event with an OIDC token of the dashboard's
+# runtime service account. Automatic mode then starts enforcement as soon as a person reaches their cap instead of
+# waiting for the next scheduled run; the scheduled run stays the safety net for period resets.
+REALTIME_READY=0
+if [[ "$REALTIME_ENFORCEMENT" == "true" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "[dry-run] Pub/Sub topic ${USAGE_EVENTS_TOPIC} + log sink ${USAGE_EVENTS_SINK} -> push ${USAGE_EVENTS_SUB_ID} -> ${USAGE_EVENT_URL} (OIDC ${SA_EMAIL})"
+    REALTIME_READY=1
+  else
+    _rt_ok=1
+    if ! gcloud pubsub topics describe "$USAGE_EVENTS_TOPIC" --project "$PROJECT_ID" >/dev/null 2>&1; then
+      retry gcloud pubsub topics create "$USAGE_EVENTS_TOPIC" --project "$PROJECT_ID" --quiet >/dev/null 2>&1 \
+        || { warn "could not create Pub/Sub topic ${USAGE_EVENTS_TOPIC}; real-time cap enforcement skipped"; _rt_ok=0; }
+    fi
+    if [[ "$_rt_ok" == "1" ]]; then
+      ensure_usage_events_sink "$PROJECT_ID" "$PROJECT_ID" "$USAGE_EVENTS_TOPIC" "$USAGE_EVENTS_SINK" 0 || _rt_ok=0
+    fi
+    if [[ "$_rt_ok" == "1" && ${#CLEAN_LINKED[@]} -gt 0 && "$PREPARE_LINKED_PROJECTS" == "true" ]]; then
+      for lp in "${CLEAN_LINKED[@]}"; do
+        ensure_usage_events_sink "$lp" "$PROJECT_ID" "$USAGE_EVENTS_TOPIC" "$USAGE_EVENTS_SINK" 1 || true
+      done
+    fi
+    if [[ "$_rt_ok" == "1" ]]; then
+      retry gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" --project "$PROJECT_ID" \
+        --member "serviceAccount:${PUBSUB_AGENT}" --role roles/iam.serviceAccountTokenCreator \
+        --condition=None --quiet >/dev/null 2>&1 \
+        || warn "could not grant roles/iam.serviceAccountTokenCreator on ${SA_EMAIL} to ${PUBSUB_AGENT}; Pub/Sub OIDC push may fail on older projects"
+      gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+        --member "serviceAccount:${SA_EMAIL}" --role roles/run.invoker --condition=None --quiet >/dev/null 2>&1 || true
+      PUSH_ARGS=(--project "$PROJECT_ID" --push-endpoint="$USAGE_EVENT_URL"
+        --push-auth-service-account="$SA_EMAIL" --push-auth-token-audience="$USAGE_EVENT_URL"
+        --ack-deadline=60 --min-retry-delay=10s --max-retry-delay=60s --message-retention-duration=10m --quiet)
+      if gcloud pubsub subscriptions describe "$USAGE_EVENTS_SUB_ID" --project "$PROJECT_ID" >/dev/null 2>&1; then
+        retry gcloud pubsub subscriptions update "$USAGE_EVENTS_SUB_ID" "${PUSH_ARGS[@]}" >/dev/null 2>&1 \
+          && REALTIME_READY=1 \
+          || warn "could not update Pub/Sub push subscription ${USAGE_EVENTS_SUB_ID}; scheduled enforcement still applies"
+      else
+        retry gcloud pubsub subscriptions create "$USAGE_EVENTS_SUB_ID" --topic="$USAGE_EVENTS_TOPIC" "${PUSH_ARGS[@]}" >/dev/null 2>&1 \
+          && REALTIME_READY=1 \
+          || warn "could not create Pub/Sub push subscription ${USAGE_EVENTS_SUB_ID}; scheduled enforcement still applies"
+      fi
+      [[ "$REALTIME_READY" == "1" ]] \
+        && info "real-time usage push ${USAGE_EVENTS_SUB_ID} -> ${USAGE_EVENT_URL} (OIDC ${SA_EMAIL})"
+    fi
+  fi
+elif [[ "$DRY_RUN" != "1" ]]; then
+  # Real-time enforcement off (or the dashboard fell back to IAP): remove what an earlier deployment created, the push
+  # subscription first so nothing is delivered any more, then the sinks of the hub and the linked projects and the topic.
+  if gcloud pubsub subscriptions describe "$USAGE_EVENTS_SUB_ID" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    gcloud pubsub subscriptions delete "$USAGE_EVENTS_SUB_ID" --project "$PROJECT_ID" --quiet >/dev/null 2>&1 \
+      && info "removed Pub/Sub push subscription ${USAGE_EVENTS_SUB_ID} (real-time enforcement off)" || true
+  fi
+  for sink_proj in "$PROJECT_ID" ${CLEAN_LINKED[@]+"${CLEAN_LINKED[@]}"}; do
+    if gcloud logging sinks describe "$USAGE_EVENTS_SINK" --project "$sink_proj" >/dev/null 2>&1; then
+      gcloud logging sinks delete "$USAGE_EVENTS_SINK" --project "$sink_proj" --quiet >/dev/null 2>&1 \
+        && info "removed log sink ${USAGE_EVENTS_SINK} on ${sink_proj} (real-time enforcement off)" || true
+    fi
+  done
+  if gcloud pubsub topics describe "$USAGE_EVENTS_TOPIC" --project "$PROJECT_ID" >/dev/null 2>&1; then
+    gcloud pubsub topics delete "$USAGE_EVENTS_TOPIC" --project "$PROJECT_ID" --quiet >/dev/null 2>&1 \
+      && info "removed Pub/Sub topic ${USAGE_EVENTS_TOPIC} (real-time enforcement off)" || true
+  fi
 fi
 
 # Maintenance tick: daily official price/FX check at pricing.sync_time (Settings > Data collection and cost) and the
@@ -1102,13 +1470,31 @@ if [[ "$MAINTENANCE_SCHEDULE" != "off" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; 
     fi
   fi
 elif [[ "$EFFECTIVE_ACCESS_MODE" == "iap" ]]; then
+  remove_scheduler_job "$MAINT_JOB" "$REGION" "IAP blocks Cloud Scheduler calls"
   info "maintenance schedule: IAP blocks Cloud Scheduler calls; scheduled work runs in-process while an instance is up (use ACCESS_MODE google, google_oauth or password for a reliable schedule)"
 else
+  remove_scheduler_job "$MAINT_JOB" "$REGION" "MAINTENANCE_SCHEDULE=off"
   info "maintenance schedule: off (MAINTENANCE_SCHEDULE=off); run the price check from the FinOps page"
 fi
 if [[ "$DRY_RUN" != "1" ]] && gcloud scheduler jobs describe "$LEGACY_PRICING_JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
   gcloud scheduler jobs delete "$LEGACY_PRICING_JOB" --project "$PROJECT_ID" --location "$REGION" --quiet >/dev/null 2>&1 \
     && info "removed ${LEGACY_PRICING_JOB} (replaced by ${MAINT_JOB})" || true
+fi
+
+# The revision of step 7 announced the enforcement schedule and the real-time push (LIVE_ENV) before step 8 set them
+# up. Whatever did not come up is taken out again, so the dashboard never shows it as configured: at most one more
+# revision, and only when something failed.
+STALE_ENV=()
+[[ "$LIVE_SCHED_ENV" == "1" && "$WEB_SCHED_READY" != "1" ]] && STALE_ENV+=(SCHEDULER_INVOKERS)
+[[ "$LIVE_RT_ENV" == "1" && "$REALTIME_READY" != "1" ]] && STALE_ENV+=(USAGE_EVENTS_SUBSCRIPTION)
+if [[ ${#STALE_ENV[@]} -gt 0 && "$DRY_RUN" != "1" ]]; then
+  STALE_CSV="$(IFS=','; echo "${STALE_ENV[*]}")"
+  if gcloud run services update "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+      --remove-env-vars "$STALE_CSV" --quiet >/dev/null 2>&1; then
+    info "removed ${STALE_CSV} from ${SERVICE_NAME} (not set up, so the dashboard shows it as not configured)"
+  else
+    warn "could not remove ${STALE_CSV} from ${SERVICE_NAME}; the dashboard may show it as configured. Run: gcloud run services update ${SERVICE_NAME} --project ${PROJECT_ID} --region ${REGION} --remove-env-vars ${STALE_CSV}"
+  fi
 fi
 
 if [[ "$DRY_RUN" != "1" ]]; then
@@ -1177,11 +1563,32 @@ if [[ ${#CLEAN_LINKED[@]} -eq 0 && ",$DISABLED_MODULES," != *",gemini_enterprise
     warn "[한국어 안내] ${PROJECT_ID}에서 Gemini Enterprise 앱이나 라이선스 좌석을 찾지 못했습니다. Gemini Enterprise가 다른 프로젝트에서 운영 중이면 그 프로젝트에 설치하거나(권장: 거버넌스와 마커 역할은 대표 프로젝트의 IAM에 적용됩니다) --link-projects <GE 프로젝트>로 다시 실행하세요."
   fi
 fi
-if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
-  if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
-    info "Antigravity caps: enforcement runs ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}); suspended users are restored automatically at each period reset"
-  else
-    info "Antigravity caps: no enforcement schedule; select Run enforcement now in the dashboard after each period reset"
-  fi
-  antigravity_readiness "$PROJECT_ID"
-fi
+case "$ENFORCEMENT_BACKEND" in
+  iam_deny)
+    if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
+      info "Antigravity caps: deny-policy enforcement by the Cloud Run job ${ENFORCER_JOB} (${ENFORCEMENT_JOB_REGION}) ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}); suspended users are restored automatically at each period reset"
+    else
+      info "Antigravity caps: deny-policy enforcement by the Cloud Run job ${ENFORCER_JOB} (${ENFORCEMENT_JOB_REGION}); no schedule: select Run enforcement now in the dashboard after each period reset"
+    fi
+    [[ "$REALTIME_READY" == "1" ]] && info "Real-time caps: active via Pub/Sub push (${USAGE_EVENTS_SUB_ID} -> ${USAGE_EVENT_URL})"
+    if [[ ${#ORG_DENY_ROLE_COMMANDS[@]} -gt 0 ]]; then
+      warn "deny-policy enforcement starts once the organization roles above are granted (until then every run stops at the safety gates)"
+    fi
+    antigravity_readiness "$PROJECT_ID"
+    ;;
+  notify_only)
+    info "Antigravity caps: notify only (plans and notifications; access never changes)${ENFORCEMENT_SCHEDULE:+; runs ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE})}"
+    antigravity_readiness "$PROJECT_ID"
+    ;;
+  *)
+    if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
+      if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
+        info "Antigravity caps: enforcement runs ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}); suspended users are restored automatically at each period reset"
+      else
+        info "Antigravity caps: no enforcement schedule; select Run enforcement now in the dashboard after each period reset"
+      fi
+      [[ "$REALTIME_READY" == "1" ]] && info "Real-time caps: active via Pub/Sub push (${USAGE_EVENTS_SUB_ID} -> ${USAGE_EVENT_URL})"
+      antigravity_readiness "$PROJECT_ID"
+    fi
+    ;;
+esac

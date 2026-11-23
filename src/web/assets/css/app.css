@@ -4,6 +4,26 @@
    Theming follows the color-scheme meta element (system / light / dark).
    ========================================================================== */
 
+/* Google Sans Flex, self-hosted (SIL Open Font License 1.1: assets/fonts/OFL.txt).
+   Variable weight 400-700 in two subsets: latin, and latin-ext (it carries the won sign U+20A9).
+   Hangul and other scripts fall through to the system fonts listed in --font. */
+@font-face {
+  font-family: "Google Sans Flex";
+  src: url("/assets/fonts/google-sans-flex-latin-ext.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C4, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Google Sans Flex";
+  src: url("/assets/fonts/google-sans-flex-latin.woff2") format("woff2");
+  font-weight: 400 700;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
 :root {
   color-scheme: light dark;
 
@@ -60,7 +80,7 @@
   --sidebar-w-collapsed: 64px;
   --topbar-h: 56px;
 
-  --font: "Inter", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
+  --font: "Google Sans Flex", "Google Sans", "Inter", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", sans-serif;
   --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
   --ease: cubic-bezier(.2, .8, .2, 1);
 
@@ -1109,12 +1129,11 @@ kbd {
 .agent-tables > div { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; }
 
 /* ---------- Antigravity: per-user caps and enforcement ---------- */
-.enf-grid { display: grid; gap: 16px 24px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.enf-grid { display: grid; gap: 16px 24px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
 .enf-item { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .enf-label { font-size: 12px; color: var(--text-3); }
 .enf-value { font-size: 15px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; }
 .enf-sub { font-size: 12px; color: var(--text-3); line-height: 1.45; }
-@media (max-width: 1100px) { .enf-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 640px) { .enf-grid { grid-template-columns: minmax(0, 1fr); } }
 .row.nowrap { flex-wrap: nowrap; }
 .price-rows { display: flex; flex-direction: column; gap: 8px; }
@@ -1266,4 +1285,178 @@ a.chip-link:hover { border-color: var(--border-strong); background: var(--hover)
   .price-row { grid-template-columns: 1fr 1fr; }
   .price-head { display: none; }
 }
+
+/* ---------- Agent details (one Agent Engine deployment) ---------- */
+.agent-head { display: grid; gap: 14px; min-width: 0; }
+.agent-heading { display: grid; gap: 8px; min-width: 0; }
+.back-link { display: inline-flex; align-items: center; gap: 4px; width: fit-content; font-size: 12.5px; font-weight: 550; color: var(--text-3); }
+.back-link:hover { color: var(--text); text-decoration: none; }
+.agent-facts { display: flex; flex-wrap: wrap; gap: 10px 28px; margin-top: 6px; }
+.agent-fact { display: grid; gap: 1px; min-width: 0; }
+.agent-fact-label { font-size: 11.5px; color: var(--text-3); }
+.agent-fact-value { font-size: 13px; color: var(--text); min-width: 0; }
+/* The views are links (each has its own address); the open one is marked with aria-current. */
+.agent-tabs .tab { display: inline-flex; align-items: center; flex-shrink: 0; text-decoration: none; }
+.agent-tabs .tab:hover { text-decoration: none; }
+.agent-tabs .tab:focus-visible { outline-offset: -2px; }
+.agent-tabs .tab[aria-current="page"] { color: var(--text); }
+.agent-tabs .tab[aria-current="page"]::after { content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--accent); }
+.section-head { display: grid; gap: 2px; margin-top: 4px; }
+/* A state badge with its explanation underneath; the badge keeps its own width. */
+.state-cell { display: grid; gap: 3px; justify-items: start; min-width: 0; }
+
+/* Trace timeline: one row per span, with a bar on the time axis of the trace. */
+.waterfall .wf-label { display: flex; align-items: center; gap: 8px; min-width: 0; --truncate-w: 230px; }
+.waterfall .wf-label .badge { flex-shrink: 0; }
+.waterfall .wf-track-cell { width: 32%; min-width: 170px; }
+.wf-track { position: relative; height: 10px; border-radius: 5px; background: var(--surface-3); }
+.wf-bar { position: absolute; top: 0; bottom: 0; min-width: 2px; border-radius: 5px; background: var(--text-4); }
+.wf-bar.error { background: var(--danger); }
+
+/* Call graph */
+.topology-scroll { overflow-x: auto; padding: 2px 0 6px; }
+.topology-svg { display: block; max-width: none; }
+.topology-edge { stroke: var(--border-strong); }
+.topology-edge-label { fill: var(--text-3); font-size: 11px; font-family: var(--font); font-variant-numeric: tabular-nums; paint-order: stroke; stroke: var(--surface); stroke-width: 4px; stroke-linejoin: round; }
+.topology-node rect { fill: var(--surface); stroke-width: 1.5; }
+.topology-name { fill: var(--text); font-size: 12.5px; font-weight: 600; font-family: var(--font); }
+.topology-sub { fill: var(--text-3); font-size: 11px; font-family: var(--font); }
+.topology-error { fill: var(--danger); }
+.topology-legend { gap: 6px 16px; font-size: 12px; color: var(--text-3); }
+
+/* Playground */
+.pg-main { min-height: 0; }
+/* The thread takes the height left under the agent header and the notice, so the message field stays in view. */
+.pg-thread { min-height: 240px; max-height: max(260px, calc(100vh - var(--topbar-h) - 520px)); }
+.pg-main .composer-box textarea { field-sizing: content; }
+.pg-thought { font-size: 12.5px; font-style: italic; color: var(--text-3); white-space: pre-wrap; overflow-wrap: anywhere; border-left: 2px solid var(--border-strong); padding-left: 10px; }
+.pg-tool { border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-2); min-width: 0; }
+.pg-tool > summary { cursor: pointer; padding: 7px 10px; font-size: 12.5px; color: var(--text-2); }
+.pg-tool > summary:hover { color: var(--text); }
+.pg-tool > summary > * { vertical-align: middle; margin-left: 4px; }
+.pg-tool[open] > summary { border-bottom: 1px solid var(--border); }
+.pg-tool > .code-wrap { margin: 8px; }
+.pg-meta { padding-left: 40px; }
+
+/* ---------- Antigravity simplified layout & per-user model cost cells ---------- */
+.tab .count.warning { background: var(--warning-bg); color: var(--warning); font-weight: 600; }
+.tab .count.danger { background: var(--danger-bg); color: var(--danger); font-weight: 600; }
+.tab .count.accent { background: var(--accent-soft); color: var(--accent-text); font-weight: 600; }
+.agy-tabs { scrollbar-gutter: stable; overscroll-behavior-x: contain; }
+.agy-tab-panel[hidden] { display: none; }
+
+.agy-control-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px 20px; flex-wrap: wrap;
+  padding: 12px 16px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xs);
+}
+.agy-control-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 22px; min-width: 0; }
+.agy-control-fact { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.agy-control-fact-label { font-size: 11px; color: var(--text-3); font-weight: 500; }
+.agy-control-fact-value { font-size: 13px; color: var(--text); font-weight: 600; }
+
+.model-cost-list { display: grid; gap: 3px; min-width: 190px; max-width: 300px; }
+.model-cost-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  font-size: 12px; line-height: 1.35;
+}
+.model-cost-name {
+  font-family: var(--mono); font-size: 11.5px; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.model-cost-amt {
+  font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text);
+  white-space: nowrap; flex-shrink: 0;
+}
+.model-cost-amt.muted { font-weight: 500; color: var(--text-3); }
+.model-cost-more { margin-top: 2px; }
+.model-cost-more > summary {
+  cursor: pointer; font-size: 11.5px; font-weight: 550; color: var(--accent-text);
+  width: fit-content; user-select: none;
+}
+.model-cost-more > summary:hover { text-decoration: underline; }
+.model-cost-more[open] > summary { margin-bottom: 3px; }
+.model-cost-more-list { display: grid; gap: 3px; }
+
+.model-summary-bar {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px 22px;
+  padding: 10px 16px;
+  background: var(--surface-2); border-bottom: 1px solid var(--border);
+}
+.model-summary-item { display: inline-flex; align-items: baseline; gap: 6px; font-size: 12.5px; }
+.model-summary-label { color: var(--text-3); }
+.model-summary-value { font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.model-summary-value.emphasis { color: var(--accent-text); font-size: 13.5px; }
+
+
+/* ---------- User details drawer: sections filled as each part arrives ---------- */
+/* The section wrappers add no box of their own: their cards stay direct items of the drawer grid (same gaps). */
+.drawer-section { display: contents; }
+.drawer-head-row { align-items: center; }
+.drawer-head-row .drawer-range { margin-left: auto; }
+.stat .stat-skeleton { display: block; width: 64%; height: 14px; margin: 5px 0; }
+
+/* ---------- Status cells and exception rule pills ---------- */
+/* A badge in a stacked cell keeps its own width instead of stretching across the column. */
+.cell-stack > .badge { justify-self: start; }
+.status-cell { display: grid; gap: 6px; justify-items: start; min-width: 0; }
+.status-cell-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+
+/* One exception rule as one pill; an optional action sits inside it after a divider. The inner height keeps the
+   action a 24px target. Borders (not shadows) draw the outline and divider, so they survive forced colors. */
+.rule-tag {
+  --rule-fg: var(--success); --rule-bg: var(--success-bg); --rule-border: var(--success-border);
+  display: inline-flex; align-items: stretch; max-width: 100%; min-block-size: 26px;
+  border: 1px solid var(--rule-border); border-radius: 999px; overflow: hidden;
+  background: var(--rule-bg); color: var(--rule-fg);
+  font-size: 12px; font-weight: 550; line-height: 1.2; white-space: nowrap;
+}
+.rule-tag-danger { --rule-fg: var(--danger); --rule-bg: var(--danger-bg); --rule-border: var(--danger-border); }
+.rule-tag-accent {
+  --rule-fg: var(--accent-text); --rule-bg: var(--accent-soft);
+  --rule-border: color-mix(in oklab, var(--accent) 28%, transparent);
+}
+.rule-tag-label { display: inline-flex; align-items: center; gap: 5px; padding-inline: 9px 10px; min-width: 0; }
+.rule-tag-label svg { flex-shrink: 0; }
+.rule-tag-text { overflow: hidden; text-overflow: ellipsis; }
+.rule-tag-action {
+  appearance: none; display: inline-flex; align-items: center; margin: 0;
+  padding-inline: 10px 11px; min-inline-size: 24px;
+  border: 0; border-inline-start: 1px solid var(--rule-border);
+  border-start-end-radius: 999px; border-end-end-radius: 999px;
+  background: transparent; color: inherit; font: inherit; font-weight: 650; cursor: pointer;
+}
+.rule-tag-action:hover { background: color-mix(in oklab, var(--rule-fg) 12%, transparent); }
+.rule-tag-action:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -3px;
+  border-start-start-radius: 0; border-end-start-radius: 0; border-start-end-radius: 999px; border-end-end-radius: 999px;
+}
+/* In a label/value list the taller rule pill keeps its text on the line of its label. */
+.kv dd > .status-cell-row { margin-block: -3px; }
+
+/* ---------- Cap period editor: radio cards, contextual schedule controls & live preview ---------- */
+.period-fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
+.period-fieldset > legend { padding: 0; margin-block-end: 8px; }
+.period-grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+.period-card { background: var(--surface); transition: border-color 0.12s ease, background-color 0.12s ease; }
+.period-card input { accent-color: var(--accent); flex-shrink: 0; }
+.period-card:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.period-controls { display: grid; gap: 12px 16px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-block-start: 4px; }
+.period-controls[hidden] { display: none; }
+.period-preview {
+  display: grid; gap: 6px; padding: 12px 14px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.period-preview:empty { display: none; }
+.period-preview-head { font-size: 13px; font-weight: 600; color: var(--text); }
+.period-preview-row { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px; font-size: 12.5px; }
+.period-preview-label { color: var(--text-3); font-weight: 500; }
+.period-preview-val { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.period-preview-note { font-size: 12px; color: var(--text-3); line-height: 1.45; margin-block-start: 2px; }
+.period-advanced { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; background: var(--surface); }
+.period-advanced-summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--text-2); user-select: none; }
+.period-advanced-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.period-advanced-body { margin-block-start: 10px; }
+.period-window-list { display: grid; gap: 8px; }
 

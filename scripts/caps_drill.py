@@ -43,6 +43,11 @@ def main():
     ap.add_argument("--crowd", type=int, default=0, help="add this many people who use Claude every 10 minutes "
                                                           "(with --org-budget: many people over at the same moment)")
     ap.add_argument("--fast", action="store_true", help="skip scheduler runs in which nothing can change")
+    ap.add_argument("--backend", choices=("iam_allow_swap", "iam_deny"), default="iam_allow_swap",
+                    help="enforcement method: allow-policy swap (default) or the IAM deny policy")
+    ap.add_argument("--unit-budget", type=float, default=None,
+                    help="monthly paid budget in USD of an organization unit (steady, claude-only and contractor), "
+                         "action suspend")
     ap.add_argument("--lang", choices=("ko", "en"), default="ko")
     args = ap.parse_args()
     zone = timeutil.get_zone(args.tz)
@@ -52,10 +57,16 @@ def main():
         today = dt.datetime.now(zone)
         first = (today.replace(day=1) - dt.timedelta(days=1)).replace(day=1, hour=0, minute=0, second=0,
                                                                       microsecond=0)
+    units = None
+    if args.unit_budget is not None:
+        units = [{"name": "Platform", "budget": max(0.0, args.unit_budget), "action": "suspend",
+                  "members": ["steady@cymbal.example.com", "claude-only@cymbal.example.com",
+                              "contractor@cymbal.example.com"]}]
     started = time.monotonic()
     drill = caps_drill.Drill(first, args.days, budget=None if args.budget < 0 else args.budget,
                              credit_month=args.credit, org_budget=args.org_budget, tz=args.tz,
-                             weekday=args.weekday, at=args.at, skip_quiet=args.fast, crowd=max(0, args.crowd))
+                             weekday=args.weekday, at=args.at, skip_quiet=args.fast, crowd=max(0, args.crowd),
+                             backend=args.backend, units=units)
     result = drill.run()
     print(caps_drill.format_report(result, args.lang))
     print("(%.1fs)" % (time.monotonic() - started))

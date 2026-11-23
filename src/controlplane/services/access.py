@@ -244,10 +244,14 @@ def save_user(ctx):
     iap_results = _grant_iap(ctx, email_members) if email_members else []
 
     id_or_pw_members = [m for m in members if has_password or "@" not in m or m in existing_accounts]
-    if id_or_pw_members:
+    explicit_members = [m for m in members if m != "*" and not m.startswith("*@")]
+    if id_or_pw_members or explicit_members:
         when = now_iso()
 
         def apply_accounts(auth):
+            blocked = auth.get("blocked") or {}
+            for member in explicit_members:
+                blocked.pop(member, None)
             accts = auth.setdefault("accounts", {})
             for member in id_or_pw_members:
                 if member == "*" or member.startswith("*@"):

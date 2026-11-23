@@ -21,8 +21,19 @@ After every enforcement run an independent reference ledger, written call by cal
   R3  every stop has a restore time no later than the end of the month, and everybody is restored by then
   R4  spending beyond the paid budget stays within one five-minute interval after each restore (plus one interval
       for each run a person waited for the change budget)
-  R5  people with an allow rule are never stopped; people with access through a group are never touched
+  R5  people with an allow rule are never stopped; people with access through a group are never touched (with the
+      IAM deny policy they can be stopped like everybody else, so only the allow rule is checked)
   R6  the monthly usage report equals the reference ledger for every person (to the cent)
+  R7  when an organization unit's monthly budget (action suspend) is spent, every person of the unit with nothing free
+      right now is stopped by that run
+  R8  with the IAM deny policy: the managed policy lists exactly the people the governance state records as stopped,
+      denies only the allow-listed permission, and has the control plane's id at the configured attachment point
+  R9  with the IAM deny policy: nobody is left in a deny policy once every restore time has passed
+  R10 the chargeback allocation of each month adds up at every level (people, units, projects) and equals the
+      reference ledger per person (to the cent)
+
+The deny backend (backend="iam_deny") simulates the IAM v2 deny policy API instead of allow-policy swaps; a person
+listed in it cannot call Antigravity, whatever their roles.
 
 Used by scripts/caps_drill.py (people run it) and tests/unit/test_caps_drill.py (every test run).
 """
@@ -32,6 +43,8 @@ from __future__ import annotations
 import bisect
 import copy
 import datetime as dt
+import re
+import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass, field
 from unittest import mock
@@ -39,12 +52,13 @@ from unittest import mock
 from . import config, timeutil
 from .cache import TTLCache
 from .gcp import GcpError
+from .httpkit import ApiError
 from .schema import Source, TableSchema
 from .security import Identity
-from .services import credit_ledger
+from .services import budgets, chargeback, credit_ledger, enforcers, org_model
 from .services import governance as gov
 from .services.base import AGY_SINK
-from .settings_store import MemoryStore, SettingsManager
+from .settings_store import MemoryStore, SettingsManager, aux_docs
 
 UTC = dt.timezone.utc
 PROJECT = "cymbal-ge-drill"
@@ -190,16 +204,22 @@ def sink_schema():
     ])
 
 
-class World:
-    """IAM policy and inference log of the simulated project."""
+IAM_V2 = "https://iam.googleapis.com/v2/"
+_DENY_PATH_RE = re.compile(r"policies/([^/]+)/denypolicies(?:/([a-z0-9-]+))?")
 
-    def __init__(self, persons, sink_created):
+
+class World:
+    """IAM policy (allow, and deny with the iam_deny backend) and inference log of the simulated project."""
+
+    def __init__(self, persons, sink_created, backend="iam_allow_swap"):
         members = ["user:%s" % p.email for p in persons if not p.via_group]
         if any(p.via_group for p in persons):
             members.append(GROUP)
         self.policy = {"version": 3, "etag": "BwE0", "bindings": [
             {"role": ACCESS_ROLE, "members": members}, {"role": "roles/owner", "members": ["user:%s" % ADMIN]}]}
         self.via_group = {p.email for p in persons if p.via_group}
+        self.backend = backend
+        self.deny = {}      # (attachment point, policy id) -> deny policy
         self.series = {}    # (email, model) -> prefix sums over calls in time order
         self.calls = defaultdict(list)    # email -> [(time, model)]
         self.policy_writes = 0
@@ -207,7 +227,18 @@ class World:
         self.sink = Source(PROJECT, "ge_analytics", AGY_SINK, "table", AGY_SINK, sink_schema(), created=sink_created)
 
     # -- IAM -------------------------------------------------------------------------------------------------
+    def denied(self, email):
+        """True when a deny policy lists the person (for any permission: the policies only ever deny Antigravity)."""
+        principal = "principal://goog/subject/%s" % email
+        for policy in self.deny.values():
+            for rule in policy.get("rules") or []:
+                if principal in ((rule.get("denyRule") or {}).get("deniedPrincipals") or []):
+                    return True
+        return False
+
     def has_access(self, email):
+        if self.backend == "iam_deny" and self.denied(email):
+            return False
         if email in self.via_group:
             return True
         member = "user:%s" % email
@@ -215,9 +246,50 @@ class World:
                    for b in self.policy["bindings"])
 
     def is_capped(self, email):
+        if self.backend == "iam_deny":
+            return self.denied(email)
         member = "user:%s" % email
         marker = gov.marker_name(PROJECT, "CustomAntigravityCapBlocked")
         return any(b.get("role") == marker and member in b.get("members", []) for b in self.policy["bindings"])
+
+    def _deny_rest(self, method, url, body, params):
+        """IAM v2 deny policies: operations are done at once; writes need the etag that was read."""
+        path = url[len(IAM_V2):]
+        if "/operations/" in path:
+            return {"name": path, "done": True}
+        m = _DENY_PATH_RE.fullmatch(path)
+        if not m:
+            raise GcpError("not_found", status=404)
+        point = urllib.parse.unquote(m.group(1))
+        key = (point, m.group(2) or (params or {}).get("policyId"))
+        current = self.deny.get(key)
+        if method == "GET":
+            if current is None:
+                raise GcpError("not_found", status=404)
+            return copy.deepcopy(current)
+        if method == "POST":
+            if current is not None:
+                raise GcpError("conflict", status=409)
+            return self._deny_store(key, m.group(1), body)
+        if current is None:
+            raise GcpError("not_found", status=404)
+        etag = (body or {}).get("etag") if method == "PUT" else (params or {}).get("etag")
+        if etag != current["etag"]:
+            raise GcpError("conflict", status=409)
+        if method == "DELETE":
+            self.policy_writes += 1
+            self.deny.pop(key)
+            return {"name": "policies/%s/denypolicies/%s/operations/op-%d" % (m.group(1), key[1], self.policy_writes),
+                    "done": True, "response": {}}
+        return self._deny_store(key, m.group(1), body)
+
+    def _deny_store(self, key, encoded, body):
+        self.policy_writes += 1
+        policy = {"name": "policies/%s/denypolicies/%s" % (encoded, key[1]), "etag": "D%d" % self.policy_writes,
+                  "displayName": (body or {}).get("displayName"), "rules": copy.deepcopy((body or {}).get("rules"))}
+        self.deny[key] = policy
+        return {"name": "%s/operations/op-%d" % (policy["name"], self.policy_writes), "done": True,
+                "response": copy.deepcopy(policy)}
 
     # -- inference log ----------------------------------------------------------------------------------------
     def log_call(self, when, email, model):
@@ -245,7 +317,9 @@ class World:
         return rows
 
     # -- API surface the control plane calls ----------------------------------------------------------------
-    def rest(self, method, url, body):
+    def rest(self, method, url, body, params=None):
+        if url.startswith(IAM_V2 + "policies/"):
+            return self._deny_rest(method, url, body, params)
         if url.endswith(":getIamPolicy"):
             return copy.deepcopy(self.policy)
         if url.endswith(":setIamPolicy"):
@@ -324,8 +398,21 @@ class DrillCtx:
     def excluded_patterns(self):
         return list(self.settings["model_catalog"]["excluded_sku_patterns"])
 
+    @property
+    def all_projects(self):
+        return [PROJECT]
+
+    def child(self, rng=None):  # pylint: disable=unused-argument
+        out = DrillCtx(self._drill, self.identity, params=self.params, body=self.body)
+        out.settings, out.version = self.settings, self.version
+        return out
+
+    def absorb(self, other):
+        self.warnings.extend(other.warnings)
+        self.sources |= other.sources
+
     def rest(self, method, url, **kwargs):
-        return self._drill.world.rest(method, url, kwargs.get("json_body"))
+        return self._drill.world.rest(method, url, kwargs.get("json_body"), kwargs.get("params"))
 
     def query(self, sql, params, module, **kwargs):  # pylint: disable=unused-argument
         return self._drill.world.query(sql, params)
@@ -438,12 +525,15 @@ class Result:
 
 class Drill:
     def __init__(self, start, days, budget=100.0, credit_month=10.0, org_budget=None, tz="Asia/Seoul", weekday=0,
-                 at="00:00", persons=None, skip_quiet=False, crowd=0):
+                 at="00:00", persons=None, skip_quiet=False, crowd=0, backend="iam_allow_swap", units=None):
+        """units: organization units with a monthly paid budget, [{"name", "members": [emails], "budget": USD,
+        "action": "suspend" | "review" | "notify"}] (members not listed are in no unit)."""
         zone = timeutil.get_zone(tz)
         self.start = start.astimezone(UTC)
         self.end = self.start + dt.timedelta(days=days)
         self.tz, self.zone = tz, zone
         self.budget, self.credit_month, self.org_budget = budget, float(credit_month), org_budget
+        self.backend = backend
         self.cycle = credit_ledger.Cycle(tz=tz, weekday=weekday, at=at)
         month_start_local = self.cycle.month(self.start)[0].astimezone(zone)
         self.persons = list(persons if persons is not None else default_people(month_start_local))
@@ -460,12 +550,13 @@ class Drill:
                 "enforcement_mode": "auto", "reset_timezone": tz, "reset_weekday": weekday, "reset_time": at,
                 "pricing_source": "manual", "usage_source": "bigquery", "token_cap": 0, "request_cap": 0,
                 "model_prices": [dict(model=m, **p) for m, p in PRICES.items()],
-                "scheduler_invokers": [SCHEDULER]}},
+                "scheduler_invokers": [SCHEDULER], "enforcement_backend": backend}},
         }
         base = config.deep_merge(copy.deepcopy(config.DEFAULTS), overrides)
         self.manager = SettingsManager(base, MemoryStore())
         self.app = DrillApp(self.manager)
-        self.world = World(self.persons, sink_created=self.start - dt.timedelta(days=90))
+        self.world = World(self.persons, sink_created=self.start - dt.timedelta(days=90), backend=backend)
+        self.units = self._store_units(units or [])
         self.now = self.start
         self.events, self.violations = [], []
         self.denied = defaultdict(int)
@@ -478,6 +569,23 @@ class Drill:
         self._slot_paid_max = defaultdict(float)
         self.deferred_max = self.deferred_runs = self.change_budget = 0
         self.refs = {p.email: Reference(*self.terms(p.email)) for p in self.persons}
+
+    def _store_units(self, units):
+        """Writes the organization model and the unit budgets (the documents the dashboard stores) and returns
+        [{"name", "members", "budget", "action"}]."""
+        if not units:
+            return []
+        store = aux_docs(self.app)
+        ids = {u["name"]: org_model.unit_id(u["name"]) for u in units}
+        store.mutate(org_model.DOC, lambda doc: doc.update({
+            "version": 1, "units": {ids[u["name"]]: {"name": u["name"], "parent": None} for u in units},
+            "members": {email: ids[u["name"]] for u in units for email in u["members"]}}))
+        org = org_model.load(DrillCtx(self, Identity(ADMIN, "admin", "password", "drill:admin")))
+        nodes = budgets.validate_nodes([{"scope": "unit", "unitId": ids[u["name"]], "monthlyPaidUsd": u["budget"],
+                                         "action": u.get("action") or "suspend", "thresholds": [50, 80, 100]}
+                                        for u in units], org)
+        store.mutate(budgets.DOC, lambda doc: doc.update({"version": 1, "nodes": nodes}))
+        return [dict(u, members=list(u["members"]), action=u.get("action") or "suspend") for u in units]
 
     # -- contexts ---------------------------------------------------------------------------------------------
     def admin(self, body=None, params=None):
@@ -498,19 +606,33 @@ class Drill:
                 budget = float(rule["paidBudget"])
         return credit / 4.0, budget
 
+    def unit_spend(self, ms):
+        """{unit name: (paid this month by its members, spent)} for the units with a budget."""
+        out = {}
+        for unit in self.units:
+            paid = sum(self.refs[e].paid[ms] for e in unit["members"] if e in self.refs)
+            out[unit["name"]] = (paid, paid >= unit["budget"] - 1e-9)
+        return out
+
     def reference_over(self, now):
+        """{email: (over, near, reference, over only because of a unit budget)}."""
         ws, ms = self.cycle.week(now)[0], self.cycle.month(now)[0]
         org_paid = sum(r.paid[ms] for r in self.refs.values())
         org_spent = self.org_budget is not None and org_paid >= self.org_budget - 1e-9
+        units = self.unit_spend(ms)
         verdict = {}
         for email, r in self.refs.items():
             budget, left, paid_week = r.budget, r.left(ws), r.paid_week[(ws, ms)]
-            spent = org_spent or (budget is not None and r.paid[ms] >= budget - 1e-9)
+            own = org_spent or (budget is not None and r.paid[ms] >= budget - 1e-9)
+            mine = [u for u in self.units if email in u["members"] and u["action"] == "suspend"]
+            unit_spent = any(units[u["name"]][1] for u in mine)
+            spent = own or unit_spent
             over = spent and (left <= 1e-9 or paid_week > 1e-9)
             near = ((budget is not None and abs(r.paid[ms] - budget) < NEAR) or abs(left) < NEAR
                     or (self.org_budget is not None and abs(org_paid - self.org_budget) < NEAR)
+                    or any(abs(units[u["name"]][0] - u["budget"]) < NEAR for u in mine)
                     or 0 < paid_week < NEAR)
-            verdict[email] = (over, near, r)
+            verdict[email] = (over, near, r, over and not own)
         return verdict
 
     # -- running ----------------------------------------------------------------------------------------------
@@ -556,11 +678,12 @@ class Drill:
         stopped = sum(1 for c in out.get("changes") or [] if c["status"] == "applied"
                       and c["action"] in ("block", "disallow"))
         max_wait = -(-len(self.persons) // budget) if budget else 0
+        deny = self.backend == "iam_deny"
         for p in self.persons:
-            over, near, _ = verdict[p.email]
+            over, near, _, by_unit = verdict[p.email]
             capped = self.world.is_capped(p.email)
             rule = (p.rule or {}).get("type")
-            if p.via_group:
+            if p.via_group and not deny:
                 if capped or not self.world.has_access(p.email):
                     self.violations.append(("R5", now, p.email, "a group-granted person was changed"))
                 continue
@@ -587,11 +710,39 @@ class Drill:
             if capped and not over:
                 self.violations.append(("R1", now, p.email, "stopped while budget or free credit was left"))
             if over and not capped and not waiting:
-                self.violations.append(("R2", now, p.email, "over but not stopped by the run"))
+                if by_unit:
+                    self.violations.append(("R7", now, p.email, "the unit budget is spent but the run did not stop "
+                                                                "the person"))
+                else:
+                    self.violations.append(("R2", now, p.email, "over but not stopped by the run"))
             if capped:
                 until = gov.parse_rfc3339((suspended.get(p.email) or {}).get("until"))
                 if until is None or until > max(week_end, month_end):
                     self.violations.append(("R3", now, p.email, "no restore time before the month ends: %s" % until))
+        if deny:
+            self._check_deny(now, suspended)
+
+    def _check_deny(self, now, suspended):
+        """R8: the deny policy is exactly the recorded suspensions, at the configured point, denying only Antigravity."""
+        expected = {"principal://goog/subject/%s" % email for email in suspended}
+        point = "cloudresourcemanager.googleapis.com/projects/%s" % PROJECT
+        listed = set()
+        for (attachment, pid), policy in self.world.deny.items():
+            if attachment != point or not pid.startswith(enforcers.POLICY_PREFIX):
+                self.violations.append(("R8", now, "-", "a deny policy %s at %s" % (pid, attachment)))
+            rules = policy.get("rules") or []
+            for rule in rules:
+                body = rule.get("denyRule") or {}
+                if body.get("deniedPermissions") != [enforcers.ANTIGRAVITY_PERMISSION]:
+                    self.violations.append(("R8", now, "-", "denied permissions %s" % body.get("deniedPermissions")))
+                listed |= set(body.get("deniedPrincipals") or [])
+            if len(rules) != 1:
+                self.violations.append(("R8", now, "-", "%d rules in the deny policy" % len(rules)))
+        if listed != expected:
+            self.violations.append(("R8", now, "-", "the deny policy lists %d people, the suspensions %d (%s)"
+                                    % (len(listed), len(expected), ", ".join(sorted(listed ^ expected))[:200])))
+        if len(listed) > enforcers.DENY_PRINCIPAL_LIMIT:
+            self.violations.append(("R8", now, "-", "%d people over the IAM limit" % len(listed)))
 
     def _record(self, now, out):
         state = self.manager.governance_state()
@@ -644,10 +795,11 @@ class Drill:
         return any(t is not None and a < t <= b for t in times)
 
     def _final_restore(self):
-        """R3: without further usage, every stop ends by its restore time."""
+        """R3: without further usage, every stop ends by its restore time. R9: no deny policy entry is left then."""
         state = self.manager.governance_state()
         untils = [gov.parse_rfc3339(s.get("until")) for s in state.get("suspensions") or []]
         if not untils:
+            self._check_no_deny_left()
             return []
         if None in untils:
             self.violations.append(("R3", self.now, "-", "a suspension without a restore time"))
@@ -659,7 +811,16 @@ class Drill:
         left = [p.email for p in self.persons if self.world.is_capped(p.email)]
         for email in left:
             self.violations.append(("R3", self.now, email, "still stopped after its restore time"))
+        self._check_no_deny_left()
         return left
+
+    def _check_no_deny_left(self):
+        if self.backend != "iam_deny":
+            return
+        for (attachment, pid), policy in self.world.deny.items():
+            people = sum(len((r.get("denyRule") or {}).get("deniedPrincipals") or []) for r in policy.get("rules") or [])
+            self.violations.append(("R9", self.now, "-", "deny policy %s at %s still lists %d people"
+                                    % (pid, attachment, people)))
 
     def _reports(self):
         reports = {}
@@ -681,8 +842,31 @@ class Drill:
                 if abs((row["chargeable"] or 0) - paid) > 0.005 or abs((row["credit"] or 0) - free) > 0.005:
                     self.violations.append(("R6", month, p.email, "report paid %.4f / free %.4f, reference %.4f / %.4f"
                                             % (row["chargeable"] or 0, row["credit"] or 0, paid, free)))
+            self._check_allocation(month, label)
             month = self.cycle.month(month)[1]
         return reports
+
+    def _check_allocation(self, month, label):
+        """R10: the chargeback model of the month (people, units, projects) adds up and matches the reference."""
+        try:
+            model = chargeback.build(self.admin(params={"month": label}), label)
+        except ApiError as err:
+            self.violations.append(("R10", month, "-", "the chargeback model failed: %s" % err.message))
+            return
+        cents = defaultdict(int)
+        for fact in model["facts"]:
+            cents[fact["person"]] += fact.get("chargeable") or 0
+        for p in self.persons:
+            want = int(round(self.refs[p.email].paid[month] * 100))
+            if abs(cents.get(p.email, 0) - want) > 1:
+                self.violations.append(("R10", month, p.email, "allocated %d cents, reference %d" %
+                                        (cents.get(p.email, 0), want)))
+        summary = model["summary"]
+        top = sum(round((u["rollup"]["chargeable"] or 0) * 100) for u in summary["units"] if u["depth"] == 0
+                  or u["id"] == org_model.UNASSIGNED)
+        total = round((summary["totals"]["chargeable"] or 0) * 100)
+        if top != total:
+            self.violations.append(("R10", month, "-", "units add up to %d cents, the total is %d" % (top, total)))
 
     def _result(self, final_capped, reports):
         weeks, totals, overshoot = {}, {}, {}
@@ -753,10 +937,18 @@ RULES = {
            "한도 초과분은 복원 1회당 실행 간격(5분) 사용량 이내 (개인·조직 한도 모두)"),
     "R5": ("Allow rules and group-granted people are never stopped", "항상 허용·그룹 권한 사용자는 정지되지 않는다"),
     "R6": ("The monthly report equals the reference ledger", "월간 리포트 금액 = 기준 계산 (센트 단위)"),
+    "R7": ("A spent organization unit budget stops its people in the same run",
+           "조직 예산이 소진되면 그 조직 사람은 같은 실행에서 정지된다"),
+    "R8": ("The deny policy lists exactly the recorded suspensions and denies only Antigravity",
+           "거부 정책에는 기록된 정지 대상만 있고 Antigravity 권한만 거부한다"),
+    "R9": ("No deny policy entry is left after every restore time", "복원 시각이 지나면 거부 정책에 아무도 남지 않는다"),
+    "R10": ("The chargeback allocation adds up and equals the reference per person",
+            "정산 배분 합계가 맞고 사람별 금액이 기준 계산과 같다"),
 }
 REASONS = {"budget": ("paid budget spent", "월 추가 결제 한도 소진"),
            "credit": ("weekly free credit used up", "이번 주 무료 크레딧 소진"),
            "paid": ("paid usage again this week", "이번 주 추가 결제 발생"),
+           "unit_budget": ("organization unit budget spent", "조직 예산 소진"),
            "tokens": ("token cap", "토큰 한도"), "requests": ("request cap", "요청 한도")}
 CROWD_PREFIX = "staff-"
 

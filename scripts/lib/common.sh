@@ -499,6 +499,10 @@ enable_project_apis() {
     )
     optional_apis=(
       modelarmor.googleapis.com
+      networkservices.googleapis.com
+      networksecurity.googleapis.com
+      agentregistry.googleapis.com
+      iap.googleapis.com
       dlp.googleapis.com
       generativelanguage.googleapis.com
       geminidataanalytics.googleapis.com
@@ -534,12 +538,16 @@ enable_project_apis() {
       iap.googleapis.com
       cloudscheduler.googleapis.com
       modelarmor.googleapis.com
+      networkservices.googleapis.com
+      networksecurity.googleapis.com
+      agentregistry.googleapis.com
       dlp.googleapis.com
       generativelanguage.googleapis.com
       geminidataanalytics.googleapis.com
       cloudasset.googleapis.com
       bigquerydatatransfer.googleapis.com
       orgpolicy.googleapis.com
+      billingbudgets.googleapis.com
     )
     [[ "$need_iap" == "1" ]] && core_apis+=(iap.googleapis.com)
     [[ "$need_sched" == "1" ]] && core_apis+=(cloudscheduler.googleapis.com)
@@ -1188,22 +1196,33 @@ def loc_verdict(loc, policy):
     return None if any(h is None for h in hits) else False
 
 
-# 1. Resource locations
+# 1. Resource locations. The BigQuery dataset location follows --region unless --dataset-location (DATASET_LOCATION)
+# names another one, so every finding says which flag fixes it.
 pol = lp("gcp.resourceLocations")
 if pol:
     allowed_txt = ", ".join((pol.get("allowedValues") or [])[:8]) or "-"
     loc_block = False
-    for what, loc in (("리전", region), ("BigQuery 위치", dsloc)):
+    if dsloc == region:
+        checks = [("리전·BigQuery 위치", region,
+                   "--region <허용 리전> (BigQuery 위치를 따로 정해 두었다면 --dataset-location <허용 위치> 도)")]
+    else:
+        checks = [("리전", region, "--region <허용 리전>"), ("BigQuery 위치", dsloc, "--dataset-location <허용 위치>")]
+    for what, loc, fix in checks:
         v = loc_verdict(loc, pol)
         if v is False:
             loc_block = True
-            blockers.append("gcp.resourceLocations: %s '%s' 가 허용되지 않습니다 (허용: %s). 허용된 리전으로 다시 실행하세요: "
-                            "--region <허용 리전>" % (what, loc, allowed_txt))
+            blockers.append("gcp.resourceLocations: %s '%s' 가 허용되지 않습니다 (허용: %s). 허용된 위치로 다시 실행하세요: %s"
+                            % (what, loc, allowed_txt, fix))
         elif v is None:
-            lines.append("WARN|gcp.resourceLocations: %s '%s' 허용 여부를 확정할 수 없습니다 (허용: %s). 실패하면 허용 리전으로 다시 실행하세요."
-                         % (what, loc, allowed_txt))
+            lines.append("WARN|gcp.resourceLocations: %s '%s' 허용 여부를 확정할 수 없습니다 (허용: %s). 실패하면 허용된 위치로 "
+                         "다시 실행하세요: %s" % (what, loc, allowed_txt, fix))
     if not loc_block and all(loc_verdict(l, pol) is True for l in (region, dsloc)):
-        lines.append("OK|gcp.resourceLocations: %s 허용 (Secret Manager·버킷·BigQuery·Artifact Registry 를 %s 에 생성)" % (region, region))
+        if dsloc == region:
+            lines.append("OK|gcp.resourceLocations: %s 허용 (Secret Manager·버킷·BigQuery·Artifact Registry 를 %s 에 생성)"
+                         % (region, region))
+        else:
+            lines.append("OK|gcp.resourceLocations: %s, %s 허용 (Secret Manager·버킷·Artifact Registry 는 %s, BigQuery 는 %s 에 "
+                         "생성)" % (region, dsloc, region, dsloc))
 else:
     lines.append("OK|gcp.resourceLocations: 제한 없음")
 
@@ -1484,6 +1503,82 @@ grant_license_reader() {
   return 0
 }
 
+# project_org_id PROJECT
+# Prints the numeric id of PROJECT's organization, or nothing when the project has no organization. Returns 1 when
+# the ancestry cannot be read.
+project_org_id() {
+  local out
+  out="$(gcloud projects get-ancestors "$1" --format=json 2>/dev/null)" || return 1
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    items = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+for item in items if isinstance(items, list) else []:
+    if isinstance(item, dict) and item.get("type") == "organization" and str(item.get("id") or "").isdigit():
+        print(item["id"])
+        break
+'
+}
+
+# grant_org_deny_roles PROJECT ENFORCER_SA RUNTIME_SA GRANT
+# IAM deny policies are managed with Deny Admin (roles/iam.denyAdmin) and read with Deny Reviewer
+# (roles/iam.denyReviewer); both can be granted on an organization only. With GRANT=true (GRANT_ORG_ROLES) this grants
+# Deny Admin to the enforcement job's service account and Deny Reviewer to the dashboard's runtime service account on
+# PROJECT's organization (the deploying account needs resourcemanager.organizations.setIamPolicy there). Otherwise, or
+# when a grant is refused, it prints the exact commands for an organization administrator and keeps them in
+# ORG_DENY_ROLE_COMMANDS. Without an organization deny-policy enforcement is unavailable, and it says so. Never fails
+# the caller; with DRY_RUN=1 it only prints the plan.
+# TODO(security): Deny Admin is organization-wide (it exists on organizations only), so the job's account could manage
+# every deny policy in the organization; the job's invariants confine its writes to the fixed ai-control-plane-* policy.
+# Narrow the grant with an IAM condition on the policy name if IAM supports one for deny policies.
+ORG_DENY_ROLE_COMMANDS=()
+grant_org_deny_roles() {
+  local project="$1" enforcer="$2" runtime="$3" grant="${4:-false}" org="" lookup=0 pair member role cmd
+  local pairs=("serviceAccount:${enforcer}|roles/iam.denyAdmin" "serviceAccount:${runtime}|roles/iam.denyReviewer")
+  ORG_DENY_ROLE_COMMANDS=()
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    if [[ "$grant" == "true" ]]; then
+      info "[dry-run] organization roles on the organization of ${project}: roles/iam.denyAdmin -> ${enforcer}, roles/iam.denyReviewer -> ${runtime}"
+    else
+      info "[dry-run] organization roles not granted (GRANT_ORG_ROLES=false): roles/iam.denyAdmin -> ${enforcer}, roles/iam.denyReviewer -> ${runtime}; the deployment prints the commands for an organization administrator"
+    fi
+    return 0
+  fi
+  org="$(project_org_id "$project")" || lookup=1
+  if [[ -z "$org" && "$lookup" == "0" ]]; then
+    warn "${project} has no organization. IAM deny policies are managed with Deny Admin, which can be granted on an organization only, so deny-policy enforcement (ENFORCEMENT_BACKEND=iam_deny) is unavailable here: use iam_allow_swap or notify_only."
+    warn "[한국어 안내] ${project} 프로젝트에는 조직이 없습니다. 거부 정책은 조직에서만 부여할 수 있는 Deny Admin 역할로 관리하므로 거부 정책 집행(ENFORCEMENT_BACKEND=iam_deny)을 쓸 수 없습니다. iam_allow_swap 또는 notify_only를 쓰세요."
+    return 0
+  fi
+  [[ -n "$org" ]] || org="ORGANIZATION_ID"
+  for pair in "${pairs[@]}"; do
+    member="${pair%%|*}"
+    role="${pair#*|}"
+    cmd="gcloud organizations add-iam-policy-binding ${org} --member=${member} --role=${role} --condition=None"
+    if [[ "$grant" == "true" && "$org" != "ORGANIZATION_ID" ]] && gcloud organizations add-iam-policy-binding "$org" \
+        --member="$member" --role="$role" --condition=None --quiet >/dev/null 2>&1; then
+      info "granted ${role} to ${member} on organization ${org}"
+    else
+      ORG_DENY_ROLE_COMMANDS+=("$cmd")
+    fi
+  done
+  [[ ${#ORG_DENY_ROLE_COMMANDS[@]} -gt 0 ]] || return 0
+  local hint=""
+  [[ "$org" == "ORGANIZATION_ID" ]] && hint=" (the organization of ${project} could not be read; find ORGANIZATION_ID with: gcloud projects get-ancestors ${project})"
+  if [[ "$grant" == "true" ]]; then
+    warn "could not grant the organization roles for deny-policy enforcement${hint}. An organization administrator runs:"
+  else
+    warn "deny-policy enforcement needs two organization roles that this deployment does not grant (GRANT_ORG_ROLES=false)${hint}. An organization administrator runs:"
+  fi
+  for cmd in "${ORG_DENY_ROLE_COMMANDS[@]}"; do
+    warn "  ${cmd}"
+  done
+  warn "[한국어 안내] 거부 정책 집행에는 조직 수준 역할 두 개(집행 작업 서비스 계정에 Deny Admin, 대시보드 서비스 계정에 Deny Reviewer)가 필요합니다. 조직 관리자에게 위 명령 실행을 요청하세요. 부여 전까지 집행 작업은 안전 게이트에서 멈추고 아무것도 바꾸지 않습니다."
+  return 0
+}
+
 # Log Router filter for the AI logs the dashboard reads (README 6.1 shows the same text).
 # Cloud Logging binds OR more tightly than AND, so the audit-log clause sits in its own parentheses.
 # Without them the Gemini Enterprise, Model Armor and Antigravity logs would also have to be audit logs,
@@ -1533,6 +1628,42 @@ ensure_ai_log_sink() {
     || die "could not grant the sink writer BigQuery Data Editor on ${project}:${dataset}"
   info "sink ${sink} -> ${project}:${dataset} (writer ${writer}: BigQuery Data Editor on this dataset only)"
 }
+
+# ensure_usage_events_sink SINK_PROJECT TOPIC_PROJECT TOPIC SINK [BEST_EFFORT]
+# Routes Antigravity inference logs (businessaicode.googleapis.com/inference_response) in SINK_PROJECT
+# to a Pub/Sub topic in TOPIC_PROJECT and grants the sink writer roles/pubsub.publisher on that topic.
+ensure_usage_events_sink() {
+  local sp="$1" topic_project="$2" topic="$3" sink="$4" best_effort="${5:-0}"
+  local dest filter writer sink_ok=0
+  dest="pubsub.googleapis.com/projects/${topic_project}/topics/${topic}"
+  filter='log_id("businessaicode.googleapis.com/inference_response")'
+  if gcloud logging sinks describe "$sink" --project "$sp" >/dev/null 2>&1; then
+    if gcloud logging sinks update "$sink" "$dest" --log-filter "$filter" \
+        --description "AI Control Plane real-time Antigravity usage events" --project "$sp" --quiet >/dev/null 2>&1; then
+      sink_ok=1
+    fi
+  else
+    if gcloud logging sinks create "$sink" "$dest" --log-filter "$filter" \
+        --description "AI Control Plane real-time Antigravity usage events" --project "$sp" --quiet >/dev/null 2>&1; then
+      sink_ok=1
+    fi
+  fi
+  if [[ "$sink_ok" != "1" ]]; then
+    [[ "$best_effort" == "1" ]] || warn "could not configure real-time usage log sink ${sink} on ${sp}"
+    return 1
+  fi
+  writer="$(gcloud logging sinks describe "$sink" --project "$sp" --format='value(writerIdentity)' 2>/dev/null || true)"
+  if [[ -n "$writer" ]]; then
+    retry gcloud pubsub topics add-iam-policy-binding "$topic" --project "$topic_project" \
+      --member "$writer" --role roles/pubsub.publisher --quiet >/dev/null 2>&1 || {
+        [[ "$best_effort" == "1" ]] || warn "could not grant roles/pubsub.publisher to ${writer} on ${topic}"
+        return 1
+      }
+  fi
+  info "real-time usage sink ${sink} on ${sp} -> topic ${topic}"
+  return 0
+}
+
 
 # prepare_linked_project_telemetry PROJECT DATASET LOCATION SINK CREATE_SINK ENABLE_AUDIT ENABLE_GE LOG_PROMPTS
 # Best-effort, non-fatal telemetry setup for secondary projects passed via --link-projects / SCAN_PROJECTS.
@@ -1641,7 +1772,7 @@ PYAUDIT
     fi
     if gcloud projects set-iam-policy "$project" "$file" --quiet >/dev/null 2>"$err_file"; then
       rm -f "$file" "$err_file"
-      info "Data Access audit logs enabled across all AI services (Agent Platform, Gemini Enterprise, NotebookLM, Model Armor, Antigravity)"
+      info "Data Access audit logs enabled across all AI services (Agent Platform, Gemini Enterprise, NotebookLM, Model Armor, Antigravity, Gemini Data Analytics${skip_csv:+; not supported in this project, skipped: ${skip_csv}})"
       return 0
     fi
     bad_svc="$(python3 - "$err_file" <<'PYERR' || true
@@ -1866,29 +1997,42 @@ antigravity_readiness() {
   fi
 }
 
-# restore_capped_users PROJECT [ACCESS_ROLE] [INCLUDE_ADMIN_BLOCKED]
+# restore_capped_users PROJECT [ACCESS_ROLE] [INCLUDE_ADMIN_BLOCKED] [CAP_ROLE_IDS] [ADMIN_ROLE_ID]
 # Gives users suspended by Antigravity caps their access role back before the control plane is removed: for every
 # direct, unconditional user: binding of the cap marker roles it first adds the access role, then removes the marker
 # role, so the user never loses the Gemini Enterprise app. Administrator blocks are kept (and listed) unless
-# INCLUDE_ADMIN_BLOCKED is true.
+# INCLUDE_ADMIN_BLOCKED is true. CAP_ROLE_IDS (comma separated: the cap marker and legacy marker roles) and
+# ADMIN_ROLE_ID default to the product's role ids; teardown passes the ids configured in the dashboard
+# (governance.antigravity.cap_marker_role, legacy_marker_roles, admin_marker_role). Never fails the caller.
 restore_capped_users() {
   local project="$1" access_role="${2:-roles/discoveryengine.agentspaceUser}" include_admin="${3:-false}"
-  python3 - "$project" "$access_role" "$include_admin" "${DRY_RUN:-0}" <<'PY'
+  local cap_ids="${4:-CustomAntigravityCapBlocked,CustomAntigravityRestrictedUser}"
+  local admin_id="${5:-CustomAntigravityAdminBlocked}"
+  python3 - "$project" "$access_role" "$include_admin" "${DRY_RUN:-0}" "$cap_ids" "$admin_id" <<'PY' || true
 import json, subprocess, sys
 project, access, include_admin, dry = sys.argv[1], sys.argv[2], sys.argv[3] == "true", sys.argv[4] == "1"
-cap = ["projects/%s/roles/%s" % (project, r) for r in ("CustomAntigravityCapBlocked", "CustomAntigravityRestrictedUser")]
-admin = "projects/%s/roles/CustomAntigravityAdminBlocked" % project
+cap = ["projects/%s/roles/%s" % (project, r.strip()) for r in sys.argv[5].split(",") if r.strip()]
+admin = "projects/%s/roles/%s" % (project, sys.argv[6].strip())
 
 def gc(*args):
     return subprocess.run(["gcloud", *args, "--quiet"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
 
+def manual(member, roles):
+    return ("gcloud projects add-iam-policy-binding %s --member=%s --role=%s --condition=None, then for each marker "
+            "role: gcloud projects remove-iam-policy-binding %s --member=%s --role=ROLE --condition=None (%s)"
+            % (project, member, access, project, member, ", ".join(roles)))
+
 got = gc("projects", "get-iam-policy", project, "--format=json")
-if got.returncode != 0:
-    print("    warning: cannot read the IAM policy of %s; restore suspended users on the Antigravity controls page" % project,
-          file=sys.stderr)
+try:
+    policy = json.loads(got.stdout[got.stdout.index("{"):]) if got.returncode == 0 else None
+except ValueError:
+    policy = None
+if not isinstance(policy, dict):
+    print("    warning: cannot read the IAM policy of %s, so users suspended by Antigravity caps were not restored. "
+          "For each holder of %s run: %s" % (project, ", ".join(cap), manual("user:EMAIL", cap)), file=sys.stderr)
     sys.exit(0)
 targets, kept = {}, []
-for b in json.loads(got.stdout).get("bindings") or []:
+for b in policy.get("bindings") or []:
     if b.get("condition"):
         continue
     role = b.get("role")
@@ -1907,7 +2051,8 @@ for member, roles in sorted(targets.items()):
         continue
     add = gc("projects", "add-iam-policy-binding", project, "--member", member, "--role", access, "--condition=None")
     if add.returncode != 0:
-        print("    warning: could not give %s back to %s; marker role kept" % (access, member), file=sys.stderr)
+        print("    warning: could not give %s back to %s; marker role kept. Run: %s" % (access, member,
+              manual(member, roles)), file=sys.stderr)
         continue
     for role in roles:
         gc("projects", "remove-iam-policy-binding", project, "--member", member, "--role", role, "--condition=None")

@@ -47,7 +47,7 @@ export default async function render(ctx) {
             { key: 'lastActive', label: t('Last active'), render: (r) => (r.lastActive ? fmt.relative(r.lastActive) : DASH), value: (r) => r.lastActive },
           ],
           rows: d.topUsers, pageSize: 10, exportName: 'notebooklm-users', initialSort: { key: 'prompts', dir: 'desc' },
-          onRowClick: (r) => r.uid && openUserDrawer(r.uid),
+          onRowClick: (r) => r.uid && openUserDrawer(r.uid, { email: r.email }),
         }),
       }));
       return null;

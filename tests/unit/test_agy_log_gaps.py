@@ -253,5 +253,65 @@ class TelemetrySeenTest(unittest.TestCase):
         self.assertFalse(gov.telemetry_seen(GapCtx(None), u, self.NOW))
 
 
+class DevToolsLoggingStatusTest(unittest.TestCase):
+    def _ctx(self, responses, projects=None):
+        settings = support.make_settings()
+        settings["workspace"]["projects"] = [p for p in (projects or []) if p != support.PROJECT]
+
+        class _Ctx(support.FakeCtx):
+            def rest(self, method, url, **_kwargs):
+                val = responses.get(url)
+                if isinstance(val, Exception):
+                    raise val
+                if val is None:
+                    raise gov.GcpError("not_found", message="missing")
+                return val
+
+        return _Ctx(settings)
+
+    def test_detects_missing_metadata_logging_in_global_while_us_is_on(self):
+        p = support.PROJECT
+        ctx = self._ctx({
+            "https://discoveryengine.googleapis.com/v1alpha/projects/%s/locations/global/devToolsConfig" % p: {
+                "name": "projects/1/locations/global/devToolsConfig", "devToolsEnabled": True},
+            "https://us-discoveryengine.googleapis.com/v1alpha/projects/%s/locations/us/devToolsConfig" % p: {
+                "name": "projects/1/locations/us/devToolsConfig", "devToolsEnabled": True,
+                "loggingConfig": {"metadataLoggingEnabled": True}},
+            "https://eu-discoveryengine.googleapis.com/v1alpha/projects/%s/locations/eu/devToolsConfig" % p: {
+                "name": "projects/1/locations/eu/devToolsConfig"},
+        })
+        res = gov.dev_tools_logging_status(ctx)
+        self.assertTrue(res["checked"])
+        self.assertFalse(res["allEnabled"])
+        self.assertEqual(res["missingLocations"], [{"project": p, "location": "global"}])
+        self.assertEqual(res["enabledLocations"], [{"project": p, "location": "us"}])
+
+    def test_all_enabled_ignores_disabled_linked_project(self):
+        p = support.PROJECT
+        ctx = self._ctx({
+            "https://discoveryengine.googleapis.com/v1alpha/projects/%s/locations/global/devToolsConfig" % p: {
+                "devToolsEnabled": True, "loggingConfig": {"metadataLoggingEnabled": True}},
+            "https://us-discoveryengine.googleapis.com/v1alpha/projects/%s/locations/us/devToolsConfig" % p: {
+                "devToolsEnabled": True, "loggingConfig": {"metadataLoggingEnabled": True}},
+            "https://eu-discoveryengine.googleapis.com/v1alpha/projects/%s/locations/eu/devToolsConfig" % p: {},
+            "https://discoveryengine.googleapis.com/v1alpha/projects/%s/locations/global/devToolsConfig" % OTHER: {},
+            "https://us-discoveryengine.googleapis.com/v1alpha/projects/%s/locations/us/devToolsConfig" % OTHER: {},
+            "https://eu-discoveryengine.googleapis.com/v1alpha/projects/%s/locations/eu/devToolsConfig" % OTHER: {},
+        }, projects=[p, OTHER])
+        res = gov.dev_tools_logging_status(ctx)
+        self.assertTrue(res["checked"])
+        self.assertTrue(res["allEnabled"])
+        self.assertEqual(res["missingLocations"], [])
+        self.assertEqual(res["enabledLocations"], [{"project": p, "location": "global"},
+                                                   {"project": p, "location": "us"}])
+
+    def test_api_errors_fail_open_without_breaking_status(self):
+        ctx = self._ctx({})
+        res = gov.dev_tools_logging_status(ctx)
+        self.assertFalse(res["checked"])
+        self.assertIsNone(res["allEnabled"])
+        self.assertEqual(res["missingLocations"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

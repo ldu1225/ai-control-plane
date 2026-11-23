@@ -103,6 +103,9 @@ def _routing_dataset(ctx):
 
 def _explicit_datasets(ctx):
     out = {(ctx.project, ctx.audit_dataset), (ctx.project, _routing_dataset(ctx))}
+    central = getattr(ctx, "central_audit_project", "")
+    if isinstance(central, str) and central:
+        out.add((central, ctx.audit_dataset))
     for ref in ctx.ws.get("telemetry_datasets") or []:
         parsed = config.parse_dataset_ref(ref, ctx.project)
         if parsed:
@@ -115,6 +118,9 @@ def discover_datasets(ctx):
     active_projects = list(getattr(ctx, "projects", None) or [ctx.project])
     sel = getattr(ctx, "selected_project", "all") or "all"
     out = []
+    central = getattr(ctx, "central_audit_project", "")
+    if isinstance(central, str) and central:
+        out.append((central, ctx.audit_dataset))
     for p in active_projects[:disc["max_projects"]]:
         if config.valid_project(p or "") and (p, ctx.audit_dataset) not in out:
             out.append((p, ctx.audit_dataset))

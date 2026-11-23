@@ -251,11 +251,49 @@ export function segmented(options, value, onChange, { label } = {}) {
 
 export function tabs(items, active, onChange) {
   const el = h('div', { class: 'tabs', role: 'tablist' });
-  const render = (cur) => {
-    mount(el, items.map((it) => h('button', {
-      type: 'button', class: 'tab', role: 'tab', 'aria-selected': it.id === cur ? 'true' : 'false',
-      onclick: () => { render(it.id); onChange(it.id); },
-    }, it.label, isNum(it.count) ? h('span', { class: 'count' }, fmt.int(it.count)) : null)));
+  let current = active;
+  const render = (cur, focusActive = false) => {
+    current = cur;
+    const btns = items.map((it) => {
+      const selected = it.id === cur;
+      const countClass = ['count', it.tone || ''];
+      return h('button', {
+        type: 'button',
+        id: it.tabId || null,
+        class: 'tab',
+        role: 'tab',
+        tabindex: selected ? 0 : -1,
+        'aria-selected': selected ? 'true' : 'false',
+        'aria-controls': it.controls || null,
+        onclick: () => { if (it.id !== current) { render(it.id); onChange(it.id); } },
+      }, it.label, isNum(it.count) ? h('span', { class: countClass }, fmt.int(it.count)) : null);
+    });
+    mount(el, btns);
+    if (focusActive) {
+      const activeBtn = btns.find((b) => b.getAttribute('aria-selected') === 'true');
+      if (activeBtn) activeBtn.focus();
+    }
+  };
+  el.addEventListener('keydown', (e) => {
+    const idx = items.findIndex((it) => it.id === current);
+    if (idx < 0) return;
+    let next = idx;
+    if (e.key === 'ArrowRight') next = (idx + 1) % items.length;
+    else if (e.key === 'ArrowLeft') next = (idx - 1 + items.length) % items.length;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = items.length - 1;
+    else return;
+    e.preventDefault();
+    if (next !== idx) {
+      render(items[next].id, true);
+      onChange(items[next].id);
+    }
+  });
+  el.setActive = (id) => {
+    if (items.some((it) => it.id === id) && id !== current) {
+      render(id);
+      onChange(id);
+    }
   };
   render(active);
   return el;
@@ -518,7 +556,7 @@ export function dataTable(opts) {
         }));
         if (onRowClick) {
           tr.tabIndex = 0;
-          tr.addEventListener('click', (e) => { if (!e.target.closest('button, a, input, select')) onRowClick(row); });
+          tr.addEventListener('click', (e) => { if (!e.target.closest('button, a, input, select, summary, details')) onRowClick(row); });
           tr.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target === tr) onRowClick(row); });
         }
         return tr;
@@ -865,10 +903,13 @@ const STATUS_TONES = {
   ENFORCEABLE_ALLOWED: ['Enforceable', 'success'],
   CAPPED_BY_TOOL: ['Capped', 'warning'],
   BLOCKED_BY_ADMIN: ['Blocked by admin', 'danger'],
+  ALL_AI_BLOCKED: ['All AI blocked', 'danger'],
   NOT_ENFORCEABLE: ['Not enforceable', 'info'],
   NO_ACCESS: ['No access', 'neutral'],
   UNKNOWN: ['Unknown', 'neutral'],
   block: ['Block', 'danger'],
+  block_all: ['Block all AI', 'danger'],
+  unblock_all: ['Restore AI access', 'success'],
   restore: ['Restore', 'success'],
   manual: ['Manual action', 'info'],
   review: ['Awaiting review', 'warning'],

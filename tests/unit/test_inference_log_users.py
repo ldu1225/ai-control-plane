@@ -48,6 +48,9 @@ OFFICIAL_SAMPLE = json.loads("""
 WINDOW = timeutil.parse_range({"start": "2026-10-01", "end": "2026-10-31"}, "UTC", 31)
 START, END = WINDOW.start_ts(), WINDOW.end_ts()
 LOG_ID = "businessaicode.googleapis.com%2Finference_response"
+# A workforce identity as logged (the subject is case-sensitive) and its person key (lower-cased).
+WF_LOGGED = "principal://iam.googleapis.com/locations/global/workforcePools/corp-pool/subject/Dana.Kim"
+WF_KEY = "principal://iam.googleapis.com/locations/global/workforcepools/corp-pool/subject/dana.kim"
 
 
 def sample(**labels):
@@ -109,9 +112,13 @@ class PrincipalTest(unittest.TestCase):
         self.assertEqual(gov.usage_user("user:user@example.com"), "user@example.com")
         self.assertEqual(gov.usage_user("User:Dev.Lead@Example.com "), "dev.lead@example.com")
         self.assertEqual(gov.usage_user("user@example.com"), "user@example.com")  # entries without the prefix
+        # Workforce Identity Federation users are people too (counted; caps report them as not enforceable).
+        self.assertEqual(
+            gov.usage_user("principal://iam.googleapis.com/locations/global/workforcePools/corp-pool/subject/S-1"),
+            "principal://iam.googleapis.com/locations/global/workforcepools/corp-pool/subject/s-1")
         for other in ("serviceAccount:bot@demo-project.iam.gserviceaccount.com",
                       "bot@demo-project.iam.gserviceaccount.com",
-                      "principal://iam.googleapis.com/locations/global/workforcePools/p/subject/s",
+                      "principal://iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/subject/s",
                       "group:team@example.com", "", None):
             self.assertIsNone(gov.usage_user(other), other)
 
@@ -147,6 +154,12 @@ class LoggingPathTest(unittest.TestCase):
         self.assertEqual(usage.by_model["claude-sonnet-5-5"]["tokens"], 85040)
         self.assertEqual(usage.by_client["antigravity_cli"]["requests"], 1)
 
+    def test_a_workforce_principal_is_kept_as_logged_next_to_its_key(self):
+        # Google documents the subject as case-sensitive: the key is lower-cased, a deny policy needs the original.
+        usage = gov._logging_usage(LoggingCtx([sample(user_id=WF_LOGGED), OFFICIAL_SAMPLE]), START, END)  # pylint: disable=protected-access
+        self.assertEqual(sorted(usage.users), sorted([WF_KEY, "user@example.com"]))
+        self.assertEqual(usage.principals, {WF_KEY: WF_LOGGED})
+
 
 class BigQueryPathTest(unittest.TestCase):
     def normalized(self):
@@ -173,6 +186,15 @@ class BigQueryPathTest(unittest.TestCase):
         ctes = users.long_ctes(ctx)[0]
         agy = next(c for c in ctes if c.startswith("agy AS ("))
         self.assertIn(self.normalized(), agy)
+
+    def test_the_label_as_logged_comes_with_each_row(self):
+        rows = [{"email": WF_KEY, "principal": WF_LOGGED, "model": "claude-sonnet-5-5", "requests": 1, "tokens": 5,
+                 "prompt_tokens": 3, "candidate_tokens": 2, "clients": [], "last_ts": None}]
+        ctx = QueryCtx(rows)
+        usage = gov._bq_usage(ctx, sink_source(), START, END)  # pylint: disable=protected-access
+        self.assertIn("t.`labels`.`user_id` AS principal", ctx.queries[0])
+        self.assertIn("ANY_VALUE(principal) AS principal", ctx.queries[0])
+        self.assertEqual(usage.principals, {WF_KEY: WF_LOGGED})
 
 
 class EnforcementTest(unittest.TestCase):

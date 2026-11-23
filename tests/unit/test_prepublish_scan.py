@@ -40,5 +40,27 @@ class PublicPhraseTest(unittest.TestCase):
         self.assertIn("e-mail address", labels)
 
 
+class LocalValueTest(unittest.TestCase):
+    """Values from deploy.env that every deployment shares (option values, regions) are not identifiers."""
+
+    def test_option_values_and_regions_are_not_identifiers(self):
+        for value in ("iam_deny", "iam_allow_swap", "notify_only", "telemetry_routed", "asia-northeast3",
+                      "europe-west1", "us-central1", "projects", "scope", "google_oauth"):
+            self.assertFalse(scan._is_identifier(value), value)
+
+    def test_deployment_identifiers_still_count(self):
+        for value in ("acme-prod-ai-123", "acme-settings-bucket", "0a1b2c-3d4e5f-6a7b8c", "123456789012",
+                      "acme_audit_logs"):
+            self.assertTrue(scan._is_identifier(value), value)
+
+    def test_documented_option_value_does_not_fail_the_scan(self):
+        values = {v for v in ("iam_deny", "asia-northeast3", "acme-prod-ai-123") if scan._is_identifier(v)}
+        text = 'ENFORCEMENT_BACKEND="iam_deny"\nREGION="asia-northeast3"\n'
+        problems, _ = scan.check_text("deploy.env.example", text, values=values)
+        self.assertEqual(problems, [])
+        problems, _ = scan.check_text("README.md", "PROJECT_ID=acme-prod-ai-123", values=values)
+        self.assertEqual(len(problems), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

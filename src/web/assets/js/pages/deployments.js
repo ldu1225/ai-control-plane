@@ -4,11 +4,14 @@
 import { h } from '../core/dom.js';
 import { t } from '../core/i18n.js';
 import { fmt, isNum, DASH } from '../core/format.js';
-import { pageHeader, kpi, card, dataTable, badge, banner, openDrawer, kv, principalCell } from '../core/components.js';
+import { pageHeader, kpi, card, dataTable, badge, banner, button, openDrawer, kv, principalCell } from '../core/components.js';
 import { hbarList } from '../core/charts.js';
 import { pageFlow, fetchRange, deltaOf, rangeText } from './_shared.js';
+import renderAgent, { agentHash } from './agent.js';
 
 export default async function render(ctx) {
+  // #/deployments/<project>/<region>/<engine>[/<tab>] opens one agent.
+  if (ctx.params.length >= 3) return renderAgent(ctx);
   const header = pageHeader({
     title: t('Deployments'),
     desc: t('Agent Engine runtimes, the identities they run as, invocation volume and the models each identity calls.'),
@@ -17,11 +20,11 @@ export default async function render(ctx) {
     header,
     kpiCount: 5,
     fetcher: () => fetchRange(ctx, '/api/v1/agent-platform/deployments'),
-    render: (body, d) => renderPage(body, d),
+    render: (body, d) => renderPage(body, d, ctx),
   });
 }
 
-function renderPage(body, d) {
+function renderPage(body, d, ctx) {
   const k = d.kpis || {};
   const deployments = d.deployments || [];
   const ccy = (deployments.find((x) => x.currency) || {}).currency || 'USD';
@@ -49,7 +52,7 @@ function renderPage(body, d) {
       ],
       rows: d.deployments === null ? null : deployments, pageSize: 10, exportName: 'agent-deployments', initialSort: { key: 'invocations', dir: 'desc' },
       emptyText: t('No Agent Engine deployments were found in the configured regions.'),
-      onRowClick: (r) => openDeployment(r, ccy),
+      onRowClick: (r) => openDeployment(r, ccy, ctx),
     }),
   }));
 
@@ -83,12 +86,18 @@ function renderPage(body, d) {
   body.append(row);
 }
 
-function openDeployment(r, ccy) {
-  openDrawer({
+function openDeployment(r, ccy, ctx) {
+  const engine = String(r.id || '').split('/').pop();
+  const drawer = openDrawer({
     title: r.name || r.id,
     subtitle: t('Agent Engine deployment'),
     width: 640,
+    actions: r.project && r.region && engine ? button({
+      label: t('Open agent details'), icon: 'arrow-right', size: 'sm', variant: 'primary',
+      onClick: () => { drawer.close(); ctx.navigate(agentHash(r.project, r.region, engine)); },
+    }) : null,
     content: (body) => body.append(
+      banner({ tone: 'info', title: t('Telemetry, traces and revisions'), text: t('Open the agent details for its telemetry, models and tools, traces, topology, revisions, evaluation and playground.') }),
       card({
         title: t('Runtime'),
         body: kv([

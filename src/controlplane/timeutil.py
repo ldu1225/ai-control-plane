@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar as _calendar
 import datetime as dt
 import re
 from dataclasses import dataclass
@@ -195,14 +196,19 @@ def fold(rng, pairs, cast=float):
 # Antigravity governance windows (agy-admin semantics)
 # ---------------------------------------------------------------------------
 
-PERIODS = ("daily", "weekly", "monthly", "all")
+# custom: periods of `cycle_days` days counted from `cycle_start` (for example every 14 days from a Monday).
+PERIODS = ("daily", "weekly", "monthly", "custom", "all")
 WINDOWS = ("calendar", "rolling")
 RESET_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+CYCLE_DAYS_MAX = 92
+CYCLE_DAYS_DEFAULT = 30
+# Custom periods without a valid start date count from here, so their boundaries never move.
+CYCLE_EPOCH = dt.date(1970, 1, 1)
 
 
 def _check_period(period, window):
     if period not in PERIODS:
-        raise ApiError("bad_request", "Parameter 'period' must be one of daily, weekly, monthly, all.")
+        raise ApiError("bad_request", "Parameter 'period' must be one of daily, weekly, monthly, custom, all.")
     if window not in WINDOWS:
         raise ApiError("bad_request", "Parameter 'window' must be 'calendar' or 'rolling'.")
 
@@ -221,11 +227,56 @@ def _reset_weekday(weekday):
     return value if 0 <= value <= 6 else 0
 
 
-def _calendar_start(period, local_now, weekday=0, at="00:00"):
+def reset_day_of_month(day):
+    """Day of the month (1-31) on which monthly periods start; invalid values mean the 1st. A month without that day
+    (29, 30 or 31) starts its period on its last day."""
+    try:
+        value = int(day)
+    except (TypeError, ValueError):
+        return 1
+    return value if 1 <= value <= 31 else 1
+
+
+def cycle_length(days):
+    """Length of custom periods in days (1 to CYCLE_DAYS_MAX); invalid values mean CYCLE_DAYS_DEFAULT."""
+    try:
+        value = int(days)
+    except (TypeError, ValueError):
+        return CYCLE_DAYS_DEFAULT
+    return value if 1 <= value <= CYCLE_DAYS_MAX else CYCLE_DAYS_DEFAULT
+
+
+def cycle_start_date(value):
+    """First day of custom periods (a date or YYYY-MM-DD); empty or invalid values mean CYCLE_EPOCH."""
+    if isinstance(value, dt.date) and not isinstance(value, dt.datetime):
+        return value
+    text = str(value or "").strip()
+    if DATE_RE.match(text):
+        try:
+            return dt.date.fromisoformat(text)
+        except ValueError:
+            pass
+    return CYCLE_EPOCH
+
+
+def _month_start(year, month, day, hour, minute, tzinfo):
+    """`day` of the month at hour:minute (wall clock in tzinfo); the month's last day when it is shorter."""
+    last = _calendar.monthrange(year, month)[1]
+    return dt.datetime(year, month, min(day, last), hour, minute, tzinfo=tzinfo)
+
+
+def _shift_month(year, month, delta):
+    index = year * 12 + (month - 1) + delta
+    return index // 12, index % 12 + 1
+
+
+def _calendar_start(period, local_now, weekday=0, at="00:00", day=1, cycle_days=CYCLE_DAYS_DEFAULT,
+                    cycle_start=""):
     """Start of the calendar period containing local_now (wall clock in its own zone).
 
-    Periods begin at the reset time `at` (HH:MM, default midnight); weekly periods begin on `weekday`
-    (0 = Monday ... 6 = Sunday, default Monday) and monthly periods on the 1st."""
+    Periods begin at the reset time `at` (HH:MM, default midnight): daily every day, weekly on `weekday` (0 = Monday
+    ... 6 = Sunday, default Monday), monthly on day `day` of the month (default the 1st; the last day in months without
+    that day) and custom every `cycle_days` days counted from `cycle_start` (YYYY-MM-DD, also before that date)."""
     hour, minute = reset_hour_minute(at)
     boundary = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if period == "daily":
@@ -233,31 +284,59 @@ def _calendar_start(period, local_now, weekday=0, at="00:00"):
     if period == "weekly":
         start = boundary - dt.timedelta(days=(local_now.weekday() - _reset_weekday(weekday)) % 7)
         return start if local_now >= start else start - dt.timedelta(days=7)
-    start = boundary.replace(day=1)
+    if period == "custom":
+        span = dt.timedelta(days=cycle_length(cycle_days))
+        anchor = dt.datetime.combine(cycle_start_date(cycle_start), dt.time(hour, minute), tzinfo=local_now.tzinfo)
+        # Whole cycles between the anchor and now on the wall clock (negative before the start date).
+        steps = (local_now.replace(tzinfo=None) - anchor.replace(tzinfo=None)) // span
+        return anchor + span * steps
+    dom = reset_day_of_month(day)
+    start = _month_start(local_now.year, local_now.month, dom, hour, minute, local_now.tzinfo)
     if local_now >= start:
         return start
-    return (start - dt.timedelta(days=1)).replace(day=1)
+    year, month = _shift_month(local_now.year, local_now.month, -1)
+    return _month_start(year, month, dom, hour, minute, local_now.tzinfo)
 
 
-def governance_window(period, window, now=None, tz=None, weekday=0, at="00:00"):
+def _next_start(period, start, day=1, cycle_days=CYCLE_DAYS_DEFAULT):
+    """The period start after `start` (local wall clock). Aware-datetime arithmetic with zoneinfo is wall-clock based,
+    so the next start keeps its local reset time across daylight-saving changes."""
+    if period == "daily":
+        return start + dt.timedelta(days=1)
+    if period == "weekly":
+        return start + dt.timedelta(days=7)
+    if period == "custom":
+        return start + dt.timedelta(days=cycle_length(cycle_days))
+    year, month = _shift_month(start.year, start.month, 1)
+    return _month_start(year, month, reset_day_of_month(day), start.hour, start.minute, start.tzinfo)
+
+
+def _span_days(period, cycle_days=CYCLE_DAYS_DEFAULT):
+    if period == "all":
+        return 90
+    if period == "custom":
+        return cycle_length(cycle_days)
+    return {"daily": 1, "weekly": 7, "monthly": 30}[period]
+
+
+def governance_window(period, window, now=None, tz=None, weekday=0, at="00:00", day=1,
+                      cycle_days=CYCLE_DAYS_DEFAULT, cycle_start=""):
     """Returns (start, end) aware UTC datetimes.
 
-    calendar: period boundaries at the reset time `at` (default 00:00) in `tz` (default UTC; daily:
-    today, weekly: the last `weekday` (default Monday), monthly: the 1st), all: now - 90 days.
-    rolling: now - 24h / 7d / 30d / 90d."""
+    calendar: period boundaries at the reset time `at` (default 00:00) in `tz` (default UTC; daily: today, weekly: the
+    last `weekday` (default Monday), monthly: day `day` of the month (default the 1st), custom: every `cycle_days` days
+    from `cycle_start`), all: now - 90 days. rolling: now - 24h / 7d / 30d / cycle_days / 90d."""
     now = (now or dt.datetime.now(UTC)).astimezone(UTC).replace(second=0, microsecond=0)
     _check_period(period, window)
-    if period == "all":
-        return now - dt.timedelta(days=90), now
-    if window == "rolling":
-        span = {"daily": 1, "weekly": 7, "monthly": 30}[period]
-        return now - dt.timedelta(days=span), now
+    if period == "all" or window == "rolling":
+        return now - dt.timedelta(days=_span_days(period, cycle_days)), now
     zone = get_zone(tz) if tz else UTC
-    start = _calendar_start(period, now.astimezone(zone), weekday, at)
+    start = _calendar_start(period, now.astimezone(zone), weekday, at, day, cycle_days, cycle_start)
     return start.astimezone(UTC), now
 
 
-def governance_next_reset(period, window, now=None, tz=None, weekday=0, at="00:00"):
+def governance_next_reset(period, window, now=None, tz=None, weekday=0, at="00:00", day=1,
+                          cycle_days=CYCLE_DAYS_DEFAULT, cycle_start=""):
     """Next calendar period boundary (aware UTC), when usage counters restart; None for rolling
     windows and 'all', which have no fixed reset."""
     _check_period(period, window)
@@ -265,27 +344,38 @@ def governance_next_reset(period, window, now=None, tz=None, weekday=0, at="00:0
         return None
     now = (now or dt.datetime.now(UTC)).astimezone(UTC)
     zone = get_zone(tz) if tz else UTC
-    start = _calendar_start(period, now.astimezone(zone), weekday, at)
-    if period == "daily":
-        nxt = start + dt.timedelta(days=1)
-    elif period == "weekly":
-        nxt = start + dt.timedelta(days=7)
-    else:
-        nxt = (start + dt.timedelta(days=32)).replace(day=1)
-    # Aware-datetime arithmetic with zoneinfo is wall-clock based: nxt is the local reset time even
-    # across daylight-saving changes.
-    return nxt.astimezone(UTC)
+    start = _calendar_start(period, now.astimezone(zone), weekday, at, day, cycle_days, cycle_start)
+    return _next_start(period, start, day, cycle_days).astimezone(UTC)
 
 
-def governance_period_end(period, window, now=None, tz=None, weekday=0, at="00:00"):
+def governance_period_end(period, window, now=None, tz=None, weekday=0, at="00:00", day=1,
+                          cycle_days=CYCLE_DAYS_DEFAULT, cycle_start=""):
     """End of the current evaluation period: the next calendar reset, or for rolling windows the
     moment the current usage has fully left the window (now + window span)."""
-    nxt = governance_next_reset(period, window, now, tz, weekday, at)
+    nxt = governance_next_reset(period, window, now, tz, weekday, at, day, cycle_days, cycle_start)
     if nxt is not None:
         return nxt
     now = (now or dt.datetime.now(UTC)).astimezone(UTC).replace(second=0, microsecond=0)
-    span = 90 if period == "all" else {"daily": 1, "weekly": 7, "monthly": 30}[period]
-    return now + dt.timedelta(days=span)
+    return now + dt.timedelta(days=_span_days(period, cycle_days))
+
+
+def governance_periods(period, window, now=None, count=3, tz=None, weekday=0, at="00:00", day=1,
+                       cycle_days=CYCLE_DAYS_DEFAULT, cycle_start=""):
+    """The current calendar period and the next ones: [(start, end)] aware UTC datetimes, `count` items (1 to 12).
+    Rolling windows and 'all' have no fixed periods: one item, (now - span, None)."""
+    _check_period(period, window)
+    now = (now or dt.datetime.now(UTC)).astimezone(UTC)
+    if period == "all" or window == "rolling":
+        start, _ = governance_window(period, window, now, tz, weekday, at, day, cycle_days, cycle_start)
+        return [(start, None)]
+    zone = get_zone(tz) if tz else UTC
+    start = _calendar_start(period, now.astimezone(zone), weekday, at, day, cycle_days, cycle_start)
+    out = []
+    for _ in range(max(1, min(int(count or 1), 12))):
+        nxt = _next_start(period, start, day, cycle_days)
+        out.append((start.astimezone(UTC), nxt.astimezone(UTC)))
+        start = nxt
+    return out
 
 
 def rfc3339(value):
