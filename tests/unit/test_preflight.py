@@ -61,7 +61,12 @@ class PreflightTest(unittest.TestCase):
         env = dict(os.environ, PATH=self.tmp.name + os.pathsep + os.environ.get("PATH", ""),
                    FAKE_POLICIES=json.dumps(policies or {}))
         if not docker:
-            # Hide any local docker so the Cloud Build pool case is deterministic.
+            # Hide any local docker so the Cloud Build pool case is deterministic: a stub first on PATH whose
+            # `docker info` fails (GitHub's ubuntu runners have /usr/bin/docker, so trimming PATH is not enough).
+            stub = os.path.join(self.tmp.name, "docker")
+            with open(stub, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 1\n")
+            os.chmod(stub, os.stat(stub).st_mode | stat.S_IEXEC)
             env["PATH"] = self.tmp.name + os.pathsep + "/usr/bin:/bin"
         env.update(extra_env or {})
         script = textwrap.dedent('''\
