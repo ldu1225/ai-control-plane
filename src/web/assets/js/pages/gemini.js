@@ -5,7 +5,7 @@ import { h, append } from '../core/dom.js';
 import { t } from '../core/i18n.js';
 import { fmt, isNum, DASH } from '../core/format.js';
 import { api } from '../core/api.js';
-import { pageHeader, kpi, card, dataTable, badge, userCell, emptyState, load, progress, stat, banner } from '../core/components.js';
+import { pageHeader, kpi, card, dataTable, badge, userCell, emptyState, load, progress, stat, banner, tabs } from '../core/components.js';
 import { lineChart, barChart, fromTimeline, hbarList, TONES, colorAt } from '../core/charts.js';
 import { pageFlow, fetchRange, rangeText, deltaOf, chartCard, mountCharts, openUserDrawer } from './_shared.js';
 
@@ -13,11 +13,24 @@ const CATEGORY_LABELS = {
   document: 'Document', spreadsheet: 'Spreadsheet', presentation: 'Presentation', image: 'Image', text: 'Text', other: 'Other',
 };
 
+/* Views (each has its own address): #/gemini-enterprise (usage) and #/gemini-enterprise/features. */
 export default async function render(ctx) {
-  const header = pageHeader({
-    title: t('Gemini Enterprise'),
-    desc: t('Adoption, license utilization, agent usage and uploaded content across Gemini Enterprise.'),
-  });
+  const view = ctx.params[0] === 'features' ? 'features' : 'usage';
+  const header = h('div', { class: 'stack' },
+    pageHeader({
+      title: t('Gemini Enterprise'),
+      desc: view === 'features'
+        ? t('Feature switches of every Gemini Enterprise app in one view. Compare apps and change many apps at once.')
+        : t('Adoption, license utilization, agent usage and uploaded content across Gemini Enterprise.'),
+    }),
+    tabs([
+      { id: 'usage', label: t('Usage') },
+      { id: 'features', label: t('Feature management') },
+    ], view, (id) => ctx.navigate(id === 'features' ? '#/gemini-enterprise/features' : '#/gemini-enterprise')));
+  if (view === 'features') {
+    const mod = await import('./gemini_features.js');
+    return mod.default(ctx, header);
+  }
   return pageFlow(ctx, {
     header,
     kpiCount: 5,

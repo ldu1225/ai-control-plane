@@ -25,7 +25,9 @@
 #   whose job is run through the Cloud Run Admin API;
 # - the custom roles: marker roles (created from the dashboard with Create marker roles when governance actions are
 #   on), the Gemini Enterprise license reader (CustomAiControlPlaneLicenseReader) and the Agent Gateway manager
-#   (CustomAiControlPlaneGatewayManager); without the license reader, Gemini Enterprise seats stay hidden;
+#   (CustomAiControlPlaneGatewayManager) and the Gemini Enterprise feature manager
+#   (CustomAiControlPlaneGeFeatureManager); without the license reader, Gemini Enterprise seats stay hidden, and without
+#   the feature manager the Gemini Enterprise feature matrix is read-only;
 # - grants on linked projects (SCAN_PROJECTS) and on folders or organizations of a workspace scope (roles/browser).
 #
 # Projects without an organization must enable IAP for Cloud Run once in the Google Cloud

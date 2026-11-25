@@ -1503,6 +1503,42 @@ grant_license_reader() {
   return 0
 }
 
+# grant_ge_feature_manager PROJECT SA
+# Creates (or updates) the least-privilege custom role CustomAiControlPlaneGeFeatureManager in PROJECT and binds it to
+# SA: Gemini Enterprise > Feature management reads every app (engines.get/list) and changes its feature switches
+# (engines.patch with updateMask=features needs discoveryengine.engines.update). Nothing else in Discovery Engine.
+# Best effort: prints the commands an Owner can run when the caller cannot create or bind the role. Honors DRY_RUN.
+GE_FEATURE_MANAGER_ROLE_ID="CustomAiControlPlaneGeFeatureManager"
+GE_FEATURE_MANAGER_PERMS="discoveryengine.engines.get,discoveryengine.engines.list,discoveryengine.engines.update"
+grant_ge_feature_manager() {
+  local project="$1" sa="$2" role create_cmd bind_cmd
+  role="projects/${project}/roles/${GE_FEATURE_MANAGER_ROLE_ID}"
+  if [[ "${DRY_RUN:-0}" == "1" ]]; then
+    info "[dry-run] custom role ${role} (${GE_FEATURE_MANAGER_PERMS}) -> ${sa}"
+    return 0
+  fi
+  create_cmd="gcloud iam roles create ${GE_FEATURE_MANAGER_ROLE_ID} --project ${project} --title \"AI Control Plane GE Feature Manager\" --permissions ${GE_FEATURE_MANAGER_PERMS} --stage GA"
+  bind_cmd="gcloud projects add-iam-policy-binding ${project} --member serviceAccount:${sa} --role ${role} --condition=None"
+  gcloud iam roles undelete "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" --quiet >/dev/null 2>&1 || true
+  if gcloud iam roles describe "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" >/dev/null 2>&1; then
+    gcloud iam roles update "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" --permissions "$GE_FEATURE_MANAGER_PERMS" \
+      --quiet >/dev/null 2>&1 || true
+  elif ! gcloud iam roles create "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" \
+      --title "AI Control Plane GE Feature Manager" \
+      --description "Read Gemini Enterprise apps and change their feature switches" \
+      --permissions "$GE_FEATURE_MANAGER_PERMS" --stage GA --quiet >/dev/null 2>&1; then
+    warn "could not create ${role}, so Gemini Enterprise features in ${project} are read-only in the dashboard. As an Owner of ${project}, run: ${create_cmd} && ${bind_cmd}"
+    return 0
+  fi
+  if gcloud projects add-iam-policy-binding "$project" --member "serviceAccount:${sa}" --role "$role" \
+      --condition=None --quiet >/dev/null 2>&1; then
+    info "granted ${role} (Gemini Enterprise feature management) to ${sa}"
+  else
+    warn "could not grant ${role} to ${sa}, so Gemini Enterprise features in ${project} are read-only in the dashboard. As an Owner of ${project}, run: ${bind_cmd}"
+  fi
+  return 0
+}
+
 # project_org_id PROJECT
 # Prints the numeric id of PROJECT's organization, or nothing when the project has no organization. Returns 1 when
 # the ancestry cannot be read.

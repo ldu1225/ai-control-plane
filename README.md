@@ -54,7 +54,7 @@ Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registr
 | 메뉴 | 모듈 ID | 제공 기능 | 데이터 소스 |
 |---|---|---|---|
 | 개요 | `overview` | 전체 KPI와 이전 기간 대비 증감, 비용 추이, 모델별 토큰, 보안 현황, 에이전트 수명 주기, 최근 거버넌스 조치 | 각 모듈 |
-| Gemini Enterprise | `gemini_enterprise` | 활성 사용자, 프롬프트, 에이전트별 호출, 라이선스 좌석 할당과 휴면 좌석, 업로드 파일 | BigQuery(Gemini Enterprise 로그), Discovery Engine API |
+| Gemini Enterprise | `gemini_enterprise` | 활성 사용자, 프롬프트, 에이전트별 호출, 라이선스 좌석 할당과 휴면 좌석, 업로드 파일. **기능 관리**: 모든 프로젝트·위치의 앱별 기능 스위치 매트릭스, 앱 간 비교, 여러 앱 일괄 변경(검토 후 적용, 감사 로그) | BigQuery(Gemini Enterprise 로그), Discovery Engine API(`engines.list`·`engines.patch`) |
 | NotebookLM | `notebooklm` | 활성 노트북, 사용자, 프롬프트 | BigQuery `cloudaudit_googleapis_com_data_access` |
 | Agent Gateway | `agent_gateway` | 게이트웨이 인벤토리와 거버넌스 점검, 생성·수정·삭제, Identity-Aware Proxy 액세스 인가 설정 및 감사 전용↔적용 전환, 연결 워크로드(Agent Runtime·Gemini Enterprise), 게이트웨이 요청·인가 판정·MCP 트래픽, AI API 호출 감사 로그 | Network Services API, Network Security API, Cloud Logging, Cloud Monitoring, BigQuery 감사 로그 |
 | Agent Registry | `agent_registry` | Agent Engine과 Gemini Enterprise 에이전트 통합 카탈로그, 휴면과 폐기 권고, 생성 이력 | Agent Platform API, Discovery Engine API, 감사 로그 |
@@ -593,6 +593,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 | `roles/resourcemanager.projectIamAdmin` | 한도 초과 정지와 복원, 개별 허용과 차단, 전체 AI 접근 차단(etag 기반 `setIamPolicy`) |
 | `roles/iam.roleAdmin` | 마커 역할 생성과 갱신 |
 | `CustomAiControlPlaneGatewayManager` | Agent Gateway 생성·수정·삭제와 액세스 인가 전환([7.4](#74-agent-gateway)) |
+| `CustomAiControlPlaneGeFeatureManager` | Gemini Enterprise 앱 기능 스위치 변경(`discoveryengine.engines.get/list/update`, [7.2](#72-gemini-enterprise)). 연동 프로젝트에도 부여 |
 
 **거부 정책 집행 (`ENFORCEMENT_BACKEND=iam_deny`일 때만)**: 런타임 서비스 계정은 조직의 Deny Reviewer와 집행 작업의 `roles/run.jobsExecutor`·`roles/run.viewer`를 받고, 거부 정책 쓰기(Deny Admin)는 집행 작업 서비스 계정만 받습니다([8.9](#89-거부-정책-집행과-집행-작업)).
 
@@ -621,6 +622,23 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 ### 7.2 Gemini Enterprise
 
 활성 사용자, 프롬프트, 에이전트별 호출, 업로드 파일, 라이선스 좌석(할당, 사용, 휴면 좌석)을 보여 줍니다. 집계 기준은 [6.3](#63-gemini-enterprise-로그)을 따릅니다. 라이선스 좌석은 `DISCOVERY_ENGINE_LOCATIONS`의 모든 위치를 합산하고, 위치가 둘 이상이면 표에 위치 열을 표시합니다.
+
+**기능 관리** (`#/gemini-enterprise/features`, 화면 위쪽 **기능 관리** 탭): 프로젝트마다 Gemini Enterprise 앱이 여러 개여도 모든 앱의 기능 스위치(엔진의 `features` 맵)를 한 매트릭스에서 보고, 여러 앱을 한 번에 바꿉니다.
+
+- **보기**: 열은 선택한 프로젝트(전체 통합 또는 단일 프로젝트)와 `DISCOVERY_ENGINE_LOCATIONS`의 모든 Gemini Enterprise 앱(`appType=APP_TYPE_INTRANET`이거나 스위치가 설정된 엔진), 행은 API 레퍼런스에 있는 모든 기능 키입니다(에이전트 갤러리, 노코드 에이전트 빌더, 모델 선택기, NotebookLM, 사람 검색, Canvas, 메모리 등). 레퍼런스에 없지만 앱에 설정된 키도 **기타 기능**에 나옵니다.
+- **상태**: **켜짐**(`FEATURE_STATE_ON`), **꺼짐**(`FEATURE_STATE_OFF`), **기본값**(키가 없어 제품 기본 동작). `disable-`로 시작하는 키는 **제한 항목**이라 켜면 그 기능이 차단됩니다(값을 뒤집어 보여 주지 않습니다). `*`(마스터 스위치)가 설정된 앱은 다른 스위치가 무시되므로 열 머리글에 표시하고 셀을 흐리게 보여 줍니다.
+- **찾기**: 기능 검색, 분류(에이전트 및 자동화, 어시스턴트 경험, 검색 및 지식, 콘텐츠 생성, 공유 및 협업, 개인화, 파일 및 접근), **앱별 상이만**(앱마다 상태가 다른 기능), **명시 설정만**, 프로젝트 선택. **앱 전체 분포** 열은 켜짐·꺼짐·기본값 앱 수입니다. **CSV 내보내기**로 현재 보이는 매트릭스를 받습니다.
+- **변경 (관리자)**: 셀을 눌러 켜짐/꺼짐/기본값을 고르거나, 행 메뉴로 **표시된 모든 앱에서 켜기/끄기/기본값으로 재설정**, 열 메뉴로 **표시된 모든 앱의 기준으로 사용**(그 앱의 스위치를 다른 앱에 복사)·**이 앱을 기본값으로 재설정**을 합니다. 변경은 바로 적용되지 않고 대기 상태로 표시되며, 아래 막대의 **검토 후 적용**에서 앱별 변경 전→후를 확인한 뒤 한 번에 적용합니다(한 번에 최대 100개 앱).
+- **적용 방식**: `POST /api/v1/gemini-enterprise/features/apply`가 앱마다 엔진을 다시 읽고(`GET .../engines/{id}`), 바꾼 키만 현재 맵에 병합해 `PATCH https://{위치}-discoveryengine.googleapis.com/v1/projects/{프로젝트}/locations/{위치}/collections/default_collection/engines/{앱}?updateMask=features`로 보냅니다(`global`은 `discoveryengine.googleapis.com`). `updateMask=features`는 맵 전체를 교체하므로, 그사이 콘솔에서 바뀐 다른 스위치를 지우지 않도록 이렇게 합니다. 앱마다 결과(업데이트, 변경 없음, 실패와 이유)를 보여 주고, 적용 한 번마다 거버넌스 감사 로그에 `ge_features_update` 항목을 남깁니다. 뷰어는 읽기만 할 수 있습니다.
+- **새로 만든 앱과 새로고침**: 목록은 서버에서 60초 동안 캐시합니다. 콘솔에서 앱을 막 만들었다면 상단의 **새로고침**(또는 명령 팔레트의 **데이터 새로고침**)을 누르면 캐시를 건너뛰고 바로 다시 읽습니다(`GET /api/v1/gemini-enterprise/features?refresh=1`). 변경을 적용하면 캐시는 자동으로 비워집니다.
+- **읽지 못한 프로젝트**: 대표 프로젝트의 목록을 읽지 못하면 원인별 데이터 소스 경고가, 연동 프로젝트를 읽지 못하면 "연동 프로젝트 N개의 Gemini Enterprise 앱을 읽지 못했습니다: 프로젝트" 경고가 화면 위에 나옵니다(응답의 `unreadableProjects`). Gemini Enterprise가 없거나 Discovery Engine API가 꺼진 프로젝트는 앱이 없는 것으로 보고 경고하지 않습니다.
+- **권한**: 조회는 `roles/discoveryengine.viewer`, 변경은 `discoveryengine.engines.update`가 필요합니다. `ENABLE_GOVERNANCE_ACTIONS=true`(기본) 배포 시 최소 권한 커스텀 역할 `CustomAiControlPlaneGeFeatureManager`(`discoveryengine.engines.get`, `.list`, `.update`)를 대표·연동 프로젝트에 부여합니다. 역할이 없는 프로젝트의 앱은 적용 결과에 `실패`와 권한 안내가 표시되고 다른 앱은 그대로 적용됩니다.
+- **API 요약**:
+
+  | 엔드포인트 | 권한 | 내용 |
+  |---|---|---|
+  | `GET /api/v1/gemini-enterprise/features[?project=ID][&refresh=1]` | 로그인 | `apps[]`(앱 키, 프로젝트, 위치, 엔진 ID, 표시 이름, `features{키: on\|off}`, `allFeatures`), `keys`, `otherEngines`, `complete`, `unreadableProjects` |
+  | `POST /api/v1/gemini-enterprise/features/apply` | 관리자, CSRF, 거버넌스 속도 제한 | 본문 `{"changes": [{"project", "location", "engineId", "set": {"agent-gallery": "on", "disable-image-generation": "off", "model-selector": "default"}}]}`(최대 100개 앱, 앱당 64개 키). 응답 `results[]`(`updated`·`unchanged`·`failed`와 `error`), `updated`, `unchanged`, `failed`, `auditLogged` |
 
 ### 7.3 NotebookLM
 
@@ -1158,7 +1176,7 @@ gcloud iam policies delete ai-control-plane-caps \
 
 ## 10. Terraform으로 배포 (선택)
 
-인프라를 코드로 관리하는 조직을 위해 `terraform/`을 제공합니다. IAP 방식(`auth_mode = "iap"`)으로 서비스 계정, 최소 권한 IAM, 필요한 API, 비공개 설정 버킷, Cloud Run, Cloud Run 직접 IAP를 만들고, `enforcement_backend = "iam_deny"`이면 집행 작업과 그 Cloud Scheduler 작업도 만듭니다. Google provider 7.x가 필요합니다. Google 로그인 방식과 그 시크릿, `iam_allow_swap`·`notify_only`의 집행 스케줄러, 유지관리 스케줄러는 `scripts/deploy.sh`만 만들고, 감사 로그 싱크, Data Access 로그, Gemini Enterprise 로그는 `scripts/prepare.sh`로 켭니다. 커스텀 역할(마커 역할은 Antigravity 통제 화면의 **마커 역할 생성**으로 만듦, 라이선스 읽기, Agent Gateway 관리)과 연동 프로젝트·워크스페이스 범위의 권한도 만들지 않습니다. 라이선스 읽기 역할이 없으면 Gemini Enterprise 좌석이 보이지 않습니다([14.5](#145-gemini-enterprise가-다른-프로젝트에-있을-때)).
+인프라를 코드로 관리하는 조직을 위해 `terraform/`을 제공합니다. IAP 방식(`auth_mode = "iap"`)으로 서비스 계정, 최소 권한 IAM, 필요한 API, 비공개 설정 버킷, Cloud Run, Cloud Run 직접 IAP를 만들고, `enforcement_backend = "iam_deny"`이면 집행 작업과 그 Cloud Scheduler 작업도 만듭니다. Google provider 7.x가 필요합니다. Google 로그인 방식과 그 시크릿, `iam_allow_swap`·`notify_only`의 집행 스케줄러, 유지관리 스케줄러는 `scripts/deploy.sh`만 만들고, 감사 로그 싱크, Data Access 로그, Gemini Enterprise 로그는 `scripts/prepare.sh`로 켭니다. 커스텀 역할(마커 역할은 Antigravity 통제 화면의 **마커 역할 생성**으로 만듦, 라이선스 읽기, Agent Gateway 관리, Gemini Enterprise 기능 관리 `CustomAiControlPlaneGeFeatureManager`)과 연동 프로젝트·워크스페이스 범위의 권한도 만들지 않습니다. 기능 관리 역할이 없으면 기능 매트릭스는 읽기만 됩니다. 라이선스 읽기 역할이 없으면 Gemini Enterprise 좌석이 보이지 않습니다([14.5](#145-gemini-enterprise가-다른-프로젝트에-있을-때)).
 
 ```bash
 # 1. 이미지 빌드
@@ -1293,6 +1311,8 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 | 에이전트 상세의 "에이전트 자체 보고"와 모델 및 도구가 비어 있음 | 에이전트가 Agent Development Kit 2.6 이상인지, `GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true`로 배포했는지([7.5](#75-agent-registry와-에이전트-배포)). 리비전 보기의 텔레메트리 열에 리비전별 설정이 나옵니다. |
 | 에이전트 상세의 트레이스·토폴로지에 액세스 거부 알림 | 에이전트가 있는 프로젝트에서 런타임 서비스 계정에 `roles/cloudtrace.user`가 있는지, Cloud Trace API가 켜져 있는지 |
 | 플레이그라운드에서 "에이전트를 호출하지 못했습니다" | 런타임 서비스 계정에 그 프로젝트의 `roles/aiplatform.user`가 있는지(연동 프로젝트에는 읽기 역할만 부여됩니다) |
+| 기능 관리에 새로 만든 Gemini Enterprise 앱이 안 보임 | 목록은 60초 캐시이므로 상단 **새로고침**을 누릅니다. 그래도 없으면 앱의 위치가 `DISCOVERY_ENGINE_LOCATIONS`에 있는지, 프로젝트가 워크스페이스(대표·연동·자동 발견)에 있는지, 화면 위 "연동 프로젝트를 읽지 못했습니다" 경고가 있는지 확인합니다([7.2](#72-gemini-enterprise)) |
+| 기능 적용 결과가 `실패`(권한) | 런타임 서비스 계정에 그 프로젝트의 `discoveryengine.engines.update`가 없습니다. `ENABLE_GOVERNANCE_ACTIONS=true`로 `scripts/deploy.sh`를 다시 실행해 `CustomAiControlPlaneGeFeatureManager`를 부여하거나 Discovery Engine 편집자 역할을 줍니다 |
 | 라이선스 좌석이 비어 있거나 적게 나옴 | `roles/discoveryengine.viewer`와 라이선스 읽기 커스텀 역할 `CustomAiControlPlaneLicenseReader`(대표·연동 프로젝트 모두), 구독을 배분한 위치가 모두 `DISCOVERY_ENGINE_LOCATIONS`에 있는지(`deploy.env`에서 비워 두고 `scripts/deploy.sh`를 다시 실행하면 다시 감지합니다) |
 | `discoveryengine.*`(licenseConfigs, userLicenses, engines) 또는 `user_activity` 테이블 접근 거부 | 런타임 서비스 계정에 Gemini Enterprise가 있는 프로젝트의 권한이 없습니다. 대개 대시보드를 다른 프로젝트에 설치한 경우입니다. Gemini Enterprise 프로젝트에 설치하거나 `--link-projects`로 연동하고, 이미 설치했다면 [14.5](#145-gemini-enterprise가-다른-프로젝트에-있을-때)의 권한 부여 명령을 실행합니다. |
 | Antigravity 사용자가 0명 | `inference_response` 로그가 프로젝트에 있는지(Antigravity for organizations). 개인 환경의 에이전트는 이 로그를 남기지 않습니다. |
@@ -1414,7 +1434,7 @@ scripts/teardown.sh --project PROJECT_ID --dry-run      # 지울 대상만 출�
 4. **텔레메트리 라우팅 싱크**(설명이 `AI Control Plane telemetry route`인 싱크, 대표·연동 프로젝트).
 5. 대표·연동·결제 프로젝트의 **IAM 바인딩**, 결제 데이터셋과 감사 로그 데이터셋의 공유 항목, 거부 정책 방식의 **조직 역할**(Deny Admin, Deny Reviewer. 권한이 없으면 회수 명령 출력).
 6. **서비스 계정**(런타임, 빌더, 스케줄러, 로그인 브리지, 집행 작업)과 **시크릿**(세션 서명 키, OAuth 클라이언트 보안 비밀, 연결형 OAuth 보안 비밀, 관리자 비밀번호).
-7. `--delete-roles`이면 아무 바인딩도 쓰지 않는 **커스텀 역할**(마커 역할, `CustomAiControlPlaneGatewayManager`, 대표·연동 프로젝트의 `CustomAiControlPlaneLicenseReader`). 같은 프로젝트의 다른 대시보드가 라이선스 읽기 역할을 쓰고 있으면 마커 역할은 남깁니다.
+7. `--delete-roles`이면 아무 바인딩도 쓰지 않는 **커스텀 역할**(마커 역할, `CustomAiControlPlaneGatewayManager`, 대표·연동 프로젝트의 `CustomAiControlPlaneLicenseReader`와 `CustomAiControlPlaneGeFeatureManager`). 같은 프로젝트의 다른 대시보드가 라이선스 읽기 역할을 쓰고 있으면 마커 역할은 남깁니다.
 8. `--delete-data`이면 설정 버킷, 감사 로그 싱크(`SERVICE_NAME-ai-logs`), 대시보드가 만든 텔레메트리 데이터셋(`managed-by=ai-control-plane` 라벨이 있을 때만).
 
 BigQuery 감사 로그 데이터셋, Artifact Registry 저장소, Data Access 감사 로그 설정, 화면에서 만든 Agent Gateway 리소스는 지우지 않고 삭제 명령이나 위치를 안내합니다. Gemini Enterprise 앱의 관측 가능성(사용 로그) 설정도 그대로 두며, 필요하면 콘솔의 앱 > 구성 > 관측 가능성에서 끕니다. 사전 점검(0단계)이 배포 계정에 스스로 부여한 역할도 회수하지 않으므로 필요하면 IAM에서 직접 뺍니다. `--delete-roles`가 없으면 커스텀 역할은 남기고 삭제 명령을 안내합니다. 지운 역할 ID는 최대 37일 동안 다시 만들 수 없어, 그 사이에 다시 설치하면 마커 역할을 만들지 못하기 때문입니다.
@@ -1469,6 +1489,8 @@ Git이 공개할 파일을 검사해 비밀 정보(개인 키, API 키, OAuth �
 | `GET /api/v1/layouts`, `POST /api/v1/layouts` | 로그인 | 사람별 위젯 배치(자기 배치만) |
 | `GET /api/v1/overview/summary` | 로그인 | 개요 |
 | `GET /api/v1/gemini-enterprise/summary`, `/licenses`, `/file-uploads` | 로그인 | Gemini Enterprise |
+| `GET /api/v1/gemini-enterprise/features` (`?refresh=1`로 캐시 건너뜀) | 로그인 | Gemini Enterprise 앱별 기능 스위치 |
+| `POST /api/v1/gemini-enterprise/features/apply` | 관리자 | 여러 앱의 기능 스위치 일괄 변경(`engines.patch`, `updateMask=features`) |
 | `GET /api/v1/notebooklm/summary` | 로그인 | NotebookLM |
 | `GET /api/v1/models/usage`, `/catalog` | 로그인 | 모델 및 토큰 |
 | `GET /api/v1/agent-platform/gateway`, `/registry`, `/deployments` | 로그인 | AI API 호출 감사 로그, Agent Registry, 에이전트 배포 |

@@ -2158,6 +2158,8 @@ class TeardownCompletenessTest(unittest.TestCase):
         self.assertEqual(deleted, {"CustomAntigravityRestrictedUser@demo-hub-proj",
                                    "CustomAntigravityAdminBlocked@demo-hub-proj",
                                    "CustomAiControlPlaneGatewayManager@demo-hub-proj",
+                                   "CustomAiControlPlaneGeFeatureManager@demo-hub-proj",
+                                   "CustomAiControlPlaneGeFeatureManager@demo-spoke-a",
                                    "CustomAiControlPlaneLicenseReader@demo-hub-proj",
                                    "CustomAiControlPlaneLicenseReader@demo-spoke-a"})
         self.assertIn("kept projects/demo-hub-proj/roles/CustomAntigravityCapBlocked (1 member(s) still hold it)",

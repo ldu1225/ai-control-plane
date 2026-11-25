@@ -31,11 +31,14 @@ from .services import (agents, analyst, finops, gateway, gemini_enterprise, gove
                        users)
 from .services import budgets, chargeback, org_model, scope, spend_caps
 from .services import usage_events
+from .services import ge_features
 
 LOG = logging.getLogger("controlplane.app")
 
 WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web"))
 RANGE_PARAMS = {"start", "end", "granularity"}
+# GET ?refresh=1 on a route with refreshable=True drops its cached entry first (the page's Refresh button).
+REFRESH_PARAM = "refresh"
 ENFORCE_PATH = "/api/v1/governance/antigravity/enforce"
 
 ROUTER = Router()
@@ -78,6 +81,12 @@ _route("GET", "/api/v1/gemini-enterprise/summary", gemini_enterprise.summary, mo
 _route("GET", "/api/v1/gemini-enterprise/licenses", gemini_enterprise.licenses, module="gemini_enterprise", cache=True)
 _route("GET", "/api/v1/gemini-enterprise/file-uploads", gemini_enterprise.file_uploads, module="gemini_enterprise",
        range=True, cache=True, mask={"restrict": ("fileName", "fileId")})
+# Feature management: the feature switches of every Gemini Enterprise app (engine `features` map) in one matrix, and
+# changes applied to many apps at once (engines.patch with updateMask=features, one audit entry per apply).
+_route("GET", "/api/v1/gemini-enterprise/features", ge_features.inventory, module="gemini_enterprise", cache=True,
+       ttl=60, refreshable=True)
+_route("POST", "/api/v1/gemini-enterprise/features/apply", ge_features.apply, module="gemini_enterprise", admin=True,
+       rate="governance", mask=False)
 _route("GET", "/api/v1/notebooklm/summary", notebooklm.summary, module="notebooklm", range=True, cache=True)
 _route("GET", "/api/v1/models/usage", models.usage, module="model_usage", range=True, cache=True)
 _route("GET", "/api/v1/models/catalog", models.catalog, module="model_usage", cache=True)
@@ -264,7 +273,7 @@ class App:
 
 
 def _cache_key(path, params, rng, version):
-    rest = tuple(sorted((k, v) for k, v in params.items() if k not in RANGE_PARAMS))
+    rest = tuple(sorted((k, v) for k, v in params.items() if k not in RANGE_PARAMS and k != REFRESH_PARAM))
     window = (rng.start.isoformat(), rng.end.isoformat(), rng.granularity, rng.tz_name) if rng else None
     return ("route", path, window, rest, version)
 
@@ -342,13 +351,16 @@ class ControlPlaneHandler(BaseHandler):
         try:
             if opts.get("cache") and method == "GET":
                 ttl = opts.get("ttl") or int(settings["server"].get("cache_ttl_seconds") or 0)
+                key = _cache_key(path, params, rng, version)
+                if opts.get("refreshable") and str(params.get(REFRESH_PARAM) or "").lower() in ("1", "true"):
+                    app.cache.delete(key)
 
                 def compute():
                     value = fn(ctx)
                     return {"data": value, "warnings": list(ctx.warnings), "sources": sorted(ctx.sources),
                             "generatedAt": now_iso()}
                 result, cached = app.cache.get_or_compute(
-                    _cache_key(path, params, rng, version), ttl, compute,
+                    key, ttl, compute,
                     cacheable=lambda r: not any(w["code"] in svc_base.TRANSIENT_CODES for w in r["warnings"]))
                 data, warnings, sources, generated = (result["data"], result["warnings"], result["sources"],
                                                       result["generatedAt"])

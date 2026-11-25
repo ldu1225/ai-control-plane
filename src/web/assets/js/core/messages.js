@@ -14,6 +14,8 @@ const TEMPLATES = [
   // Data source notices
   [/^Only the first (\d+) reasoning engines per region are listed\.$/, 'Only the first {a} reasoning engines per region are listed.'],
   [/^Only the first (\d+) engines are inspected\.$/, 'Only the first {a} engines are inspected.'],
+  [/^Only the first (\d+) engines per location are listed\.$/, 'Only the first {a} engines per location are listed.'],
+  [/^Gemini Enterprise apps in (\d+) linked project\(s\) could not be read: (.+)\. Grant the runtime service account Discovery Engine Viewer there\.$/, 'Gemini Enterprise apps in {a} linked project(s) could not be read: {b}. Grant the runtime service account Discovery Engine Viewer there.'],
   [/^Only the first (\d+) runtime revisions are listed\.$/, 'Only the first {a} runtime revisions are listed.'],
   [/^Only the first (\d+) user licenses are shown\.$/, 'Only the first {a} user licenses are shown.'],
   [/^Only the first (\d+) log names are listed\.$/, 'Only the first {a} log names are listed.'],

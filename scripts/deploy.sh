@@ -676,6 +676,8 @@ if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
   # Marker roles for per-user Antigravity caps (Gemini Enterprise User without businessaicode.*), created now so
   # suspensions work right after installation without the "Create marker roles" step.
   ensure_antigravity_marker_roles "$PROJECT_ID"
+  # Gemini Enterprise > Feature management: change the feature switches of Gemini Enterprise apps (least privilege).
+  grant_ge_feature_manager "$PROJECT_ID" "$SA_EMAIL"
   # Least-privilege custom role for managing Agent Gateway resources, IAP authorization extensions and policies.
   GATEWAY_MANAGER_ROLE_ID="CustomAiControlPlaneGatewayManager"
   GATEWAY_MANAGER_ROLE="projects/${PROJECT_ID}/roles/${GATEWAY_MANAGER_ROLE_ID}"
@@ -809,6 +811,10 @@ if [[ -n "$SCAN_PROJECTS" ]]; then
     # Gemini Enterprise seats of the linked project: the same read-only custom role as in the hub, because
     # roles/discoveryengine.viewer cannot list license configs or user licenses (best effort, honors DRY_RUN).
     grant_license_reader "$lp" "$SA_EMAIL" "$LICENSE_READER_ROLE_ID" "$LICENSE_READER_PERMS"
+    # Gemini Enterprise > Feature management changes the apps of linked projects too (governance actions only).
+    if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
+      grant_ge_feature_manager "$lp" "$SA_EMAIL"
+    fi
     # iam_deny: the enforcement job reads usage, logs and licenses of every workspace project (read roles only).
     if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
       if [[ "$DRY_RUN" == "1" ]]; then

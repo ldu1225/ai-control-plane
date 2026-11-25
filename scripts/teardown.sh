@@ -477,6 +477,7 @@ if [[ "$DELETE_ROLES" == "1" ]]; then
       [[ -n "$marker_id" ]] && delete_unused_role "$PROJECT_ID" "$marker_id" "$HOLDERS" "$OTHER_DEPLOYMENT"
     done
     delete_unused_role "$PROJECT_ID" "$GATEWAY_MANAGER_ROLE_ID" "$HOLDERS" ""
+    delete_unused_role "$PROJECT_ID" "$GE_FEATURE_MANAGER_ROLE_ID" "$HOLDERS" ""
     delete_unused_role "$PROJECT_ID" "$LICENSE_READER_ROLE_ID" "$HOLDERS" ""
   else
     info "cannot read the IAM policy of ${PROJECT_ID}; custom roles kept"
@@ -484,6 +485,7 @@ if [[ "$DELETE_ROLES" == "1" ]]; then
   for lr_project in ${TORN_LINKED[@]+"${TORN_LINKED[@]}"}; do
     if LINKED_HOLDERS="$(role_holders "$lr_project")"; then
       delete_unused_role "$lr_project" "$LICENSE_READER_ROLE_ID" "$LINKED_HOLDERS" ""
+      delete_unused_role "$lr_project" "$GE_FEATURE_MANAGER_ROLE_ID" "$LINKED_HOLDERS" ""
     else
       info "cannot read the IAM policy of ${lr_project}; ${LICENSE_READER_ROLE_ID} kept there"
     fi
@@ -527,5 +529,6 @@ if [[ "$DELETE_ROLES" != "1" ]]; then
   info "  gcloud iam roles delete ${GATEWAY_MANAGER_ROLE_ID} --project ${PROJECT_ID}"
   for lr_project in "$PROJECT_ID" ${TORN_LINKED[@]+"${TORN_LINKED[@]}"}; do
     info "  gcloud iam roles delete ${LICENSE_READER_ROLE_ID} --project ${lr_project}"
+    info "  gcloud iam roles delete ${GE_FEATURE_MANAGER_ROLE_ID} --project ${lr_project}"
   done
 fi
