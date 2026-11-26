@@ -11,7 +11,7 @@ from .. import __version__, config, timeutil
 from ..gcp import GcpError
 from ..httpkit import ApiError, issue_csrf_token
 from ..security import GUEST_MODE, admin_guard, is_admin_email, mask_for_viewer, resolve_auth_mode
-from .base import AUDIT_DATA_ACCESS, describe_error
+from .base import AUDIT_DATA_ACCESS, describe_error, discovery_host
 from . import analyst, iap_access, pricing_sync, telemetry_routing
 
 LOG = logging.getLogger("controlplane.system")
@@ -205,9 +205,22 @@ def run_health(ctx):
     def discovery():
         if not configured:
             return unconfigured
-        url = "https://discoveryengine.googleapis.com/v1alpha/projects/%s/locations/global/licenseConfigs" % ctx.project
-        data = ctx.rest("GET", url)
-        return "ok", "%d license configuration(s) found" % len(data.get("licenseConfigs") or [])
+        locs = [loc for loc in (s["workspace"].get("discovery_engine_locations") or ["global"])
+                if config.LOCATION_RE.match(loc or "")] or ["global"]
+        total, ok_locs, last_err = 0, [], None
+        for loc in locs:
+            url = "%s/v1alpha/projects/%s/locations/%s/licenseConfigs" % (discovery_host(loc), ctx.project, loc)
+            try:
+                data = ctx.rest("GET", url)
+            except GcpError as err:
+                last_err = err
+                continue
+            ok_locs.append(loc)
+            total += len(data.get("licenseConfigs") or [])
+        if not ok_locs and last_err is not None:
+            raise last_err
+        suffix = " (%s)" % ", ".join(ok_locs) if ok_locs != ["global"] else ""
+        return "ok", "%d license configuration(s) found%s" % (total, suffix)
 
     def agent_engine():
         if not configured:

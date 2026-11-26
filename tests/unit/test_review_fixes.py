@@ -201,5 +201,39 @@ class WebhookTextTest(unittest.TestCase):
         self.assertIs(post.call_args.kwargs["allow_redirects"], False)
 
 
+class DiscoveryHealthCheckTest(unittest.TestCase):
+    def test_discovery_health_check_uses_configured_non_global_locations(self):
+        from controlplane.services import system as system_svc
+        ctx = support.FakeCtx()
+        ctx.settings["workspace"]["discovery_engine_locations"] = ["eu", "us"]
+        called = []
+
+        def fake_rest(method, url, **kwargs):  # pylint: disable=unused-argument
+            called.append(url)
+            if "locations/eu/licenseConfigs" in url:
+                return {"licenseConfigs": [{"name": "projects/demo-project/locations/eu/licenseConfigs/c1"}]}
+            if "locations/us/licenseConfigs" in url:
+                return {"licenseConfigs": [{"name": "projects/demo-project/locations/us/licenseConfigs/c2"},
+                                           {"name": "projects/demo-project/locations/us/licenseConfigs/c3"}]}
+            return {}
+
+        ctx.rest = fake_rest
+        ctx.max_bytes = 10**9
+        ctx.app = mock.Mock()
+        ctx.app.ai.client.return_value = mock.Mock()
+        ctx.app.ai.client.return_value.models.get.return_value = mock.Mock()
+        ctx.registry = mock.Mock()
+        ctx.registry.tables.return_value = {}
+        with mock.patch("controlplane.services.governance.get_policy", return_value={"bindings": []}), \
+                mock.patch("controlplane.services.governance.permission_status", return_value={}):
+            res = system_svc.run_health(ctx)
+        disc = next(c for c in res["checks"] if c["id"] == "discovery_engine")
+        self.assertEqual(disc["status"], "ok")
+        self.assertIn("3 license configuration(s) found (eu, us)", disc["detail"])
+        self.assertTrue(any(u.startswith("https://eu-discoveryengine.googleapis.com/") for u in called))
+        self.assertTrue(any(u.startswith("https://us-discoveryengine.googleapis.com/") for u in called))
+        self.assertFalse(any("/locations/global/licenseConfigs" in u for u in called))
+
+
 if __name__ == "__main__":
     unittest.main()

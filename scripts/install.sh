@@ -132,26 +132,24 @@ if [[ -z "$LOCAL_ROOT" ]]; then
     fi
   fi
   if [[ "$UPDATED" != "1" ]]; then
-    # The settings snapshots of earlier runs (deploy.PROJECT_ID.env) and the deploy.env backup survive the re-clone:
-    # without them a later run would fall back to the defaults (for example another region or access mode).
-    KEEP_DIR=""
-    if [[ -d "$INSTALL_DIR" ]]; then
-      KEEP_DIR="$(mktemp -d 2>/dev/null || true)"
-      if [[ -n "$KEEP_DIR" ]]; then
-        for _kept in "$INSTALL_DIR"/deploy.*.env "$INSTALL_DIR/deploy.env.bak"; do
-          [[ -f "$_kept" ]] && cp -p "$_kept" "$KEEP_DIR/" 2>/dev/null || true
-        done
-      fi
-    fi
-    rm -rf "$INSTALL_DIR"
+    # Clone into a staging directory first so a network error never deletes an existing checkout or its
+    # deploy.PROJECT_ID.env snapshots; copy snapshots into the new checkout before swapping it into place.
+    CLONE_PARENT="$(dirname "$INSTALL_DIR")"
+    mkdir -p "$CLONE_PARENT" 2>/dev/null || true
+    CLONE_TMP="$(mktemp -d "${CLONE_PARENT}/.acp-clone.XXXXXX" 2>/dev/null || mktemp -d)"
     printf '\n==> Downloading AI Control Plane into %s\n' "$INSTALL_DIR"
-    git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
-    if [[ -n "$KEEP_DIR" ]]; then
-      for _kept in "$KEEP_DIR"/*; do
-        [[ -f "$_kept" ]] && cp -p "$_kept" "$INSTALL_DIR/" 2>/dev/null || true
-      done
-      rm -rf "$KEEP_DIR"
+    if ! git clone --depth 1 "$REPO_URL" "$CLONE_TMP"; then
+      rm -rf "$CLONE_TMP"
+      echo "error: failed to clone ${REPO_URL} (existing files in ${INSTALL_DIR} were kept untouched)" >&2
+      exit 1
     fi
+    if [[ -d "$INSTALL_DIR" ]]; then
+      for _kept in "$INSTALL_DIR"/deploy.*.env "$INSTALL_DIR/deploy.env.bak"; do
+        [[ -f "$_kept" ]] && cp -p "$_kept" "$CLONE_TMP/" 2>/dev/null || true
+      done
+      rm -rf "$INSTALL_DIR"
+    fi
+    mv "$CLONE_TMP" "$INSTALL_DIR"
   fi
   chmod +x "$INSTALL_DIR/scripts/"*.sh 2>/dev/null || true
   cd "$INSTALL_DIR"
@@ -347,7 +345,7 @@ if [[ -z "$TARGET_PROJECTS" && "$AUTO_YES" == "0" && ( -t 0 || "${ACP_FORCE_WIZA
     [[ "$TARGET_PROJECTS" != *,* ]] && PREV_PROJECT="$TARGET_PROJECTS"
     if [[ "$TARGET_PROJECTS" != *,* && -z "$CLI_LINK_PROJECTS" ]]; then
       PREV_LINKS="$(saved_setting "$PREV_PROJECT" SCAN_PROJECTS)"
-      read -r -p "  2. Additional projects to monitor together in this dashboard (optional, IDs/numbers) [${PREV_LINKS}${PREV_LINKS:+; none clears}]: " INPUT_LINK
+      read -r -p "  2. Additional projects to monitor together in this dashboard (optional, comma-separated IDs/numbers) [${PREV_LINKS}${PREV_LINKS:+; none clears}]: " INPUT_LINK
       INPUT_LINK="$(trim_ws "${INPUT_LINK:-}")"
       if [[ "$(lower_trim "$INPUT_LINK")" == "none" ]]; then
         CLI_LINK_PROJECTS="none"
@@ -368,7 +366,7 @@ if [[ -z "$TARGET_PROJECTS" && "$AUTO_YES" == "0" && ( -t 0 || "${ACP_FORCE_WIZA
     DEF_ADMINS="${CLI_ADMINS:-}"
     [[ -n "$DEF_ADMINS" || -z "$PREV_PROJECT" ]] || DEF_ADMINS="$(saved_setting "$PREV_PROJECT" ADMIN_EMAILS)"
     DEF_ADMINS="${DEF_ADMINS:-$ACCOUNT}"
-    read -r -p "  $((3 + STEP_OFFSET)). Administrator email(s) [${DEF_ADMINS}]: " INPUT_ADMINS
+    read -r -p "  $((3 + STEP_OFFSET)). Administrator email(s) (comma-separated) [${DEF_ADMINS}]: " INPUT_ADMINS
     CLI_ADMINS="$(trim_ws "${INPUT_ADMINS:-$DEF_ADMINS}")"
 
     DEF_VIEWERS="${CLI_VIEWERS:-}"

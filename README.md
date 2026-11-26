@@ -211,7 +211,7 @@ scripts/deploy.sh --project my-project-id --link-projects project-b,project-c
 | 0. 사전 권한·결제 점검 | 기반 제어 API를 먼저 켜고, 호출자 IAM 권한 확인 및 자동 보강(Self-bootstrap), 결제 계정 연결 확인·자동 연결, 조직 정책·VPC Service Controls 사전 점검([14.4](#144-고객-프로젝트-사전-점검-조직-정책vpc-service-controls))을 수행합니다. |
 | 1. 필수 API & 서비스 에이전트 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Cloud Trace, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, IAP, Cloud Scheduler, Cloud Billing Budget, 실시간 집행용 Pub/Sub 등 API와 Google 관리형 서비스 에이전트(`service-PROJECT_NUMBER@...`)를 즉시 생성합니다. |
 | 2. 설정 버킷 | 공개 접근이 차단되고 버전 관리가 켜진 Cloud Storage 버킷을 생성합니다. |
-| 3. 전용 서비스 계정 & IAM | 런타임 SA, 로그인 브리지 SA, **전용 Cloud Build 빌더 SA**(Compute Engine 기본 SA에 의존하지 않음), `iam_deny`이면 집행 작업 SA를 만들고 최소 권한을 부여합니다([6.6](#66-런타임-서비스-계정-권한)). 통제 기능(`ENABLE_GOVERNANCE_ACTIONS=true`, 기본)이면 IAM 쓰기 역할과 Antigravity 마커 역할(`CustomAntigravityCapBlocked`, `CustomAntigravityAdminBlocked`), Agent Gateway 관리 커스텀 역할을 만듭니다. `--link-projects`로 지정한 연동 프로젝트에도 읽기 전용 스캔 권한을 자동 부여하며, BigQuery 결제 내보내기 테이블이 있으면 자동으로 탐지합니다. |
+| 3. 전용 서비스 계정 & IAM | 런타임 SA, 로그인 브리지 SA, **전용 Cloud Build 빌더 SA**(Compute Engine 기본 SA에 의존하지 않음), `iam_deny`이면 집행 작업 SA를 만들고 최소 권한(`CustomAiControlPlaneLicenseReader` 포함)을 부여합니다([6.6](#66-런타임-서비스-계정-권한)). 통제 기능(`ENABLE_GOVERNANCE_ACTIONS=true`, 기본)이면 IAM 쓰기 역할과 Antigravity 마커 역할(`CustomAntigravityCapBlocked`, `CustomAntigravityAdminBlocked`), Gemini Enterprise 기능 관리 커스텀 역할(`CustomAiControlPlaneGeFeatureManager`), Agent Gateway 관리 커스텀 역할(`CustomAiControlPlaneGatewayManager`)을 만듭니다. `--link-projects`로 지정한 연동 프로젝트에도 읽기 전용 스캔 권한과 기능 관리 역할(통제 기능 사용 시)을 자동 부여하며, BigQuery 결제 내보내기 테이블이 있으면 자동으로 탐지합니다. |
 | 4. 컨테이너 이미지 | Artifact Registry 저장소를 만들고 전용 빌더 SA로 Cloud Build 이미지를 빌드합니다(리전 워커 제한 시 글로벌 Cloud Build -> Cloud Shell/로컬 Docker로 3단계 자동 전환). |
 | 5. 시크릿 | 세션 서명 키, 기본 `admin` 계정의 무작위 초기 비밀번호, 화면에서 연결할 OAuth 클라이언트 보안 비밀 자리(`google`, `password` 방식)를 리전 제한 조직 정책(`constraints/gcp.resourceLocations`)에 맞춰 Secret Manager에 만듭니다. |
 | 6. 데이터 소스 일괄 활성화 | BigQuery 데이터셋(`ge_analytics`)과 파티션 Log Router 싱크 생성, **AI 서비스 Data Access 감사 로그 활성화**, 모든 Gemini Enterprise 앱의 **사용 로그 + 프롬프트·사용자 식별 로깅 활성화**, 연동 프로젝트 로그 싱크 온보딩(권한 보유 시), 조직명 및 Agent Platform 엔드포인트 자동 탐지를 수행합니다. |
@@ -323,7 +323,7 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `ENABLE_GOVERNANCE_ACTIONS` | `true` | IAM 쓰기 역할 부여(`--read-only`면 `false`, `--no-read-only`면 `true`). 한도 초과 사용자 정지, 복원, 개별 허용/차단, 마커 역할 생성, Agent Gateway 관리에 필요 |
+| `ENABLE_GOVERNANCE_ACTIONS` | `true` | IAM 쓰기 역할 부여(`--read-only`면 `false`, `--no-read-only`면 `true`). 한도 초과 사용자 정지, 복원, 개별 허용/차단, 마커 역할 생성, Gemini Enterprise 기능 관리, Agent Gateway 관리에 필요 |
 | `ENFORCEMENT_BACKEND` | `iam_allow_swap` | 정지 적용 방식: `iam_allow_swap`, `iam_deny`, `notify_only`([8.9](#89-거부-정책-집행과-집행-작업), `--enforcement-backend`) |
 | `DENY_ATTACHMENT` | `projects` | `iam_deny` 거부 정책 부착점: `projects`, `scope`(`--deny-attachment`) |
 | `ENFORCEMENT_JOB_REGION` | 비어 있음(`REGION`) | `iam_deny` 집행 작업과 그 스케줄러의 리전(`--enforcement-job-region`) |
@@ -564,7 +564,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 
 ### 6.6 런타임 서비스 계정 권한
 
-`scripts/deploy.sh`가 자동으로 부여합니다. Terraform은 이 중 시크릿 권한, `roles/bigquery.user`, `roles/logging.configWriter`, `roles/iap.admin`, 커스텀 역할(라이선스 읽기, Agent Gateway 관리)을 부여하지 않습니다([10장](#10-terraform으로-배포-선택)). 직접 구성할 때도 같은 기준을 따릅니다.
+`scripts/deploy.sh`가 자동으로 부여합니다. Terraform은 이 중 시크릿 권한, `roles/bigquery.user`, `roles/logging.configWriter`, `roles/iap.admin`, 커스텀 역할(라이선스 읽기, Gemini Enterprise 기능 관리, Agent Gateway 관리)을 부여하지 않습니다([10장](#10-terraform으로-배포-선택)). 직접 구성할 때도 같은 기준을 따릅니다.
 
 **조회 (항상 필요)**
 
@@ -597,7 +597,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 
 **거부 정책 집행 (`ENFORCEMENT_BACKEND=iam_deny`일 때만)**: 런타임 서비스 계정은 조직의 Deny Reviewer와 집행 작업의 `roles/run.jobsExecutor`·`roles/run.viewer`를 받고, 거부 정책 쓰기(Deny Admin)는 집행 작업 서비스 계정만 받습니다([8.9](#89-거부-정책-집행과-집행-작업)).
 
-**연동 프로젝트 (`SCAN_PROJECTS`, `scripts/deploy.sh`)**: `roles/bigquery.dataViewer`, `roles/logging.viewer`, `roles/logging.privateLogViewer`, `roles/monitoring.viewer`, `roles/aiplatform.viewer`, `roles/discoveryengine.viewer`와 `CustomAiControlPlaneLicenseReader`, `roles/iam.securityReviewer`, `roles/modelarmor.viewer`, `roles/networkservices.viewer`, `roles/networksecurity.viewer`, `roles/cloudtrace.user`를 받고, `ENABLE_LINKED_TELEMETRY_ROUTING=true`(기본)이면 `roles/logging.configWriter`도 받습니다. `iam_deny`이면 집행 작업 서비스 계정도 읽기 역할을 받습니다.
+**연동 프로젝트 (`SCAN_PROJECTS`, `scripts/deploy.sh`)**: `roles/bigquery.dataViewer`, `roles/logging.viewer`, `roles/logging.privateLogViewer`, `roles/monitoring.viewer`, `roles/aiplatform.viewer`, `roles/discoveryengine.viewer`와 `CustomAiControlPlaneLicenseReader`, `roles/iam.securityReviewer`, `roles/modelarmor.viewer`, `roles/networkservices.viewer`, `roles/networksecurity.viewer`, `roles/cloudtrace.user`를 받고, `ENABLE_LINKED_TELEMETRY_ROUTING=true`(기본)이면 `roles/logging.configWriter`를, `ENABLE_GOVERNANCE_ACTIONS=true`(기본)이면 `CustomAiControlPlaneGeFeatureManager`도 받습니다. `iam_deny`이면 집행 작업 서비스 계정도 읽기 역할을 받습니다.
 
 **로그인 브리지 (`google` 방식)**: 브리지는 별도 서비스 계정(`SERVICE_NAME-signin`, 서비스 이름은 앞 23자까지)으로 실행됩니다. 프로젝트 역할이 없고 세션 서명 키만 읽을 수 있습니다.
 
@@ -1346,7 +1346,8 @@ gcloud logging sinks delete ai-control-plane-ai-logs --project "$DROPPED" --quie
 for role in roles/bigquery.dataViewer roles/logging.viewer roles/logging.privateLogViewer roles/monitoring.viewer \
     roles/aiplatform.viewer roles/discoveryengine.viewer roles/iam.securityReviewer roles/modelarmor.viewer \
     roles/networkservices.viewer roles/networksecurity.viewer roles/cloudtrace.user roles/logging.configWriter \
-    "projects/${DROPPED}/roles/CustomAiControlPlaneLicenseReader"; do
+    "projects/${DROPPED}/roles/CustomAiControlPlaneLicenseReader" \
+    "projects/${DROPPED}/roles/CustomAiControlPlaneGeFeatureManager"; do
   gcloud projects remove-iam-policy-binding "$DROPPED" --member "$SA" --role "$role" --condition=None
 done
 ```
@@ -1407,6 +1408,12 @@ gcloud iam roles create CustomAiControlPlaneLicenseReader --project "$GE" \
   --permissions discoveryengine.licenseConfigs.get,discoveryengine.licenseConfigs.list,discoveryengine.userStores.get,discoveryengine.userStores.listUserLicenses
 gcloud projects add-iam-policy-binding "$GE" --member "$SA" \
   --role "projects/${GE}/roles/CustomAiControlPlaneLicenseReader" --condition=None
+# (선택) 대시보드에서 이 프로젝트의 Gemini Enterprise 기능 스위치까지 변경하려면 함께 부여합니다.
+gcloud iam roles create CustomAiControlPlaneGeFeatureManager --project "$GE" \
+  --title "AI Control Plane GE Feature Manager" --stage GA \
+  --permissions discoveryengine.engines.get,discoveryengine.engines.list,discoveryengine.engines.update
+gcloud projects add-iam-policy-binding "$GE" --member "$SA" \
+  --role "projects/${GE}/roles/CustomAiControlPlaneGeFeatureManager" --condition=None
 for role in roles/discoveryengine.viewer roles/bigquery.dataViewer roles/bigquery.jobUser roles/bigquery.user \
     roles/logging.viewer roles/logging.privateLogViewer roles/logging.configWriter roles/monitoring.viewer \
     roles/aiplatform.viewer roles/iam.securityReviewer roles/modelarmor.viewer roles/serviceusage.serviceUsageConsumer \

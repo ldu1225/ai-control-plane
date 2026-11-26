@@ -26,6 +26,75 @@ retry() {
   done
 }
 
+# Like retry(), but buffers stderr so transient propagation errors (such as a just-created scheduler service account
+# returning NOT_FOUND on attempt 1) are printed only if all attempts fail.
+retry_quiet() {
+  local n=0 err rc=0
+  err="$(mktemp 2>/dev/null || true)"
+  while :; do
+    if [[ -n "$err" ]]; then
+      if "$@" 2>"$err"; then
+        rm -f "$err"
+        return 0
+      else
+        rc=$?
+      fi
+    elif "$@"; then
+      return 0
+    else
+      rc=$?
+    fi
+    n=$((n + 1))
+    if [[ $n -ge 6 ]]; then
+      [[ -n "$err" && -s "$err" ]] && cat "$err" >&2
+      rm -f "$err"
+      return "$rc"
+    fi
+    sleep 10
+  done
+}
+
+# Probes a deployed Cloud Run IAP endpoint without following redirects.
+# On a standalone project (outside any GCP Organization) where IAP has not been initialized in Cloud Console,
+# `gcloud run deploy --iap` succeeds with only a warning while the live IAP frontend returns HTTP 502 with
+# "Empty Google Account OAuth client ID(s)/secret(s)." — which would break Google sign-in on /login.
+# Returns 1 only when that broken IAP 502 state is confirmed after a short recheck; returns 0 otherwise.
+probe_iap_bridge_ready() {  # probe_iap_bridge_ready URL
+  local url="$1" attempt res code rest
+  for attempt in 1 2; do
+    res="$(python3 - "$url" <<'PY' 2>/dev/null || echo "000|"
+import sys, urllib.error, urllib.request
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+opener = urllib.request.build_opener(NoRedirect)
+try:
+    with opener.open(urllib.request.Request(sys.argv[1]), timeout=6) as r:
+        body = r.read(256).decode("utf-8", errors="ignore").replace("\n", " ")
+        print(f"{r.status}||{body}")
+except urllib.error.HTTPError as e:
+    body = ""
+    try:
+        body = e.read(256).decode("utf-8", errors="ignore").replace("\n", " ")
+    except Exception:
+        pass
+    hdr = (e.headers.get("x-goog-iap-generated-response") or "").lower()
+    print(f"{e.code}|{hdr}|{body}")
+except Exception:
+    print("000||")
+PY
+)"
+    code="${res%%|*}"
+    rest="${res#*|}"
+    if [[ "$code" == "502" ]] && printf '%s' "$rest" | grep -Eiq 'Empty Google Account OAuth client|true\|.*OAuth client'; then
+      [[ $attempt -lt 2 ]] && sleep 2 && continue
+      return 1
+    fi
+    return 0
+  done
+  return 0
+}
+
 # Trims leading and trailing whitespace (including UTF-8 non-breaking spaces) from $1.
 trim_ws() {
   local s="${1:-}" nbsp=$'\xc2\xa0'
@@ -532,11 +601,11 @@ enable_project_apis() {
     # Cloud Build, IAP, Cloud Scheduler and Cloud Billing Catalog have automatic runtime fallbacks
     # (local Docker build, ID/Password login, manual enforcement, and BigQuery/manual token pricing),
     # so restricted billing/build/IAP APIs never abort deployment.
+    [[ "$need_iap" == "1" ]] && core_apis+=(iap.googleapis.com)
+    [[ "$need_sched" == "1" ]] && core_apis+=(cloudscheduler.googleapis.com)
+    core_apis+=(cloudbuild.googleapis.com)
     optional_apis=(
       cloudbilling.googleapis.com
-      cloudbuild.googleapis.com
-      iap.googleapis.com
-      cloudscheduler.googleapis.com
       modelarmor.googleapis.com
       networkservices.googleapis.com
       networksecurity.googleapis.com
@@ -549,9 +618,8 @@ enable_project_apis() {
       orgpolicy.googleapis.com
       billingbudgets.googleapis.com
     )
-    [[ "$need_iap" == "1" ]] && core_apis+=(iap.googleapis.com)
-    [[ "$need_sched" == "1" ]] && core_apis+=(cloudscheduler.googleapis.com)
-    core_apis+=(cloudbuild.googleapis.com)
+    [[ "$need_iap" == "1" ]] || optional_apis+=(iap.googleapis.com)
+    [[ "$need_sched" == "1" ]] || optional_apis+=(cloudscheduler.googleapis.com)
   fi
 
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -598,7 +666,7 @@ _sanitize_billing_account_id() {
 # Usage: ensure_project_billing PROJECT [PREFERRED_BILLING_ACCOUNT_ID]
 # Prints the linked billing account ID (XXXXXX-XXXXXX-XXXXXX) on stdout only when readable and valid.
 ensure_project_billing() {
-  local project="$1" preferred_ba="${2:-}" info_json enabled acct_name candidates=() cand parent_info parent_id sib_list sib sib_ba open_accts count link_err probe_err last_err=""
+  local project="$1" preferred_ba="${2:-}" info_json enabled acct_name candidates=() cand parent_info parent_id sib_list sib sib_ba open_accts open_hint="" count link_err probe_err last_err=""
   [[ "${DRY_RUN:-0}" == "1" ]] && return 0
   preferred_ba="$(_sanitize_billing_account_id "$preferred_ba")"
   info_json="$(gcloud billing projects describe "$project" --format=json 2>/dev/null || true)"
@@ -647,6 +715,9 @@ except Exception:
     if [[ "$count" == "1" ]]; then
       cand="$(_sanitize_billing_account_id "$(printf '%s\n' "$open_accts" | head -n 1)")"
       [[ -n "$cand" && " ${candidates[*]-} " != *" ${cand} "* ]] && candidates+=("$cand")
+    elif [[ "$count" =~ ^[0-9]+$ && "$count" -gt 1 ]]; then
+      open_hint="$(gcloud billing accounts list --filter="open=true" --format="value(name.basename(),displayName)" 2>/dev/null \
+        | awk -F'\t' 'NF { printf "    %s  %s\n", $1, $2 }' || true)"
     fi
 
     link_err="$(mktemp)"
@@ -657,7 +728,7 @@ except Exception:
         enabled="true"
         break
       fi
-      last_err="$(tr '\n' ' ' <"$link_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
+      last_err="$(tr '\n' ' ' <"$link_err" | tr -s '[:space:]' ' ' | cut -c1-240)"
     done
     rm -f "$link_err"
 
@@ -669,14 +740,16 @@ except Exception:
       if gcloud services enable run.googleapis.com --project "$project" --quiet >/dev/null 2>"$probe_err"; then
         enabled="true"
       else
-        [[ -n "$last_err" ]] || last_err="$(tr '\n' ' ' <"$probe_err" | sed 's/[[:space:]]\+/ /g' | cut -c1-240)"
+        [[ -n "$last_err" ]] || last_err="$(tr '\n' ' ' <"$probe_err" | tr -s '[:space:]' ' ' | cut -c1-240)"
       fi
       rm -f "$probe_err"
     fi
 
     if [[ "$enabled" == "false" ]]; then
       die "Cloud Billing is not enabled on project ${project}${last_err:+ (${last_err})}.
-  Link an active billing account in Google Cloud Console (Billing > Link a billing account) or pass --billing-account ACCOUNT_ID, then re-run.
+  Link an active billing account in Google Cloud Console (Billing > Link a billing account) or pass --billing-account ACCOUNT_ID, then re-run.${open_hint:+
+  Open billing accounts visible to your account:
+${open_hint}}
   [안내] 배포 실행 계정에 빌링 열람/관리 권한은 없어도 되지만, 프로젝트 자체에는 결제 계정(Billing Account)이 연결되어 있어야 Cloud Run 활성화가 가능합니다. 클라우드/빌링 담당자에게 '${project}' 프로젝트 결제 계정 연결만 요청하신 뒤 동일 명령어를 다시 실행해 주세요."
     fi
   fi
@@ -851,7 +924,7 @@ print("%s|%s" % (ae_regions, ai_loc))
 PYAI
 }
 
-# _check_project_permissions MODE PROJECT NEED_BUILD NEED_SINK NEED_IAP NEED_SCHEDULER NEED_AUDIT_ADMIN
+# _check_project_permissions MODE PROJECT NEED_BUILD NEED_SINK NEED_IAP NEED_SCHEDULER NEED_AUDIT_ADMIN [NEED_REALTIME]
 # Calls Cloud Resource Manager projects.testIamPermissions and prints a single-line JSON verdict:
 #   status="ok"         every required permission is already present
 #   status="bootstrap"  some operational permissions are missing, but caller has setIamPolicy so script can self-grant
@@ -873,6 +946,7 @@ need_sink = sys.argv[4] == "1"
 need_iap = sys.argv[5] == "1"
 need_scheduler = sys.argv[6] == "1"
 need_audit_admin = sys.argv[7] == "1"
+need_realtime = len(sys.argv) > 8 and sys.argv[8] == "1"
 has_local_docker = os.environ.get("ACP_HAS_LOCAL_DOCKER") == "1"
 token = os.environ["ACP_ACCESS_TOKEN"]
 
@@ -882,6 +956,7 @@ if mode == "prepare":
     if need_sink:
         checks += [
             ("bigquery.datasets.create", "roles/bigquery.admin"),
+            ("bigquery.datasets.update", "roles/bigquery.admin"),
             ("logging.sinks.create", "roles/logging.configWriter"),
         ]
     if need_audit_admin:
@@ -897,6 +972,7 @@ else:
         ("iam.serviceAccounts.create", "roles/iam.serviceAccountAdmin"),
         ("iam.serviceAccounts.setIamPolicy", "roles/iam.serviceAccountAdmin"),
         ("iam.serviceAccounts.actAs", "roles/iam.serviceAccountUser"),
+        ("iam.roles.create", "roles/iam.roleAdmin"),
         ("storage.buckets.create", "roles/storage.admin"),
         ("storage.buckets.setIamPolicy", "roles/storage.admin"),
         ("secretmanager.secrets.create", "roles/secretmanager.admin"),
@@ -909,25 +985,29 @@ else:
             ("cloudbuild.builds.create", "roles/cloudbuild.builds.editor"),
             ("artifactregistry.repositories.create", "roles/artifactregistry.admin"),
             ("artifactregistry.repositories.uploadArtifacts", "roles/artifactregistry.admin"),
+            ("artifactregistry.repositories.setIamPolicy", "roles/artifactregistry.admin"),
         ]
     if need_sink:
         checks += [
             ("bigquery.datasets.create", "roles/bigquery.admin"),
+            ("bigquery.datasets.update", "roles/bigquery.admin"),
             ("logging.sinks.create", "roles/logging.configWriter"),
         ]
     if need_iap:
         checks += [("iap.web.setIamPolicy", "roles/iap.admin")]
     if need_scheduler:
         checks += [("cloudscheduler.jobs.create", "roles/cloudscheduler.admin")]
+    if need_realtime:
+        checks += [("pubsub.topics.setIamPolicy", "roles/pubsub.admin")]
 
 all_perms = []
 for perm, _ in checks:
     if perm not in all_perms:
         all_perms.append(perm)
-if "resourcemanager.projects.setIamPolicy" not in all_perms:
-    probe_perms = all_perms + ["resourcemanager.projects.setIamPolicy"]
-else:
-    probe_perms = list(all_perms)
+probe_perms = list(all_perms)
+for extra_perm in ("resourcemanager.projects.setIamPolicy", "discoveryengine.engines.update"):
+    if extra_perm not in probe_perms:
+        probe_perms.append(extra_perm)
 
 url = "https://cloudresourcemanager.googleapis.com/v1/projects/%s:testIamPermissions" % project
 
@@ -985,50 +1065,79 @@ if not missing_perms:
     print(json.dumps({"status": "ok", "missing_perms": [], "missing_roles": []}))
 elif "resourcemanager.projects.setIamPolicy" in granted:
     bootstrap_roles = [r for r in missing_roles if r != "roles/resourcemanager.projectIamAdmin"]
-    for extra in ("roles/discoveryengine.admin",):
-        if extra not in bootstrap_roles:
-            bootstrap_roles.append(extra)
+    if "discoveryengine.engines.update" in valid_perms and "discoveryengine.engines.update" not in granted:
+        if "roles/discoveryengine.admin" not in bootstrap_roles:
+            bootstrap_roles.append("roles/discoveryengine.admin")
     print(json.dumps({"status": "bootstrap", "missing_perms": missing_perms, "missing_roles": bootstrap_roles}))
 else:
     print(json.dumps({"status": "denied", "missing_perms": missing_perms, "missing_roles": missing_roles}))
 PYPREFLIGHT
 }
 
-# preflight_caller_permissions MODE PROJECT ACCOUNT [NEED_BUILD] [NEED_SINK] [NEED_IAP] [NEED_SCHEDULER] [NEED_AUDIT_ADMIN]
+# preflight_caller_permissions MODE PROJECT ACCOUNT [NEED_BUILD] [NEED_SINK] [NEED_IAP] [NEED_SCHEDULER] [NEED_AUDIT_ADMIN] [NEED_REALTIME]
 # Verifies caller IAM permissions upfront. When the caller has Project IAM Admin (setIamPolicy) but lacks
 # operational roles (such as Cloud Build Editor, Cloud Run Admin, Secret Manager Admin or IAP Admin),
 # automatically grants the missing roles to the caller and waits for IAM propagation. When the caller lacks
 # setIamPolicy as well (for example Editor/Viewer only), fails fast with exact copy-paste remediation commands.
 preflight_caller_permissions() {
   local mode="$1" project="$2" account="$3"
-  local need_build="${4:-1}" need_sink="${5:-1}" need_iap="${6:-0}" need_sched="${7:-0}" need_audit="${8:-0}"
-  local verdict status member roles_csv perms_csv role attempt docker_avail=0
+  local need_build="${4:-1}" need_sink="${5:-1}" need_iap="${6:-0}" need_sched="${7:-0}" need_audit="${8:-0}" need_rt="${9:-0}"
+  local verdict status reason member roles_csv perms_csv role attempt docker_avail=0 iam_probe_err
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     docker_avail=1
   fi
   member="$(caller_iam_member "$account")"
-  verdict="$(ACP_HAS_LOCAL_DOCKER="$docker_avail" _check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit")"
+  verdict="$(ACP_HAS_LOCAL_DOCKER="$docker_avail" _check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit" "$need_rt")"
   status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status","skip"))' "$verdict" 2>/dev/null || echo "skip")"
-  if [[ "$status" == "ok" || "$status" == "skip" ]]; then
+  reason="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("reason",""))' "$verdict" 2>/dev/null || true)"
+  if [[ "$status" == "ok" ]]; then
+    return 0
+  fi
+  if [[ "$status" == "skip" ]]; then
+    # On mTLS / Context-Aware Access workstations, raw REST testIamPermissions returns HTTP 401 while gcloud CLI
+    # succeeds through the client certificate. Probe getIamPolicy via gcloud so deploy still fails fast for callers
+    # without Project IAM read/admin access.
+    if [[ "$mode" == "deploy" && "$reason" == "http_401" ]]; then
+      iam_probe_err="$(mktemp)"
+      if ! gcloud projects get-iam-policy "$project" --format='value(etag)' >/dev/null 2>"$iam_probe_err"; then
+        if grep -Eiq 'PERMISSION_DENIED|does not have permission' "$iam_probe_err"; then
+          rm -f "$iam_probe_err"
+          die "account ${account} lacks required IAM permissions on project ${project} (cannot read project IAM policy).
+
+  Fix option 1 — log in as a Project Owner and re-run:
+    gcloud auth login
+
+  Fix option 2 — ask a Project Owner to grant Owner (or Editor + Project IAM Admin) to ${account}:
+    gcloud projects add-iam-policy-binding ${project} --member=\"${member}\" --role=\"roles/owner\"
+
+  [한국어 안내] 현재 로그인된 계정(${account})에 '${project}' 프로젝트 배포 권한(IAM 정책 조회/설정)이 없습니다.
+   1) 다른 Google 계정으로 잘못 로그인된 경우: gcloud auth login 실행 후 소유자 계정으로 다시 로그인하세요.
+   2) 프로젝트 관리자에게 '${account}' 계정에 소유자(roles/owner) 또는 편집자+프로젝트 IAM 관리자 권한 부여를 요청하신 뒤 다시 실행해 주세요."
+        fi
+      fi
+      rm -f "$iam_probe_err"
+    fi
     return 0
   fi
   perms_csv="$(python3 -c 'import json,sys; print(", ".join(json.loads(sys.argv[1]).get("missing_perms",[])))' "$verdict")"
   roles_csv="$(python3 -c 'import json,sys; print(" ".join(json.loads(sys.argv[1]).get("missing_roles",[])))' "$verdict")"
   if [[ "$status" == "bootstrap" ]]; then
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+      info "[dry-run] account ${account} has IAM admin access; would grant missing deployment roles: ${roles_csv}"
+      return 0
+    fi
     info "account ${account} has IAM admin access; granting missing deployment roles: ${roles_csv}"
     for role in $roles_csv; do
       run retry gcloud projects add-iam-policy-binding "$project" --member "$member" --role "$role" \
         --condition=None --quiet >/dev/null 2>&1 \
         || warn "could not grant ${role} to ${member}; continuing"
     done
-    if [[ "${DRY_RUN:-0}" != "1" ]]; then
-      for attempt in 1 2 3 4 5 6; do
-        sleep 5
-        verdict="$(ACP_HAS_LOCAL_DOCKER="$docker_avail" _check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit")"
-        status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status","skip"))' "$verdict" 2>/dev/null || echo "skip")"
-        [[ "$status" == "ok" ]] && break
-      done
-    fi
+    for attempt in 1 2 3 4 5 6; do
+      sleep 5
+      verdict="$(ACP_HAS_LOCAL_DOCKER="$docker_avail" _check_project_permissions "$mode" "$project" "$need_build" "$need_sink" "$need_iap" "$need_sched" "$need_audit" "$need_rt")"
+      status="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("status","skip"))' "$verdict" 2>/dev/null || echo "skip")"
+      [[ "$status" == "ok" ]] && break
+    done
     return 0
   fi
   die "account ${account} lacks required permissions on project ${project}:
@@ -1095,6 +1204,7 @@ REQUIRED_APIS = {"run.googleapis.com", "artifactregistry.googleapis.com", "stora
 OPTIONAL_APIS = {"cloudbuild.googleapis.com": "Cloud Build (로컬 Docker 빌드로 대체)",
                  "iap.googleapis.com": "IAP 로그인 브리지 (ID/비밀번호 로그인으로 대체)",
                  "cloudscheduler.googleapis.com": "정기 작업 스케줄러 (인스턴스 내 실행으로 대체)",
+                 "pubsub.googleapis.com": "실시간 한도 집행 푸시 (5분 스케줄러로 대체)",
                  "aiplatform.googleapis.com": "AI 애널리스트·Agent Engine 화면",
                  "discoveryengine.googleapis.com": "Gemini Enterprise·NotebookLM 화면",
                  "monitoring.googleapis.com": "모델 사용량 지표", "modelarmor.googleapis.com": "Model Armor 화면"}
@@ -1200,7 +1310,9 @@ def loc_verdict(loc, policy):
 # names another one, so every finding says which flag fixes it.
 pol = lp("gcp.resourceLocations")
 if pol:
-    allowed_txt = ", ".join((pol.get("allowedValues") or [])[:8]) or "-"
+    raw_allowed = pol.get("allowedValues") or []
+    raw_denied = pol.get("deniedValues") or []
+    allowed_txt = ", ".join(raw_allowed[:8]) or "-"
     loc_block = False
     if dsloc == region:
         checks = [("리전·BigQuery 위치", region,
@@ -1211,8 +1323,16 @@ if pol:
         v = loc_verdict(loc, pol)
         if v is False:
             loc_block = True
-            blockers.append("gcp.resourceLocations: %s '%s' 가 허용되지 않습니다 (허용: %s). 허용된 위치로 다시 실행하세요: %s"
-                            % (what, loc, allowed_txt, fix))
+            if raw_allowed:
+                detail = "(허용: %s)" % allowed_txt
+            elif raw_denied:
+                suggested = [r for r in ("asia-northeast3", "asia-northeast1", "asia-southeast1", "us-central1",
+                                         "us-east1", "europe-west1", "europe-west4") if loc_verdict(r, pol) is True][:4]
+                detail = ("(금지 목록 포함; 사용 가능 예: %s)" % ", ".join(suggested)) if suggested else "(조직 정책 금지 목록에 포함됨)"
+            else:
+                detail = "(모든 위치 차단)"
+            blockers.append("gcp.resourceLocations: %s '%s' 가 허용되지 않습니다 %s. 허용된 위치로 다시 실행하세요: %s"
+                            % (what, loc, detail, fix))
         elif v is None:
             lines.append("WARN|gcp.resourceLocations: %s '%s' 허용 여부를 확정할 수 없습니다 (허용: %s). 실패하면 허용된 위치로 "
                          "다시 실행하세요: %s" % (what, loc, allowed_txt, fix))
@@ -1438,8 +1558,52 @@ ensure_secret_created() {
       --labels=app=ai-control-plane >/dev/null
 }
 
-# Dataset-level BigQuery access (a dataset ACL entry) for one service account; project IAM is not touched.
-# grant_dataset_role PROJECT DATASET ROLE EMAIL, where ROLE is READER (Data Viewer) or WRITER (Data Editor).
+# _bind_project_role_retry PROJECT MEMBER ROLE
+# Binds ROLE to MEMBER on PROJECT, retrying briefly only on transient IAM propagation or etag conflict errors
+# (for example right after creating a custom role or service account on a brand-new project). Permanent refusals
+# such as PERMISSION_DENIED return immediately without sleeping.
+_bind_project_role_retry() {
+  local project="$1" member="$2" role="$3" err_file attempt
+  err_file="$(mktemp)"
+  for attempt in 1 2 3 4; do
+    if gcloud projects add-iam-policy-binding "$project" --member "$member" --role "$role" \
+        --condition=None --quiet >/dev/null 2>"$err_file"; then
+      rm -f "$err_file"
+      return 0
+    fi
+    if [[ $attempt -lt 4 ]] \
+        && grep -Eiq 'does not exist|NOT_FOUND|INVALID_ARGUMENT|ABORTED|UNAVAILABLE|CONFLICT|409|429|concurrent' "$err_file" \
+        && ! grep -Eiq 'PERMISSION_DENIED|does not have permission' "$err_file"; then
+      sleep 4
+    else
+      break
+    fi
+  done
+  rm -f "$err_file"
+  return 1
+}
+
+# Prints the location (for example US, EU, asia-northeast3) of an existing BigQuery dataset, or returns non-zero.
+dataset_location_of() {
+  local raw
+  raw="$(bq --project_id "$1" show --format=prettyjson "${1}:${2}" 2>/dev/null || true)"
+  [[ -n "$raw" ]] || return 1
+  python3 - "$raw" <<'PYLOC'
+import json, sys
+raw = sys.argv[1]
+try:
+    loc = json.loads(raw[raw.index("{"):]).get("location") or ""
+except Exception:
+    sys.exit(1)
+if not loc:
+    sys.exit(1)
+print(loc)
+PYLOC
+}
+
+# Dataset-level BigQuery access (a dataset ACL entry) for one principal; project IAM is not touched.
+# grant_dataset_role PROJECT DATASET ROLE PRINCIPAL, where ROLE is READER (Data Viewer) or WRITER (Data Editor),
+# and PRINCIPAL is a bare email or an IAM member (serviceAccount:..., user:..., group:...).
 # Returns non-zero when the dataset cannot be read or updated.
 grant_dataset_role() {
   local file rc=0
@@ -1450,14 +1614,21 @@ grant_dataset_role() {
   fi
   python3 - "$file" "$3" "$4" <<'PYCODE' || rc=$?
 import json, sys
-path, role, email = sys.argv[1], sys.argv[2], sys.argv[3].lower()
+path, role, principal = sys.argv[1], sys.argv[2], sys.argv[3].strip()
+low = principal.lower()
+if low.startswith("group:"):
+    key, email = "groupByEmail", low.split(":", 1)[1]
+elif low.startswith(("serviceaccount:", "user:")):
+    key, email = "userByEmail", low.split(":", 1)[1]
+else:
+    key, email = "userByEmail", low
 enough = {"READER": ("READER", "WRITER", "OWNER"), "WRITER": ("WRITER", "OWNER")}[role]
 raw = open(path, encoding="utf-8", errors="replace").read()
 dataset = json.loads(raw[raw.index("{"):])
 access = dataset.setdefault("access", [])
-if any((a.get("userByEmail") or "").lower() == email and a.get("role") in enough for a in access):
+if any((a.get(key) or "").lower() == email and a.get("role") in enough for a in access):
     sys.exit(3)  # already granted
-access.append({"role": role, "userByEmail": email})
+access.append({"role": role, key: email})
 json.dump(dataset, open(path, "w", encoding="utf-8"))
 PYCODE
   if [[ $rc -eq 0 ]]; then
@@ -1476,7 +1647,7 @@ PYCODE
 # Gemini Enterprise seats of PROJECT stay hidden. Never fails the caller: when the deploying account cannot do
 # it, the warning carries the exact commands for an Owner of PROJECT. With DRY_RUN=1 it only prints the plan.
 grant_license_reader() {
-  local project="$1" sa="$2" role_id="$3" perms="$4" role create_cmd bind_cmd
+  local project="$1" sa="$2" role_id="$3" perms="$4" role create_cmd bind_cmd deleted_flag=""
   role="projects/${project}/roles/${role_id}"
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     info "[dry-run] custom role ${role} (${perms}) -> ${sa}"
@@ -1485,7 +1656,11 @@ grant_license_reader() {
   create_cmd="gcloud iam roles create ${role_id} --project ${project} --title \"AI Control Plane License Reader\" --permissions ${perms} --stage GA"
   bind_cmd="gcloud projects add-iam-policy-binding ${project} --member serviceAccount:${sa} --role ${role} --condition=None"
   gcloud iam roles undelete "$role_id" --project "$project" --quiet >/dev/null 2>&1 || true
-  if gcloud iam roles describe "$role_id" --project "$project" >/dev/null 2>&1; then
+  if deleted_flag="$(gcloud iam roles describe "$role_id" --project "$project" --format='value(deleted)' 2>/dev/null)"; then
+    if [[ "$(printf '%s' "$deleted_flag" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+      warn "custom role ${role} is in its 30-day deletion window in ${project}; Gemini Enterprise seats there stay hidden until Google purges the role ID or roles/discoveryengine.editor is granted"
+      return 0
+    fi
     gcloud iam roles update "$role_id" --project "$project" --permissions "$perms" --quiet >/dev/null 2>&1 || true
   elif ! gcloud iam roles create "$role_id" --project "$project" \
       --title "AI Control Plane License Reader" \
@@ -1494,8 +1669,7 @@ grant_license_reader() {
     warn "could not create the license reader role ${role}, so Gemini Enterprise seats in ${project} stay hidden. As an Owner of ${project}, run: ${create_cmd} && ${bind_cmd}"
     return 0
   fi
-  if gcloud projects add-iam-policy-binding "$project" --member "serviceAccount:${sa}" --role "$role" \
-      --condition=None --quiet >/dev/null 2>&1; then
+  if _bind_project_role_retry "$project" "serviceAccount:${sa}" "$role"; then
     info "linked project ${project}: granted ${role} (Gemini Enterprise seats) to ${sa}"
   else
     warn "could not grant ${role} to ${sa}, so Gemini Enterprise seats in ${project} stay hidden. As an Owner of ${project}, run: ${bind_cmd}"
@@ -1511,7 +1685,7 @@ grant_license_reader() {
 GE_FEATURE_MANAGER_ROLE_ID="CustomAiControlPlaneGeFeatureManager"
 GE_FEATURE_MANAGER_PERMS="discoveryengine.engines.get,discoveryengine.engines.list,discoveryengine.engines.update"
 grant_ge_feature_manager() {
-  local project="$1" sa="$2" role create_cmd bind_cmd
+  local project="$1" sa="$2" role create_cmd bind_cmd deleted_flag=""
   role="projects/${project}/roles/${GE_FEATURE_MANAGER_ROLE_ID}"
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     info "[dry-run] custom role ${role} (${GE_FEATURE_MANAGER_PERMS}) -> ${sa}"
@@ -1520,7 +1694,11 @@ grant_ge_feature_manager() {
   create_cmd="gcloud iam roles create ${GE_FEATURE_MANAGER_ROLE_ID} --project ${project} --title \"AI Control Plane GE Feature Manager\" --permissions ${GE_FEATURE_MANAGER_PERMS} --stage GA"
   bind_cmd="gcloud projects add-iam-policy-binding ${project} --member serviceAccount:${sa} --role ${role} --condition=None"
   gcloud iam roles undelete "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" --quiet >/dev/null 2>&1 || true
-  if gcloud iam roles describe "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" >/dev/null 2>&1; then
+  if deleted_flag="$(gcloud iam roles describe "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" --format='value(deleted)' 2>/dev/null)"; then
+    if [[ "$(printf '%s' "$deleted_flag" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+      warn "custom role ${role} is in its 30-day deletion window in ${project}; Gemini Enterprise features there stay read-only until Google purges the role ID"
+      return 0
+    fi
     gcloud iam roles update "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" --permissions "$GE_FEATURE_MANAGER_PERMS" \
       --quiet >/dev/null 2>&1 || true
   elif ! gcloud iam roles create "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" \
@@ -1530,8 +1708,7 @@ grant_ge_feature_manager() {
     warn "could not create ${role}, so Gemini Enterprise features in ${project} are read-only in the dashboard. As an Owner of ${project}, run: ${create_cmd} && ${bind_cmd}"
     return 0
   fi
-  if gcloud projects add-iam-policy-binding "$project" --member "serviceAccount:${sa}" --role "$role" \
-      --condition=None --quiet >/dev/null 2>&1; then
+  if _bind_project_role_retry "$project" "serviceAccount:${sa}" "$role"; then
     info "granted ${role} (Gemini Enterprise feature management) to ${sa}"
   else
     warn "could not grant ${role} to ${sa}, so Gemini Enterprise features in ${project} are read-only in the dashboard. As an Owner of ${project}, run: ${bind_cmd}"
@@ -1660,7 +1837,7 @@ ensure_ai_log_sink() {
     return 0
   fi
   writer="$(gcloud logging sinks describe "$sink" --project "$project" --format='value(writerIdentity)')"
-  retry grant_dataset_role "$project" "$dataset" WRITER "${writer#serviceAccount:}" \
+  retry grant_dataset_role "$project" "$dataset" WRITER "$writer" \
     || die "could not grant the sink writer BigQuery Data Editor on ${project}:${dataset}"
   info "sink ${sink} -> ${project}:${dataset} (writer ${writer}: BigQuery Data Editor on this dataset only)"
 }
@@ -1701,12 +1878,12 @@ ensure_usage_events_sink() {
 }
 
 
-# prepare_linked_project_telemetry PROJECT DATASET LOCATION SINK CREATE_SINK ENABLE_AUDIT ENABLE_GE LOG_PROMPTS
+# prepare_linked_project_telemetry PROJECT DATASET LOCATION SINK CREATE_SINK ENABLE_AUDIT ENABLE_GE LOG_PROMPTS [FALLBACK_LOCATION]
 # Best-effort, non-fatal telemetry setup for secondary projects passed via --link-projects / SCAN_PROJECTS.
 # Never aborts the hub deployment when the caller only has read/IAM privileges on the linked project.
 prepare_linked_project_telemetry() {
   local project="$1" dataset="$2" location="$3" sink="$4"
-  local create_sink="${5:-true}" enable_audit="${6:-true}" enable_ge="${7:-true}" log_prompts="${8:-true}"
+  local create_sink="${5:-true}" enable_audit="${6:-true}" enable_ge="${7:-true}" log_prompts="${8:-true}" fallback_loc="${9:-}"
   local dest filter writer ge_locs sink_ok=0
   if [[ "${DRY_RUN:-0}" == "1" ]]; then
     info "[dry-run] linked project ${project}: best-effort APIs, ${project}:${dataset} (${location}) sink, Data Access logs & GE observability"
@@ -1719,6 +1896,9 @@ prepare_linked_project_telemetry() {
     if ! bq --project_id "$project" show --dataset "${project}:${dataset}" >/dev/null 2>&1; then
       bq --project_id "$project" --location "$location" mk --dataset \
         --description "AI audit logs routed for AI Control Plane" "${project}:${dataset}" >/dev/null 2>&1 \
+        || { [[ -n "$fallback_loc" && "$fallback_loc" != "$location" ]] \
+             && bq --project_id "$project" --location "$fallback_loc" mk --dataset \
+               --description "AI audit logs routed for AI Control Plane" "${project}:${dataset}" >/dev/null 2>&1; } \
         || bq --project_id "$project" --location "US" mk --dataset \
           --description "AI audit logs routed for AI Control Plane" "${project}:${dataset}" >/dev/null 2>&1 || true
     fi
@@ -1733,7 +1913,7 @@ prepare_linked_project_telemetry() {
       fi
       if [[ "$sink_ok" == "1" ]]; then
         writer="$(gcloud logging sinks describe "$sink" --project "$project" --format='value(writerIdentity)' 2>/dev/null || true)"
-        if [[ -n "$writer" ]] && grant_dataset_role "$project" "$dataset" WRITER "${writer#serviceAccount:}" >/dev/null 2>&1; then
+        if [[ -n "$writer" ]] && grant_dataset_role "$project" "$dataset" WRITER "$writer" >/dev/null 2>&1; then
           info "linked project ${project}: log sink ${sink} -> ${project}:${dataset} ready"
         fi
       fi
@@ -1893,7 +2073,14 @@ for location in [l.strip() for l in locations.split(",") if l.strip()]:
             if not page:
                 break
     except urllib.error.HTTPError as err:
-        warn("cannot list Gemini Enterprise apps in %s (%s)" % (location, reason(err)))
+        msg = reason(err)
+        if err.code == 401:
+            warn("cannot list Gemini Enterprise apps in %s (%s — workstation may require mTLS / Context-Aware Access; run from Cloud Shell or configure in console)" % (location, msg))
+        elif dry and err.code == 403 and "has not been used in project" in msg:
+            if mode == "enable":
+                print("    [dry-run] Discovery Engine API is not enabled yet in %s (apps will be configured after step 1 enables APIs)" % project)
+        else:
+            warn("cannot list Gemini Enterprise apps in %s (%s)" % (location, msg))
         continue
     except (urllib.error.URLError, TimeoutError, OSError) as err:
         warn("cannot reach Discovery Engine in %s (%s)" % (location, err))
@@ -1987,7 +2174,13 @@ roles = {
 ok = True
 for role_id, (title, description) in roles.items():
     gc("iam", "roles", "undelete", role_id, "--project", project)
-    exists = gc("iam", "roles", "describe", role_id, "--project", project, "--format=value(name)").returncode == 0
+    desc = gc("iam", "roles", "describe", role_id, "--project", project, "--format=value(deleted)")
+    exists = desc.returncode == 0
+    if exists and desc.stdout.strip().lower() == "true":
+        print("    warning: marker role %s is in its 30-day deletion window in %s and cannot be recreated until purged (choose another role ID in Settings > Governance policy)"
+              % (role_id, project), file=sys.stderr)
+        ok = False
+        continue
     use = list(perms)
     done = False
     for _ in range(5):

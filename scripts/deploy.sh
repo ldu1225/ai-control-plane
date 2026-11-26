@@ -272,6 +272,8 @@ DEFAULT_LOCALE="${DEFAULT_LOCALE:-ko}"
 WORKSPACE_TIMEZONE="${WORKSPACE_TIMEZONE:-Asia/Seoul}"
 AUDIT_DATASET="$(trim_ws "${AUDIT_DATASET:-ge_analytics}")"
 CREATE_LOG_SINK="${CREATE_LOG_SINK:-true}"
+DATASET_LOCATION_EXPLICIT=0
+[[ -n "$(trim_ws "${DATASET_LOCATION:-}")" ]] && DATASET_LOCATION_EXPLICIT=1
 DATASET_LOCATION="$(trim_ws "${DATASET_LOCATION:-$REGION}")"
 PREPARE_LINKED_PROJECTS="${PREPARE_LINKED_PROJECTS:-true}"
 # Full coverage by default: enable Data Access audit logs, Gemini Enterprise observability + prompt logging,
@@ -282,7 +284,11 @@ GE_PROMPT_LOGGING="${GE_PROMPT_LOGGING:-true}"
 BILLING_PROJECT_ID="$(normalize_project_id "${BILLING_PROJECT_ID:-}")"
 BILLING_DATASET="$(trim_ws "${BILLING_DATASET:-}")"
 BILLING_TABLE="$(trim_ws "${BILLING_TABLE:-}")"
-BILLING_ACCOUNT_ID="$(trim_ws "${BILLING_ACCOUNT_ID:-}")"
+RAW_BILLING_ACCOUNT_ID="$(trim_ws "${BILLING_ACCOUNT_ID:-}")"
+BILLING_ACCOUNT_ID="$(_sanitize_billing_account_id "$RAW_BILLING_ACCOUNT_ID")"
+if [[ -n "$RAW_BILLING_ACCOUNT_ID" && -z "$BILLING_ACCOUNT_ID" ]]; then
+  die "invalid BILLING_ACCOUNT_ID '${RAW_BILLING_ACCOUNT_ID}' (expected XXXXXX-XXXXXX-XXXXXX or billingAccounts/XXXXXX-XXXXXX-XXXXXX)"
+fi
 DISCOVERY_ENGINE_LOCATIONS="${DISCOVERY_ENGINE_LOCATIONS:-}"
 AGENT_ENGINE_REGIONS="${AGENT_ENGINE_REGIONS:-}"
 ENABLE_GOVERNANCE_ACTIONS="${ENABLE_GOVERNANCE_ACTIONS:-true}"
@@ -357,7 +363,8 @@ if [[ "$ACCESS_MODE" == "iap" && -z "$IAP_MEMBERS" ]]; then
   info "IAP_MEMBERS defaulted to user:${ACCOUNT}"
 fi
 
-[[ "$SERVICE_NAME" =~ ^[a-z]([a-z0-9-]{0,40}[a-z0-9])?$ ]] || die "SERVICE_NAME must be lowercase letters, digits and hyphens"
+[[ "$SERVICE_NAME" =~ ^[a-z][a-z0-9-]{1,40}[a-z0-9]$ ]] || die "SERVICE_NAME must be 3-42 lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit"
+[[ "$SERVICE_ACCOUNT_ID" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] || die "SERVICE_ACCOUNT_ID '${SERVICE_ACCOUNT_ID}' must be 6-30 lowercase letters, digits and hyphens, starting with a letter and ending with a letter or digit"
 [[ -n "$SETTINGS_BUCKET" ]] || SETTINGS_BUCKET="$(default_settings_bucket "$PROJECT_ID" "$SERVICE_NAME")"
 [[ ${#SETTINGS_BUCKET} -le 63 ]] || die "SETTINGS_BUCKET '${SETTINGS_BUCKET}' is longer than 63 characters; set a shorter SETTINGS_BUCKET"
 case "$ACCESS_MODE" in
@@ -460,7 +467,7 @@ export CLOUDSDK_CORE_PROJECT="$PROJECT_ID"
 
 for attempt in 1 2 3; do
   PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>"$GCLOUD_ERR" || true)"
-  PROJECT_NUMBER="$(printf '%s' "$PROJECT_NUMBER" | tr -d '[:space:]')"
+  PROJECT_NUMBER="$(printf '%s\n' "$PROJECT_NUMBER" | tail -n 1 | tr -d '[:space:]')"
   [[ "$PROJECT_NUMBER" =~ ^[0-9]+$ ]] && break
   [[ $attempt -lt 3 ]] || die "cannot read project ${PROJECT_ID} with ${ACCOUNT}: $(tail -n 3 "$GCLOUD_ERR")
   [한국어 안내] 현재 로그인된 계정(${ACCOUNT})이 '${PROJECT_ID}' 프로젝트를 조회할 수 없습니다.
@@ -508,13 +515,14 @@ NEED_SCHED=0; [[ -n "$ENFORCEMENT_SCHEDULE" ]] && NEED_SCHED=1
 # The maintenance tick is a Cloud Scheduler job as well (not created in IAP mode, where the scheduler cannot call in).
 [[ "$MAINTENANCE_SCHEDULE" != "off" && "$ACCESS_MODE" != "iap" ]] && NEED_SCHED=1
 NEED_AUDIT=0; [[ "$ENABLE_DATA_ACCESS_LOGS" == "true" ]] && NEED_AUDIT=1
+NEED_REALTIME=0; [[ "$REALTIME_ENFORCEMENT" == "true" && "$ACCESS_MODE" != "iap" ]] && NEED_REALTIME=1
 
 log "Deploying ${SERVICE_NAME} to ${PROJECT_ID} (${REGION}) as ${ACCOUNT}"
 info "access mode: ${ACCESS_MODE}    dashboard URL: ${BASE_URL}"
 [[ "$DRY_RUN" == "1" ]] && info "dry run: commands that change anything are printed, not executed"
 
 # Verify caller IAM permissions upfront (and auto-grant missing deployment roles when caller has IAM Admin).
-preflight_caller_permissions deploy "$PROJECT_ID" "$ACCOUNT" "$NEED_BUILD" "$NEED_SINK" "$NEED_IAP" "$NEED_SCHED" "$NEED_AUDIT"
+preflight_caller_permissions deploy "$PROJECT_ID" "$ACCOUNT" "$NEED_BUILD" "$NEED_SINK" "$NEED_IAP" "$NEED_SCHED" "$NEED_AUDIT" "$NEED_REALTIME"
 
 # Verify Cloud Billing is linked (auto-links when accessible) and detect account ID.
 DETECTED_BA="$(ensure_project_billing "$PROJECT_ID" "$BILLING_ACCOUNT_ID")"
@@ -563,8 +571,17 @@ ensure_service_identities "$PROJECT_ID" "$PROJECT_NUMBER" "${SID_APIS[@]}"
 # ------------------------------------------------------------------------------- 2. settings bucket
 log "2/8 Settings bucket gs://${SETTINGS_BUCKET}"
 if ! gcloud storage buckets describe "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" >/dev/null 2>&1; then
-  run gcloud storage buckets create "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" --location "$REGION" \
-    --uniform-bucket-level-access --public-access-prevention
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run gcloud storage buckets create "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" --location "$REGION" \
+      --uniform-bucket-level-access --public-access-prevention
+  elif ! gcloud storage buckets create "gs://${SETTINGS_BUCKET}" --project "$PROJECT_ID" --location "$REGION" \
+      --uniform-bucket-level-access --public-access-prevention 2>"$GCLOUD_ERR"; then
+    if grep -Eiq 'not available|already exists|409|CONFLICT' "$GCLOUD_ERR"; then
+      die "settings bucket name gs://${SETTINGS_BUCKET} is already taken globally in Cloud Storage: $(tail -n 2 "$GCLOUD_ERR")
+  Set a unique SETTINGS_BUCKET (for example SETTINGS_BUCKET=\"${PROJECT_ID}-acp-settings-2\") in deploy.${PROJECT_ID}.env or deploy.env and re-run."
+    fi
+    die "could not create settings bucket gs://${SETTINGS_BUCKET}: $(tail -n 3 "$GCLOUD_ERR")"
+  fi
   run gcloud storage buckets update "gs://${SETTINGS_BUCKET}" --versioning
 fi
 
@@ -621,8 +638,7 @@ grant_optional_role() {  # grant_optional_role PROJECT MEMBER ROLE
     info "[dry-run] optional role $3 -> $2"
     return 0
   fi
-  gcloud projects add-iam-policy-binding "$1" --member "$2" --role "$3" \
-    --condition=None --quiet >/dev/null 2>&1 \
+  _bind_project_role_retry "$1" "$2" "$3" \
     && info "granted $3 to $2 on $1" || true
 }
 
@@ -659,14 +675,24 @@ if [[ "$DRY_RUN" == "1" ]]; then
   info "[dry-run] custom role ${LICENSE_READER_ROLE} (${LICENSE_READER_PERMS}) -> ${SA_EMAIL}"
 else
   gcloud iam roles undelete "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" --quiet >/dev/null 2>&1 || true
-  if gcloud iam roles describe "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" >/dev/null 2>&1; then
-    gcloud iam roles update "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" --permissions "$LICENSE_READER_PERMS" --quiet >/dev/null 2>&1 || true
-    grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$LICENSE_READER_ROLE"
+  _lr_deleted=""
+  if _lr_deleted="$(gcloud iam roles describe "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" --format='value(deleted)' 2>/dev/null)"; then
+    if [[ "$(printf '%s' "$_lr_deleted" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+      warn "custom role ${LICENSE_READER_ROLE} is in its 30-day deletion window; falling back to roles/discoveryengine.editor"
+      grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/discoveryengine.editor"
+    else
+      gcloud iam roles update "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" --permissions "$LICENSE_READER_PERMS" --quiet >/dev/null 2>&1 || true
+      _bind_project_role_retry "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$LICENSE_READER_ROLE" \
+        && info "granted ${LICENSE_READER_ROLE} to serviceAccount:${SA_EMAIL} on ${PROJECT_ID}" \
+        || warn "could not grant ${LICENSE_READER_ROLE} to ${SA_EMAIL}; Gemini Enterprise license seats may stay hidden"
+    fi
   elif gcloud iam roles create "$LICENSE_READER_ROLE_ID" --project "$PROJECT_ID" \
       --title "AI Control Plane License Reader" \
       --description "Read-only Gemini Enterprise license config and user seat reader" \
       --permissions "$LICENSE_READER_PERMS" --stage GA --quiet >/dev/null 2>&1; then
-    grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$LICENSE_READER_ROLE"
+    _bind_project_role_retry "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$LICENSE_READER_ROLE" \
+      && info "granted ${LICENSE_READER_ROLE} to serviceAccount:${SA_EMAIL} on ${PROJECT_ID}" \
+      || warn "could not grant ${LICENSE_READER_ROLE} to ${SA_EMAIL}; Gemini Enterprise license seats may stay hidden"
   else
     grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/discoveryengine.editor"
   fi
@@ -686,14 +712,25 @@ if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
     info "[dry-run] custom role ${GATEWAY_MANAGER_ROLE} -> ${SA_EMAIL}"
   else
     gcloud iam roles undelete "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" --quiet >/dev/null 2>&1 || true
-    if gcloud iam roles describe "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" >/dev/null 2>&1; then
-      gcloud iam roles update "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" --permissions "$GATEWAY_MANAGER_PERMS" --quiet >/dev/null 2>&1 || true
-      grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$GATEWAY_MANAGER_ROLE"
+    _gw_deleted=""
+    if _gw_deleted="$(gcloud iam roles describe "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" --format='value(deleted)' 2>/dev/null)"; then
+      if [[ "$(printf '%s' "$_gw_deleted" | tr '[:upper:]' '[:lower:]')" == "true" ]]; then
+        warn "custom role ${GATEWAY_MANAGER_ROLE} is in its 30-day deletion window; falling back to roles/networkservices.editor + roles/networksecurity.editor"
+        grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/networkservices.editor"
+        grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/networksecurity.editor"
+      else
+        gcloud iam roles update "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" --permissions "$GATEWAY_MANAGER_PERMS" --quiet >/dev/null 2>&1 || true
+        _bind_project_role_retry "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$GATEWAY_MANAGER_ROLE" \
+          && info "granted ${GATEWAY_MANAGER_ROLE} to serviceAccount:${SA_EMAIL} on ${PROJECT_ID}" \
+          || warn "could not grant ${GATEWAY_MANAGER_ROLE} to ${SA_EMAIL}; Agent Gateway management may be read-only"
+      fi
     elif gcloud iam roles create "$GATEWAY_MANAGER_ROLE_ID" --project "$PROJECT_ID" \
         --title "AI Control Plane Agent Gateway Manager" \
         --description "Manage Agent Gateway resources, authorization extensions and policies" \
         --permissions "$GATEWAY_MANAGER_PERMS" --stage GA --quiet >/dev/null 2>&1; then
-      grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$GATEWAY_MANAGER_ROLE"
+      _bind_project_role_retry "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "$GATEWAY_MANAGER_ROLE" \
+        && info "granted ${GATEWAY_MANAGER_ROLE} to serviceAccount:${SA_EMAIL} on ${PROJECT_ID}" \
+        || warn "could not grant ${GATEWAY_MANAGER_ROLE} to ${SA_EMAIL}; Agent Gateway management may be read-only"
     else
       grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/networkservices.editor"
       grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/networksecurity.editor"
@@ -892,7 +929,7 @@ EOF
         BUILD_OK=1
         break
       fi
-      if [[ $build_attempt -lt 3 ]] && grep -Eiq 'PERMISSION_DENIED|NOT_FOUND|does not exist|serviceAccount|actAs|propagation' "$BUILD_LOG"; then
+      if [[ $build_attempt -lt 3 ]] && grep -Eiq 'PERMISSION_DENIED|AccessDenied|denied|unauthorized|403|NOT_FOUND|does not exist|serviceAccount|actAs|propagation|UNAVAILABLE|DEADLINE_EXCEEDED' "$BUILD_LOG"; then
         warn "Cloud Build attempt ${build_attempt}/3 hit IAM/API propagation; retrying in 12s..."
         sleep 12
       else
@@ -923,8 +960,16 @@ EOF
         gcloud auth print-access-token 2>/dev/null \
           | docker login -u oauth2accesstoken --password-stdin "https://${REGION}-docker.pkg.dev" >/dev/null 2>&1 \
           || gcloud auth configure-docker "${REGION}-docker.pkg.dev" --quiet
-        if (docker build --platform linux/amd64 -t "$IMAGE" "$ROOT" || docker build -t "$IMAGE" "$ROOT") \
-            && docker push "$IMAGE"; then
+        HOST_ARCH="$(uname -m 2>/dev/null || echo "")"
+        DOCKER_BUILT=0
+        if docker build --platform linux/amd64 -t "$IMAGE" "$ROOT"; then
+          DOCKER_BUILT=1
+        elif [[ "$HOST_ARCH" == "x86_64" || "$HOST_ARCH" == "amd64" ]] && docker build -t "$IMAGE" "$ROOT"; then
+          DOCKER_BUILT=1
+        elif [[ "$HOST_ARCH" != "x86_64" && "$HOST_ARCH" != "amd64" ]]; then
+          warn "local Docker could not build linux/amd64 on ${HOST_ARCH} (Cloud Run requires linux/amd64; run from Cloud Shell or enable Docker buildx/Rosetta)"
+        fi
+        if [[ "$DOCKER_BUILT" == "1" ]] && docker push "$IMAGE"; then
           BUILD_OK=1
         fi
       fi
@@ -942,14 +987,26 @@ else
 fi
 
 # ------------------------------------------------------------------------------- 5. secrets
+add_secret_version() {  # add_secret_version SECRET_NAME VALUE
+  local secret="$1" value="$2" attempt
+  for attempt in 1 2 3 4; do
+    if printf '%s' "$value" | gcloud secrets versions add "$secret" --project "$PROJECT_ID" --data-file=- >/dev/null; then
+      return 0
+    fi
+    [[ $attempt -lt 4 ]] && sleep 4
+  done
+  return 1
+}
+
 log "5/8 Session signing key (Secret Manager: ${SESSION_SECRET_NAME})"
 ensure_secret_created "$SESSION_SECRET_NAME" "$PROJECT_ID" "$REGION"
 if [[ "$DRY_RUN" == "1" ]]; then
   info "[dry-run] ensure ${SESSION_SECRET_NAME} has an active secret version"
 else
   if [[ -z "$(gcloud secrets versions list "$SESSION_SECRET_NAME" --project "$PROJECT_ID" --filter='state=ENABLED' --limit 1 --format='value(name)' 2>/dev/null || true)" ]]; then
-    python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(48))' \
-      | gcloud secrets versions add "$SESSION_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+    _SESSION_VAL="$(python3 -c 'import secrets,sys; sys.stdout.write(secrets.token_urlsafe(48))')"
+    add_secret_version "$SESSION_SECRET_NAME" "$_SESSION_VAL"
+    unset _SESSION_VAL
     info "created secret version"
   fi
 fi
@@ -981,8 +1038,9 @@ PY
   if [[ "$DRY_RUN" == "1" ]]; then
     info "[dry-run] add the client secret from ${OAUTH_CLIENT_JSON} as a new version of ${OAUTH_SECRET_NAME}"
   else
-    python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))["web"]["client_secret"])' "$OAUTH_CLIENT_JSON" \
-      | gcloud secrets versions add "$OAUTH_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+    _OAUTH_VAL="$(python3 -c 'import json,sys; sys.stdout.write(json.load(open(sys.argv[1]))["web"]["client_secret"])' "$OAUTH_CLIENT_JSON")"
+    add_secret_version "$OAUTH_SECRET_NAME" "$_OAUTH_VAL"
+    unset _OAUTH_VAL
   fi
   run retry gcloud secrets add-iam-policy-binding "$OAUTH_SECRET_NAME" --project "$PROJECT_ID" \
     --member "serviceAccount:${SA_EMAIL}" --role roles/secretmanager.secretAccessor --condition=None >/dev/null
@@ -1026,8 +1084,9 @@ if [[ "$DRY_RUN" == "1" ]]; then
   info "[dry-run] ensure ${ADMIN_SECRET_NAME} holds a random initial admin password"
 else
   if [[ -z "$(gcloud secrets versions list "$ADMIN_SECRET_NAME" --project "$PROJECT_ID" --filter='state=ENABLED' --limit 1 --format='value(name)' 2>/dev/null || true)" ]]; then
-    python3 -c 'import secrets,string,sys; a=string.ascii_letters+string.digits; sys.stdout.write("".join(secrets.choice(a) for _ in range(20)))' \
-      | gcloud secrets versions add "$ADMIN_SECRET_NAME" --project "$PROJECT_ID" --data-file=- >/dev/null
+    _ADMIN_VAL="$(python3 -c 'import secrets,string,sys; a=string.ascii_letters+string.digits; sys.stdout.write("".join(secrets.choice(a) for _ in range(20)))')"
+    add_secret_version "$ADMIN_SECRET_NAME" "$_ADMIN_VAL"
+    unset _ADMIN_VAL
     info "created a random initial password for the built-in admin account (${ADMIN_SECRET_NAME})"
   fi
 fi
@@ -1076,6 +1135,18 @@ if [[ "$CREATE_LOG_SINK" == "true" ]]; then
 else
   info "sink skipped (CREATE_LOG_SINK=false): the dashboard reads the existing dataset ${AUDIT_DATASET}"
 fi
+AUDIT_DATASET_DISPLAY_LOC="$DATASET_LOCATION"
+LINKED_DATASET_LOCATION="$DATASET_LOCATION"
+if [[ "$DRY_RUN" != "1" ]]; then
+  ACTUAL_AUDIT_LOC="$(dataset_location_of "$PROJECT_ID" "$AUDIT_DATASET" || true)"
+  if [[ -n "$ACTUAL_AUDIT_LOC" ]]; then
+    AUDIT_DATASET_DISPLAY_LOC="$ACTUAL_AUDIT_LOC"
+    if [[ "$DATASET_LOCATION_EXPLICIT" != "1" && "$(printf '%s' "$ACTUAL_AUDIT_LOC" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$DATASET_LOCATION" | tr '[:upper:]' '[:lower:]')" ]]; then
+      LINKED_DATASET_LOCATION="$ACTUAL_AUDIT_LOC"
+      info "existing hub audit dataset ${PROJECT_ID}:${AUDIT_DATASET} is in ${ACTUAL_AUDIT_LOC}; new linked-project audit datasets will prefer ${ACTUAL_AUDIT_LOC}"
+    fi
+  fi
+fi
 if [[ "$ENABLE_DATA_ACCESS_LOGS" == "true" ]]; then
   enable_data_access_logs "$PROJECT_ID"
 else
@@ -1088,8 +1159,8 @@ else
 fi
 if [[ ${#CLEAN_LINKED[@]} -gt 0 && "$PREPARE_LINKED_PROJECTS" == "true" ]]; then
   for lp in "${CLEAN_LINKED[@]}"; do
-    prepare_linked_project_telemetry "$lp" "$AUDIT_DATASET" "$DATASET_LOCATION" "${SERVICE_NAME}-ai-logs" \
-      "$CREATE_LOG_SINK" "$ENABLE_DATA_ACCESS_LOGS" "$ENABLE_GE_OBSERVABILITY" "$GE_PROMPT_LOGGING"
+    prepare_linked_project_telemetry "$lp" "$AUDIT_DATASET" "$LINKED_DATASET_LOCATION" "${SERVICE_NAME}-ai-logs" \
+      "$CREATE_LOG_SINK" "$ENABLE_DATA_ACCESS_LOGS" "$ENABLE_GE_OBSERVABILITY" "$GE_PROMPT_LOGGING" "$DATASET_LOCATION"
   done
 fi
 
@@ -1155,7 +1226,9 @@ MAIN=("${COMMON[@]}" --service-account "$SA_EMAIL")
 
 RUN_DEPLOY_HELP="$(gcloud run deploy --help 2>&1 || true)"
 NO_IAP_ARGS=()
-[[ "$RUN_DEPLOY_HELP" == *"--no-iap"* || "$RUN_DEPLOY_HELP" == *"--iap"* ]] && NO_IAP_ARGS=(--no-iap)
+[[ "$RUN_DEPLOY_HELP" == *"--no-iap"* || "$RUN_DEPLOY_HELP" == *"--iap"* || "$RUN_DEPLOY_HELP" == *"--[no-]iap"* ]] && NO_IAP_ARGS=(--no-iap)
+INVOKER_CHECK_ARGS=()
+[[ "$RUN_DEPLOY_HELP" == *"--invoker-iam-check"* || "$RUN_DEPLOY_HELP" == *"--no-invoker-iam-check"* || "$RUN_DEPLOY_HELP" == *"--[no-]invoker-iam-check"* ]] && INVOKER_CHECK_ARGS=(--invoker-iam-check)
 
 EFFECTIVE_ACCESS_MODE="$ACCESS_MODE"
 IAP_FALLBACK=0
@@ -1184,7 +1257,7 @@ deploy_main_resilient() {
   fi
   if [[ "$ORGPOL_DRS" == "1" && "$ORGPOL_REQUIRE_INVOKER_IAM" == "1" ]]; then
     info "organization policies allow neither --no-invoker-iam-check nor allUsers; deploying with Cloud Run IAP"
-  elif gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} --allow-unauthenticated \
+  elif gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" ${NO_IAP_ARGS[@]+"${NO_IAP_ARGS[@]}"} ${INVOKER_CHECK_ARGS[@]+"${INVOKER_CHECK_ARGS[@]}"} --allow-unauthenticated \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
       --set-env-vars "$public_env" --set-secrets "$MAIN_SECRETS"; then
     return 0
@@ -1192,7 +1265,7 @@ deploy_main_resilient() {
   warn "organization policy blocks unauthenticated Cloud Run entry; automatically switching ${SERVICE_NAME} to Direct Cloud Run IAP..."
   # Neither Cloud Scheduler's nor Pub/Sub's token passes IAP: the schedule and push variables (LIVE_ENV) stay out.
   local iap_env="${ENV_VARS}##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
-  retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
+  retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap ${INVOKER_CHECK_ARGS[@]+"${INVOKER_CHECK_ARGS[@]}"} --no-allow-unauthenticated \
     --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
     --set-env-vars "$iap_env" --set-secrets "$MAIN_SECRETS" \
     || die "Cloud Run deployment failed under all access modes for ${PROJECT_ID}"
@@ -1234,7 +1307,14 @@ case "$ACCESS_MODE" in
         fi
       done
       rm -f "$BRIDGE_LOG"
-      if [[ "$BRIDGE_READY" != "1" ]]; then
+      if [[ "$BRIDGE_READY" == "1" ]]; then
+        if ! probe_iap_bridge_ready "$BRIDGE_URL"; then
+          BRIDGE_READY=0
+          gcloud run services delete "$BRIDGE_NAME" --project "$PROJECT_ID" --region "$REGION" --quiet >/dev/null 2>&1 || true
+          warn "sign-in bridge (${BRIDGE_NAME}) returned HTTP 502 (project outside a GCP Organization has no Google-managed IAP OAuth client yet); switching to built-in ID/Password sign-in. Sign in as 'admin' and connect a Google OAuth client in Settings > Access control (no redeployment), or enable IAP once in Cloud Console and re-run deploy."
+          warn "[한국어 안내] 이 프로젝트는 GCP 조직(Organization)에 속하지 않은 단독 프로젝트로 Google 관리형 IAP OAuth 클라이언트가 자동 생성되지 않습니다(HTTP 502). 우선 기본 'admin' ID/비밀번호 로그인으로 자동 전환했습니다. 로그인 후 설정 > 접근 제어 > 'Google OAuth 클라이언트'를 연결하면 재배포 없이 모든 Google 계정(Gmail 포함) 로그인이 가능합니다."
+        fi
+      else
         warn "sign-in bridge (${BRIDGE_NAME}) with Cloud Run IAP could not be deployed; deploying the dashboard with built-in ID/Password sign-in enabled"
       fi
     fi
@@ -1264,13 +1344,17 @@ case "$ACCESS_MODE" in
     ;;
   iap)
     IAP_ENV="${ENV_VARS}##AUTH_MODE=iap##IAP_AUDIENCE=/projects/${PROJECT_NUMBER}/locations/${REGION}/services/${SERVICE_NAME}"
-    run retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap --invoker-iam-check --no-allow-unauthenticated \
+    run retry gcloud run deploy "$SERVICE_NAME" "${MAIN[@]}" --iap ${INVOKER_CHECK_ARGS[@]+"${INVOKER_CHECK_ARGS[@]}"} --no-allow-unauthenticated \
       --memory "$MEMORY" --cpu "$CPU" --min-instances "$MIN_INSTANCES" --max-instances "$MAX_INSTANCES" --timeout 300 \
       --set-env-vars "$IAP_ENV" --set-secrets "$MAIN_SECRETS"
     run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
       --member "serviceAccount:${IAP_AGENT}" --role roles/run.invoker --condition=None >/dev/null
     configure_iap_access "$PROJECT_ID" "$PROJECT_NUMBER" "$REGION" "$SERVICE_NAME" gate "$IAP_MEMBERS"
     grant_optional_role "$PROJECT_ID" "serviceAccount:${SA_EMAIL}" "roles/iap.admin"
+    if [[ "$DRY_RUN" != "1" ]] && ! probe_iap_bridge_ready "$BASE_URL"; then
+      warn "Cloud Run IAP on ${SERVICE_NAME} returned HTTP 502 (project outside a GCP Organization has no IAP OAuth client yet). Open Cloud Console > Cloud Run > ${SERVICE_NAME} > Security to initialize IAP once, or re-deploy with --access-mode google / password."
+      warn "[한국어 안내] 이 프로젝트는 GCP 조직(Organization) 밖의 단독 프로젝트여서 Cloud Run IAP OAuth 클라이언트가 아직 초기화되지 않았습니다(HTTP 502). Cloud Console > Cloud Run > ${SERVICE_NAME} > 보안에서 IAP를 1회 초기화하거나, --access-mode google 또는 password로 배포하세요."
+    fi
     ;;
 esac
 
@@ -1311,6 +1395,7 @@ ensure_scheduler_sa() {
   fi
 }
 WEB_SCHED_READY=0   # 1 once the -enforce job that calls the dashboard exists (SCHEDULER_INVOKERS is kept only then)
+ENFORCER_SCHED_READY=0
 if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
   # Who may run the enforcement job, on this job only: the dashboard's service account ("Run now", and reading the job
   # and its executions for the status card) and the scheduler's service account (scheduled runs).
@@ -1330,11 +1415,20 @@ if [[ "$ENFORCEMENT_BACKEND" == "iam_deny" ]]; then
       --time-zone "$WORKSPACE_TIMEZONE" --uri "$ENFORCER_RUN_URI" --http-method POST --message-body '{}'
       --oauth-service-account-email "$SCHEDULER_SA" --attempt-deadline 180s --max-retry-attempts 1 --quiet)
     if gcloud scheduler jobs describe "$ENFORCER_SCHED_JOB" --project "$PROJECT_ID" --location "$ENFORCEMENT_JOB_REGION" >/dev/null 2>&1; then
-      run retry gcloud scheduler jobs update http "$ENFORCER_SCHED_JOB" "${SCHED_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null
+      if run retry_quiet gcloud scheduler jobs update http "$ENFORCER_SCHED_JOB" "${SCHED_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null; then
+        ENFORCER_SCHED_READY=1
+      else
+        warn "could not update Cloud Scheduler job ${ENFORCER_SCHED_JOB} (Cloud Scheduler API blocked or unavailable in ${ENFORCEMENT_JOB_REGION}); select Run enforcement now in the dashboard after each period reset"
+      fi
     else
-      run retry gcloud scheduler jobs create http "$ENFORCER_SCHED_JOB" "${SCHED_ARGS[@]}" --headers Content-Type=application/json >/dev/null
+      if run retry_quiet gcloud scheduler jobs create http "$ENFORCER_SCHED_JOB" "${SCHED_ARGS[@]}" --headers Content-Type=application/json >/dev/null; then
+        ENFORCER_SCHED_READY=1
+      else
+        warn "could not create Cloud Scheduler job ${ENFORCER_SCHED_JOB} (Cloud Scheduler API blocked or unavailable in ${ENFORCEMENT_JOB_REGION}); select Run enforcement now in the dashboard after each period reset"
+      fi
     fi
-    info "job ${ENFORCER_SCHED_JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> Cloud Run job ${ENFORCER_JOB} (${ENFORCEMENT_JOB_REGION})"
+    [[ "$ENFORCER_SCHED_READY" == "1" ]] \
+      && info "job ${ENFORCER_SCHED_JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> Cloud Run job ${ENFORCER_JOB} (${ENFORCEMENT_JOB_REGION})"
   else
     remove_scheduler_job "$ENFORCER_SCHED_JOB" "$ENFORCEMENT_JOB_REGION" "ENFORCEMENT_SCHEDULE off"
     info "enforcement schedule: on-demand from the dashboard (Run enforcement now runs ${ENFORCER_JOB})"
@@ -1356,17 +1450,26 @@ else
       --oidc-service-account-email "$SCHEDULER_SA" --oidc-token-audience "$ENFORCE_URL"
       --attempt-deadline 300s --max-retry-attempts 1 --quiet)
     if gcloud scheduler jobs describe "$JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
-      run retry gcloud scheduler jobs update http "$JOB" "${JOB_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null
+      if run retry_quiet gcloud scheduler jobs update http "$JOB" "${JOB_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null; then
+        WEB_SCHED_READY=1
+      else
+        warn "could not update Cloud Scheduler job ${JOB} (Cloud Scheduler API blocked or unavailable in ${REGION}); run enforcement from the dashboard after each period reset"
+      fi
     else
-      run retry gcloud scheduler jobs create http "$JOB" "${JOB_ARGS[@]}" --headers Content-Type=application/json >/dev/null
+      if run retry_quiet gcloud scheduler jobs create http "$JOB" "${JOB_ARGS[@]}" --headers Content-Type=application/json >/dev/null; then
+        WEB_SCHED_READY=1
+      else
+        warn "could not create Cloud Scheduler job ${JOB} (Cloud Scheduler API blocked or unavailable in ${REGION}); run enforcement from the dashboard after each period reset"
+      fi
     fi
-    WEB_SCHED_READY=1
-    info "job ${JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> ${ENFORCE_URL}"
-    # When the organization requires IAM invoker checks (run.managed.requireInvokerIam) the service is not public and
-    # Cloud Run would reject the scheduler's OIDC call before the app sees it; restores would then never run.
-    run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
-      --member "serviceAccount:${SCHEDULER_SA}" --role roles/run.invoker --condition=None --quiet >/dev/null \
-      || warn "could not grant roles/run.invoker on ${SERVICE_NAME} to ${SCHEDULER_SA}; if the service requires IAM invoker checks, scheduled enforcement (and automatic restores) will fail"
+    if [[ "$WEB_SCHED_READY" == "1" ]]; then
+      info "job ${JOB}: ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}) -> ${ENFORCE_URL}"
+      # When the organization requires IAM invoker checks (run.managed.requireInvokerIam) the service is not public and
+      # Cloud Run would reject the scheduler's OIDC call before the app sees it; restores would then never run.
+      run retry gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
+        --member "serviceAccount:${SCHEDULER_SA}" --role roles/run.invoker --condition=None --quiet >/dev/null \
+        || warn "could not grant roles/run.invoker on ${SERVICE_NAME} to ${SCHEDULER_SA}; if the service requires IAM invoker checks, scheduled enforcement (and automatic restores) will fail"
+    fi
   else
     # No scheduled runs (ENFORCEMENT_SCHEDULE off, a read-only install or IAP): the job of an earlier deployment would
     # keep calling the dashboard on the old schedule, so it is removed with the scheduler's right to call the service.
@@ -1466,11 +1569,11 @@ if [[ "$MAINTENANCE_SCHEDULE" != "off" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; 
     gcloud run services add-iam-policy-binding "$SERVICE_NAME" --project "$PROJECT_ID" --region "$REGION" \
       --member "serviceAccount:${SA_EMAIL}" --role roles/run.invoker --condition=None --quiet >/dev/null 2>&1 || true
     if gcloud scheduler jobs describe "$MAINT_JOB" --project "$PROJECT_ID" --location "$REGION" >/dev/null 2>&1; then
-      run retry gcloud scheduler jobs update http "$MAINT_JOB" "${MAINT_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null \
+      run retry_quiet gcloud scheduler jobs update http "$MAINT_JOB" "${MAINT_ARGS[@]}" --update-headers Content-Type=application/json >/dev/null \
         && info "job ${MAINT_JOB}: ${MAINTENANCE_SCHEDULE} -> ${MAINT_URL}" \
         || warn "could not update ${MAINT_JOB}; the in-process monitor still runs scheduled work while an instance is up"
     else
-      run retry gcloud scheduler jobs create http "$MAINT_JOB" "${MAINT_ARGS[@]}" --headers Content-Type=application/json >/dev/null \
+      run retry_quiet gcloud scheduler jobs create http "$MAINT_JOB" "${MAINT_ARGS[@]}" --headers Content-Type=application/json >/dev/null \
         && info "job ${MAINT_JOB}: ${MAINTENANCE_SCHEDULE} -> ${MAINT_URL}" \
         || warn "could not create ${MAINT_JOB}; the in-process monitor still runs scheduled work while an instance is up"
     fi
@@ -1521,6 +1624,8 @@ PYPROBE
 )"
   if [[ "$HTTP_CODE" == "200" || "$HTTP_CODE" == "302" || "$HTTP_CODE" == "401" ]]; then
     info "live readiness verified (${BASE_URL} responded HTTP ${HTTP_CODE})"
+  else
+    warn "readiness probe ${BASE_URL}/api/v1/auth/state returned HTTP ${HTTP_CODE}; if the dashboard does not open, inspect Cloud Run logs: gcloud run services logs read ${SERVICE_NAME} --project ${PROJECT_ID} --region ${REGION} --limit 50"
   fi
   if [[ "$MAINTENANCE_SCHEDULE" != "off" && "$EFFECTIVE_ACCESS_MODE" != "iap" ]]; then
     if gcloud scheduler jobs run "$MAINT_JOB" --project "$PROJECT_ID" --location "$REGION" --quiet >/dev/null 2>&1; then
@@ -1553,7 +1658,7 @@ if [[ "$IAP_FALLBACK" == "1" ]]; then
   warn "Organization policies block a public entry, so the dashboard itself runs behind IAP: only accounts IAP admits can open it, and ID/password sign-in is not available. Add people under Settings > Access control or with the gcloud command above."
   warn "[한국어 안내] 조직 정책(도메인 제한 공유 + run.managed.requireInvokerIam) 때문에 대시보드 자체를 IAP 뒤에 배포했습니다. IAP가 허용한 Google 계정만 대시보드를 열 수 있고 ID/비밀번호 로그인은 쓸 수 없습니다. 사람 추가: 설정 > 접근 제어, 또는 위 gcloud 명령."
 fi
-info "Audit dataset : ${PROJECT_ID}:${AUDIT_DATASET} (${DATASET_LOCATION}, Data Access=${ENABLE_DATA_ACCESS_LOGS}, GE Prompt Logging=${GE_PROMPT_LOGGING})"
+info "Audit dataset : ${PROJECT_ID}:${AUDIT_DATASET} (${AUDIT_DATASET_DISPLAY_LOC}, Data Access=${ENABLE_DATA_ACCESS_LOGS}, GE Prompt Logging=${GE_PROMPT_LOGGING})"
 [[ -n "$NORMALIZED_SCAN_PROJECTS" ]] && info "Linked scan   : ${NORMALIZED_SCAN_PROJECTS}"
 info "Settings store: gs://${SETTINGS_BUCKET}"
 info "Container     : ${IMAGE}"
@@ -1571,7 +1676,7 @@ if [[ ${#CLEAN_LINKED[@]} -eq 0 && ",$DISABLED_MODULES," != *",gemini_enterprise
 fi
 case "$ENFORCEMENT_BACKEND" in
   iam_deny)
-    if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
+    if [[ "$ENFORCER_SCHED_READY" == "1" ]]; then
       info "Antigravity caps: deny-policy enforcement by the Cloud Run job ${ENFORCER_JOB} (${ENFORCEMENT_JOB_REGION}) ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}); suspended users are restored automatically at each period reset"
     else
       info "Antigravity caps: deny-policy enforcement by the Cloud Run job ${ENFORCER_JOB} (${ENFORCEMENT_JOB_REGION}); no schedule: select Run enforcement now in the dashboard after each period reset"
@@ -1583,12 +1688,16 @@ case "$ENFORCEMENT_BACKEND" in
     antigravity_readiness "$PROJECT_ID"
     ;;
   notify_only)
-    info "Antigravity caps: notify only (plans and notifications; access never changes)${ENFORCEMENT_SCHEDULE:+; runs ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE})}"
+    if [[ "$WEB_SCHED_READY" == "1" ]]; then
+      info "Antigravity caps: notify only (plans and notifications; access never changes); runs ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE})"
+    else
+      info "Antigravity caps: notify only (plans and notifications; access never changes)"
+    fi
     antigravity_readiness "$PROJECT_ID"
     ;;
   *)
     if [[ "$ENABLE_GOVERNANCE_ACTIONS" == "true" ]]; then
-      if [[ -n "$ENFORCEMENT_SCHEDULE" ]]; then
+      if [[ "$WEB_SCHED_READY" == "1" ]]; then
         info "Antigravity caps: enforcement runs ${ENFORCEMENT_SCHEDULE} (${WORKSPACE_TIMEZONE}); suspended users are restored automatically at each period reset"
       else
         info "Antigravity caps: no enforcement schedule; select Run enforcement now in the dashboard after each period reset"

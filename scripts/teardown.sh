@@ -252,7 +252,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   info "[dry-run] service accounts: ${SA_EMAIL}, ${BUILD_SA}, ${SCHEDULER_SA}, ${BRIDGE_SA}, ${ENFORCER_SA}"
   info "[dry-run] secrets: ${SESSION_SECRET_NAME}, ${OAUTH_SECRET_NAME}, ${OAUTH_CONNECT_SECRET_NAME}, ${ADMIN_SECRET_NAME}"
   if [[ "$DELETE_ROLES" == "1" ]]; then
-    info "[dry-run] custom roles nothing holds: ${CAP_ROLE_IDS//,/, }, ${ADMIN_MARKER_ID}, ${GATEWAY_MANAGER_ROLE_ID}, ${LICENSE_READER_ROLE_ID} (also on linked projects)"
+    info "[dry-run] custom roles nothing holds: ${CAP_ROLE_IDS//,/, }, ${ADMIN_MARKER_ID}, ${GATEWAY_MANAGER_ROLE_ID}, ${LICENSE_READER_ROLE_ID}, ${GE_FEATURE_MANAGER_ROLE_ID} (also on linked projects)"
   fi
   [[ "$DELETE_DATA" == "1" ]] && info "[dry-run] delete gs://${SETTINGS_BUCKET}, log sink ${SINK} and the routed telemetry dataset ${TELEMETRY_DATASET} (only if labelled managed-by=ai-control-plane)"
   exit 0
@@ -505,7 +505,7 @@ if [[ "$DELETE_DATA" == "1" ]]; then
   fi
   # The routed telemetry dataset is deleted only when this control plane created it (label managed-by).
   if bq --project_id "$PROJECT_ID" show --format=json "${PROJECT_ID}:${TELEMETRY_DATASET}" 2>/dev/null \
-      | python3 -c 'import json,sys; sys.exit(0 if (json.load(sys.stdin).get("labels") or {}).get("managed-by") == "ai-control-plane" else 3)' 2>/dev/null; then
+      | python3 -c 'import json,sys; raw=sys.stdin.read(); data=json.loads(raw[raw.index("{"):]); sys.exit(0 if (data.get("labels") or {}).get("managed-by") == "ai-control-plane" else 3)' 2>/dev/null; then
     quiet bq --project_id "$PROJECT_ID" rm -r -f -d "${PROJECT_ID}:${TELEMETRY_DATASET}" \
       && info "deleted dataset ${PROJECT_ID}:${TELEMETRY_DATASET}" || info "could not delete ${PROJECT_ID}:${TELEMETRY_DATASET}"
   else

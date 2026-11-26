@@ -2403,6 +2403,394 @@ class DataAccessLogsMessageTest(unittest.TestCase):
         self.assertIn("skipped: geminidataanalytics.googleapis.com", res.stdout)
 
 
+class DeploymentEdgeCasesHardeningTest(unittest.TestCase):
+    """Regression tests for brand-new and existing GCP project edge cases found during E2E audit."""
+
+    def _run_preflight_py(self, handler, mode="deploy", need_build="1", need_sink="1",
+                          need_iap="1", need_sched="1", need_audit="1", need_rt="1"):
+        out = io.StringIO()
+        argv = ["-", mode, "demo-proj", need_build, need_sink, need_iap, need_sched, need_audit, need_rt]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.dict(os.environ, {"ACP_ACCESS_TOKEN": "tok"}), \
+                mock.patch("urllib.request.urlopen", handler), \
+                contextlib.redirect_stdout(out):
+            try:
+                exec(compile(preflight_script(), "preflight", "exec"), {"__name__": "__main__"})  # pylint: disable=exec-used
+            except SystemExit:
+                pass
+        return json.loads(out.getvalue().strip())
+
+    def test_preflight_editor_plus_iam_admin_bootstraps_all_missing_roles(self):
+        # Exact permission gaps of roles/editor + roles/resourcemanager.projectIamAdmin verified live against GCP.
+        missing_for_editor = {
+            "bigquery.datasets.update",
+            "iam.roles.create",
+            "artifactregistry.repositories.setIamPolicy",
+            "pubsub.topics.setIamPolicy",
+            "storage.buckets.setIamPolicy",
+            "secretmanager.secrets.setIamPolicy",
+            "run.services.setIamPolicy",
+            "iam.serviceAccounts.setIamPolicy",
+            "logging.sinks.create",
+            "iap.web.setIamPolicy",
+        }
+
+        def handler(req, timeout=None):  # pylint: disable=unused-argument
+            perms = json.loads(req.data)["permissions"]
+            granted = [p for p in perms if p not in missing_for_editor]
+            return io.BytesIO(json.dumps({"permissions": granted}).encode())
+
+        verdict = self._run_preflight_py(handler)
+        self.assertEqual(verdict["status"], "bootstrap")
+        for role in ("roles/bigquery.admin", "roles/iam.roleAdmin", "roles/artifactregistry.admin",
+                     "roles/pubsub.admin", "roles/storage.admin", "roles/secretmanager.admin",
+                     "roles/run.admin", "roles/iam.serviceAccountAdmin", "roles/logging.configWriter",
+                     "roles/iap.admin"):
+            self.assertIn(role, verdict["missing_roles"])
+        # Editor already has discoveryengine.engines.update; do not grant roles/discoveryengine.admin unnecessarily.
+        self.assertNotIn("roles/discoveryengine.admin", verdict["missing_roles"])
+
+    def test_preflight_owner_with_discoveryengine_does_not_grant_extra_discovery_admin(self):
+        def handler(req, timeout=None):  # pylint: disable=unused-argument
+            perms = json.loads(req.data)["permissions"]
+            # Owner has every permission except project-level storage.buckets.setIamPolicy.
+            granted = [p for p in perms if p != "storage.buckets.setIamPolicy"]
+            return io.BytesIO(json.dumps({"permissions": granted}).encode())
+
+        verdict = self._run_preflight_py(handler)
+        self.assertEqual(verdict["status"], "bootstrap")
+        self.assertEqual(verdict["missing_roles"], ["roles/storage.admin"])
+
+    def test_preflight_mtls_401_falls_back_to_gcloud_iam_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            gcloud = os.path.join(tmp, "gcloud")
+            with open(gcloud, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env python3\n"
+                         "import sys\n"
+                         "args = sys.argv[1:]\n"
+                         "if args[:2] == ['auth', 'print-access-token']:\n"
+                         "    print('tok')\n"
+                         "    sys.exit(0)\n"
+                         "if args[:2] == ['projects', 'get-iam-policy']:\n"
+                         "    sys.stderr.write('ERROR: PERMISSION_DENIED: The caller does not have permission\\n')\n"
+                         "    sys.exit(1)\n"
+                         "sys.exit(0)\n")
+            os.chmod(gcloud, 0o755)
+            # Intercept _check_project_permissions to emit http_401 directly without hitting the network.
+            cmd = ('set -euo pipefail; source "%s"; '
+                   '_check_project_permissions() { printf \'{"status":"skip","reason":"http_401"}\\n\'; }; '
+                   'preflight_caller_permissions deploy demo-proj user@example.org 1 1 1 1 1 1') % (
+                os.path.join(ROOT, "scripts/lib/common.sh"))
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}")
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, check=False)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("lacks required IAM permissions on project demo-proj", res.stderr)
+
+    def test_short_service_name_rejected_and_prefixed_billing_account_normalized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _ = fake_env(tmp)
+            for short_name in ("a", "ai"):
+                res = run_script(os.path.join(ROOT, "scripts/deploy.sh"),
+                                 ["--project", "demo-hub-proj", "--service-name", short_name, "--dry-run"], env)
+                self.assertNotEqual(res.returncode, 0)
+                self.assertIn("3-42", res.stderr)
+                res_p = run_script(os.path.join(ROOT, "scripts/prepare.sh"),
+                                   ["--project", "demo-hub-proj", "--service-name", short_name, "--dry-run"], env)
+                self.assertNotEqual(res_p.returncode, 0)
+                self.assertIn("3-42", res_p.stderr)
+
+            bad_ba = run_script(os.path.join(ROOT, "scripts/deploy.sh"),
+                                ["--project", "demo-hub-proj", "--billing-account", "not-a-billing-id", "--dry-run"], env)
+            self.assertNotEqual(bad_ba.returncode, 0)
+            self.assertIn("invalid BILLING_ACCOUNT_ID", bad_ba.stderr)
+
+            ok_ba = run_script(
+                os.path.join(ROOT, "scripts/deploy.sh"),
+                ["--project", "demo-hub-proj", "--billing-account", "billingAccounts/012345-6789ab-cdef01", "--dry-run"],
+                env,
+            )
+            self.assertEqual(ok_ba.returncode, 0, msg=(ok_ba.stdout, ok_ba.stderr))
+            self.assertIn("BILLING_ACCOUNT_ID=012345-6789AB-CDEF01", ok_ba.stderr)
+            self.assertNotIn("BILLING_ACCOUNT_ID=billingAccounts/", ok_ba.stderr)
+
+    def test_grant_dataset_role_handles_legacy_group_writer_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ds_path = os.path.join(tmp, "dataset.json")
+            with open(ds_path, "w", encoding="utf-8") as fh:
+                json.dump({"location": "US", "access": [{"role": "OWNER", "specialGroup": "projectOwners"}]}, fh)
+            bq = os.path.join(tmp, "bq")
+            with open(bq, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env python3\n"
+                         "import os, shutil, sys\n"
+                         "args = sys.argv[1:]\n"
+                         "ds = os.environ['FAKE_DS_FILE']\n"
+                         "if 'show' in args:\n"
+                         "    print(open(ds, encoding='utf-8').read())\n"
+                         "    sys.exit(0)\n"
+                         "if 'update' in args:\n"
+                         "    src = args[args.index('--source') + 1]\n"
+                         "    shutil.copyfile(src, ds)\n"
+                         "    sys.exit(0)\n"
+                         "sys.exit(0)\n")
+            os.chmod(bq, 0o755)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}", FAKE_DS_FILE=ds_path)
+            cmd = ('set -euo pipefail; source "%s"; '
+                   'grant_dataset_role demo-proj ge_analytics WRITER group:cloud-logs@example.org; '
+                   'grant_dataset_role demo-proj ge_analytics WRITER group:cloud-logs@example.org') % (
+                os.path.join(ROOT, "scripts/lib/common.sh"))
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            with open(ds_path, encoding="utf-8") as fh:
+                saved = json.load(fh)
+        group_entries = [a for a in saved["access"] if a.get("groupByEmail") == "cloud-logs@example.org"]
+        self.assertEqual(len(group_entries), 1)
+        self.assertEqual(group_entries[0]["role"], "WRITER")
+        self.assertFalse(any("group:" in str(a.get("userByEmail", "")) for a in saved["access"]))
+
+    def test_cloud_scheduler_blocked_falls_back_cleanly_and_removes_stale_env(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = fake_env(tmp, FAKE_FAIL="scheduler jobs create ")
+            # Fast no-op sleep so retry exhaustion finishes immediately in unit tests.
+            sleep_stub = os.path.join(tmp, "fakebin", "sleep")
+            with open(sleep_stub, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(sleep_stub, 0o755)
+            cfg = os.path.join(tmp, "deploy.env")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write(ServiceEnvMatchesSetupTest.CONFIG)
+            res = run_script(os.path.join(ROOT, "scripts/deploy.sh"), ["--config", cfg], env)
+            calls = read_log(log).splitlines()
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn("could not create Cloud Scheduler job ai-control-plane-enforce", res.stderr)
+        self.assertIn("removed SCHEDULER_INVOKERS from ai-control-plane", res.stdout)
+        self.assertIn("no enforcement schedule", res.stdout)
+        self.assertIn("run services update ai-control-plane --project demo-hub-proj --region asia-northeast3 "
+                      "--remove-env-vars SCHEDULER_INVOKERS --quiet", calls)
+
+    def test_existing_hub_dataset_location_aligns_linked_projects_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = fake_env(tmp, FAKE_EXISTING="ai-control-plane-ai-logs")
+            # Ensure logging sinks describe --format=value(writerIdentity) prints a writer identity.
+            gc_path = os.path.join(tmp, "fakebin", "gcloud")
+            with open(gc_path, encoding="utf-8") as fh:
+                gc_body = fh.read()
+            gc_body = gc_body.replace(
+                'elif "describe" in args:',
+                'elif "writerIdentity" in line:\n    print("serviceAccount:sink-123@gcp-sa-logging.iam.gserviceaccount.com")\nelif "describe" in args:',
+            )
+            with open(gc_path, "w", encoding="utf-8") as fh:
+                fh.write(gc_body)
+            # Hub dataset already exists in US; spoke dataset does not exist yet.
+            bq_path = os.path.join(tmp, "fakebin", "bq")
+            with open(bq_path, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env python3\n"
+                         "import json, os, sys\n"
+                         "args = sys.argv[1:]\n"
+                         "with open(os.environ['FAKE_GCLOUD_LOG'], 'a', encoding='utf-8') as f:\n"
+                         "    f.write('bq ' + ' '.join(args) + '\\n')\n"
+                         "if 'show' in args:\n"
+                         "    if any('demo-hub-proj:ge_analytics' in a for a in args):\n"
+                         "        print(json.dumps({'location': 'US', 'access': []}))\n"
+                         "        sys.exit(0)\n"
+                         "    sys.exit(1)\n"
+                         "sys.exit(0)\n")
+            os.chmod(bq_path, 0o755)
+            cfg = os.path.join(tmp, "deploy.env")
+            with open(cfg, "w", encoding="utf-8") as fh:
+                fh.write('PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\n'
+                         'SCAN_PROJECTS="demo-spoke-a"\nENABLE_DATA_ACCESS_LOGS="false"\n'
+                         'ENABLE_GE_OBSERVABILITY="false"\nREALTIME_ENFORCEMENT="false"\n'
+                         'MAINTENANCE_SCHEDULE="off"\nENFORCEMENT_SCHEDULE="off"\n'
+                         'IMAGE="asia-northeast3-docker.pkg.dev/demo-hub-proj/acp/acp:test"\n'
+                         'PUBLIC_BASE_URL="https://dashboard.invalid"\n')
+            res = run_script(os.path.join(ROOT, "scripts/deploy.sh"), ["--config", cfg], env)
+            calls = read_log(log).splitlines()
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertIn("existing hub audit dataset demo-hub-proj:ge_analytics is in US", res.stdout)
+        self.assertIn("Audit dataset : demo-hub-proj:ge_analytics (US,", res.stdout)
+        self.assertTrue(any("bq --project_id demo-spoke-a --location US mk --dataset" in c for c in calls), calls)
+
+    def test_custom_role_binding_retries_on_propagation_and_detects_30_day_deleted_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "attempts.txt")
+            gcloud = os.path.join(tmp, "gcloud")
+            with open(gcloud, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env python3\n"
+                         "import os, sys\n"
+                         "args = sys.argv[1:]\n"
+                         "mode = os.environ['TEST_MODE']\n"
+                         "if args[:3] == ['iam', 'roles', 'undelete']:\n"
+                         "    sys.exit(1)\n"
+                         "if args[:3] == ['iam', 'roles', 'describe']:\n"
+                         "    if mode == 'deleted':\n"
+                         "        print('True')\n"
+                         "        sys.exit(0)\n"
+                         "    sys.exit(1)\n"
+                         "if args[:3] == ['iam', 'roles', 'create']:\n"
+                         "    sys.exit(0)\n"
+                         "if args[:2] == ['projects', 'add-iam-policy-binding']:\n"
+                         "    p = os.environ['ATTEMPT_FILE']\n"
+                         "    n = int(open(p).read()) if os.path.exists(p) else 0\n"
+                         "    open(p, 'w').write(str(n + 1))\n"
+                         "    if n == 0:\n"
+                         "        sys.stderr.write('ERROR: INVALID_ARGUMENT: Role projects/demo/roles/R does not exist\\n')\n"
+                         "        sys.exit(1)\n"
+                         "    sys.exit(0)\n"
+                         "sys.exit(0)\n")
+            os.chmod(gcloud, 0o755)
+            sleep_stub = os.path.join(tmp, "sleep")
+            with open(sleep_stub, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 0\n")
+            os.chmod(sleep_stub, 0o755)
+
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}",
+                       ATTEMPT_FILE=state, TEST_MODE="propagate")
+            cmd = 'set -euo pipefail; source "%s"; grant_license_reader demo-proj %s %s %s' % (
+                os.path.join(ROOT, "scripts/lib/common.sh"), HUB_SA, LICENSE_ROLE_ID, license_perms())
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn("granted projects/demo-proj/roles/%s" % LICENSE_ROLE_ID, res.stdout)
+            with open(state, encoding="utf-8") as fh:
+                self.assertEqual(fh.read().strip(), "2")
+
+            env_del = dict(env, TEST_MODE="deleted")
+            res_del = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env_del, check=False)
+            self.assertEqual(res_del.returncode, 0)
+            self.assertIn("30-day deletion window", res_del.stderr)
+
+    def test_install_sh_atomic_reclone_preserves_env_on_clone_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install_dir = os.path.join(tmp, "home", "ai-control-plane")
+            os.makedirs(install_dir, exist_ok=True)
+            snap = os.path.join(install_dir, "deploy.demo-proj.env")
+            with open(snap, "w", encoding="utf-8") as fh:
+                fh.write('PROJECT_ID="demo-proj"\nREGION="us-central1"\n')
+            standalone = os.path.join(tmp, "streamed_install.sh")
+            with open(os.path.join(ROOT, "scripts/install.sh"), "rb") as sf, open(standalone, "wb") as df:
+                df.write(sf.read())
+            os.chmod(standalone, 0o755)
+            env = dict(os.environ, HOME=os.path.join(tmp, "home"),
+                       ACP_REPO_URL=os.path.join(tmp, "nonexistent-repo.git"),
+                       ACP_INSTALL_DIR=install_dir)
+            res = subprocess.run(["bash", standalone, "--project", "demo-proj", "--dry-run"],
+                                 capture_output=True, text=True, env=env, check=False)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("kept untouched", res.stderr)
+            self.assertTrue(os.path.exists(snap))
+            with open(snap, encoding="utf-8") as fh:
+                self.assertIn('REGION="us-central1"', fh.read())
+
+    def test_teardown_dry_run_delete_roles_includes_ge_feature_manager_and_handles_bq_preamble(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = fake_env(
+                tmp,
+                FAKE_DATASET='Welcome to BigQuery!\n{"labels": {"managed-by": "ai-control-plane"}}',
+            )
+            dry = run_script(os.path.join(ROOT, "scripts/teardown.sh"),
+                             ["--project", "demo-hub-proj", "--dry-run", "--delete-roles"], env)
+            self.assertEqual(dry.returncode, 0, msg=(dry.stdout, dry.stderr))
+            self.assertIn("CustomAiControlPlaneGeFeatureManager", dry.stdout)
+
+            live = run_script(os.path.join(ROOT, "scripts/teardown.sh"),
+                              ["--project", "demo-hub-proj", "--yes", "--delete-data"], env)
+            calls = read_log(log).splitlines()
+        self.assertEqual(live.returncode, 0, msg=(live.stdout, live.stderr))
+        self.assertIn("deleted dataset demo-hub-proj:telemetry_routed", live.stdout)
+        self.assertTrue(any("bq --project_id demo-hub-proj rm -r -f -d demo-hub-proj:telemetry_routed" in c for c in calls))
+
+    def test_readmes_have_zero_broken_anchors_and_document_ge_feature_manager(self):
+        for fname in ("README.md", "README.en.md"):
+            text = read(fname)
+            headings, seen, in_code = set(), {}, False
+            for line in text.splitlines():
+                if line.startswith("```"):
+                    in_code = not in_code
+                    continue
+                if in_code:
+                    continue
+                m = re.match(r"^#{1,6}\s+(.*)$", line)
+                if m:
+                    slug = re.sub(r"[^\w\s-]", "", m.group(1).strip().lower(), flags=re.UNICODE).replace(" ", "-")
+                    count = seen.get(slug, 0)
+                    seen[slug] = count + 1
+                    headings.add(f"{slug}-{count}" if count else slug)
+            broken = [m.group(1) for m in re.finditer(r"\]\(#([^)]+)\)", text) if m.group(1) not in headings]
+            self.assertEqual(broken, [], f"Broken anchors in {fname}: {broken}")
+            self.assertIn("CustomAiControlPlaneGeFeatureManager", text, fname)
+            self.assertGreaterEqual(text.count("CustomAiControlPlaneGeFeatureManager"), 5, fname)
+
+    def test_probe_iap_bridge_ready_and_retry_quiet(self):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # pylint: disable=invalid-name
+                if self.path == "/broken":
+                    self.send_response(502)
+                    self.send_header("x-goog-iap-generated-response", "true")
+                    self.end_headers()
+                    self.wfile.write(b"Empty Google Account OAuth client ID(s)/secret(s).")
+                else:
+                    self.send_response(302)
+                    self.send_header("Location", "https://accounts.example.org/o/oauth2/v2/auth")
+                    self.end_headers()
+
+            def log_message(self, *args):  # pylint: disable=arguments-differ
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                sleep_stub = os.path.join(tmp, "sleep")
+                with open(sleep_stub, "w", encoding="utf-8") as fh:
+                    fh.write("#!/bin/sh\nexit 0\n")
+                os.chmod(sleep_stub, 0o755)
+                env = dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}")
+                common = os.path.join(ROOT, "scripts/lib/common.sh")
+
+                bad = subprocess.run(
+                    ["bash", "-c", f'set -euo pipefail; source "{common}"; probe_iap_bridge_ready "http://127.0.0.1:{port}/broken"'],
+                    capture_output=True, text=True, env=env, check=False,
+                )
+                self.assertNotEqual(bad.returncode, 0)
+
+                good = subprocess.run(
+                    ["bash", "-c", f'set -euo pipefail; source "{common}"; probe_iap_bridge_ready "http://127.0.0.1:{port}/ok"'],
+                    capture_output=True, text=True, env=env, check=False,
+                )
+                self.assertEqual(good.returncode, 0, msg=(good.stdout, good.stderr))
+
+                # retry_quiet suppresses transient stderr when a later attempt succeeds, and prints it if all attempts fail.
+                flag = os.path.join(tmp, "once")
+                flaky = os.path.join(tmp, "flaky")
+                with open(flaky, "w", encoding="utf-8") as fh:
+                    fh.write(f'#!/bin/sh\nif [ ! -f "{flag}" ]; then touch "{flag}"; echo "ERROR: transient NOT_FOUND" >&2; exit 1; fi\nexit 0\n')
+                os.chmod(flaky, 0o755)
+                ok_rq = subprocess.run(
+                    ["bash", "-c", f'set -euo pipefail; source "{common}"; retry_quiet "{flaky}"'],
+                    capture_output=True, text=True, env=env, check=False,
+                )
+                self.assertEqual(ok_rq.returncode, 0)
+                self.assertEqual(ok_rq.stderr, "")
+
+                always_fail = os.path.join(tmp, "always_fail")
+                with open(always_fail, "w", encoding="utf-8") as fh:
+                    fh.write('#!/bin/sh\necho "ERROR: permanent failure" >&2\nexit 1\n')
+                os.chmod(always_fail, 0o755)
+                fail_rq = subprocess.run(
+                    ["bash", "-c", f'set -euo pipefail; source "{common}"; retry_quiet "{always_fail}"'],
+                    capture_output=True, text=True, env=env, check=False,
+                )
+                self.assertNotEqual(fail_rq.returncode, 0)
+                self.assertIn("ERROR: permanent failure", fail_rq.stderr)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()
 

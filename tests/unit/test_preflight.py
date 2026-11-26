@@ -148,14 +148,25 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("bigquery.googleapis.com", err)
 
     def test_restricted_services_split_required_and_optional(self):
-        policies = {"serviceuser.services": {"listPolicy": {"deniedValues": ["discoveryengine.googleapis.com"]}}}
+        policies = {"serviceuser.services": {"listPolicy": {"deniedValues": ["discoveryengine.googleapis.com",
+                                                                             "pubsub.googleapis.com"]}}}
         rc, out, err = self.run_preflight(policies)
         self.assertEqual(rc, 0, err)
         self.assertIn("discoveryengine.googleapis.com 금지", err)
+        self.assertIn("pubsub.googleapis.com 금지", err)
         policies = {"serviceuser.services": {"listPolicy": {"deniedValues": ["run.googleapis.com"]}}}
         rc, out, err = self.run_preflight(policies)
         self.assertEqual(rc, 1)
         self.assertIn("run.googleapis.com", err)
+
+    def test_denied_values_resource_locations_suggests_allowed_regions(self):
+        policies = {"gcp.resourceLocations": {"listPolicy": {"deniedValues": ["asia-northeast3", "asia-northeast3-locations"]}}}
+        rc, out, err = self.run_preflight(policies, region="asia-northeast3")
+        self.assertEqual(rc, 1)
+        self.assertIn("[중단] gcp.resourceLocations", err)
+        self.assertNotIn("(허용: -)", err)
+        self.assertIn("사용 가능 예:", err)
+        self.assertIn("us-central1", err)
 
     def test_vpc_egress_needs_a_subnet(self):
         policies = {"run.allowedVPCEgress": {"listPolicy": {"allowedValues": ["all-traffic"]}}}

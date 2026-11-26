@@ -216,7 +216,7 @@ What the script automates end-to-end on a brand-new project:
 | 0. Preflight & billing | Bootstraps foundational control-plane APIs, verifies or self-grants missing caller IAM roles, verifies or auto-links Cloud Billing, and checks organization policies and VPC Service Controls ([14.4](#144-customer-project-preflight-organization-policies-vpc-service-controls)). |
 | 1. APIs & service agents | Enables Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Cloud Trace, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, IAP, Cloud Scheduler, Cloud Billing Budget, Pub/Sub for real-time enforcement and more, and provisions the Google-managed service agents (`service-PROJECT_NUMBER@...`) immediately. |
 | 2. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. |
-| 3. Dedicated service accounts & IAM | Creates the runtime SA, the sign-in bridge SA, a **dedicated Cloud Build SA** (never the Compute Engine default SA) and, with `iam_deny`, the enforcement job SA, each with least-privilege roles ([6.6](#66-runtime-service-account-permissions)). With the control features (`ENABLE_GOVERNANCE_ACTIONS=true`, the default) it grants the IAM write roles and creates the Antigravity marker roles (`CustomAntigravityCapBlocked`, `CustomAntigravityAdminBlocked`) and the Agent Gateway manager custom role. It grants read roles on `--link-projects` projects and auto-detects a BigQuery billing export table. |
+| 3. Dedicated service accounts & IAM | Creates the runtime SA, the sign-in bridge SA, a **dedicated Cloud Build SA** (never the Compute Engine default SA) and, with `iam_deny`, the enforcement job SA, each with least-privilege roles including `CustomAiControlPlaneLicenseReader` ([6.6](#66-runtime-service-account-permissions)). With the control features (`ENABLE_GOVERNANCE_ACTIONS=true`, the default) it grants the IAM write roles and creates the Antigravity marker roles (`CustomAntigravityCapBlocked`, `CustomAntigravityAdminBlocked`), the Gemini Enterprise feature manager role (`CustomAiControlPlaneGeFeatureManager`) and the Agent Gateway manager custom role (`CustomAiControlPlaneGatewayManager`). It grants read roles (and `CustomAiControlPlaneGeFeatureManager` when control features are enabled) on `--link-projects` projects and auto-detects a BigQuery billing export table. |
 | 4. Container image | Creates the Artifact Registry repository and builds with Cloud Build as the dedicated builder SA (falls back from regional to global Cloud Build, then to Cloud Shell or local Docker). |
 | 5. Secrets | Creates the session signing key, a random initial password for the built-in `admin` account and the slot for an OAuth client secret connected later in the UI (`google` and `password` modes), in Secret Manager and compliant with `constraints/gcp.resourceLocations`. |
 | 6. Data sources | Creates the BigQuery dataset (`ge_analytics`) and the partitioned Log Router sink, **enables Data Access audit logs of the AI services**, turns on **Gemini Enterprise usage + prompt/user logging** for every app, onboards `--link-projects` projects (when permitted), and auto-detects the organization name and Agent Platform endpoints. |
@@ -328,7 +328,7 @@ You can also enter or update the billing values after deployment in **Settings >
 
 | Variable | Default | Description |
 |---|---|---|
-| `ENABLE_GOVERNANCE_ACTIONS` | `true` | Grants IAM write roles (`--read-only` sets `false`, `--no-read-only` sets `true`). Required to suspend users over their cap, restore them, allow or disallow individual users, create marker roles and manage Agent Gateways |
+| `ENABLE_GOVERNANCE_ACTIONS` | `true` | Grants IAM write roles (`--read-only` sets `false`, `--no-read-only` sets `true`). Required to suspend users over their cap, restore them, allow or disallow individual users, create marker roles, manage Gemini Enterprise features and manage Agent Gateways |
 | `ENFORCEMENT_BACKEND` | `iam_allow_swap` | How suspensions take effect: `iam_allow_swap`, `iam_deny` or `notify_only` ([8.9](#89-deny-policy-enforcement-and-the-enforcement-job), `--enforcement-backend`) |
 | `DENY_ATTACHMENT` | `projects` | Where the `iam_deny` deny policy is attached: `projects` or `scope` (`--deny-attachment`) |
 | `ENFORCEMENT_JOB_REGION` | Empty (`REGION`) | Region of the `iam_deny` enforcement job and its schedule (`--enforcement-job-region`) |
@@ -569,7 +569,7 @@ Antigravity token usage per user is read from the `businessaicode.googleapis.com
 
 ### 6.6 Runtime service account permissions
 
-`scripts/deploy.sh` grants these roles automatically. Terraform does not grant the secret access, `roles/bigquery.user`, `roles/logging.configWriter`, `roles/iap.admin` or the custom roles (license reader, Agent Gateway manager) ([Section 10](#10-deploying-with-terraform-optional)). Follow the same rules when you configure them yourself.
+`scripts/deploy.sh` grants these roles automatically. Terraform does not grant the secret access, `roles/bigquery.user`, `roles/logging.configWriter`, `roles/iap.admin` or the custom roles (license reader, Gemini Enterprise feature manager, Agent Gateway manager) ([Section 10](#10-deploying-with-terraform-optional)). Follow the same rules when you configure them yourself.
 
 **Read (always required)**
 
@@ -602,7 +602,7 @@ Antigravity token usage per user is read from the `businessaicode.googleapis.com
 
 **Deny-policy enforcement (only when `ENFORCEMENT_BACKEND=iam_deny`)**: the runtime service account gets Deny Reviewer on the organization and `roles/run.jobsExecutor` and `roles/run.viewer` on the enforcement job; only the enforcement job's service account gets Deny Admin, which writes deny policies ([8.9](#89-deny-policy-enforcement-and-the-enforcement-job)).
 
-**Linked projects (`SCAN_PROJECTS`, `scripts/deploy.sh`)**: `roles/bigquery.dataViewer`, `roles/logging.viewer`, `roles/logging.privateLogViewer`, `roles/monitoring.viewer`, `roles/aiplatform.viewer`, `roles/discoveryengine.viewer` with `CustomAiControlPlaneLicenseReader`, `roles/iam.securityReviewer`, `roles/modelarmor.viewer`, `roles/networkservices.viewer`, `roles/networksecurity.viewer` and `roles/cloudtrace.user`, plus `roles/logging.configWriter` with `ENABLE_LINKED_TELEMETRY_ROUTING=true` (the default). With `iam_deny` the enforcement job's service account gets read roles there too.
+**Linked projects (`SCAN_PROJECTS`, `scripts/deploy.sh`)**: `roles/bigquery.dataViewer`, `roles/logging.viewer`, `roles/logging.privateLogViewer`, `roles/monitoring.viewer`, `roles/aiplatform.viewer`, `roles/discoveryengine.viewer` with `CustomAiControlPlaneLicenseReader`, `roles/iam.securityReviewer`, `roles/modelarmor.viewer`, `roles/networkservices.viewer`, `roles/networksecurity.viewer` and `roles/cloudtrace.user`, plus `roles/logging.configWriter` with `ENABLE_LINKED_TELEMETRY_ROUTING=true` (the default) and `CustomAiControlPlaneGeFeatureManager` with `ENABLE_GOVERNANCE_ACTIONS=true` (the default). With `iam_deny` the enforcement job's service account gets read roles there too.
 
 **Sign-in bridge (`google` mode)**: The bridge runs as its own service account (`SERVICE_NAME-signin`, at most 23 characters of the service name). It has no project roles and can read only the session signing key.
 
@@ -1354,7 +1354,8 @@ gcloud logging sinks delete ai-control-plane-ai-logs --project "$DROPPED" --quie
 for role in roles/bigquery.dataViewer roles/logging.viewer roles/logging.privateLogViewer roles/monitoring.viewer \
     roles/aiplatform.viewer roles/discoveryengine.viewer roles/iam.securityReviewer roles/modelarmor.viewer \
     roles/networkservices.viewer roles/networksecurity.viewer roles/cloudtrace.user roles/logging.configWriter \
-    "projects/${DROPPED}/roles/CustomAiControlPlaneLicenseReader"; do
+    "projects/${DROPPED}/roles/CustomAiControlPlaneLicenseReader" \
+    "projects/${DROPPED}/roles/CustomAiControlPlaneGeFeatureManager"; do
   gcloud projects remove-iam-policy-binding "$DROPPED" --member "$SA" --role "$role" --condition=None
 done
 ```
@@ -1415,6 +1416,12 @@ gcloud iam roles create CustomAiControlPlaneLicenseReader --project "$GE" \
   --permissions discoveryengine.licenseConfigs.get,discoveryengine.licenseConfigs.list,discoveryengine.userStores.get,discoveryengine.userStores.listUserLicenses
 gcloud projects add-iam-policy-binding "$GE" --member "$SA" \
   --role "projects/${GE}/roles/CustomAiControlPlaneLicenseReader" --condition=None
+# (Optional) Also grant this role if administrators should change Gemini Enterprise feature switches in this project.
+gcloud iam roles create CustomAiControlPlaneGeFeatureManager --project "$GE" \
+  --title "AI Control Plane GE Feature Manager" --stage GA \
+  --permissions discoveryengine.engines.get,discoveryengine.engines.list,discoveryengine.engines.update
+gcloud projects add-iam-policy-binding "$GE" --member "$SA" \
+  --role "projects/${GE}/roles/CustomAiControlPlaneGeFeatureManager" --condition=None
 for role in roles/discoveryengine.viewer roles/bigquery.dataViewer roles/bigquery.jobUser roles/bigquery.user \
     roles/logging.viewer roles/logging.privateLogViewer roles/logging.configWriter roles/monitoring.viewer \
     roles/aiplatform.viewer roles/iam.securityReviewer roles/modelarmor.viewer roles/serviceusage.serviceUsageConsumer \
