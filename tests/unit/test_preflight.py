@@ -32,6 +32,21 @@ FAKE_GCLOUD = textwrap.dedent('''\
             sys.stderr.write(err)
             sys.exit(1)
         sys.exit(0)
+    if args[:2] == ["projects", "get-ancestors"]:
+        if os.environ.get("FAKE_PERIMETER"):
+            print(json.dumps([{"id": "111222333", "type": "organization"}]))
+        else:
+            print("[]")
+        sys.exit(0)
+    if args[:3] == ["access-context-manager", "policies", "list"]:
+        if os.environ.get("FAKE_PERIMETER"):
+            print(json.dumps([{"name": "accessPolicies/999"}]))
+        else:
+            print("[]")
+        sys.exit(0)
+    if args[:3] == ["access-context-manager", "perimeters", "list"]:
+        print(os.environ.get("FAKE_PERIMETER", "[]"))
+        sys.exit(0)
     if "describe" in args and "--effective" in args:
         constraint = next(a for a in args if a.startswith("constraints/"))[len("constraints/"):]
         if os.environ.get("FAKE_DENY_ALL"):
@@ -73,7 +88,7 @@ class PreflightTest(unittest.TestCase):
             set -euo pipefail
             source "%s/scripts/lib/common.sh"
             preflight_org_policies demo-project "%s" "%s"
-            echo "RESULT DRS=$ORGPOL_DRS INVOKER=$ORGPOL_REQUIRE_INVOKER_IAM BINAUTHZ=$ORGPOL_BINAUTHZ VPC=$ORGPOL_VPC_EGRESS POOL=$ORGPOL_NO_DEFAULT_POOL"
+            echo "RESULT DRS=$ORGPOL_DRS INVOKER=$ORGPOL_REQUIRE_INVOKER_IAM BINAUTHZ=$ORGPOL_BINAUTHZ VPC=$ORGPOL_VPC_EGRESS POOL=$ORGPOL_NO_DEFAULT_POOL VPCSC=$VPCSC_RESTRICTED"
         ''' % (ROOT, region, region))
         res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, check=False)
         return res.returncode, res.stdout, res.stderr
@@ -188,11 +203,45 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("BINAUTHZ=default", out)
         self.assertIn("POOL=0", out)  # a prebuilt image needs no build
 
+        rc, out, err = self.run_preflight(policies, extra_env={
+            "CLOUD_BUILD_WORKER_POOL": "projects/p/locations/asia-northeast3/workerPools/pool"}, docker=False)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("POOL=0", out)
+        self.assertIn("private pool", out)
+
     def test_vpc_service_controls_is_detected(self):
         rc, out, err = self.run_preflight({}, extra_env={
             "FAKE_STORAGE_ERROR": "ERROR: Request is prohibited by organization's policy. vpcServiceControlsUniqueIdentifier: X"})
         self.assertEqual(rc, 1)
         self.assertIn("VPC Service Controls", err)
+
+    def test_vpc_service_controls_perimeter_is_reported_and_exports_restricted_services(self):
+        perimeters = [
+            {"name": "accessPolicies/999/servicePerimeters/bridge", "perimeterType": "PERIMETER_TYPE_BRIDGE",
+             "status": {"resources": ["projects/123456789012"], "restrictedServices": ["run.googleapis.com"]}},
+            {"name": "accessPolicies/999/servicePerimeters/corp", "title": "Corp Perimeter",
+             "status": {"resources": ["projects/123456789012"],
+                        "restrictedServices": ["storage.googleapis.com", "bigquery.googleapis.com",
+                                               "aiplatform.googleapis.com", "sqladmin.googleapis.com"]}},
+        ]
+        rc, out, err = self.run_preflight({}, extra_env={
+            "PROJECT_NUMBER": "123456789012", "FAKE_PERIMETER": json.dumps(perimeters)})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("VPCSC=storage.googleapis.com,bigquery.googleapis.com,aiplatform.googleapis.com,sqladmin.googleapis.com", out)
+        self.assertIn("Corp Perimeter", out)
+        self.assertIn("storage, bigquery, aiplatform", out)
+        self.assertNotIn("sqladmin)", out)
+        self.assertIn("Cloud Storage 업로드가 필요 없습니다", out)
+
+    def test_vpc_service_controls_wildcard_restricted_services_expands(self):
+        perimeters = [{"name": "accessPolicies/999/servicePerimeters/all", "title": "All Services",
+                       "status": {"resources": ["projects/123456789012"], "restrictedServices": ["*"]}}]
+        rc, out, err = self.run_preflight({}, extra_env={
+            "PROJECT_NUMBER": "123456789012", "FAKE_PERIMETER": json.dumps(perimeters)})
+        self.assertEqual(rc, 0, err)
+        self.assertIn("storage.googleapis.com", out)
+        self.assertIn("bigquery.googleapis.com", out)
+        self.assertNotIn("VPCSC=*", out)
 
     def test_unreadable_policies_skip_with_a_hint(self):
         rc, out, err = self.run_preflight({}, extra_env={

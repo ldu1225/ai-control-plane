@@ -13,6 +13,11 @@ SRC = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
+# Script tests run scripts/deploy.sh from this checkout. With the default BUILD_SOURCE=auto, every run that builds an
+# image would ask GitHub (git ls-remote) whether the checkout is public; the uploaded source keeps them offline and
+# deterministic. The Git source has its own tests (test_scripts.BuildSourceTest, with a fake git).
+os.environ.setdefault("BUILD_SOURCE", "upload")
+
 from controlplane import config  # noqa: E402  pylint: disable=wrong-import-position
 from controlplane.cache import TTLCache  # noqa: E402  pylint: disable=wrong-import-position
 from controlplane.security import Identity  # noqa: E402  pylint: disable=wrong-import-position

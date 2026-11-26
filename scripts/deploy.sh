@@ -53,6 +53,11 @@
 #                           Gemini Enterprise locations
 #   --vpc-network NAME      Send Cloud Run egress through this VPC (needed when run.allowedVPCEgress forces it)
 #   --vpc-subnet NAME       Subnet for --vpc-network (enable Private Google Access on it)
+#   --image IMAGE           Deploy this prebuilt image and skip the build (REGION-docker.pkg.dev/PROJECT/REPO/NAME:TAG)
+#   --worker-pool POOL      Build in this Cloud Build private pool: a pool name in --region, or
+#                           projects/PROJECT/locations/REGION/workerPools/POOL (default: the default pool; the source is
+#                           fetched from the public Git repository when this is a clean checkout of it, so VPC Service
+#                           Controls perimeters that restrict Cloud Storage do not stop the build)
 #   --skip-preflight-blockers  Continue even when the organization policy preflight finds blockers
 #   --config FILE           Read settings from FILE (CLI flags override FILE values)
 #   --dry-run               Print commands that would run without changing anything
@@ -98,6 +103,8 @@ CLI_MAINTENANCE_SCHEDULE=""
 CLI_VPC_NETWORK=""
 CLI_VPC_SUBNET=""
 CLI_PREFLIGHT_STRICT=""
+CLI_IMAGE=""
+CLI_WORKER_POOL=""
 
 # Prints the comment block at the top of this file (every line after the shebang up to `set -euo pipefail`).
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; exit "${1:-0}"; }
@@ -143,6 +150,8 @@ while [[ $# -gt 0 ]]; do
     --no-prepare-linked-projects) CLI_PREPARE_LINKED="false"; shift ;;
     --vpc-network) need_arg "$@"; CLI_VPC_NETWORK="$2"; shift 2 ;;
     --vpc-subnet) need_arg "$@"; CLI_VPC_SUBNET="$2"; shift 2 ;;
+    --image) need_arg "$@"; CLI_IMAGE="$2"; shift 2 ;;
+    --worker-pool) need_arg "$@"; CLI_WORKER_POOL="$2"; shift 2 ;;
     --skip-preflight-blockers) CLI_PREFLIGHT_STRICT="false"; shift ;;
     --auto-discover-projects) CLI_SCAN_ALL="true"; shift ;;
     --no-auto-discover-projects) CLI_SCAN_ALL="false"; shift ;;
@@ -232,6 +241,8 @@ SCAN_ALL_PROJECTS="${SCAN_ALL_PROJECTS:-${AUTO_DISCOVER_PROJECTS:-}}"
 [[ -n "$CLI_MAINTENANCE_SCHEDULE" ]] && MAINTENANCE_SCHEDULE="$CLI_MAINTENANCE_SCHEDULE"
 [[ -n "$CLI_VPC_NETWORK" ]] && VPC_NETWORK="$CLI_VPC_NETWORK"
 [[ -n "$CLI_VPC_SUBNET" ]] && VPC_SUBNET="$CLI_VPC_SUBNET"
+[[ -n "$CLI_IMAGE" ]] && IMAGE="$CLI_IMAGE"
+[[ -n "$CLI_WORKER_POOL" ]] && CLOUD_BUILD_WORKER_POOL="$CLI_WORKER_POOL"
 [[ -n "$CLI_PREFLIGHT_STRICT" ]] && PREFLIGHT_STRICT="$CLI_PREFLIGHT_STRICT"
 # "none" is an explicit empty list (--link-projects none, --viewers none): it clears what deploy.env or the installer's
 # snapshot holds, where an empty flag value would be refused as a likely mistake.
@@ -334,6 +345,9 @@ TELEMETRY_DATASET="$(trim_ws "${TELEMETRY_DATASET:-}")"
 AI_DEFAULT_MODEL="${AI_DEFAULT_MODEL:-}"
 AI_LOCATION="${AI_LOCATION:-}"
 IMAGE="$(trim_ws "${IMAGE:-}")"
+# Where Cloud Build reads the image source: auto | git | upload (step 4 explains them) and an optional private pool.
+BUILD_SOURCE="$(trim_ws "${BUILD_SOURCE:-auto}" | tr '[:upper:]' '[:lower:]')"
+CLOUD_BUILD_WORKER_POOL="$(trim_ws "${CLOUD_BUILD_WORKER_POOL:-}")"
 AR_REPOSITORY="$(trim_ws "${AR_REPOSITORY:-ai-control-plane}")"
 SERVICE_ACCOUNT_ID="$(trim_ws "${SERVICE_ACCOUNT_ID:-${SERVICE_NAME:0:27}-sa}")"
 SETTINGS_BUCKET="$(trim_ws "${SETTINGS_BUCKET:-}")"
@@ -445,6 +459,19 @@ fi
 DISCOVERY_ENGINE_LOCATIONS="$(printf '%s' "$DISCOVERY_ENGINE_LOCATIONS" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
 [[ -z "$DISCOVERY_ENGINE_LOCATIONS" || "$DISCOVERY_ENGINE_LOCATIONS" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]] \
   || die "DISCOVERY_ENGINE_LOCATIONS must be a comma-separated list such as global,us (or empty to detect)"
+case "$BUILD_SOURCE" in
+  auto|git|upload) ;;
+  *) die "BUILD_SOURCE must be auto, git or upload" ;;
+esac
+# A private pool runs builds in its own region: a bare pool name means a pool of this project in REGION.
+POOL_REGION=""
+if [[ -n "$CLOUD_BUILD_WORKER_POOL" ]]; then
+  [[ "$CLOUD_BUILD_WORKER_POOL" == */* ]] \
+    || CLOUD_BUILD_WORKER_POOL="projects/${PROJECT_ID}/locations/${REGION}/workerPools/${CLOUD_BUILD_WORKER_POOL}"
+  [[ "$CLOUD_BUILD_WORKER_POOL" =~ ^projects/[a-z0-9.:-]+/locations/([a-z0-9-]+)/workerPools/[a-z0-9-]+$ ]] \
+    || die "CLOUD_BUILD_WORKER_POOL (--worker-pool) must be a private pool name or projects/PROJECT/locations/REGION/workerPools/POOL"
+  POOL_REGION="${BASH_REMATCH[1]}"
+fi
 
 # Keep this list in sync with MODULE_IDS in src/controlplane/config.py (checked by the unit tests).
 MODULE_IDS=(overview gemini_enterprise notebooklm model_usage agent_gateway agent_registry agent_deployments
@@ -536,6 +563,10 @@ fi
 VPC_NETWORK="$(trim_ws "${VPC_NETWORK:-}")"; VPC_SUBNET="$(trim_ws "${VPC_SUBNET:-}")"
 [[ -z "$VPC_NETWORK" || -n "$VPC_SUBNET" ]] || die "--vpc-network needs --vpc-subnet"
 preflight_org_policies "$PROJECT_ID" "$REGION" "$DATASET_LOCATION"
+# A perimeter that restricts Cloud Storage refuses Cloud Build's default pool an uploaded source archive (step 4).
+VPCSC_STORAGE=0
+[[ ",${VPCSC_RESTRICTED}," == *",storage.googleapis.com,"* ]] && VPCSC_STORAGE=1
+BUILD_VPCSC=0; BUILD_USED=""; BUILD_GIT_URL=""; BUILD_GIT_SHA=""; BUILD_GIT_WHY=""
 if [[ "$ORGPOL_DRS" == "1" ]]; then
   BRIDGE_MEMBERS="$(printf '%s' "$BRIDGE_MEMBERS" | tr ',' '\n' | grep -viE '^ *(allusers|allauthenticatedusers) *$' | paste -sd, - || true)"
 fi
@@ -872,6 +903,107 @@ if [[ -n "$SCAN_PROJECTS" ]]; then
 fi
 
 # ------------------------------------------------------------------------------- 4. image
+# write_build_config FILE SOURCE: the Cloud Build config of the image. With SOURCE git the build first fetches
+# BUILD_GIT_SHA from BUILD_GIT_URL (git_build_source vetted both: an https URL without credentials and a 40-hex commit),
+# so nothing is uploaded; with SOURCE upload Cloud Build unpacks the archive staged in the settings bucket.
+write_build_config() {
+  local dir=""
+  {
+    echo "steps:"
+    if [[ "$2" == "git" ]]; then
+      dir="  dir: 'src'"
+      echo "- name: 'gcr.io/cloud-builders/git'"
+      echo "  args: ['init', '-q', 'src']"
+      echo "- name: 'gcr.io/cloud-builders/git'"
+      echo "$dir"
+      echo "  args: ['remote', 'add', 'origin', '${BUILD_GIT_URL}']"
+      echo "- name: 'gcr.io/cloud-builders/git'"
+      echo "$dir"
+      echo "  args: ['fetch', '-q', '--depth', '1', 'origin', '${BUILD_GIT_SHA}']"
+      echo "- name: 'gcr.io/cloud-builders/git'"
+      echo "$dir"
+      echo "  args: ['checkout', '-q', 'FETCH_HEAD']"
+    fi
+    echo "- name: 'gcr.io/cloud-builders/docker'"
+    if [[ -n "$dir" ]]; then echo "$dir"; fi
+    echo "  args: ['build', '-t', '${IMAGE}', '.']"
+    echo "images:"
+    echo "- '${IMAGE}'"
+    echo "serviceAccount: 'projects/${PROJECT_ID}/serviceAccounts/${BUILD_SA}'"
+    echo "options:"
+    echo "  logging: CLOUD_LOGGING_ONLY"
+  } >"$1"
+}
+
+# cloud_build SOURCE SCOPE: one Cloud Build run of the image (SOURCE git | upload; SCOPE regional | global | pool). Its
+# output goes to the terminal and to $BUILD_LOG. IAM/API propagation errors of fresh projects are retried; a VPC Service
+# Controls denial is not (the perimeter answers the same way every time) and sets BUILD_VPCSC=1.
+cloud_build() {
+  local source="$1" scope="$2" cfg="${CB_DIR}/cloudbuild-${1}.yaml" out="${CB_DIR}/attempt.log" attempt id region=""
+  local -a args=()
+  write_build_config "$cfg" "$source"
+  if [[ "$source" == "git" ]]; then
+    args=(--no-source)
+  else
+    args=("$ROOT" --gcs-source-staging-dir "gs://${SETTINGS_BUCKET}/_build/source")
+    if [[ "$BUILD_UPLOADED" != "1" ]]; then
+      # The build service account reads the uploaded archive: bucket access only while builds run (removed below).
+      retry gcloud storage buckets add-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
+        --member "serviceAccount:${BUILD_SA}" --role roles/storage.objectAdmin >/dev/null || true
+      BUILD_UPLOADED=1
+    fi
+  fi
+  case "$scope" in
+    regional) region="$REGION" ;;
+    pool) region="$POOL_REGION"; args+=(--worker-pool "$CLOUD_BUILD_WORKER_POOL") ;;
+  esac
+  [[ -z "$region" ]] || args+=(--region "$region")
+  for attempt in 1 2 3; do
+    if gcloud builds submit "${args[@]}" --project "$PROJECT_ID" --config "$cfg" 2>&1 | tee "$out"; then
+      cat "$out" >>"$BUILD_LOG"
+      return 0
+    fi
+    # The build's own failure reason names a VPC Service Controls denial even when the streamed log does not.
+    id="$(grep -Eo 'builds/[0-9a-f-]{36}' "$out" | tail -n 1 | cut -d/ -f2 || true)"
+    if [[ -n "$id" ]]; then
+      gcloud builds describe "$id" --project "$PROJECT_ID" ${region:+--region "$region"} \
+        --format='value(status,failureInfo.type,failureInfo.detail,statusDetail)' >>"$out" 2>&1 || true
+    fi
+    cat "$out" >>"$BUILD_LOG"
+    if is_vpcsc_denial "$out"; then
+      BUILD_VPCSC=1
+      return 1
+    fi
+    if [[ $attempt -lt 3 ]] && grep -Eiq 'PERMISSION_DENIED|AccessDenied|denied|unauthorized|403|NOT_FOUND|does not exist|serviceAccount|actAs|propagation|UNAVAILABLE|DEADLINE_EXCEEDED' "$out"; then
+      warn "Cloud Build attempt ${attempt}/3 hit IAM/API propagation; retrying in 12s..."
+      sleep 12
+    else
+      return 1
+    fi
+  done
+  return 1
+}
+
+# vpcsc_build_help: a VPC Service Controls perimeter stopped the image build. Lists the ways out that need no change to
+# this script, with the exact ingress rule for the build service account.
+vpcsc_build_help() {
+  local -a svcs=(storage.googleapis.com)
+  [[ ",${VPCSC_RESTRICTED}," != *",artifactregistry.googleapis.com,"* ]] || svcs+=(artifactregistry.googleapis.com)
+  warn "VPC Service Controls stopped the image build: Cloud Build's default pool runs outside the service perimeter of ${PROJECT_ID}. Any one of these works; then run the same command again:"
+  if [[ -n "$BUILD_GIT_URL" ]]; then
+    warn "  (the build already fetched its source from ${BUILD_GIT_URL}, so the perimeter also restricts Cloud Build or Artifact Registry)"
+  else
+    warn "  - Run the installer from a clean checkout of the public repository, as bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) does: Cloud Build then fetches the source from Git and needs no Cloud Storage access.${BUILD_GIT_WHY:+ This run could not use Git: ${BUILD_GIT_WHY}.}"
+  fi
+  warn "  - A perimeter administrator admits the build service account with this ingress rule (console: Security > VPC Service Controls > perimeter > Edit > Ingress policy > Add rule):"
+  vpcsc_print_rule "serviceAccount:${BUILD_SA}" "$PROJECT_NUMBER" "${svcs[@]}"
+  warn "  - Build in a Cloud Build private pool inside the perimeter: --worker-pool projects/${PROJECT_ID}/locations/${REGION}/workerPools/POOL"
+  warn "  - Build and push the image on a machine with Docker and internet access, then deploy it with --image:"
+  warn "      docker build --platform linux/amd64 -t ${IMAGE} . && docker push ${IMAGE}"
+  warn "      scripts/install.sh --project ${PROJECT_ID} --image ${IMAGE}"
+  warn "[한국어 안내] VPC 서비스 제어 경계 때문에 이미지 빌드가 막혔습니다(Cloud Build 기본 풀은 경계 밖에서 실행됩니다). 위 방법 중 하나를 적용한 뒤 같은 명령을 다시 실행하세요: 공개 저장소의 깨끗한 체크아웃에서 실행(설치 명령 bash <(curl ...) 이 그렇게 합니다), 빌드 서비스 계정 인그레스 규칙 추가, --worker-pool 로 경계 안 private pool 사용, Docker 로 직접 빌드·push 후 --image 지정."
+}
+
 log "4/8 Container image"
 if [[ -z "$IMAGE" ]]; then
   if ! gcloud artifacts repositories describe "$AR_REPOSITORY" --location "$REGION" --project "$PROJECT_ID" >/dev/null 2>&1; then
@@ -897,61 +1029,89 @@ if [[ -z "$IMAGE" ]]; then
   run gcloud iam service-accounts add-iam-policy-binding "$BUILD_SA" --project "$PROJECT_ID" \
     --member "serviceAccount:${CB_SERVICE_AGENT}" --role roles/iam.serviceAccountTokenCreator \
     --condition=None --quiet >/dev/null 2>&1 || true
-  run retry gcloud storage buckets add-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
-    --member "serviceAccount:${BUILD_SA}" --role roles/storage.objectAdmin >/dev/null
+
+  # Where Cloud Build reads the source (BUILD_SOURCE). git: the build fetches this checkout's exact commit from its
+  # public Git repository, so nothing is uploaded and the build service account needs no bucket access. Cloud Build's
+  # default pool runs outside VPC Service Controls perimeters, and a perimeter that restricts storage.googleapis.com
+  # refuses it an uploaded archive unless an ingress rule admits the build service account: git is what works there
+  # as is. upload: the source is staged in the settings bucket (the way for local changes, and for private pools, which
+  # read it inside the perimeter but often have no internet). auto: git for a clean checkout of a public repository
+  # (the installer's checkout is one), then upload if the Git build fails for another reason.
+  if [[ "$BUILD_SOURCE" == "upload" ]]; then
+    BUILD_GIT_WHY="BUILD_SOURCE=upload"
+  elif [[ "$BUILD_SOURCE" == "auto" && -n "$CLOUD_BUILD_WORKER_POOL" ]]; then
+    BUILD_GIT_WHY="a private pool reads the uploaded source unless BUILD_SOURCE=git"
+  else
+    _git_src="$(git_build_source "$ROOT" 2>"$GCLOUD_ERR" || true)"
+    if [[ "$_git_src" == "https://"*" "* ]]; then
+      BUILD_GIT_URL="${_git_src%% *}"
+      BUILD_GIT_SHA="${_git_src##* }"
+    else
+      BUILD_GIT_WHY="$(tail -n 1 "$GCLOUD_ERR" 2>/dev/null || true)"
+      [[ -n "$BUILD_GIT_WHY" ]] || BUILD_GIT_WHY="this checkout cannot be fetched from Git"
+      [[ "$BUILD_SOURCE" != "git" ]] || die "BUILD_SOURCE=git, but Cloud Build cannot fetch this checkout: ${BUILD_GIT_WHY}"
+    fi
+  fi
+  BUILD_PLAN=()   # SOURCE:SCOPE pairs, tried in order
+  if [[ -n "$CLOUD_BUILD_WORKER_POOL" ]]; then
+    if [[ -n "$BUILD_GIT_URL" ]]; then BUILD_PLAN+=("git:pool"); else BUILD_PLAN+=("upload:pool"); fi
+  elif [[ "$ORGPOL_NO_DEFAULT_POOL" != "1" ]]; then
+    if [[ -n "$BUILD_GIT_URL" ]]; then BUILD_PLAN+=("git:regional"); fi
+    # Behind a perimeter that restricts Cloud Storage the uploaded archive passes only when an ingress rule admits the
+    # build service account; a refusal stops the build with that rule (vpcsc_build_help).
+    if [[ "$BUILD_SOURCE" != "git" ]]; then BUILD_PLAN+=("upload:regional"); fi
+  fi
+  if [[ -n "$BUILD_GIT_URL" ]]; then
+    info "build source: ${BUILD_GIT_URL} @ ${BUILD_GIT_SHA:0:12}, fetched by Cloud Build (nothing is uploaded to Cloud Storage)"
+  elif [[ ${#BUILD_PLAN[@]} -gt 0 ]]; then
+    info "build source: this folder, uploaded to gs://${SETTINGS_BUCKET}/_build (Git source not used: ${BUILD_GIT_WHY})"
+  fi
+  if [[ -n "$CLOUD_BUILD_WORKER_POOL" ]]; then info "Cloud Build private pool: ${CLOUD_BUILD_WORKER_POOL}"; fi
+  if [[ -z "$BUILD_GIT_URL" && -z "$CLOUD_BUILD_WORKER_POOL" && ${#BUILD_PLAN[@]} -gt 0 && "$VPCSC_STORAGE" == "1" ]]; then
+    warn "the VPC Service Controls perimeter restricts Cloud Storage: Cloud Build's default pool reads the uploaded source only when an ingress rule admits ${BUILD_SA}"
+  fi
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    info "[dry-run] gcloud builds submit ${ROOT} --region ${REGION} --service-account ${BUILD_SA} -> ${IMAGE}"
+    for _step in ${BUILD_PLAN[@]+"${BUILD_PLAN[@]}"}; do
+      info "[dry-run] gcloud builds submit (${_step%%:*} source, ${_step##*:}) as ${BUILD_SA} -> ${IMAGE}"
+    done
+    [[ ${#BUILD_PLAN[@]} -gt 0 ]] || info "[dry-run] build ${IMAGE} with local Docker and push it to Artifact Registry"
   else
     CB_DIR="$(mktemp -d)"
-    CB_CONFIG="${CB_DIR}/cloudbuild.yaml"
     BUILD_LOG="${CB_DIR}/build.log"
-    cat >"$CB_CONFIG" <<EOF
-steps:
-- name: 'gcr.io/cloud-builders/docker'
-  args: ['build', '-t', '${IMAGE}', '.']
-images:
-- '${IMAGE}'
-serviceAccount: 'projects/${PROJECT_ID}/serviceAccounts/${BUILD_SA}'
-options:
-  logging: CLOUD_LOGGING_ONLY
-EOF
+    : >"$BUILD_LOG"
     BUILD_OK=0
-    [[ "$ORGPOL_NO_DEFAULT_POOL" == "1" ]] && : >"$BUILD_LOG"
-    for build_attempt in 1 2 3; do
-      [[ "$ORGPOL_NO_DEFAULT_POOL" == "1" ]] && break
-      if gcloud builds submit "$ROOT" \
-          --project "$PROJECT_ID" \
-          --region "$REGION" \
-          --config "$CB_CONFIG" \
-          --gcs-source-staging-dir "gs://${SETTINGS_BUCKET}/_build/source" \
-          2>&1 | tee "$BUILD_LOG"; then
+    BUILD_UPLOADED=0
+    for _step in ${BUILD_PLAN[@]+"${BUILD_PLAN[@]}"}; do
+      if cloud_build "${_step%%:*}" "${_step##*:}"; then
         BUILD_OK=1
+        BUILD_USED="Cloud Build, ${_step%%:*} source"
         break
       fi
-      if [[ $build_attempt -lt 3 ]] && grep -Eiq 'PERMISSION_DENIED|AccessDenied|denied|unauthorized|403|NOT_FOUND|does not exist|serviceAccount|actAs|propagation|UNAVAILABLE|DEADLINE_EXCEEDED' "$BUILD_LOG"; then
-        warn "Cloud Build attempt ${build_attempt}/3 hit IAM/API propagation; retrying in 12s..."
-        sleep 12
-      else
+      if [[ "$BUILD_VPCSC" == "1" ]]; then
+        # Every other run on the default pool meets the same perimeter.
+        warn "VPC Service Controls refused this Cloud Build run (${_step%%:*} source)"
         break
       fi
     done
 
-    # Tier 2 fallback: if regional worker pool quota is 0 or unavailable (and not restricted by resourceLocations), try global Cloud Build.
-    if [[ "$BUILD_OK" != "1" && "$ORGPOL_NO_DEFAULT_POOL" != "1" ]] && ! grep -Eiq 'resourceLocations' "$BUILD_LOG"; then
+    # Tier 2 fallback: regional Cloud Build can be unavailable (quota 0, region not served); retry once without --region
+    # unless VPC Service Controls or resource locations decided the outcome.
+    if [[ "$BUILD_OK" != "1" && "$BUILD_VPCSC" != "1" && -z "$CLOUD_BUILD_WORKER_POOL" && ${#BUILD_PLAN[@]} -gt 0 ]] \
+        && ! grep -Eiq 'resourceLocations' "$BUILD_LOG"; then
       warn "regional Cloud Build (${REGION}) did not succeed; retrying with global Cloud Build..."
-      if gcloud builds submit "$ROOT" \
-          --project "$PROJECT_ID" \
-          --config "$CB_CONFIG" \
-          --gcs-source-staging-dir "gs://${SETTINGS_BUCKET}/_build/source" \
-          2>&1 | tee -a "$BUILD_LOG"; then
+      _first="${BUILD_PLAN[0]}"
+      if cloud_build "${_first%%:*}" global; then
         BUILD_OK=1
+        BUILD_USED="Cloud Build, ${_first%%:*} source, global"
       fi
     fi
 
-    gcloud storage rm --recursive "gs://${SETTINGS_BUCKET}/_build/**" --project "$PROJECT_ID" >/dev/null 2>&1 || true
-    gcloud storage buckets remove-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
-      --member "serviceAccount:${BUILD_SA}" --role roles/storage.objectAdmin >/dev/null 2>&1 || true
+    if [[ "$BUILD_UPLOADED" == "1" ]]; then
+      gcloud storage rm --recursive "gs://${SETTINGS_BUCKET}/_build/**" --project "$PROJECT_ID" >/dev/null 2>&1 || true
+      gcloud storage buckets remove-iam-policy-binding "gs://${SETTINGS_BUCKET}" \
+        --member "serviceAccount:${BUILD_SA}" --role roles/storage.objectAdmin >/dev/null 2>&1 || true
+    fi
 
     # Tier 3 fallback: Cloud Shell and workstations with Docker build & push directly to Artifact Registry.
     if [[ "$BUILD_OK" != "1" ]]; then
@@ -971,12 +1131,16 @@ EOF
         fi
         if [[ "$DOCKER_BUILT" == "1" ]] && docker push "$IMAGE"; then
           BUILD_OK=1
+          BUILD_USED="local Docker"
         fi
       fi
     fi
     if [[ "$BUILD_OK" != "1" ]]; then
       BUILD_TAIL="$(tail -n 20 "$BUILD_LOG" 2>/dev/null || true)"
       rm -rf "$CB_DIR"
+      if [[ "$BUILD_VPCSC" == "1" || "$VPCSC_STORAGE" == "1" ]]; then
+        vpcsc_build_help
+      fi
       die "container image build failed for ${PROJECT_ID} (as ${ACCOUNT}):
 ${BUILD_TAIL}"
     fi
@@ -984,6 +1148,7 @@ ${BUILD_TAIL}"
   fi
 else
   info "using prebuilt image ${IMAGE}"
+  BUILD_USED="prebuilt"
 fi
 
 # ------------------------------------------------------------------------------- 5. secrets
@@ -1632,6 +1797,11 @@ PYPROBE
       info "triggered initial maintenance (${MAINT_JOB}: official pricing sync + telemetry discovery)"
     fi
   fi
+  # VPC Service Controls can refuse the dashboard's own calls too (settings in Cloud Storage, BigQuery, Gemini
+  # Enterprise, Agent Platform). Inside a known perimeter, wait for the audit logs of its first requests.
+  VPCSC_WAIT=0
+  [[ -n "$VPCSC_RESTRICTED" || "$BUILD_VPCSC" == "1" ]] && VPCSC_WAIT=120
+  vpcsc_runtime_check "$PROJECT_ID" "$PROJECT_NUMBER" "$SA_EMAIL" "$VPCSC_WAIT"
 fi
 
 log "Deployment complete: ${PROJECT_ID}"
@@ -1661,7 +1831,7 @@ fi
 info "Audit dataset : ${PROJECT_ID}:${AUDIT_DATASET} (${AUDIT_DATASET_DISPLAY_LOC}, Data Access=${ENABLE_DATA_ACCESS_LOGS}, GE Prompt Logging=${GE_PROMPT_LOGGING})"
 [[ -n "$NORMALIZED_SCAN_PROJECTS" ]] && info "Linked scan   : ${NORMALIZED_SCAN_PROJECTS}"
 info "Settings store: gs://${SETTINGS_BUCKET}"
-info "Container     : ${IMAGE}"
+info "Container     : ${IMAGE}${BUILD_USED:+ (${BUILD_USED})}"
 # A hub without Gemini Enterprise and no linked project usually means Gemini Enterprise runs in another project the
 # runtime service account cannot read (its pages stay empty). Advice only: never fails the deployment, and a dry run
 # only reuses the detection above (no extra lookup).

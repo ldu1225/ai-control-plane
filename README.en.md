@@ -523,7 +523,9 @@ You can also enter or update the billing values after deployment in **Settings >
 | `AI_LOCATION` | Empty (detected) | Location of the Agent Platform model endpoint. When empty, `global`, or `REGION` when `global` does not answer |
 | `TELEMETRY_AI_MODEL` | Empty (`gemini-4-argon`) | Gemini model that describes and groups telemetry sources |
 | `TELEMETRY_DATASET` | Empty (`telemetry_routed`) | BigQuery dataset of telemetry routes (in `DATASET_LOCATION`) |
-| `IMAGE` | Empty | Prebuilt image. If empty, the image is built with Cloud Build (local Docker fallback) |
+| `IMAGE` | Empty | Prebuilt image (`--image`, for one run only). If empty, the image is built with Cloud Build (local Docker fallback) |
+| `BUILD_SOURCE` | `auto` | Where Cloud Build reads the source: `git` (Cloud Build fetches this checkout's commit from its public Git repository without uploading to Cloud Storage — passes VPC-SC perimeters that restrict Storage), `upload` (stages this folder in the settings bucket), `auto` (`git` for a clean clone of a public repository, `upload` for local changes or private pools) |
+| `CLOUD_BUILD_WORKER_POOL` | Empty (default pool) | Cloud Build private pool for the image build (`--worker-pool`, `projects/P/locations/R/workerPools/NAME` or a pool name in `REGION`) |
 | `MEMORY`, `CPU` | `1Gi`, `1` | Cloud Run resources (the enforcement job uses the same values) |
 | `MIN_INSTANCES`, `MAX_INSTANCES` | `0`, `3` | Number of instances. With 0, instances stop when there are no requests and run briefly only for scheduled calls ([Section 13](#13-costs)). |
 | `AR_REPOSITORY` | `ai-control-plane` | Artifact Registry repository name |
@@ -1555,11 +1557,17 @@ Before creating anything (step 0/8), `deploy.sh` and `install.sh` read the proje
 | `run.allowedBinaryAuthorizationPolicies` | Automatic: deploys with `--binary-authorization=<policy>` | If the policy rejects the image, ask security for an exception |
 | `gcp.restrictNonCmekServices` | **Stops** (CMEK is not supported) | Ask for an exception for this project |
 | `serviceuser.services` | Required APIs (Run, Artifact Registry, Storage, Secret Manager, BigQuery, Logging, IAM) denied: **stops**; other APIs: warns and only those pages lose data | Ask for the APIs to be allowed |
-| `cloudbuild.allowedWorkerPools` | Automatic: builds with Docker in Cloud Shell instead of Cloud Build (**stops** without Docker) | Run from Cloud Shell |
+| `cloudbuild.allowedWorkerPools` | Uses `--worker-pool` if given, else Docker in Cloud Shell (**stops** if neither is available) | Pass `--worker-pool` or `--image`, or run from a machine with Docker (Cloud Shell) |
 | `storage.publicAccessPrevention`, `storage.uniformBucketLevelAccess`, `iam.disableServiceAccountKeyCreation`, `iam.automaticIamGrantsForDefaultServiceAccounts` | Already compliant | None |
-| VPC Service Controls perimeter | **Stops** | Add an ingress rule (or access level) for the deploying account, or run inside the perimeter |
+| VPC Service Controls perimeter (installer blocked) | **Stops** | Add an ingress rule (or access level) for the deploying account, or run inside the perimeter |
+| VPC Service Controls perimeter (installer admitted) | **Automatic**: builds from public Git without uploading to Cloud Storage for a clean checkout, and inspects Policy Denied audit logs after deploy to print any ingress rule the dashboard needs | Add the printed runtime service account ingress rule if denials are reported (see below) |
 
 Use `--skip-preflight-blockers` only when you are sure a finding is wrong.
+
+**Installing into a project inside a VPC Service Controls perimeter**
+
+1. **Container image build**: Cloud Build's default pool runs outside VPC Service Controls perimeters, so when the perimeter restricts Cloud Storage (`storage.googleapis.com`), uploading a source archive to the settings bucket is refused. On a clean checkout of the public repository (as `install.sh` creates), the default `BUILD_SOURCE=auto` has Cloud Build fetch the exact commit directly from Git with no Cloud Storage upload, so no ingress exception for the build service account (`ai-control-plane-build`) is needed. If the perimeter also restricts Cloud Build or Artifact Registry, or you are building local changes, use `--worker-pool` (a private pool inside the perimeter), `--image` (an image built and pushed with Docker), or the build service account ingress rule printed by the script.
+2. **Dashboard runtime calls**: Cloud Run without VPC egress can be treated as outside the perimeter when calling restricted APIs (Cloud Storage settings bucket, BigQuery, Discovery Engine, Agent Platform). At the end of deployment, the script checks `cloudaudit.googleapis.com/policy` audit logs for denials of the runtime service account (`ai-control-plane-sa@PROJECT_ID.iam.gserviceaccount.com`) and, if any occur, prints a single **ingress rule YAML** covering every restricted service the dashboard calls. Once a perimeter administrator adds that rule in the console (**Security > VPC Service Controls > perimeter > Edit > Ingress policy > Add rule**), the dashboard starts working without redeployment (perimeter propagation takes up to 30 minutes). Because `gcloud ... perimeters update --set-ingress-policies` replaces the entire rule list, include existing rules when updating via CLI.
 
 ### 14.5 When Gemini Enterprise lives in another project
 

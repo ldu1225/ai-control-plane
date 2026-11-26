@@ -1162,23 +1162,27 @@ preflight_caller_permissions() {
 # preflight_org_policies PROJECT REGION DATASET_LOCATION
 # Reads the effective organization policies that decide whether this deployment can work (resource locations, domain
 # restricted sharing, Cloud Run ingress / VPC egress / Binary Authorization / invoker IAM, CMEK, restricted services,
-# Cloud Build worker pools) and probes for VPC Service Controls, before anything is created. Prints one line per
-# finding and sets ORGPOL_* variables that later steps use to adapt automatically:
+# Cloud Build worker pools) and the VPC Service Controls perimeter around the project, before anything is created.
+# Prints one line per finding and sets variables that later steps use to adapt automatically:
 #   ORGPOL_DRS=1                  domain restricted sharing: no allUsers / allAuthenticatedUsers bindings
 #   ORGPOL_REQUIRE_INVOKER_IAM=1  Cloud Run must keep the invoker IAM check (no --no-invoker-iam-check)
 #   ORGPOL_BINAUTHZ=<policy>      Cloud Run revisions must name a Binary Authorization policy
 #   ORGPOL_VPC_EGRESS=1           Cloud Run revisions must send all egress through a VPC (needs VPC_NETWORK/VPC_SUBNET)
-#   ORGPOL_NO_DEFAULT_POOL=1      Cloud Build default pool not allowed: build locally with Docker
+#   ORGPOL_NO_DEFAULT_POOL=1      Cloud Build default pool not allowed (and no CLOUD_BUILD_WORKER_POOL): build with Docker
+#   VPCSC_RESTRICTED=a,b          services restricted by the VPC Service Controls perimeter that holds the project (read
+#                                 with Access Context Manager when this account may; empty when unknown or none)
 # Real blockers (location not allowed, no public ingress, CMEK required, required API denied, VPC-SC perimeter, VPC
 # egress without a VPC) stop the run with remediation unless PREFLIGHT_STRICT=false.
 preflight_org_policies() {
   local project="$1" region="$2" dslocation="${3:-$2}" out rc=0
   ORGPOL_DRS=0; ORGPOL_REQUIRE_INVOKER_IAM=0; ORGPOL_BINAUTHZ=""; ORGPOL_VPC_EGRESS=0; ORGPOL_NO_DEFAULT_POOL=0
+  VPCSC_RESTRICTED=""
   log "0/8 Organization policy preflight (조직 정책 사전 점검: ${project})"
   [[ "${DRY_RUN:-0}" == "1" ]] || gcloud services enable cloudresourcemanager.googleapis.com orgpolicy.googleapis.com \
-    --project "$project" --quiet >/dev/null 2>&1 || true
+    accesscontextmanager.googleapis.com --project "$project" --quiet >/dev/null 2>&1 || true
   out="$(ACP_PF_PROJECT="$project" ACP_PF_REGION="$region" ACP_PF_DSLOC="$dslocation" \
     ACP_PF_VPC_NETWORK="${VPC_NETWORK:-}" ACP_PF_VPC_SUBNET="${VPC_SUBNET:-}" ACP_PF_IMAGE="${IMAGE:-}" \
+    ACP_PF_WORKER_POOL="${CLOUD_BUILD_WORKER_POOL:-}" ACP_PF_PROJECT_NUMBER="${PROJECT_NUMBER:-}" \
     python3 - <<'PYORG'
 import concurrent.futures as cf
 import json
@@ -1192,6 +1196,8 @@ region = os.environ["ACP_PF_REGION"].lower()
 dsloc = (os.environ.get("ACP_PF_DSLOC") or region).lower()
 has_vpc = bool(os.environ.get("ACP_PF_VPC_NETWORK") and os.environ.get("ACP_PF_VPC_SUBNET"))
 prebuilt = bool(os.environ.get("ACP_PF_IMAGE"))
+worker_pool = os.environ.get("ACP_PF_WORKER_POOL") or ""
+project_number = os.environ.get("ACP_PF_PROJECT_NUMBER") or ""
 LEGACY = ["gcp.resourceLocations", "iam.allowedPolicyMemberDomains", "run.allowedIngress", "run.allowedVPCEgress",
           "run.allowedBinaryAuthorizationPolicies", "gcp.restrictNonCmekServices", "serviceuser.services",
           "cloudbuild.allowedWorkerPools", "storage.publicAccessPrevention", "storage.uniformBucketLevelAccess",
@@ -1211,6 +1217,14 @@ OPTIONAL_APIS = {"cloudbuild.googleapis.com": "Cloud Build (로컬 Docker 빌드
 CMEK_SERVICES = {"storage.googleapis.com", "bigquery.googleapis.com", "secretmanager.googleapis.com",
                  "artifactregistry.googleapis.com", "run.googleapis.com", "logging.googleapis.com",
                  "cloudbuild.googleapis.com"}
+# Services this deployment uses that a VPC Service Controls perimeter can restrict: the build (Cloud Build, Artifact
+# Registry, Cloud Storage for an uploaded source) and the runtime calls of the dashboard.
+VPCSC_SERVICES = ["storage.googleapis.com", "bigquery.googleapis.com", "discoveryengine.googleapis.com",
+                  "aiplatform.googleapis.com", "cloudbuild.googleapis.com", "artifactregistry.googleapis.com",
+                  "run.googleapis.com", "secretmanager.googleapis.com", "logging.googleapis.com",
+                  "monitoring.googleapis.com", "modelarmor.googleapis.com", "agentregistry.googleapis.com",
+                  "businessaicode.googleapis.com", "cloudscheduler.googleapis.com", "pubsub.googleapis.com",
+                  "iap.googleapis.com", "iam.googleapis.com", "cloudresourcemanager.googleapis.com"]
 
 
 def gcloud(args):
@@ -1232,9 +1246,65 @@ def fetch(kind, name):
         return name, None, so
 
 
+def json_list(text):
+    try:
+        data = json.loads(text[text.index("["):])
+    except ValueError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def acm(args):
+    """gcloud access-context-manager ARGS. The API needs a quota project that has it enabled: the target project
+    first (the preflight enables the API there), then the default project of gcloud."""
+    rc, so, se = gcloud(["access-context-manager"] + args + ["--format=json", "--quiet", "--billing-project", project])
+    if rc != 0:
+        rc, so, se = gcloud(["access-context-manager"] + args + ["--format=json", "--quiet"])
+    return rc, so, se
+
+
+def vpcsc_perimeter():
+    """(title, restricted services) of the regular service perimeter that holds this project, or None when there is
+    none or Access Context Manager cannot be read (roles/accesscontextmanager.policyReader on the organization)."""
+    if not project_number.isdigit():
+        return None
+    rc, so, _ = gcloud(["projects", "get-ancestors", project, "--format=json"])
+    org = next((str(a.get("id")) for a in json_list(so) if isinstance(a, dict) and a.get("type") == "organization"),
+               "") if rc == 0 else ""
+    if not org:
+        return None
+    rc, so, _ = acm(["policies", "list", "--organization", org])
+    if rc != 0:
+        return None
+    member = "projects/" + project_number
+    for pol in json_list(so):
+        pid = str((pol or {}).get("name", "")).rsplit("/", 1)[-1] if isinstance(pol, dict) else ""
+        if not pid:
+            continue
+        rc, so, _ = acm(["perimeters", "list", "--policy", pid])
+        if rc != 0:
+            continue
+        for per in json_list(so):
+            if not isinstance(per, dict) or per.get("perimeterType") == "PERIMETER_TYPE_BRIDGE":
+                continue
+            status = per.get("status") or {}
+            if member in (status.get("resources") or []):
+                name = per.get("title") or str(per.get("name", "")).rsplit("/", 1)[-1]
+                restricted = [str(s) for s in (status.get("restrictedServices") or [])]
+                if "*" in restricted:
+                    restricted = sorted(set(restricted + VPCSC_SERVICES) - {"*"})
+                return name, restricted
+    return None
+
+
 with cf.ThreadPoolExecutor(max_workers=8) as pool:
+    perimeter_future = pool.submit(vpcsc_perimeter)
     lres = {n: (p, e) for n, p, e in pool.map(lambda n: fetch("legacy", n), LEGACY)}
     mres = {n: (p, e) for n, p, e in pool.map(lambda n: fetch("managed", n), MANAGED)}
+    try:
+        perimeter = perimeter_future.result()
+    except Exception:  # pylint: disable=broad-except
+        perimeter = None
 
 lines, blockers, sets = [], [], {}
 if all(p is None for p, _ in lres.values()):
@@ -1416,14 +1486,18 @@ if allowed or denied:
 # 9. Cloud Build worker pools
 allowed, denied, allv = listed(lp("cloudbuild.allowedWorkerPools"))
 if (allowed or allv == "DENY") and not prebuilt:
-    sets["ORGPOL_NO_DEFAULT_POOL"] = "1"
-    docker = shutil.which("docker") is not None and \
-        subprocess.run(["docker", "info"], capture_output=True, check=False).returncode == 0
-    if docker:
-        lines.append("AUTO|cloudbuild.allowedWorkerPools: 기본 빌드 풀 금지 -> Cloud Build 대신 이 환경의 Docker 로 빌드합니다.")
+    if worker_pool:
+        lines.append("AUTO|cloudbuild.allowedWorkerPools: 기본 빌드 풀 금지 -> 지정한 private pool(%s)로 빌드합니다." % worker_pool)
     else:
-        blockers.append("cloudbuild.allowedWorkerPools: 기본 Cloud Build 풀이 금지되어 있고 이 환경에 Docker 가 없습니다. "
-                        "Google Cloud Shell(Docker 내장)에서 다시 실행하세요.")
+        sets["ORGPOL_NO_DEFAULT_POOL"] = "1"
+        docker = shutil.which("docker") is not None and \
+            subprocess.run(["docker", "info"], capture_output=True, check=False).returncode == 0
+        if docker:
+            lines.append("AUTO|cloudbuild.allowedWorkerPools: 기본 빌드 풀 금지 -> Cloud Build 대신 이 환경의 Docker 로 빌드합니다.")
+        else:
+            blockers.append("cloudbuild.allowedWorkerPools: 기본 Cloud Build 풀이 금지되어 있고 이 환경에 Docker 가 없습니다. "
+                            "허용된 private pool 로 빌드하거나(--worker-pool projects/P/locations/R/workerPools/POOL), "
+                            "미리 빌드한 이미지를 지정하거나(--image), Docker 가 있는 환경(Google Cloud Shell 등)에서 다시 실행하세요.")
 
 # 10. Constraints this deployment already satisfies
 for name, text in (("storage.publicAccessPrevention", "버킷 공개 차단"), ("storage.uniformBucketLevelAccess", "균일 버킷 접근"),
@@ -1432,18 +1506,33 @@ for name, text in (("storage.publicAccessPrevention", "버킷 공개 차단"), (
     if enforced(name):
         lines.append("OK|%s(%s) 적용됨: 이 배포는 그대로 준수합니다." % (name, text))
 
-# 11. VPC Service Controls probe
+# 11. VPC Service Controls probe: can this environment reach Cloud Storage of the project at all?
 rc, so, se = gcloud(["storage", "buckets", "list", "--project", project, "--limit", "1", "--format=value(name)"])
 if rc != 0 and re.search(r"VPC Service Controls|vpcServiceControls|SECURITY_POLICY_VIOLATED|prohibited by organization", se or "", re.I):
     blockers.append("VPC Service Controls: 이 프로젝트가 서비스 경계 안에 있고 현재 실행 환경은 경계 밖입니다. 보안 담당자에게 이 계정의 "
                     "인그레스 규칙(또는 액세스 수준) 추가를 요청하거나 경계 안의 환경에서 실행하세요.")
+    sets.setdefault("VPCSC_RESTRICTED", "storage.googleapis.com")
+
+# 12. The VPC Service Controls perimeter that holds the project (Access Context Manager; skipped silently without access).
+if perimeter:
+    title, restricted = perimeter
+    used = [s for s in VPCSC_SERVICES if s in restricted]
+    sets["VPCSC_RESTRICTED"] = ",".join(restricted)
+    short = ", ".join(s.split(".")[0] for s in used) or "없음"
+    plan = []
+    if "storage.googleapis.com" in restricted and not prebuilt and not worker_pool:
+        plan.append("공개 저장소를 그대로 받은 체크아웃(설치 명령이 만드는 것)이면 Cloud Build 가 Git 에서 소스를 직접 받아 "
+                    "빌드하므로 Cloud Storage 업로드가 필요 없습니다")
+    plan.append("배포가 끝나면 대시보드 호출이 경계에 막히는지 확인하고, 막히면 추가할 인그레스 규칙을 그대로 출력합니다")
+    lines.append("AUTO|VPC 서비스 제어: 이 프로젝트는 서비스 경계 '%s' 안에 있습니다(이 배포가 쓰는 제한 서비스: %s). %s."
+                 % (title, short, ", ".join(plan)))
 
 for line in lines:
     print("LINE|" + line)
 for b in blockers:
     print("BLOCK|" + b)
 for k, v in sets.items():
-    print("SET|%s=%s" % (k, re.sub(r"[^A-Za-z0-9_.:/-]", "", v)))
+    print("SET|%s=%s" % (k, re.sub(r"[^A-Za-z0-9_.:/,-]", "", v)))
 PYORG
 )" || rc=$?
   local tag kind body var line blockers=()
@@ -1464,7 +1553,7 @@ PYORG
       SET)
         var="${line%%=*}"
         case "$var" in
-          ORGPOL_DRS|ORGPOL_REQUIRE_INVOKER_IAM|ORGPOL_BINAUTHZ|ORGPOL_VPC_EGRESS|ORGPOL_NO_DEFAULT_POOL)
+          ORGPOL_DRS|ORGPOL_REQUIRE_INVOKER_IAM|ORGPOL_BINAUTHZ|ORGPOL_VPC_EGRESS|ORGPOL_NO_DEFAULT_POOL|VPCSC_RESTRICTED)
             printf -v "$var" '%s' "${line#*=}" ;;
         esac ;;
     esac
@@ -1479,6 +1568,165 @@ PYORG
    (Organization policies block this deployment; no dashboard resources were created. Fix the [중단] items and re-run.)"
     fi
   fi
+}
+
+# Files that make up the container image (the Dockerfile copies requirements.txt, config.yaml and src/).
+IMAGE_SOURCE_PATHS=(Dockerfile .dockerignore requirements.txt config.yaml src)
+
+# git_build_source ROOT
+# Prints "URL SHA" when ROOT is a clean checkout of a Git repository that anyone can read: Cloud Build can then fetch
+# that exact commit itself and nothing is uploaded to Cloud Storage. Cloud Build's default pool runs outside VPC Service
+# Controls perimeters, so a perimeter that restricts storage.googleapis.com refuses it the uploaded source archive, while
+# a public repository stays reachable. The installer's checkout (a clone of the public repository) qualifies. Prints
+# nothing otherwise and gives the reason on stderr. Credentials never leave this computer: user:token@ parts of the origin
+# URL are dropped, ssh URLs become https, and the repository must answer an anonymous `git ls-remote` (no credential
+# helpers, no ~/.gitconfig, no prompts) before its URL is used.
+git_build_source() {
+  local root="$1"
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git is not installed" >&2
+    return 0
+  fi
+  python3 - "$root" "${IMAGE_SOURCE_PATHS[@]}" <<'PYGIT' || true
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+root, inputs = os.path.realpath(sys.argv[1]), sys.argv[2:]
+
+
+def skip(reason):
+    print(reason, file=sys.stderr)
+    sys.exit(0)
+
+
+def git(*args, env=None):
+    try:
+        return subprocess.run(["git", *args], capture_output=True, text=True, timeout=25, stdin=subprocess.DEVNULL,
+                              env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+top = git("-C", root, "rev-parse", "--show-toplevel")
+if not top or top.returncode != 0 or os.path.realpath(top.stdout.strip()) != root:
+    skip("not a Git checkout")
+head = git("-C", root, "rev-parse", "HEAD")
+sha = head.stdout.strip() if head and head.returncode == 0 else ""
+if not re.fullmatch(r"[0-9a-f]{40}", sha):
+    skip("no commit is checked out")
+status = git("-C", root, "status", "--porcelain", "--", *inputs)
+if not status or status.returncode != 0 or status.stdout.strip():
+    skip("local changes in the image sources (Dockerfile, requirements.txt, config.yaml or src/)")
+origin = git("-C", root, "remote", "get-url", "origin")
+url = origin.stdout.strip() if origin and origin.returncode == 0 else ""
+ssh = re.fullmatch(r"(?:ssh://)?[A-Za-z0-9._-]+@([A-Za-z0-9.-]+)[:/]([A-Za-z0-9._/-]+?)/?", url)
+if ssh:
+    url = "https://%s/%s" % (ssh.group(1), ssh.group(2))
+https = re.fullmatch(r"https://(?:[^@/\s]+@)?([A-Za-z0-9.-]+(?::[0-9]+)?)(/[A-Za-z0-9._~/-]+?)/?", url)
+if not https:
+    skip("its origin remote is not an https or ssh Git URL")
+url = "https://%s%s" % (https.group(1), https.group(2))
+keep = ("PATH", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "GIT_SSL_CAINFO")
+with tempfile.TemporaryDirectory() as home:
+    env = {k: v for k, v in os.environ.items() if k.upper() in keep}
+    env.update(HOME=home, XDG_CONFIG_HOME=home, GIT_CONFIG_NOSYSTEM="1", GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true",
+               SSH_ASKPASS="true", LC_ALL="C")
+    probe = git("-c", "credential.helper=", "ls-remote", "--exit-code", url, env=env)
+if not probe or probe.returncode != 0:
+    skip("its origin repository cannot be read anonymously")
+# Cloud Build fetches the commit by its hash: it must be published (a branch or tag of the origin points at it, or a
+# remote-tracking branch of origin contains it).
+published = sha in probe.stdout.split()
+if not published:
+    tracked = git("-C", root, "for-each-ref", "--contains", sha, "--format=%(refname)", "refs/remotes/origin")
+    published = bool(tracked and tracked.returncode == 0 and tracked.stdout.strip())
+if not published:
+    skip("the checked-out commit is not pushed to its origin repository")
+print(url, sha)
+PYGIT
+}
+
+# is_vpcsc_denial FILE: true when FILE (gcloud or Cloud Build output) holds a VPC Service Controls denial.
+is_vpcsc_denial() {
+  grep -Eiq 'vpcServiceControls|VPC Service Controls|prohibited by organization|SECURITY_POLICY_VIOLATED|SecurityPolicyViolated' "$1" 2>/dev/null
+}
+
+# vpcsc_ingress_yaml MEMBER PROJECT_NUMBER SERVICE...
+# Prints the ingress rule (an entry of the perimeter's ingressPolicies) that admits MEMBER (serviceAccount:EMAIL) from any
+# network origin to SERVICEs on the project's resources only: what a perimeter administrator adds in the console
+# (Security > VPC Service Controls > perimeter > Edit > Ingress policy > Add rule) or with gcloud.
+vpcsc_ingress_yaml() {
+  local member="$1" number="$2" svc
+  shift 2
+  printf -- '- ingressFrom:\n    identities:\n    - %s\n    sources:\n    - accessLevel: "*"\n  ingressTo:\n    operations:\n' "$member"
+  for svc in "$@"; do
+    printf -- '    - serviceName: %s\n      methodSelectors:\n      - method: "*"\n' "$svc"
+  done
+  printf -- '    resources:\n    - projects/%s\n' "$number"
+}
+
+# vpcsc_print_rule MEMBER PROJECT_NUMBER SERVICE...: the rule of vpcsc_ingress_yaml, indented, on stderr.
+vpcsc_print_rule() {
+  local line
+  while IFS= read -r line; do
+    printf '        %s\n' "$line" >&2
+  done < <(vpcsc_ingress_yaml "$@")
+}
+
+# Google APIs the dashboard itself calls (as its runtime service account) that a VPC Service Controls perimeter can
+# restrict.
+VPCSC_RUNTIME_SERVICES=(storage.googleapis.com bigquery.googleapis.com discoveryengine.googleapis.com
+  aiplatform.googleapis.com logging.googleapis.com monitoring.googleapis.com cloudresourcemanager.googleapis.com
+  iam.googleapis.com run.googleapis.com secretmanager.googleapis.com modelarmor.googleapis.com
+  agentregistry.googleapis.com businessaicode.googleapis.com cloudscheduler.googleapis.com pubsub.googleapis.com
+  iap.googleapis.com networkservices.googleapis.com networksecurity.googleapis.com cloudtrace.googleapis.com
+  serviceusage.googleapis.com billingbudgets.googleapis.com)
+
+# vpcsc_runtime_check PROJECT PROJECT_NUMBER RUNTIME_SA WAIT_SECONDS
+# After a deployment: reads the VPC Service Controls denials (Policy Denied audit logs) that the dashboard's runtime
+# service account caused in the last 30 minutes. With denials it names the refused services and prints the one ingress
+# rule that admits the dashboard; it never changes the perimeter (only its administrators can). A perimeter that refuses
+# the dashboard one service refuses it every restricted service, while the first requests after a deployment touch only
+# a few (Cloud Storage at start-up, BigQuery from maintenance): the rule also lists every service in VPCSC_RESTRICTED that
+# the dashboard calls. Waits up to WAIT_SECONDS for audit entries to arrive (they take a minute or two). Never fails the
+# caller.
+vpcsc_runtime_check() {
+  local project="$1" number="$2" sa="$3" wait="${4:-0}" waited=0 seen="" filter svc rc=0
+  local -a blocked=()
+  filter="log_id(\"cloudaudit.googleapis.com/policy\") AND protoPayload.authenticationInfo.principalEmail=\"${sa}\""
+  while :; do
+    rc=0
+    seen="$(gcloud logging read "$filter" --project "$project" --freshness=30m --limit=200 \
+      --format='value(protoPayload.serviceName)' 2>/dev/null)" || rc=$?
+    seen="$(printf '%s\n' "$seen" | sed '/^[[:space:]]*$/d' | sort -u | paste -sd' ' - || true)"
+    if [[ -n "$seen" || $waited -ge $wait ]]; then
+      break
+    fi
+    # ACP_VPCSC_POLL_SECONDS shortens the pause between polls (tests); the budget still counts 15 s per poll.
+    sleep "${ACP_VPCSC_POLL_SECONDS:-15}"
+    waited=$((waited + 15))
+  done
+  if [[ -z "$seen" ]]; then
+    if [[ "$wait" -gt 0 && "$rc" != "0" ]]; then
+      warn "VPC Service Controls: could not read the audit logs of ${project}; if the dashboard shows no settings or data, look for denials of ${sa} in Logs Explorer: log_id(\"cloudaudit.googleapis.com/policy\")"
+    elif [[ "$wait" -gt 0 ]]; then
+      info "VPC Service Controls: no denial for the dashboard's service account ${sa}"
+    fi
+    return 0
+  fi
+  read -r -a blocked <<<"$seen"
+  for svc in "${VPCSC_RUNTIME_SERVICES[@]}"; do
+    if [[ ",${VPCSC_RESTRICTED:-}," == *",${svc},"* && " ${seen} " != *" ${svc} "* ]]; then
+      blocked+=("$svc")
+    fi
+  done
+  warn "VPC Service Controls blocks the dashboard's service account ${sa} (refused so far: ${seen// /, }). The dashboard cannot read its settings or data until the perimeter admits it. A perimeter administrator adds this ingress rule, which covers every restricted service the dashboard calls (console: Security > VPC Service Controls > perimeter > Edit > Ingress policy > Add rule); no redeployment is needed:"
+  vpcsc_print_rule "serviceAccount:${sa}" "$number" "${blocked[@]}"
+  warn "[한국어 안내] VPC 서비스 제어가 대시보드 런타임 계정(${sa})의 호출을 막고 있습니다(지금까지 막힌 서비스: ${seen// /, }). 경계 관리자가 위 인그레스 규칙 하나를 추가하면 재배포 없이 바로 동작합니다(콘솔: 보안 > VPC Service Controls > 경계 수정 > 인그레스 정책 > 규칙 추가). gcloud --set-ingress-policies 는 규칙 목록 전체를 바꾸므로 기존 규칙을 함께 넣어야 합니다."
+  return 0
 }
 
 # ensure_service_identities PROJECT PROJECT_NUMBER SERVICE [SERVICE ...]

@@ -87,7 +87,10 @@ Options
   --maintenance-schedule CRON | --no-maintenance-schedule
   --enforcement-backend iam_allow_swap|iam_deny|notify_only  --deny-attachment projects|scope
   --enforcement-job-region REGION  --[no-]grant-org-roles
+  --worker-pool POOL                  Build the image in this Cloud Build private pool
+                                      (projects/P/locations/R/workerPools/NAME, or NAME in --region)
   Passed to scripts/deploy.sh for this run only: --config FILE  --skip-preflight-blockers
+  --image IMAGE                       Deploy this prebuilt image (REGION-docker.pkg.dev/...) instead of building one
 
 Running the command again updates the deployment in place. Settings are saved per project in
 deploy.PROJECT_ID.env next to the scripts (git-ignored); later runs keep them unless a flag gives a new value.
@@ -251,6 +254,7 @@ while [[ $# -gt 0 ]]; do
       need_val "$@"
       [[ "$2" =~ ^[a-z]+-[a-z]+[0-9]+$ ]] || die "$1 must be a region such as asia-northeast3"
       save_setting ENFORCEMENT_JOB_REGION "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --worker-pool) need_val "$@"; save_setting CLOUD_BUILD_WORKER_POOL "$2"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
     # Deploy switches.
     --read-only) save_setting ENABLE_GOVERNANCE_ACTIONS false; EXTRA_ARGS+=("$1"); shift ;;
     --no-read-only) save_setting ENABLE_GOVERNANCE_ACTIONS true; EXTRA_ARGS+=("$1"); shift ;;
@@ -265,7 +269,7 @@ while [[ $# -gt 0 ]]; do
     --grant-org-roles) save_setting GRANT_ORG_ROLES true; EXTRA_ARGS+=("$1"); shift ;;
     --no-grant-org-roles) save_setting GRANT_ORG_ROLES false; EXTRA_ARGS+=("$1"); shift ;;
     # Passed to deploy.sh for this run only (never saved).
-    --config) need_val "$@"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
+    --config|--image) need_val "$@"; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
     --skip-preflight-blockers) EXTRA_ARGS+=("$1"); shift ;;
     -h|--help) show_install_help 0 ;;
     *) echo "unknown argument: $1" >&2; show_install_help 2 ;;

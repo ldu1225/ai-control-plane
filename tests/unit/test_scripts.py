@@ -1640,20 +1640,33 @@ class RealtimeEnforcementScriptTest(unittest.TestCase):
 # Fake gcloud for the deploy, install and teardown runs below: every call is logged; FAKE_EXISTING lists resource names
 # whose `describe` succeeds; FAKE_POLICY / FAKE_ROLES answer get-iam-policy (JSON / value(bindings.role));
 # FAKE_SETTINGS is the dashboard's settings object (gcloud storage cat); FAKE_FAIL lists call prefixes that fail and
-# FAKE_FAIL_RE is a regular expression for calls that fail.
+# FAKE_FAIL_RE is a regular expression for calls that fail. FAKE_SAY maps regular expressions to the output of matching
+# calls (printed before a FAKE_FAIL exit, so a failing call can explain itself). The Cloud Build config of every
+# `builds submit` is logged on a CONFIG line (newlines as " | ").
 FAKE_GCLOUD = """#!/usr/bin/env python3
-import os, re, sys
+import json, os, re, sys
 args = sys.argv[1:]
 line = " ".join(args)
 with open(os.environ["FAKE_GCLOUD_LOG"], "a", encoding="utf-8") as fh:
     fh.write(line + "\\n")
+    if args[:2] == ["builds", "submit"] and "--config" in args:
+        with open(args[args.index("--config") + 1], encoding="utf-8") as cfg:
+            fh.write("CONFIG " + cfg.read().replace("\\n", " | ") + "\\n")
 if "--data-file=-" in args:
     sys.stdin.read()  # as gcloud does: the writer of the pipe must never see a closed pipe
 existing = [s for s in os.environ.get("FAKE_EXISTING", "").split(",") if s]
+said = False
+for pattern, text in json.loads(os.environ.get("FAKE_SAY", "{}")).items():
+    if re.search(pattern, line):
+        print(text)
+        said = True
+        break
 if any(line.startswith(p) for p in os.environ.get("FAKE_FAIL", "").split("|") if p):
     sys.exit(1)
 if os.environ.get("FAKE_FAIL_RE") and re.search(os.environ["FAKE_FAIL_RE"], line):
     sys.exit(1)
+if said:
+    sys.exit(0)
 if "config get-value account" in line:
     print("owner@example.org")
 elif "config get-value project" in line:
@@ -1692,10 +1705,11 @@ SCRIPT_FILES = ("scripts/install.sh", "scripts/deploy.sh", "scripts/prepare.sh",
 
 
 def fake_env(tmp, **extra):
-    """PATH with the fake gcloud and bq; returns (env, log path)."""
+    """PATH with the fake gcloud and bq, and a docker that is not running (no local build fallback); returns (env,
+    log path)."""
     bin_dir = os.path.join(tmp, "fakebin")
     os.makedirs(bin_dir, exist_ok=True)
-    for name, body in (("gcloud", FAKE_GCLOUD), ("bq", FAKE_BQ)):
+    for name, body in (("gcloud", FAKE_GCLOUD), ("bq", FAKE_BQ), ("docker", "#!/bin/sh\nexit 1\n")):
         with open(os.path.join(bin_dir, name), "w", encoding="utf-8") as fh:
             fh.write(body)
         os.chmod(os.path.join(bin_dir, name), 0o755)
@@ -2791,7 +2805,246 @@ class DeploymentEdgeCasesHardeningTest(unittest.TestCase):
             server.server_close()
 
 
+FAKE_GIT_TEMPLATE = """#!/usr/bin/env python3
+import json, os, sys
+with open({cfg_path!r}, encoding="utf-8") as fh:
+    cfg = json.load(fh)
+args = sys.argv[1:]
+while args and args[0] in ("-C", "-c"):
+    args = args[2:]
+sha = cfg.get("sha", "a" * 40)
+if args[:2] == ["rev-parse", "--show-toplevel"]:
+    print(cfg["root"])
+elif args[:2] == ["rev-parse", "HEAD"]:
+    print(sha)
+elif args[:2] == ["status", "--porcelain"]:
+    if cfg.get("status"):
+        print(cfg["status"])
+elif args[:3] == ["remote", "get-url", "origin"]:
+    print(cfg.get("origin", "https://example.org/acme/app.git"))
+elif args[:1] == ["ls-remote"]:
+    # git_build_source scrubs the environment so local credentials never leak to anonymous probes.
+    if os.environ.get("GIT_CONFIG_NOSYSTEM") != "1" or os.environ.get("GIT_TERMINAL_PROMPT") != "0":
+        sys.exit(99)
+    if cfg.get("private"):
+        sys.exit(128)
+    print(cfg.get("ls_remote", f"{{sha}}\\trefs/heads/main"))
+elif args[:1] == ["for-each-ref"]:
+    if cfg.get("tracked"):
+        print(cfg["tracked"])
+sys.exit(0)
+"""
+
+
+class BuildSourceAndVpcScTest(unittest.TestCase):
+    """Cloud Build Git-source mode, --worker-pool, --image, VPC-SC fast-fail, and post-deploy runtime checks."""
+
+    BASE_CFG = (
+        'PROJECT_ID="demo-hub-proj"\nADMIN_EMAILS="admin@example.org"\nCREATE_LOG_SINK="false"\n'
+        'ENABLE_DATA_ACCESS_LOGS="false"\nENABLE_GE_OBSERVABILITY="false"\n'
+        'PUBLIC_BASE_URL="https://dashboard.invalid"\n'
+    )
+
+    def _with_fake_git(self, tmp, git_cfg=None, **extra):
+        env, log = fake_env(tmp, ACP_VPCSC_POLL_SECONDS="0", **extra)
+        cfg_path = os.path.join(tmp, "fake_git.json")
+        state = {"root": ROOT, **(git_cfg or {})}
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        git_path = os.path.join(tmp, "fakebin", "git")
+        with open(git_path, "w", encoding="utf-8") as fh:
+            fh.write(FAKE_GIT_TEMPLATE.format(cfg_path=cfg_path))
+        os.chmod(git_path, 0o755)
+        return env, log, cfg_path
+
+    def _run_deploy(self, tmp, cli_args=(), cfg_extra="", git_cfg=None, **extra):
+        env, log, _ = self._with_fake_git(tmp, git_cfg=git_cfg, **extra)
+        cfg = os.path.join(tmp, "deploy.env")
+        with open(cfg, "w", encoding="utf-8") as fh:
+            fh.write(self.BASE_CFG + cfg_extra)
+        res = run_script(os.path.join(ROOT, "scripts/deploy.sh"), ["--config", cfg, *cli_args], env)
+        return res, read_log(log).splitlines()
+
+    def test_git_build_source_strips_credentials_and_verifies_public_commit(self):
+        common = os.path.join(ROOT, "scripts/lib/common.sh")
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        tok = "test_secret_token_value"
+        with tempfile.TemporaryDirectory() as tmp:
+            state = {"root": ROOT, "sha": sha, "origin": "https://" + "octocat:" + tok + "@example.org/acme/app.git"}
+            env, _, cfg_path = self._with_fake_git(tmp, git_cfg=state)
+
+            def probe():
+                with open(cfg_path, "w", encoding="utf-8") as fh:
+                    json.dump(state, fh)
+                return subprocess.run(
+                    ["bash", "-c", f'set -euo pipefail; source "{common}"; git_build_source "{ROOT}"'],
+                    capture_output=True, text=True, env=env, check=False)
+
+            # Credentials in origin URL are stripped and never printed.
+            res = probe()
+            self.assertEqual(res.returncode, 0)
+            self.assertEqual(res.stdout.strip(), f"https://example.org/acme/app.git {sha}")
+            self.assertNotIn(tok, res.stdout + res.stderr)
+
+            # SSH origin converts to https.
+            state["origin"] = "git@example.org:acme/app.git"
+            res = probe()
+            self.assertEqual(res.stdout.strip(), f"https://example.org/acme/app.git {sha}")
+
+            # Local edits to image sources skip Git source.
+            state["status"] = " M src/controlplane/app.py"
+            res = probe()
+            self.assertEqual(res.stdout.strip(), "")
+            self.assertIn("local changes", res.stderr)
+
+            # Unpushed commit skips Git source.
+            state["status"] = ""
+            state["ls_remote"] = ("b" * 40) + "\trefs/heads/main"
+            res = probe()
+            self.assertEqual(res.stdout.strip(), "")
+            self.assertIn("not pushed", res.stderr)
+
+            # Private repository skips Git source.
+            state["private"] = True
+            res = probe()
+            self.assertEqual(res.stdout.strip(), "")
+            self.assertIn("anonymously", res.stderr)
+
+    def test_deploy_uses_git_source_without_storage_upload_or_bucket_grant(self):
+        sha = "1234567890abcdef1234567890abcdef12345678"
+        with tempfile.TemporaryDirectory() as tmp:
+            res, calls = self._run_deploy(tmp, BUILD_SOURCE="auto", git_cfg={"sha": sha})
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        submits = [c for c in calls if c.startswith("builds submit ")]
+        self.assertEqual(len(submits), 1, submits)
+        self.assertIn("--no-source", submits[0])
+        self.assertNotIn("--gcs-source-staging-dir", submits[0])
+        configs = [c for c in calls if c.startswith("CONFIG ")]
+        self.assertEqual(len(configs), 1)
+        for token in ("gcr.io/cloud-builders/git", "'init'", "'fetch'", sha, "dir: 'src'",
+                      "gcr.io/cloud-builders/docker", "CLOUD_LOGGING_ONLY"):
+            self.assertIn(token, configs[0])
+        # Build SA never received temporary bucket access when nothing was uploaded.
+        self.assertFalse([c for c in calls if "ai-control-plane-build@" in c and "roles/storage.objectAdmin" in c])
+        self.assertIn("(Cloud Build, git source)", res.stdout)
+
+    def test_deploy_upload_source_grants_and_cleans_up_bucket_access(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res, calls = self._run_deploy(tmp, BUILD_SOURCE="upload")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        submits = [c for c in calls if c.startswith("builds submit ")]
+        self.assertEqual(len(submits), 1, submits)
+        self.assertIn("--gcs-source-staging-dir", submits[0])
+        self.assertTrue([c for c in calls if "storage buckets add-iam-policy-binding" in c
+                         and "ai-control-plane-build@" in c and "roles/storage.objectAdmin" in c])
+        self.assertTrue([c for c in calls if "storage rm --recursive" in c and "_build/**" in c])
+        self.assertTrue([c for c in calls if "storage buckets remove-iam-policy-binding" in c
+                         and "ai-control-plane-build@" in c and "roles/storage.objectAdmin" in c])
+        self.assertIn("(Cloud Build, upload source)", res.stdout)
+
+    def test_deploy_worker_pool_expands_bare_name_and_uses_upload_in_auto_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res, calls = self._run_deploy(tmp, cli_args=("--worker-pool", "corp-pool"), BUILD_SOURCE="auto")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        submits = [c for c in calls if c.startswith("builds submit ")]
+        self.assertEqual(len(submits), 1, submits)
+        self.assertIn("--worker-pool projects/demo-hub-proj/locations/asia-northeast3/workerPools/corp-pool", submits[0])
+        self.assertIn("--region asia-northeast3", submits[0])
+        self.assertIn("--gcs-source-staging-dir", submits[0])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            full = "projects/shared-p/locations/us-central1/workerPools/net-pool"
+            res, calls = self._run_deploy(tmp, cli_args=("--worker-pool", full), BUILD_SOURCE="auto")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        submits = [c for c in calls if c.startswith("builds submit ")]
+        self.assertIn("--region us-central1", submits[0])
+        self.assertIn(f"--worker-pool {full}", submits[0])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            res, _ = self._run_deploy(tmp, cli_args=("--worker-pool", "bad/pool/path"), BUILD_SOURCE="auto")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("--worker-pool", res.stderr)
+
+    def test_deploy_image_flag_skips_cloud_build(self):
+        img = "asia-northeast3-docker.pkg.dev/demo-hub-proj/ai-control-plane/ai-control-plane:v1"
+        with tempfile.TemporaryDirectory() as tmp:
+            res, calls = self._run_deploy(tmp, cli_args=("--image", img), BUILD_SOURCE="auto")
+        self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+        self.assertEqual([c for c in calls if c.startswith("builds submit ")], [])
+        self.assertIn(f"Container     : {img} (prebuilt)", res.stdout)
+
+    def test_vpcsc_build_denial_fails_fast_with_ingress_rule_and_no_retries(self):
+        deny_msg = (
+            "BUILD FAILURE: fetching object from gcs: HTTP 403 "
+            "<Error><Code>SecurityPolicyViolated</Code><Message>Request violates VPC Service Controls.</Message></Error>"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            res, calls = self._run_deploy(
+                tmp, BUILD_SOURCE="upload",
+                FAKE_FAIL_RE=r"^builds submit ",
+                FAKE_SAY=json.dumps({r"^builds submit ": deny_msg}),
+            )
+        self.assertNotEqual(res.returncode, 0)
+        # Never retries 3x or falls back to global Cloud Build on a VPC-SC denial.
+        submits = [c for c in calls if c.startswith("builds submit ")]
+        self.assertEqual(len(submits), 1, submits)
+        self.assertIn("serviceAccount:ai-control-plane-build@demo-hub-proj.iam.gserviceaccount.com", res.stderr)
+        self.assertIn("serviceName: storage.googleapis.com", res.stderr)
+        self.assertIn("- projects/123456789012", res.stderr)
+        self.assertIn("--worker-pool", res.stderr)
+        self.assertIn("--image", res.stderr)
+
+    def test_vpcsc_runtime_check_reports_denials_with_all_restricted_runtime_services(self):
+        common = os.path.join(ROOT, "scripts/lib/common.sh")
+        sa = "ai-control-plane-sa@demo-hub-proj.iam.gserviceaccount.com"
+        restricted = "storage.googleapis.com,bigquery.googleapis.com,discoveryengine.googleapis.com,aiplatform.googleapis.com,sqladmin.googleapis.com"
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Denial seen -> prints ingress rule covering every restricted service the dashboard calls (not sqladmin).
+            env, _ = fake_env(tmp, ACP_VPCSC_POLL_SECONDS="0",
+                              FAKE_SAY=json.dumps({r"^logging read ": "storage.googleapis.com"}))
+            cmd = (f'set -euo pipefail; source "{common}"; VPCSC_RESTRICTED="{restricted}"; '
+                   f'vpcsc_runtime_check demo-hub-proj 123456789012 "{sa}" 15')
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0)
+            for expected in (f"serviceAccount:{sa}", "serviceName: storage.googleapis.com",
+                             "serviceName: bigquery.googleapis.com", "serviceName: discoveryengine.googleapis.com",
+                             "serviceName: aiplatform.googleapis.com", "- projects/123456789012"):
+                self.assertIn(expected, res.stderr)
+            self.assertNotIn("sqladmin.googleapis.com", res.stderr)
+
+            # 2. No denial -> prints clear confirmation.
+            env, _ = fake_env(tmp, ACP_VPCSC_POLL_SECONDS="0")
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("no denial", res.stdout)
+
+            # 3. Unreadable audit logs -> warns instead of falsely claiming no denial.
+            env, _ = fake_env(tmp, ACP_VPCSC_POLL_SECONDS="0", FAKE_FAIL="logging read ")
+            res = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(res.returncode, 0)
+            self.assertIn("could not read the audit logs", res.stderr)
+            self.assertNotIn("no denial", res.stdout)
+
+    def test_installer_saves_worker_pool_but_keeps_image_one_run_only(self):
+        img = "asia-northeast3-docker.pkg.dev/demo-hub-proj/ai-control-plane/ai-control-plane:v9"
+        with tempfile.TemporaryDirectory() as tmp:
+            copy_scripts(tmp, *SCRIPT_FILES)
+            env, _ = fake_env(tmp, ACP_SAVE_ENV_ON_DRY_RUN="1")
+            res = run_script(
+                os.path.join(tmp, "scripts/install.sh"),
+                ["--project", "demo-hub-proj", "--worker-pool", "corp-pool", "--image", img, "--dry-run"],
+                env, cwd=tmp,
+            )
+            self.assertEqual(res.returncode, 0, msg=(res.stdout, res.stderr))
+            self.assertIn(f"using prebuilt image {img}", res.stdout)
+            with open(os.path.join(tmp, "deploy.demo-hub-proj.env"), encoding="utf-8") as fh:
+                saved = fh.read()
+            self.assertIn('CLOUD_BUILD_WORKER_POOL="corp-pool"', saved)
+            self.assertNotIn("IMAGE=", saved)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

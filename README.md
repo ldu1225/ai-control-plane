@@ -518,7 +518,9 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 | `AI_LOCATION` | 비어 있음(자동 감지) | Agent Platform 모델 엔드포인트 위치. 비우면 `global`, 응답이 없으면 `REGION` |
 | `TELEMETRY_AI_MODEL` | 비어 있음(`gemini-4-argon`) | 텔레메트리 소스를 설명하고 묶는 Gemini 모델 |
 | `TELEMETRY_DATASET` | 비어 있음(`telemetry_routed`) | 텔레메트리 라우팅 BigQuery 데이터셋(위치는 `DATASET_LOCATION`) |
-| `IMAGE` | 비어 있음 | 미리 빌드한 이미지. 비우면 Cloud Build로 빌드(제한 시 로컬 Docker 자동 전환) |
+| `IMAGE` | 비어 있음 | 미리 빌드한 이미지(`--image`, 이번 실행에만 적용). 비우면 Cloud Build로 빌드(제한 시 로컬 Docker 자동 전환) |
+| `BUILD_SOURCE` | `auto` | Cloud Build 소스 전달 방식: `git`(공개 Git 저장소의 현재 커밋을 Cloud Build가 직접 받음, Cloud Storage 업로드 없음 — VPC-SC가 Storage를 제한해도 통과), `upload`(설정 버킷에 업로드), `auto`(공개 저장소의 깨끗한 체크아웃은 `git`, 로컬 수정본·private pool은 `upload`) |
+| `CLOUD_BUILD_WORKER_POOL` | 비어 있음(기본 풀) | 이미지 빌드에 쓸 Cloud Build private pool(`--worker-pool`, `projects/P/locations/R/workerPools/NAME` 또는 현재 리전의 풀 이름) |
 | `MEMORY`, `CPU` | `1Gi`, `1` | Cloud Run 리소스(집행 작업도 같은 값) |
 | `MIN_INSTANCES`, `MAX_INSTANCES` | `0`, `3` | 인스턴스 수. 0이면 요청이 없을 때 인스턴스가 내려가고, 정기 작업 호출 때만 잠깐 실행됩니다([13장](#13-비용)). |
 | `AR_REPOSITORY` | `ai-control-plane` | Artifact Registry 저장소 이름 |
@@ -1547,11 +1549,17 @@ done
 | `run.allowedBinaryAuthorizationPolicies` | 자동: `--binary-authorization=<정책>`으로 배포 | 정책이 이미지를 막으면 보안 담당자에게 예외 요청 |
 | `gcp.restrictNonCmekServices` | **중단** (CMEK 미지원) | 이 프로젝트만 예외 요청 |
 | `serviceuser.services` | 필수 API(Run, Artifact Registry, Storage, Secret Manager, BigQuery, Logging, IAM)가 금지면 **중단**, 그 밖의 API는 경고 후 해당 화면만 제한 | 허용 요청 |
-| `cloudbuild.allowedWorkerPools` | 자동: Cloud Build 대신 Cloud Shell의 Docker로 빌드 (Docker가 없으면 **중단**) | Cloud Shell에서 실행 |
+| `cloudbuild.allowedWorkerPools` | `--worker-pool`을 주면 그 private pool로, 아니면 Cloud Shell의 Docker로 빌드 (둘 다 없으면 **중단**) | `--worker-pool`, `--image`, 또는 Docker가 있는 환경(Cloud Shell)에서 실행 |
 | `storage.publicAccessPrevention`, `storage.uniformBucketLevelAccess`, `iam.disableServiceAccountKeyCreation`, `iam.automaticIamGrantsForDefaultServiceAccounts` | 그대로 준수 | 없음 |
-| VPC Service Controls 경계 | **중단** | 실행 계정의 인그레스 규칙(또는 액세스 수준) 추가, 또는 경계 안의 환경에서 실행 |
+| VPC Service Controls 경계 (실행 환경이 경계 밖) | **중단** | 실행 계정의 인그레스 규칙(또는 액세스 수준) 추가, 또는 경계 안의 환경에서 실행 |
+| VPC Service Controls 경계 (실행 계정은 허용됨) | **자동**: 공개 저장소 체크아웃이면 GCS 업로드 없이 Git에서 직접 빌드하고, 배포 끝에 런타임 서비스 계정 차단 로그를 점검해 필요한 인그레스 규칙 YAML을 출력 | 아래 VPC Service Controls 안내대로 런타임 서비스 계정 인그레스 규칙 추가(필요 시) |
 
 판단이 틀렸다고 확신할 때만 `--skip-preflight-blockers`로 계속합니다.
+
+**VPC Service Controls 경계 안 프로젝트에 설치할 때**
+
+1. **이미지 빌드**: Cloud Build 기본 풀은 VPC-SC 경계 밖에서 실행되므로, 경계가 Cloud Storage(`storage.googleapis.com`)를 제한하면 소스 아카이브를 버킷에 올려 빌드하는 방식이 막힙니다. `install.sh`처럼 공개 저장소를 그대로 받은 깨끗한 체크아웃에서는 기본 설정(`BUILD_SOURCE=auto`)이 소스를 Cloud Storage에 올리지 않고 Cloud Build가 Git에서 직접 받아 빌드하므로, 빌드 서비스 계정(`ai-control-plane-build`) 예외 규칙 없이 통과합니다. 경계가 Cloud Build나 Artifact Registry까지 제한하거나 로컬 수정본을 빌드해야 하면 `--worker-pool`(경계 안 private pool), `--image`(Docker로 직접 빌드·push한 이미지), 또는 스크립트가 출력하는 빌드 서비스 계정 인그레스 규칙 중 하나를 사용합니다.
+2. **대시보드 런타임 호출**: Cloud Run이 별도 VPC 이그레스 없이 실행되면, 경계로 보호되는 API(Cloud Storage 설정 버킷, BigQuery, Discovery Engine, Agent Platform 등)를 호출할 때 VPC-SC가 거부할 수 있습니다. 배포가 끝나면 스크립트가 `cloudaudit.googleapis.com/policy` 감사 로그를 확인해 대시보드 런타임 서비스 계정(`ai-control-plane-sa@PROJECT_ID.iam.gserviceaccount.com`)이 막히는지 점검하고, 막혔으면 대시보드가 호출하는 제한 서비스를 모두 담은 **인그레스 규칙 YAML 하나**를 그대로 출력합니다. 보안 담당자가 콘솔(**보안 > VPC Service Controls > 경계 수정 > 인그레스 정책 > 규칙 추가**)에 그 규칙 하나를 추가하면 재배포 없이 바로 동작합니다(경계 반영 최대 30분). `gcloud ... perimeters update --set-ingress-policies`는 규칙 목록 전체를 덮어쓰므로 기존 규칙을 함께 넣어야 합니다.
 
 ### 14.5 Gemini Enterprise가 다른 프로젝트에 있을 때
 
