@@ -1927,11 +1927,12 @@ grant_license_reader() {
 
 # grant_ge_feature_manager PROJECT SA
 # Creates (or updates) the least-privilege custom role CustomAiControlPlaneGeFeatureManager in PROJECT and binds it to
-# SA: Gemini Enterprise > Feature management reads every app (engines.get/list) and changes its feature switches
-# (engines.patch with updateMask=features needs discoveryengine.engines.update). Nothing else in Discovery Engine.
+# SA: Gemini Enterprise > Feature management reads every app (engines.get/list, widgetConfigs.get) and AI developer
+# tools settings (devToolsConfigs.get), and changes feature switches and model selection (engines.patch with
+# updateMask=features,modelConfigs needs discoveryengine.engines.update). Nothing else in Discovery Engine.
 # Best effort: prints the commands an Owner can run when the caller cannot create or bind the role. Honors DRY_RUN.
 GE_FEATURE_MANAGER_ROLE_ID="CustomAiControlPlaneGeFeatureManager"
-GE_FEATURE_MANAGER_PERMS="discoveryengine.engines.get,discoveryengine.engines.list,discoveryengine.engines.update"
+GE_FEATURE_MANAGER_PERMS="discoveryengine.engines.get,discoveryengine.engines.list,discoveryengine.engines.update,discoveryengine.widgetConfigs.get,discoveryengine.devToolsConfigs.get"
 grant_ge_feature_manager() {
   local project="$1" sa="$2" role create_cmd bind_cmd deleted_flag=""
   role="projects/${project}/roles/${GE_FEATURE_MANAGER_ROLE_ID}"
@@ -1951,7 +1952,7 @@ grant_ge_feature_manager() {
       --quiet >/dev/null 2>&1 || true
   elif ! gcloud iam roles create "$GE_FEATURE_MANAGER_ROLE_ID" --project "$project" \
       --title "AI Control Plane GE Feature Manager" \
-      --description "Read Gemini Enterprise apps and change their feature switches" \
+      --description "Read Gemini Enterprise apps and AI developer tools settings, and change app feature switches and model selection" \
       --permissions "$GE_FEATURE_MANAGER_PERMS" --stage GA --quiet >/dev/null 2>&1; then
     warn "could not create ${role}, so Gemini Enterprise features in ${project} are read-only in the dashboard. As an Owner of ${project}, run: ${create_cmd} && ${bind_cmd}"
     return 0

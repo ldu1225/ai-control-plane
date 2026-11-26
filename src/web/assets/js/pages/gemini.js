@@ -13,22 +13,32 @@ const CATEGORY_LABELS = {
   document: 'Document', spreadsheet: 'Spreadsheet', presentation: 'Presentation', image: 'Image', text: 'Text', other: 'Other',
 };
 
-/* Views (each has its own address): #/gemini-enterprise (usage) and #/gemini-enterprise/features. */
+/* Views (each has its own address): #/gemini-enterprise (usage), #/gemini-enterprise/features (features & models),
+   and #/gemini-enterprise/dev-tools (AI developer tools & Antigravity authorized models). */
 export default async function render(ctx) {
-  const view = ctx.params[0] === 'features' ? 'features' : 'usage';
+  const first = ctx.params[0];
+  const view = first === 'features' ? 'features' : (first === 'dev-tools' ? 'dev-tools' : 'usage');
+  const desc = view === 'features'
+    ? t('Feature switches and model selection of every Gemini Enterprise app in one view. Compare apps and change many apps at once.')
+    : (view === 'dev-tools'
+      ? t('Project and location settings for AI developer tools, security policies, compliance logging, and Antigravity authorized models.')
+      : t('Adoption, license utilization, agent usage and uploaded content across Gemini Enterprise.'));
   const header = h('div', { class: 'stack' },
-    pageHeader({
-      title: t('Gemini Enterprise'),
-      desc: view === 'features'
-        ? t('Feature switches of every Gemini Enterprise app in one view. Compare apps and change many apps at once.')
-        : t('Adoption, license utilization, agent usage and uploaded content across Gemini Enterprise.'),
-    }),
+    pageHeader({ title: t('Gemini Enterprise'), desc }),
     tabs([
       { id: 'usage', label: t('Usage') },
       { id: 'features', label: t('Feature management') },
-    ], view, (id) => ctx.navigate(id === 'features' ? '#/gemini-enterprise/features' : '#/gemini-enterprise')));
+      { id: 'dev-tools', label: t('AI developer tools') },
+    ], view, (id) => ctx.navigate(
+      id === 'features' ? '#/gemini-enterprise/features'
+        : (id === 'dev-tools' ? '#/gemini-enterprise/dev-tools' : '#/gemini-enterprise'),
+    )));
   if (view === 'features') {
     const mod = await import('./gemini_features.js');
+    return mod.default(ctx, header);
+  }
+  if (view === 'dev-tools') {
+    const mod = await import('./gemini_devtools.js');
     return mod.default(ctx, header);
   }
   return pageFlow(ctx, {

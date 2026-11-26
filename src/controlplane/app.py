@@ -81,12 +81,15 @@ _route("GET", "/api/v1/gemini-enterprise/summary", gemini_enterprise.summary, mo
 _route("GET", "/api/v1/gemini-enterprise/licenses", gemini_enterprise.licenses, module="gemini_enterprise", cache=True)
 _route("GET", "/api/v1/gemini-enterprise/file-uploads", gemini_enterprise.file_uploads, module="gemini_enterprise",
        range=True, cache=True, mask={"restrict": ("fileName", "fileId")})
-# Feature management: the feature switches of every Gemini Enterprise app (engine `features` map) in one matrix, and
-# changes applied to many apps at once (engines.patch with updateMask=features, one audit entry per apply).
+# Feature management & model selection: the feature switches (Engine.features) and model overrides (Engine.modelConfigs)
+# of every Gemini Enterprise app in one matrix, applied to many apps at once (engines.patch, one audit entry per apply),
+# plus project/location-level AI developer tools & Antigravity authorized models (DevToolsConfig v1alpha, read-only).
 _route("GET", "/api/v1/gemini-enterprise/features", ge_features.inventory, module="gemini_enterprise", cache=True,
        ttl=60, refreshable=True)
 _route("POST", "/api/v1/gemini-enterprise/features/apply", ge_features.apply, module="gemini_enterprise", admin=True,
        rate="governance", mask=False)
+_route("GET", "/api/v1/gemini-enterprise/dev-tools", ge_features.dev_tools_inventory, module="gemini_enterprise",
+       cache=True, ttl=60, refreshable=True)
 _route("GET", "/api/v1/notebooklm/summary", notebooklm.summary, module="notebooklm", range=True, cache=True)
 _route("GET", "/api/v1/models/usage", models.usage, module="model_usage", range=True, cache=True)
 _route("GET", "/api/v1/models/catalog", models.catalog, module="model_usage", cache=True)

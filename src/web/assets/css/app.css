@@ -1576,6 +1576,34 @@ button.fm-cell:focus-visible { outline: 2px solid var(--accent); outline-offset:
 .fm-diff-name { display: grid; gap: 1px; font-size: 13px; font-weight: 550; }
 .fm-diff-states { display: inline-flex; align-items: center; gap: 8px; color: var(--text-3); flex-shrink: 0; }
 .fm-result-error { display: flex; align-items: flex-start; gap: 6px; margin: 8px 0 0; font-size: 12.5px; color: var(--danger); }
+.fm-section-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 12px 18px; border-bottom: 1px solid var(--border); background: var(--surface-2);
+}
+.fm-live-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--success); flex-shrink: 0;
+}
+.fm-pop-info { padding: 6px 10px; font-size: 11.5px; color: var(--success); }
+
+.dt-summary-table th.dt-scope-col { min-width: 190px; padding-left: 18px; }
+.dt-summary-table th.dt-act-col, .dt-summary-table td.dt-act-col { text-align: right; white-space: nowrap; padding-right: 18px; }
+.dt-model-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.dt-hint { font-size: 11.5px; color: var(--text-3); }
+
+/* Canonical visually-hidden utility (keeps semantic table captions in the accessibility tree). */
+.visually-hidden:where(:not(:focus-within, :active)) {
+  position: absolute !important;
+  clip-path: inset(50%) !important;
+  overflow: hidden !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  white-space: nowrap !important;
+}
+
 @media (max-width: 720px) {
   .fm-table th.fm-feature-col { min-width: 200px; }
   .fm-legend-note { margin-inline-start: 0; }

@@ -83,8 +83,10 @@ class FrontendHygieneTest(unittest.TestCase):
         maps = {
             "pages/antigravity.js": ("GATE_TEXT", "REASON_LABELS", "TRIGGER_LABELS", "RULE_HINTS", "PERIODS", "WEEKDAYS"),
             "pages/_shared.js": ("CAP_REASON_LABELS",),
-            "pages/gemini_features.js": ("GROUPS", "FEATURES", "STATE_LABELS", "ROW_ACTIONS", "RESULT_LABELS",
-                                         "ERROR_HINTS"),
+            "pages/gemini_features.js": ("GROUPS", "FEATURES", "MODEL_GROUPS", "STATE_LABELS", "MODEL_STATE_LABELS",
+                                         "ROW_ACTIONS", "MODEL_ROW_ACTIONS", "RESULT_LABELS", "ERROR_HINTS"),
+            "pages/gemini_devtools.js": ("SETTING_GROUPS", "FILE_POLICY_LABELS", "TERMINAL_POLICY_LABELS",
+                                         "JS_POLICY_LABELS", "MODEL_AVAIL_LABELS"),
         }
         missing = []
         for rel, names in maps.items():

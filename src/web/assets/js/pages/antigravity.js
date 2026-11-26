@@ -79,10 +79,16 @@ export default async function render(ctx) {
       if (status) runEnforce(ctx, status, false, runBtn, hooks);
     },
   });
+  const devToolsBtn = button({
+    label: t('AI developer tools'),
+    icon: 'sliders',
+    title: t('Audit AI developer tools settings and Antigravity authorized models'),
+    onClick: () => ctx.navigate('#/gemini-enterprise/dev-tools'),
+  });
   const header = pageHeader({
     title: t('Antigravity Controls'),
     desc: t('Per-user model usage, estimated costs, spending caps and access control.'),
-    actions: [policyBtn, dryBtn, runBtn],
+    actions: [devToolsBtn, policyBtn, dryBtn, runBtn],
   });
   const body = h('div', { class: 'stack-lg' });
   mount(ctx.root, header, body);

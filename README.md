@@ -771,7 +771,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 | `roles/resourcemanager.projectIamAdmin` | 한도 초과 정지와 복원, 개별 허용과 차단, 전체 AI 접근 차단(etag 기반 `setIamPolicy`) |
 | `roles/iam.roleAdmin` | 마커 역할 생성과 갱신 |
 | `CustomAiControlPlaneGatewayManager` | Agent Gateway 생성·수정·삭제와 액세스 인가 전환([7.4](#74-agent-gateway)) |
-| `CustomAiControlPlaneGeFeatureManager` | Gemini Enterprise 앱 기능 스위치 변경(`discoveryengine.engines.get/list/update`, [7.2](#72-gemini-enterprise)). 연동 프로젝트에도 부여 |
+| `CustomAiControlPlaneGeFeatureManager` | Gemini Enterprise 앱 기능 스위치·모델 선택 변경 및 AI 개발자 도구 조회(`discoveryengine.engines.get/list/update`, `widgetConfigs.get`, `devToolsConfigs.get`, [7.2](#72-gemini-enterprise)). 연동 프로젝트에도 부여 |
 
 **거부 정책 집행 (`ENFORCEMENT_BACKEND=iam_deny`일 때만)**: 런타임 서비스 계정은 조직의 Deny Reviewer와 집행 작업의 `roles/run.jobsExecutor`·`roles/run.viewer`를 받고, 거부 정책 쓰기(Deny Admin)는 집행 작업 서비스 계정만 받습니다([8.9](#89-거부-정책-집행과-집행-작업)).
 
@@ -801,22 +801,31 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 
 활성 사용자, 프롬프트, 에이전트별 호출, 업로드 파일, 라이선스 좌석(할당, 사용, 휴면 좌석)을 보여 줍니다. 집계 기준은 [6.3](#63-gemini-enterprise-로그)을 따릅니다. 라이선스 좌석은 `DISCOVERY_ENGINE_LOCATIONS`의 모든 위치를 합산하고, 위치가 둘 이상이면 표에 위치 열을 표시합니다.
 
-**기능 관리** (`#/gemini-enterprise/features`, 화면 위쪽 **기능 관리** 탭): 프로젝트마다 Gemini Enterprise 앱이 여러 개여도 모든 앱의 기능 스위치(엔진의 `features` 맵)를 한 매트릭스에서 보고, 여러 앱을 한 번에 바꿉니다.
+**기능 관리 및 모델 선택** (`#/gemini-enterprise/features`, `#/gemini-enterprise/features/models`, 화면 위쪽 **기능 관리** 탭): 프로젝트마다 Gemini Enterprise 앱이 여러 개여도 모든 앱의 **기능 스위치**(`Engine.features`)와 **모델 선택**(`Engine.modelConfigs`)을 한 화면에서 비교하고 여러 앱에 일괄 적용합니다.
 
-- **보기**: 열은 선택한 프로젝트(전체 통합 또는 단일 프로젝트)와 `DISCOVERY_ENGINE_LOCATIONS`의 모든 Gemini Enterprise 앱(`appType=APP_TYPE_INTRANET`이거나 스위치가 설정된 엔진), 행은 API 레퍼런스에 있는 모든 기능 키입니다(에이전트 갤러리, 노코드 에이전트 빌더, 모델 선택기, NotebookLM, 사람 검색, Canvas, 메모리 등). 레퍼런스에 없지만 앱에 설정된 키도 **기타 기능**에 나옵니다.
-- **상태**: **켜짐**(`FEATURE_STATE_ON`), **꺼짐**(`FEATURE_STATE_OFF`), **기본값**(키가 없어 제품 기본 동작). `disable-`로 시작하는 키는 **제한 항목**이라 켜면 그 기능이 차단됩니다(값을 뒤집어 보여 주지 않습니다). `*`(마스터 스위치)가 설정된 앱은 다른 스위치가 무시되므로 열 머리글에 표시하고 셀을 흐리게 보여 줍니다.
-- **찾기**: 기능 검색, 분류(에이전트 및 자동화, 어시스턴트 경험, 검색 및 지식, 콘텐츠 생성, 공유 및 협업, 개인화, 파일 및 접근), **앱별 상이만**(앱마다 상태가 다른 기능), **명시 설정만**, 프로젝트 선택. **앱 전체 분포** 열은 켜짐·꺼짐·기본값 앱 수입니다. **CSV 내보내기**로 현재 보이는 매트릭스를 받습니다.
-- **변경 (관리자)**: 셀을 눌러 켜짐/꺼짐/기본값을 고르거나, 행 메뉴로 **표시된 모든 앱에서 켜기/끄기/기본값으로 재설정**, 열 메뉴로 **표시된 모든 앱의 기준으로 사용**(그 앱의 스위치를 다른 앱에 복사)·**이 앱을 기본값으로 재설정**을 합니다. 변경은 바로 적용되지 않고 대기 상태로 표시되며, 아래 막대의 **검토 후 적용**에서 앱별 변경 전→후를 확인한 뒤 한 번에 적용합니다(한 번에 최대 100개 앱).
-- **적용 방식**: `POST /api/v1/gemini-enterprise/features/apply`가 앱마다 엔진을 다시 읽고(`GET .../engines/{id}`), 바꾼 키만 현재 맵에 병합해 `PATCH https://{위치}-discoveryengine.googleapis.com/v1/projects/{프로젝트}/locations/{위치}/collections/default_collection/engines/{앱}?updateMask=features`로 보냅니다(`global`은 `discoveryengine.googleapis.com`). `updateMask=features`는 맵 전체를 교체하므로, 그사이 콘솔에서 바뀐 다른 스위치를 지우지 않도록 이렇게 합니다. 앱마다 결과(업데이트, 변경 없음, 실패와 이유)를 보여 주고, 적용 한 번마다 거버넌스 감사 로그에 `ge_features_update` 항목을 남깁니다. 뷰어는 읽기만 할 수 있습니다.
-- **새로 만든 앱과 새로고침**: 목록은 서버에서 60초 동안 캐시합니다. 콘솔에서 앱을 막 만들었다면 상단의 **새로고침**(또는 명령 팔레트의 **데이터 새로고침**)을 누르면 캐시를 건너뛰고 바로 다시 읽습니다(`GET /api/v1/gemini-enterprise/features?refresh=1`). 변경을 적용하면 캐시는 자동으로 비워집니다.
-- **읽지 못한 프로젝트**: 대표 프로젝트의 목록을 읽지 못하면 원인별 데이터 소스 경고가, 연동 프로젝트를 읽지 못하면 "연동 프로젝트 N개의 Gemini Enterprise 앱을 읽지 못했습니다: 프로젝트" 경고가 화면 위에 나옵니다(응답의 `unreadableProjects`). Gemini Enterprise가 없거나 Discovery Engine API가 꺼진 프로젝트는 앱이 없는 것으로 보고 경고하지 않습니다.
-- **권한**: 조회는 `roles/discoveryengine.viewer`, 변경은 `discoveryengine.engines.update`가 필요합니다. `ENABLE_GOVERNANCE_ACTIONS=true`(기본) 배포 시 최소 권한 커스텀 역할 `CustomAiControlPlaneGeFeatureManager`(`discoveryengine.engines.get`, `.list`, `.update`)를 대표·연동 프로젝트에 부여합니다. 역할이 없는 프로젝트의 앱은 적용 결과에 `실패`와 권한 안내가 표시되고 다른 앱은 그대로 적용됩니다.
+- **기능 스위치**: 열은 선택한 프로젝트와 `DISCOVERY_ENGINE_LOCATIONS`의 모든 Gemini Enterprise 앱(`appType=APP_TYPE_INTRANET`이거나 스위치·모델 설정이 있는 엔진), 행은 Discovery Engine v1 레퍼런스의 모든 기능 키입니다(에이전트 갤러리, 노코드 에이전트 빌더, 에이전트 마켓플레이스·예약 실행·프리뷰 에이전트, 플러그인, 스킬 보안 스캔, 모델 선택기, NotebookLM, 코드 추출, Canvas·앱 공유, 음악·음성 생성, 메모리 등). 레퍼런스에 없지만 앱에 설정된 키도 **기타 기능**에 나옵니다.
+- **모델 선택**: 상단 세그먼트에서 **모델 선택**을 고르면 앱별 Gemini 모델(`Gemini 4 Hydrogen/Carbon/Argon`, `Gemini 3.8/3.7/3.6/3.5 Flash`, `Gemini 3.1 Pro`, `Gemini 2.5 Pro`), 이미지 생성 모델(`Gemini 3 Pro Image`, `Gemini 3.1 Flash Image`, `Gemini 2.5 Flash Image`), 서드파티 모델(`Anthropic Claude Opus 5.5`, `Claude Sonnet 5.5`)의 `MODEL_ENABLED`/`MODEL_DISABLED`/기본값 상태를 매트릭스로 관리합니다. `WidgetConfig.uiSettings.modelConfigInfo.resolvedModels`를 함께 읽어 현재 웹 앱 모델 선택기에 활성 표시되는 모델을 녹색 점으로 나타내고, 관리자는 **모델 ID 추가**로 신규 출시 모델 ID도 바로 대기 목록에 넣을 수 있습니다. 서드파티 Claude 모델은 Cloud Console에서 종량제(PAYG) 초과 사용 활성화와 프로젝트별 1회 이용약관 동의가 필요합니다.
+- **상태**: 기능은 **켜짐**(`FEATURE_STATE_ON`)/`꺼짐`(`FEATURE_STATE_OFF`)/`기본값`, 모델은 **사용**(`MODEL_ENABLED`)/`사용 안 함`(`MODEL_DISABLED`)/`기본값`(키 없음 = 제품 기본 동작). `disable-`로 시작하는 기능 키는 **제한 항목**이라 켜면 그 기능이 차단됩니다(값을 뒤집어 보여 주지 않습니다). `*`(마스터 스위치)가 설정된 앱은 다른 기능 스위치가 무시되므로 열 머리글에 표시하고 셀을 흐리게 보여 줍니다.
+- **찾기 및 일괄 변경 (관리자)**: 검색, 분류 칩, **앱별 상이만**, **명시 설정만**, 프로젝트 선택, **CSV 내보내기**. 셀 클릭, 행 메뉴(표시된 모든 앱 일괄 설정), 열 메뉴(기준 앱 복사·기본값 재설정)로 기능과 모델 변경을 함께 대기시킨 뒤 **검토 후 적용**에서 변경 전→후를 확인하고 한 번에 적용합니다(최대 100개 앱).
+- **적용 방식**: `POST /api/v1/gemini-enterprise/features/apply`가 앱마다 엔진을 다시 읽고(`GET .../engines/{id}`), 바꾼 기능 키와 모델 ID만 현재 맵에 병합해 `PATCH https://{위치}-discoveryengine.googleapis.com/v1/projects/{프로젝트}/locations/{위치}/collections/default_collection/engines/{앱}?updateMask=features,modelConfigs`로 보냅니다(`global`은 `discoveryengine.googleapis.com`). 변경된 맵만 `updateMask`에 포함하며, 그사이 콘솔에서 바뀐 다른 설정을 덮어쓰지 않습니다. 적용마다 거버넌스 감사 로그에 `ge_features_update` 항목(기능 변경 및 `modelChanges`)을 기록합니다. 뷰어는 읽기만 할 수 있습니다.
+- **새로 만든 앱과 새로고침**: 목록은 서버에서 60초 동안 캐시합니다. 상단의 **새로고침**으로 캐시를 건너뛰고 즉시 다시 읽습니다(`?refresh=1`). 변경을 적용하면 캐시는 자동으로 비워집니다.
+- **읽지 못한 프로젝트**: 연동 프로젝트를 읽지 못하면 상단에 경고가 표시됩니다(`unreadableProjects`). Discovery Engine API가 꺼진 프로젝트는 경고하지 않습니다.
+- **권한**: 조회는 `roles/discoveryengine.viewer`, 변경은 `discoveryengine.engines.update`가 필요합니다. `ENABLE_GOVERNANCE_ACTIONS=true`(기본) 배포 시 최소 권한 커스텀 역할 `CustomAiControlPlaneGeFeatureManager`(`discoveryengine.engines.get`, `.list`, `.update`, `widgetConfigs.get`, `devToolsConfigs.get`)를 대표·연동 프로젝트에 부여합니다.
+
+**AI 개발자 도구 및 Antigravity 모델 선택** (`#/gemini-enterprise/dev-tools`, 화면 위쪽 **AI 개발자 도구** 탭 — **Antigravity 통제** 화면 상단의 **AI 개발자 도구** 버튼에서도 바로 이동):
+
+- **실시간 멀티 프로젝트·위치 감사**: 모든 워크스페이스 프로젝트와 위치(`global`, `us`, `eu` 및 `DISCOVERY_ENGINE_LOCATIONS`)의 Discovery Engine `v1alpha` `DevToolsConfig` 리소스를 실시간으로 조회합니다.
+- **Antigravity 허용 모델 (`modelConfig`)**: 위치별 Google(Gemini) 모델 허용 정책(**전체 Gemini 기본값** vs **사용자 지정 허용 목록**)과 서드파티 모델(`Anthropic Claude Opus 5.5`, `Claude Sonnet 5.5`, PAYG) 허용 현황을 **정책 요약** 표와 **모델 매트릭스** 두 가지 보기로 비교합니다.
+- **AI 개발자 도구 설정**: 활성화 여부(`devToolsEnabled`), 컴플라이언스 로깅(`metadataLoggingEnabled`, `promptAndResponseLoggingEnabled`), 보안 정책(작업공간 외부 파일 접근 `Deny`/`Always ask`/`Allow`, 터미널 자동 실행 `Require review`/`Proceed in sandbox`/`Always proceed`, 샌드박스 모드), 외부 웹 접근(브라우저 접근, JavaScript 자동 실행), MCP 서버 및 허용 서버 JSON 구성(`mcpAllowlist` 모달 검사), 플러그인/마켓플레이스 제한, PAYG 초과 사용 설정을 매트릭스로 비교하고 CSV로 내보냅니다.
+- **쓰기 제약(Google Cloud Console 연동)**: 현재 Google Cloud는 `DevToolsConfigService.UpdateDevToolsConfig` 쓰기 API를 Google Cloud Console 퍼스트파티 클라이언트로만 제한하고 있어 외부 REST 호출 시 `404 Method not found`를 반환합니다. 대시보드는 모든 프로젝트·위치 설정을 실시간 읽기 전용으로 감사하고, 각 프로젝트 행에서 **콘솔에서 편집** 버튼으로 Google Cloud Console로 바로 이동할 수 있습니다.
+
 - **API 요약**:
 
   | 엔드포인트 | 권한 | 내용 |
   |---|---|---|
-  | `GET /api/v1/gemini-enterprise/features[?project=ID][&refresh=1]` | 로그인 | `apps[]`(앱 키, 프로젝트, 위치, 엔진 ID, 표시 이름, `features{키: on\|off}`, `allFeatures`), `keys`, `otherEngines`, `complete`, `unreadableProjects` |
-  | `POST /api/v1/gemini-enterprise/features/apply` | 관리자, CSRF, 거버넌스 속도 제한 | 본문 `{"changes": [{"project", "location", "engineId", "set": {"agent-gallery": "on", "disable-image-generation": "off", "model-selector": "default"}}]}`(최대 100개 앱, 앱당 64개 키). 응답 `results[]`(`updated`·`unchanged`·`failed`와 `error`), `updated`, `unchanged`, `failed`, `auditLogged` |
+  | `GET /api/v1/gemini-enterprise/features[?project=ID][&refresh=1]` | 로그인 | `apps[]`(앱 메타, `features{키: on\|off}`, `allFeatures`, `models{모델ID: on\|off}`, `resolvedModels[]`, `defaultModelId`), `keys`, `modelKeys`, `resolvedModelMeta`, `otherEngines`, `complete`, `unreadableProjects` |
+  | `POST /api/v1/gemini-enterprise/features/apply` | 관리자, CSRF, 거버넌스 속도 제한 | 본문 `{"changes": [{"project", "location", "engineId", "set"?: {...}, "setModels"?: {"gemini-4-argon": "on", "claude-opus-5-5": "default"}}]}`(최대 100개 앱, 앱당 기능 64개·모델 64개). 응답 `results[]`, `updated`, `unchanged`, `failed`, `auditLogged` |
+  | `GET /api/v1/gemini-enterprise/dev-tools[?project=ID][&refresh=1]` | 로그인 | `configs[]`(프로젝트·위치별 `devToolsEnabled`, `logging`, `agent`, `browser`, `mcp`, `plugins`, `models`, `overage`, `features`), `observedModels`, `observedThirdPartyModels`, `writeSupported: false`, `complete`, `unreadableProjects` |
 
 ### 7.3 NotebookLM
 
@@ -1592,10 +1601,10 @@ gcloud iam roles create CustomAiControlPlaneLicenseReader --project "$GE" \
   --permissions discoveryengine.licenseConfigs.get,discoveryengine.licenseConfigs.list,discoveryengine.userStores.get,discoveryengine.userStores.listUserLicenses
 gcloud projects add-iam-policy-binding "$GE" --member "$SA" \
   --role "projects/${GE}/roles/CustomAiControlPlaneLicenseReader" --condition=None
-# (선택) 대시보드에서 이 프로젝트의 Gemini Enterprise 기능 스위치까지 변경하려면 함께 부여합니다.
+# (선택) 대시보드에서 이 프로젝트의 Gemini Enterprise 기능 스위치와 모델 선택까지 변경하려면 함께 부여합니다.
 gcloud iam roles create CustomAiControlPlaneGeFeatureManager --project "$GE" \
   --title "AI Control Plane GE Feature Manager" --stage GA \
-  --permissions discoveryengine.engines.get,discoveryengine.engines.list,discoveryengine.engines.update
+  --permissions discoveryengine.engines.get,discoveryengine.engines.list,discoveryengine.engines.update,discoveryengine.widgetConfigs.get,discoveryengine.devToolsConfigs.get
 gcloud projects add-iam-policy-binding "$GE" --member "$SA" \
   --role "projects/${GE}/roles/CustomAiControlPlaneGeFeatureManager" --condition=None
 for role in roles/discoveryengine.viewer roles/bigquery.dataViewer roles/bigquery.jobUser roles/bigquery.user \
