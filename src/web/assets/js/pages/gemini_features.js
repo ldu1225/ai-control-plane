@@ -394,13 +394,29 @@ export default async function render(ctx, header) {
     }));
   }
 
+  const scannedProjects = Array.isArray(data.projects) && data.projects.length
+    ? data.projects
+    : [...new Set(model.apps.map((a) => a.project))];
+  const appProjectSet = new Set(model.apps.map((a) => a.project));
+  const emptyProjects = scannedProjects.filter((p) => !appProjectSet.has(p));
+  const locationsText = (data.locations || []).join(', ') || DASH;
+  const cardSubtitle = emptyProjects.length
+    ? t('{apps} apps \u00b7 {active}/{total} projects with apps \u00b7 Locations: {locations} \u00b7 No GE apps in {empty}', {
+      apps: fmt.int(model.apps.length),
+      active: fmt.int(appProjectSet.size),
+      total: fmt.int(scannedProjects.length),
+      locations: locationsText,
+      empty: emptyProjects.join(', '),
+    })
+    : t('{apps} apps \u00b7 {projects} projects \u00b7 Locations: {locations}', {
+      apps: fmt.int(model.apps.length),
+      projects: fmt.int(appProjectSet.size),
+      locations: locationsText,
+    });
+
   body.append(card({
     title: t('App features and model selection'),
-    subtitle: t('{apps} apps \u00b7 {projects} projects \u00b7 Locations: {locations}', {
-      apps: fmt.int(model.apps.length),
-      projects: fmt.int(new Set(model.apps.map((a) => a.project)).size),
-      locations: (data.locations || []).join(', ') || DASH,
-    }),
+    subtitle: cardSubtitle,
     actions: view.actionsHost,
     flush: true,
     source: model.discoveredCount
@@ -548,6 +564,11 @@ function paintKpis(model, el) {
   const isModels = model.section === 'models';
   const totalPend = totalPendingCount(model);
   const totalPendApps = totalPendingApps(model);
+  const activeProjCount = new Set(apps.map((a) => a.project)).size;
+  const scannedProjCount = Array.isArray(model.data.projects) ? model.data.projects.length : activeProjCount;
+  const projMeta = model.filter.project === 'all' && scannedProjCount > activeProjCount
+    ? t('{active} of {total} scanned projects', { active: fmt.int(activeProjCount), total: fmt.int(scannedProjCount) })
+    : t('{n} projects', { n: fmt.int(activeProjCount) });
   if (isModels) {
     const explicitModels = apps.reduce((n, a) => n + Object.keys(a.models || {}).length, 0);
     const mixedModels = model.modelRows.filter((r) => isMixed(distribution(model, apps, r.key, 'models'))).length;
@@ -556,7 +577,7 @@ function paintKpis(model, el) {
       kpi({
         label: t('Gemini Enterprise apps'),
         value: fmt.int(apps.length),
-        meta: t('{n} projects', { n: fmt.int(new Set(apps.map((a) => a.project)).size) }),
+        meta: projMeta,
         tip: t('Apps in the selected projects and configured locations.'),
       }),
       kpi({
@@ -584,7 +605,7 @@ function paintKpis(model, el) {
   const mixed = model.rows.filter((r) => isMixed(distribution(model, apps, r.key, 'features'))).length;
   const masters = apps.filter((a) => masterSet(model, a)).length;
   mount(el,
-    kpi({ label: t('Gemini Enterprise apps'), value: fmt.int(apps.length), meta: t('{n} projects', { n: fmt.int(new Set(apps.map((a) => a.project)).size) }), tip: t('Apps in the selected projects and configured locations.') }),
+    kpi({ label: t('Gemini Enterprise apps'), value: fmt.int(apps.length), meta: projMeta, tip: t('Apps in the selected projects and configured locations.') }),
     kpi({ label: t('Explicit switches'), value: fmt.int(explicit), meta: t('{n} features documented', { n: fmt.int(FEATURES.length) }), tip: t('Switches set to On or Off. Unset switches follow the product default.') }),
     kpi({ label: t('Mixed features'), value: fmt.int(mixed), meta: masters ? t('{n} apps use the master switch', { n: fmt.int(masters) }) : t('Same state in every app when 0'), tip: t('Features whose state differs between the shown apps.') }),
     kpi({ label: t('Pending changes'), value: fmt.int(totalPend), meta: t('{n} apps', { n: fmt.int(totalPendApps) }), tip: t('Staged feature and model changes that are not applied yet.') }));

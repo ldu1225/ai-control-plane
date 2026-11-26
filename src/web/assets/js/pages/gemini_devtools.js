@@ -414,7 +414,7 @@ export default async function render(ctx, header) {
     filter: {
       query: '',
       project: 'all',
-      enabledOnly: data.configs.some((c) => c.devToolsEnabled),
+      enabledOnly: false,
       mixedOnly: false,
     },
   };

@@ -4,14 +4,37 @@
 import { h, append } from '../core/dom.js';
 import { t } from '../core/i18n.js';
 import { fmt, isNum, DASH } from '../core/format.js';
-import { api } from '../core/api.js';
-import { pageHeader, kpi, card, dataTable, badge, userCell, emptyState, load, progress, stat, banner, tabs } from '../core/components.js';
+import { store, setProject } from '../core/state.js';
+import { pageHeader, kpi, card, dataTable, badge, button, userCell, emptyState, load, progress, stat, banner, tabs } from '../core/components.js';
 import { lineChart, barChart, fromTimeline, hbarList, TONES, colorAt } from '../core/charts.js';
 import { pageFlow, fetchRange, rangeText, deltaOf, chartCard, mountCharts, openUserDrawer } from './_shared.js';
 
 const CATEGORY_LABELS = {
   document: 'Document', spreadsheet: 'Spreadsheet', presentation: 'Presentation', image: 'Image', text: 'Text', other: 'Other',
 };
+
+function projectScopeBanner() {
+  const connected = (store.boot && store.boot.workspace && store.boot.workspace.projects) || [];
+  if (!store.project || store.project === 'all' || connected.length <= 1) return null;
+  return banner({
+    tone: 'info',
+    iconName: 'filter',
+    title: t('Filtered to project: {id}', { id: store.project }),
+    text: t('Only {id} is shown because the workspace project filter is active. Switch to all {n} connected projects to view every linked project together.', {
+      id: store.project,
+      n: fmt.int(connected.length),
+    }),
+    actions: [
+      button({
+        label: t('Show all {n} connected projects', { n: fmt.int(connected.length) }),
+        icon: 'layers',
+        variant: 'primary',
+        size: 'sm',
+        onClick: () => setProject('all'),
+      }),
+    ],
+  });
+}
 
 /* Views (each has its own address): #/gemini-enterprise (usage), #/gemini-enterprise/features (features & models),
    and #/gemini-enterprise/dev-tools (AI developer tools & Antigravity authorized models). */
@@ -32,7 +55,8 @@ export default async function render(ctx) {
     ], view, (id) => ctx.navigate(
       id === 'features' ? '#/gemini-enterprise/features'
         : (id === 'dev-tools' ? '#/gemini-enterprise/dev-tools' : '#/gemini-enterprise'),
-    )));
+    )),
+    projectScopeBanner());
   if (view === 'features') {
     const mod = await import('./gemini_features.js');
     return mod.default(ctx, header);
@@ -93,7 +117,7 @@ function renderPage(ctx, body, d) {
   licCard.classList.add('span-12');
   row3.append(licCard);
   body.append(row3);
-  load(licHost, () => api.get('/api/v1/gemini-enterprise/licenses', null, { signal: ctx.signal }), (res) => renderLicenses(licHost, res.data), { skeletonKind: 'lines', signal: ctx.signal });
+  load(licHost, () => fetchRange(ctx, '/api/v1/gemini-enterprise/licenses'), (res) => renderLicenses(licHost, res.data), { skeletonKind: 'lines', signal: ctx.signal });
 
   body.append(card({
     title: t('Top users'), subtitle: rangeText(), flush: true,
@@ -136,6 +160,11 @@ function renderLicenses(host, d) {
   const assigned = d.assigned;
   const util = isNum(purchased) && purchased > 0 && isNum(assigned) ? assigned / purchased : null;
   const tone = util === null ? '' : util > 0.95 ? 'danger' : util > 0.8 ? 'warning' : 'success';
+  const cfgProjects = new Set((d.configs || []).map((c) => c.project).filter(Boolean));
+  const userProjects = new Set((d.users || []).map((u) => u.project).filter(Boolean));
+  const byProject = (cfgProjects.size > 1 || userProjects.size > 1)
+    ? [{ key: 'project', label: t('Project'), render: (r) => h('span', { class: 'cell-mono' }, r.project || DASH) }]
+    : [];
   // Seats are distributed per location; show where each row lives when more than one location is read.
   const byLocation = Array.isArray(d.locations) && d.locations.length > 1
     ? [{ key: 'location', label: t('Location'), render: (r) => h('span', { class: 'cell-mono' }, r.location || DASH) }]
@@ -151,6 +180,7 @@ function renderLicenses(host, d) {
     (d.configs && d.configs.length) ? dataTable({
       columns: [
         { key: 'displayName', label: t('Configuration'), render: (r) => h('div', { class: 'cell-stack' }, h('span', { class: 'cell-main' }, r.displayName || r.name.split('/').pop()), h('span', { class: 'cell-sub cell-mono' }, r.name.split('/').pop())) },
+        ...byProject,
         ...byLocation,
         { key: 'subscriptionTier', label: t('Tier'), render: (r) => r.subscriptionTier || DASH },
         { key: 'state', label: t('State'), render: (r) => badge(r.state || DASH, r.state === 'ACTIVE' ? 'success' : 'neutral', { size: 'sm', dot: true }) },
@@ -163,6 +193,7 @@ function renderLicenses(host, d) {
       title: t('Seat assignments'),
       columns: [
         { key: 'email', label: t('User'), render: (r) => userCell(r.email) },
+        ...byProject,
         ...byLocation,
         { key: 'state', label: t('Assignment'), render: (r) => badge(r.state || DASH, r.state === 'ASSIGNED' ? 'success' : 'neutral', { size: 'sm' }) },
         { key: 'lastLogin', label: t('Last sign-in'), render: (r) => (r.lastLogin ? fmt.dateTime(r.lastLogin) : t('Never')), value: (r) => r.lastLogin || '' },

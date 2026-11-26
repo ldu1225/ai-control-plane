@@ -4026,6 +4026,10 @@ const KO = {
   "{n} models auto-discovered": "모델 {n}개 자동 발견",
   "Automatically discovered from Discovery Engine apps, WidgetConfig, and Google Cloud Model Garden.": "Discovery Engine 앱, WidgetConfig 및 Google Cloud Model Garden에서 자동으로 발견한 모델입니다.",
   "Automatically discovered from Google Cloud Model Garden or active app configurations.": "Google Cloud Model Garden 또는 실제 앱 설정에서 자동으로 발견한 모델입니다.",
+  "Only {id} is shown because the workspace project filter is active. Switch to all {n} connected projects to view every linked project together.": "워크스페이스 프로젝트 필터가 {id}(으)로 설정되어 해당 프로젝트만 표시됩니다. 연동된 {n}개 프로젝트를 모두 보려면 전체 보기로 전환하세요.",
+  "Show all {n} connected projects": "연동된 {n}개 프로젝트 모두 보기",
+  "{apps} apps · {active}/{total} projects with apps · Locations: {locations} · No GE apps in {empty}": "앱 {apps}개 · 앱 보유 프로젝트 {active}/{total}개 · 위치: {locations} · GE 앱 없음: {empty}",
+  "{active} of {total} scanned projects": "스캔된 {total}개 중 {active}개 프로젝트",
 };
 
 export default KO;
