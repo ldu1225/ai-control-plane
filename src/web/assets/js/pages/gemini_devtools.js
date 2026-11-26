@@ -283,39 +283,13 @@ function agyModelRows(data) {
   const partnerRows = AGY_THIRD_PARTY_MODELS.map(([id, label]) => ({
     id, label, provider: 'partner', preview: false,
   }));
-  const discovered = data.discoveredModels || [];
-  discovered.forEach((item) => {
-    if (!item || !item.modelId) return;
-    const id = item.modelId;
-    if (item.group === 'partner') {
-      if (seen3p.has(id)) return;
-      seen3p.add(id);
-      partnerRows.push({
-        id,
-        label: item.displayName || modelDisplayName(id),
-        provider: 'partner',
-        preview: Boolean(item.isPreview),
-        discovered: true,
-      });
-    } else if (item.group === 'gemini') {
-      if (seenGoogle.has(id)) return;
-      seenGoogle.add(id);
-      googleRows.push({
-        id,
-        label: item.displayName || modelDisplayName(id),
-        provider: 'google',
-        preview: Boolean(item.isPreview),
-        discovered: true,
-      });
-    }
-  });
   (data.observedModels || []).filter((id) => !seenGoogle.has(id)).forEach((id) => {
     seenGoogle.add(id);
-    googleRows.push({ id, label: modelDisplayName(id), provider: 'google', preview: id.includes('preview'), discovered: true });
+    googleRows.push({ id, label: modelDisplayName(id), provider: 'google', preview: id.includes('preview') });
   });
   (data.observedThirdPartyModels || []).filter((id) => !seen3p.has(id)).forEach((id) => {
     seen3p.add(id);
-    partnerRows.push({ id, label: modelDisplayName(id), provider: 'partner', preview: id.includes('preview'), discovered: true });
+    partnerRows.push({ id, label: modelDisplayName(id), provider: 'partner', preview: id.includes('preview') });
   });
   return googleRows.concat(partnerRows);
 }
@@ -677,8 +651,7 @@ function paintModelMatrix(state, configs, el) {
         h('div', { class: 'fm-feature-text' },
           h('span', { class: 'fm-feature-name' }, r.label,
             r.preview ? badge(t('Preview'), 'neutral', { size: 'sm' }) : null,
-            r.provider === 'partner' ? badge(t('3P · PAYG'), 'accent', { size: 'sm' }) : null,
-            r.discovered ? badge(t('Auto-discovered'), 'neutral', { size: 'sm', title: t('Automatically discovered from Google Cloud Model Garden or active app configurations.') }) : null),
+            r.provider === 'partner' ? badge(t('3P · PAYG'), 'accent', { size: 'sm' }) : null),
           h('span', { class: 'fm-feature-key' }, r.id))),
       vals.map((v) => h('td', { class: 'fm-cell-td' },
         badge(t(MODEL_AVAIL_LABELS[v.code] || v.code), v.tone, { size: 'sm', dot: v.tone !== 'neutral' })))));

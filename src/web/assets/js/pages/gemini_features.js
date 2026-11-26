@@ -107,24 +107,23 @@ const MODEL_GROUPS = [
   ['other', 'Other models'],
 ];
 
-/* Verified Engine.modelConfigs catalog from Gemini Enterprise web app documentation & live Discovery Engine v1.
-   Entry shape: [modelId, group, displayName, flags] where flags may contain { defaultOn, preview, partner, globalOnly }. */
-const MODELS = [
+/* Fallback Gemini Enterprise catalog used only when WidgetConfig (modelInfoView=ADMIN) cannot be read.
+   Entry shape: [modelId, group, displayName, flags]. */
+const FALLBACK_MODELS = [
   ['gemini-4-neon', 'gemini', 'Gemini 4 Neon', {}],
   ['gemini-4-hydrogen', 'gemini', 'Gemini 4 Hydrogen', {}],
   ['gemini-4-carbon', 'gemini', 'Gemini 4 Carbon', {}],
   ['gemini-4-argon', 'gemini', 'Gemini 4 Argon', {}],
   ['gemini-3.8-flash', 'gemini', 'Gemini 3.8 Flash', { defaultOn: true }],
   ['gemini-3.7-flash', 'gemini', 'Gemini 3.7 Flash', {}],
-  ['gemini-3.6-flash', 'gemini', 'Gemini 3.6 Flash', {}],
-  ['gemini-3.5-flash', 'gemini', 'Gemini 3.5 Flash', { defaultOn: true }],
+  ['gemini-3.5-flash', 'gemini', 'Gemini 3.5 Flash', { defaultOn: true, lockedOn: true }],
   ['gemini-3.1-pro-preview', 'gemini', 'Gemini 3.1 Pro', { preview: true }],
   ['gemini-2.5-pro', 'gemini', 'Gemini 2.5 Pro', { defaultOn: true }],
-  ['gemini-3-pro-image-preview', 'image', 'Gemini 3 Pro Image (Nano Banana Pro)', { globalOnly: true }],
-  ['gemini-3.1-flash-image-preview', 'image', 'Gemini 3.1 Flash Image (Nano Banana 2)', {}],
+  ['gemini-3.1-flash-image', 'image', 'Gemini 3.1 Flash Image', {}],
+  ['gemini-3-pro-image', 'image', 'Gemini 3 Pro Image', { globalOnly: true }],
   ['gemini-2.5-flash-image', 'image', 'Gemini 2.5 Flash Image', { defaultOn: true }],
-  ['claude-opus-5-5', 'partner', 'Anthropic Claude Opus 5.5', { partner: true }],
-  ['claude-sonnet-5-5', 'partner', 'Anthropic Claude Sonnet 5.5', { partner: true }],
+  ['claude-opus-5-5', 'partner', 'Claude Opus 5.5', { partner: true }],
+  ['claude-sonnet-5-5', 'partner', 'Claude Sonnet 5.5', { partner: true }],
 ];
 
 const STATE_LABELS = { on: 'On', off: 'Off', default: 'Default' };
@@ -155,7 +154,7 @@ function featureRows(keys) {
   return rows;
 }
 
-function modelRows(modelKeys, resolvedMeta, discoveredModels) {
+function modelRows(modelKeys, resolvedMeta, availableModels) {
   const byGroup = Object.fromEntries(MODEL_GROUPS.map(([id]) => [id, []]));
   const seen = new Set();
   const meta = resolvedMeta || {};
@@ -165,36 +164,45 @@ function modelRows(modelKeys, resolvedMeta, discoveredModels) {
     seen.add(row.key);
   };
 
-  MODELS.forEach(([key, group, label, flags]) => {
-    const live = meta[key];
-    push({
-      key,
-      group,
-      label: (live && live.displayName) || label,
-      defaultOn: Boolean(flags.defaultOn),
-      preview: Boolean(flags.preview || (live && live.isPreview)),
-      partner: Boolean(flags.partner),
-      globalOnly: Boolean(flags.globalOnly),
+  if (Array.isArray(availableModels) && availableModels.length) {
+    // Authoritative Gemini Enterprise model registry from Discovery Engine WidgetConfig (modelInfoView=ADMIN).
+    availableModels.forEach((item) => {
+      if (!item || !item.modelId || seen.has(item.modelId)) return;
+      const key = item.modelId;
+      const group = byGroup[item.group] ? item.group : 'other';
+      const regions = Array.isArray(item.regions) ? item.regions : [];
+      push({
+        key,
+        group,
+        label: item.displayName || key,
+        description: item.description || null,
+        defaultOn: Boolean(item.enabledByDefault),
+        lockedOn: Boolean(item.lockedOn),
+        preview: Boolean(item.isPreview),
+        partner: group === 'partner',
+        globalOnly: regions.length === 1 && regions[0] === 'global',
+        regions,
+      });
     });
-  });
-
-  (discoveredModels || []).forEach((item) => {
-    if (!item || !item.modelId || seen.has(item.modelId)) return;
-    const key = item.modelId;
-    const live = meta[key];
-    const group = byGroup[item.group] ? item.group : 'other';
-    push({
-      key,
-      group,
-      label: (live && live.displayName) || item.displayName || key,
-      defaultOn: false,
-      preview: Boolean(item.isPreview || (live && live.isPreview)),
-      partner: group === 'partner' || item.publisher === 'anthropic',
-      globalOnly: false,
-      discovered: true,
+  } else {
+    FALLBACK_MODELS.forEach(([key, group, label, flags]) => {
+      const live = meta[key];
+      push({
+        key,
+        group,
+        label: (live && live.displayName) || label,
+        description: (live && live.description) || null,
+        defaultOn: Boolean(flags.defaultOn),
+        lockedOn: Boolean(flags.lockedOn),
+        preview: Boolean(flags.preview || (live && live.isPreview)),
+        partner: Boolean(flags.partner),
+        globalOnly: Boolean(flags.globalOnly),
+        regions: [],
+      });
     });
-  });
+  }
 
+  // Keep any legacy/previous model IDs already explicitly stored on an app so administrators can review or clear them.
   [...(modelKeys || [])].filter((k) => !seen.has(k)).sort().forEach((key) => {
     const live = meta[key];
     const isPartner = key.startsWith('claude-') || key.startsWith('anthropic-');
@@ -204,11 +212,14 @@ function modelRows(modelKeys, resolvedMeta, discoveredModels) {
       key,
       group: isPartner ? 'partner' : (isImage ? 'image' : (isGemini ? 'gemini' : 'other')),
       label: (live && live.displayName) || key,
+      description: (live && live.description) || null,
       defaultOn: false,
+      lockedOn: false,
       preview: Boolean((live && live.isPreview) || key.includes('preview')),
       partner: isPartner,
       globalOnly: false,
-      discovered: true,
+      regions: [],
+      legacy: true,
     });
   });
 
@@ -216,14 +227,14 @@ function modelRows(modelKeys, resolvedMeta, discoveredModels) {
 }
 
 function createModel(data, initialSection) {
-  const discovered = data.discoveredModels || [];
+  const available = Array.isArray(data.availableModels) ? data.availableModels : [];
   return {
     data,
     apps: data.apps || [],
     section: initialSection === 'models' ? 'models' : 'features',
     rows: featureRows(data.keys),
-    discoveredCount: discovered.length,
-    modelRows: modelRows(data.modelKeys, data.resolvedModelMeta, discovered),
+    liveCatalogCount: available.length,
+    modelRows: modelRows(data.modelKeys, data.resolvedModelMeta, available),
     pending: new Map(), // app key -> Map(feature key -> state)
     pendingModels: new Map(), // app key -> Map(modelId -> state)
     filter: {
@@ -419,8 +430,8 @@ export default async function render(ctx, header) {
     subtitle: cardSubtitle,
     actions: view.actionsHost,
     flush: true,
-    source: model.discoveredCount
-      ? `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'}) · Model Garden publisherModels`
+    source: model.liveCatalogCount
+      ? `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'}) · widgetConfigs (v1alpha ADMIN)`
       : `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'})`,
     body: h('div', null,
       h('div', { class: 'fm-section-bar' }, view.switchHost),
@@ -452,11 +463,11 @@ function paintSectionBar(ctx, model, view, repaint) {
       model.section = v;
       repaint();
     }, { label: t('Configuration section') }),
-    model.section === 'models' && model.discoveredCount
-      ? badge(t('{n} models auto-discovered', { n: fmt.int(model.modelRows.length) }), 'info', {
+    model.section === 'models' && model.liveCatalogCount
+      ? badge(t('{n} Gemini Enterprise models synced', { n: fmt.int(model.liveCatalogCount) }), 'info', {
         size: 'sm',
         dot: true,
-        title: t('Automatically discovered from Discovery Engine apps, WidgetConfig, and Google Cloud Model Garden.'),
+        title: t('Synced live from Discovery Engine WidgetConfig (modelInfoView=ADMIN).'),
       })
       : null);
 
@@ -736,9 +747,14 @@ function matrixRow(model, row, apps, admin, repaint) {
   const badges = [];
   if (isModels) {
     if (row.preview) badges.push(badge(t('Preview'), 'neutral', { size: 'sm' }));
+    if (row.lockedOn) {
+      badges.push(badge(t('Always on'), 'success', { size: 'sm', title: t('Always on by default in Gemini Enterprise (cannot be turned off).') }));
+    } else if (row.defaultOn) {
+      badges.push(badge(t('Default on'), 'neutral', { size: 'sm', title: t('Turned on by default when no explicit override is set.') }));
+    }
     if (row.partner) badges.push(badge(t('3P · PAYG'), 'accent', { size: 'sm', title: t('Requires pay-as-you-go usage above quota and one-time Terms of Service acceptance in Google Cloud Console.') }));
     if (row.globalOnly) badges.push(badge(t('Global'), 'neutral', { size: 'sm', title: t('Available in the global region only; regional apps display a warning before routing to global.') }));
-    if (row.discovered) badges.push(badge(t('Auto-discovered'), 'neutral', { size: 'sm', title: t('Automatically discovered from Google Cloud Model Garden or active app configurations.') }));
+    if (row.legacy) badges.push(badge(t('Legacy override'), 'neutral', { size: 'sm', title: t('Previously set in Engine.modelConfigs on an app, not listed in the current Gemini Enterprise model registry.') }));
   } else {
     if (row.restriction) badges.push(badge(t('Restriction'), 'neutral', { size: 'sm', title: t('On blocks this capability.') }));
     if (row.key === '*') badges.push(badge(t('Overrides all'), 'warning', { size: 'sm', title: t('While it is set, every other switch of the app is ignored.') }));
@@ -749,7 +765,7 @@ function matrixRow(model, row, apps, admin, repaint) {
     h('th', { class: 'fm-feature-col', scope: 'row' },
       h('div', { class: 'fm-feature' },
         h('div', { class: 'fm-feature-text' },
-          h('span', { class: 'fm-feature-name' }, row.label, ...badges),
+          h('span', { class: 'fm-feature-name', title: row.description || '' }, row.label, ...badges),
           h('span', { class: 'fm-feature-key' }, row.key)),
         rowMenu)),
     h('td', { class: 'fm-dist-col' }, h('div', { class: 'fm-dist' }, bar,
@@ -765,6 +781,7 @@ function cell(model, row, app, admin, repaint) {
   const pending = isPending(model, app, row.key);
   const ignored = !isModels && row.key !== '*' && masterSet(model, app);
   const resolved = isModels && isResolved(app, row.key);
+  const outOfRegion = isModels && Array.isArray(row.regions) && row.regions.length > 0 && !row.regions.includes(app.location);
   const from = original(app, row.key, model.section);
   const title = pending
     ? t('{feature} in {app}: {from} \u2192 {to} (pending)', { feature: row.label, app: app.displayName, from: t(labels[from]), to: t(labels[state]) })
@@ -798,6 +815,8 @@ function cell(model, row, app, admin, repaint) {
         onClick: () => { close(); stage(model, app, row.key, s); repaint(); },
       })),
       resolved ? h('div', { class: 'fm-pop-info' }, t('Currently available in the web app model selector.')) : null,
+      isModels && row.lockedOn ? h('div', { class: 'fm-pop-note' }, t('Always on by default in Gemini Enterprise (cannot be turned off).')) : null,
+      outOfRegion ? h('div', { class: 'fm-pop-note' }, t('Supported natively in: {regions}. Enabling in {loc} may route traffic to global.', { regions: row.regions.join(', '), loc: app.location })) : null,
       isModels && row.partner ? h('div', { class: 'fm-pop-note' }, t('Third-party models require PAYG overage and one-time Terms of Service acceptance in Google Cloud Console.')) : null,
       isModels && selectorDisabled(model, app) ? h('div', { class: 'fm-pop-note' }, t('The model-selector feature switch is Off for this app.')) : null,
       ignored ? h('div', { class: 'fm-pop-note' }, t('Ignored while the master switch of this app is set.')) : null)),

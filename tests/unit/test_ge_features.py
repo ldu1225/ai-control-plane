@@ -64,9 +64,9 @@ class Cloud:
         self.calls = []
         self.audit = []
         self.engines = {}    # (project, location) -> [Engine]
-        self.widgets = {}    # (location, engine_id) -> WidgetConfig
+        self.widgets = {}    # (location, engine_id) -> WidgetConfig (END_USER_WEB)
+        self.admin_widgets = {}  # location -> WidgetConfig (modelInfoView=ADMIN)
         self.dev_tools = {}  # (project, location) -> DevToolsConfig
-        self.publisher_models = {}  # (hostname, publisher) -> [PublisherModel]
         self.fail = {}       # substring of "METHOD url" -> GcpError
         self.on_get = None   # hook run before an engine GET answers (simulates a concurrent change)
 
@@ -94,10 +94,6 @@ class Cloud:
         if path.endswith("/entries:write"):
             self.audit.extend(e["jsonPayload"] for e in body["entries"])
             return {}, {}
-        if parsed.hostname and "aiplatform" in parsed.hostname and "/publishers/" in path and method == "GET":
-            segs = path.split("/")
-            pub = segs[segs.index("publishers") + 1]
-            return {"publisherModels": list(self.publisher_models.get((parsed.hostname, pub), []))}, {}
         if "discoveryengine" not in parsed.hostname:
             return {}, {}
         parts = path.split("/")
@@ -109,6 +105,11 @@ class Cloud:
             return json.loads(json.dumps(cfg)), {}
         if "/widgetConfigs/" in path and method == "GET":
             loc, eid = parts[5], parts[9]
+            if params.get("modelInfoView") == "ADMIN":
+                widget = self.admin_widgets.get(loc)
+                if widget is None:
+                    raise GcpError("not_found", status=404, message=UPSTREAM_SECRET)
+                return json.loads(json.dumps(widget)), {}
             widget = self.widgets.get((loc, eid))
             if widget is None:
                 raise GcpError("not_found", status=404, message=UPSTREAM_SECRET)
@@ -554,84 +555,77 @@ class FeatureManagementTest(unittest.TestCase):
         _, fresh = self.call("GET", path + "?refresh=1")
         self.assertTrue(next(c for c in fresh["data"]["configs"] if c["key"] == "demo-project/eu")["devToolsEnabled"])
 
-    def test_inventory_and_dev_tools_auto_discover_model_garden_models(self):
-        self.cloud.publisher_models[("aiplatform.googleapis.com", "google")] = [
-            {"name": "publishers/google/models/gemini-4-neon", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-3.5-flash-lite", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-3.1-pro-preview", "launchStage": "PUBLIC_PREVIEW"},
-            {"name": "publishers/google/models/gemini-3.1-flash-image-preview", "launchStage": "PUBLIC_PREVIEW"},
-            # Non-GE modalities & legacy snapshots must be filtered out automatically.
-            {"name": "publishers/google/models/gemini-1.5-pro-002", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-2.5-flash-preview-04-17", "launchStage": "PUBLIC_PREVIEW"},
-            {"name": "publishers/google/models/gemini-embedding-2", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-2.5-pro-tts", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-3.5-transcribe", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-live-2.5-flash-native-audio", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-omni-1.2-flash", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-nano-banana-2.1", "launchStage": "GA"},
-            {"name": "publishers/google/models/veo-3.1-generate-001", "launchStage": "GA"},
-        ]
-        self.cloud.publisher_models[("us-central1-aiplatform.googleapis.com", "google")] = [
-            {"name": "publishers/google/models/gemini-2.5-flash-image", "launchStage": "GA"},
-            {"name": "publishers/google/models/gemini-4-neon", "launchStage": "GA"},  # duplicate deduped
-            {"name": "publishers/google/models/gemini-robotics-er-2-preview", "launchStage": "PUBLIC_PREVIEW"},
-        ]
-        self.cloud.publisher_models[("aiplatform.googleapis.com", "anthropic")] = [
-            {"name": "publishers/anthropic/models/claude-sonnet-5-5", "launchStage": "GA"},
-            {"name": "publishers/anthropic/models/claude-opus-5-5", "launchStage": "GA"},
-            {"name": "publishers/anthropic/models/claude-haiku-4-5", "launchStage": "GA"},
-        ]
+    def test_inventory_discovers_authoritative_ge_models_from_widget_admin_view(self):
+        self.cloud.admin_widgets["global"] = {
+            "uiSettings": {
+                "modelConfigInfo": {
+                    "resolvedModels": [
+                        {
+                            "modelId": "gemini-4-neon",
+                            "displayName": "Gemini 4 Neon",
+                            "description": "Gemini 4 Neon model",
+                            "promoted": True,
+                            "adminView": {"adminOverridable": True, "regions": ["eu", "global", "us"]},
+                        },
+                        {
+                            "modelId": "gemini-3.5-flash",
+                            "displayName": "Gemini 3.5 Flash",
+                            "description": "Frontier intelligence built for speed",
+                            "adminView": {"enabledByDefault": True, "regions": ["eu", "global", "us"]},
+                        },
+                        {
+                            "modelId": "gemini-3.1-pro-preview",
+                            "displayName": "Gemini 3.1 Pro",
+                            "isPreview": True,
+                            "adminView": {"adminOverridable": True, "regions": ["global", "us"]},
+                        },
+                        {
+                            "modelId": "claude-opus-5-5",
+                            "displayName": "Claude Opus 5.5",
+                            "adminView": {"adminOverridable": True, "regions": ["eu", "global", "us"]},
+                        },
+                        {
+                            "modelId": "gemini-3-pro-image",
+                            "displayName": "Gemini 3 pro image",
+                            "adminView": {"regions": ["global"]},
+                        },
+                    ]
+                }
+            }
+        }
 
-        status, feat_payload = self.call("GET", "/api/v1/gemini-enterprise/features?refresh=1")
-        self.assertEqual(status, 200, feat_payload)
-        self.assertEqual(feat_payload["meta"]["warnings"], [])
-        discovered = feat_payload["data"]["discoveredModels"]
-        self.assertEqual(
-            [m["modelId"] for m in discovered],
-            [
-                "gemini-4-neon",
-                "gemini-3.5-flash-lite",
-                "gemini-3.1-pro-preview",
-                "gemini-3.1-flash-image-preview",
-                "gemini-2.5-flash-image",
-                "claude-opus-5-5",
-                "claude-sonnet-5-5",
-                "claude-haiku-4-5",
-            ],
-        )
-        by_id = {m["modelId"]: m for m in discovered}
-        self.assertEqual(by_id["gemini-4-neon"]["displayName"], "Gemini 4 Neon")
-        self.assertEqual(by_id["gemini-3.5-flash-lite"]["displayName"], "Gemini 3.5 Flash-Lite")
-        self.assertEqual(by_id["gemini-3.1-pro-preview"]["displayName"], "Gemini 3.1 Pro")
-        self.assertTrue(by_id["gemini-3.1-pro-preview"]["isPreview"])
-        self.assertEqual(by_id["gemini-2.5-flash-image"]["group"], "image")
-        self.assertEqual(by_id["claude-opus-5-5"]["displayName"], "Anthropic Claude Opus 5.5")
-        self.assertEqual(by_id["claude-opus-5-5"]["group"], "partner")
-        self.assertIn(ge_features.MODEL_GARDEN_SOURCE, feat_payload["meta"]["sources"])
-
-        # DevTools (Antigravity) excludes image-only models while keeping Gemini chat + Claude partner models.
-        status, dt_payload = self.call("GET", "/api/v1/gemini-enterprise/dev-tools?refresh=1")
-        self.assertEqual(status, 200, dt_payload)
-        self.assertEqual(dt_payload["meta"]["warnings"], [])
-        dt_ids = [m["modelId"] for m in dt_payload["data"]["discoveredModels"]]
-        self.assertEqual(
-            dt_ids,
-            [
-                "gemini-4-neon",
-                "gemini-3.5-flash-lite",
-                "gemini-3.1-pro-preview",
-                "claude-opus-5-5",
-                "claude-sonnet-5-5",
-                "claude-haiku-4-5",
-            ],
-        )
-
-    def test_model_garden_failure_is_fail_open_without_warnings(self):
-        self.cloud.fail["aiplatform.googleapis.com"] = GcpError("denied", status=403, message=UPSTREAM_SECRET)
         status, payload = self.call("GET", "/api/v1/gemini-enterprise/features?refresh=1")
         self.assertEqual(status, 200, payload)
         self.assertEqual(payload["meta"]["warnings"], [])
-        self.assertEqual(payload["data"]["discoveredModels"], [])
+        # Must NEVER call aiplatform.googleapis.com Model Garden — only Discovery Engine itself.
+        self.assertEqual([c for c in self.cloud.calls if "aiplatform" in c[1]], [])
+        avail = payload["data"]["availableModels"]
+        self.assertEqual(
+            [m["modelId"] for m in avail],
+            ["gemini-4-neon", "gemini-3.5-flash", "gemini-3.1-pro-preview", "claude-opus-5-5", "gemini-3-pro-image"],
+        )
+        by_id = {m["modelId"]: m for m in avail}
+        self.assertEqual(by_id["gemini-4-neon"]["group"], "gemini")
+        self.assertTrue(by_id["gemini-4-neon"]["promoted"])
+        self.assertTrue(by_id["gemini-4-neon"]["adminOverridable"])
+        self.assertFalse(by_id["gemini-4-neon"]["lockedOn"])
+        # Gemini 3.5 Flash: enabledByDefault=True with adminOverridable omitted (proto3 false) -> lockedOn=True.
+        self.assertTrue(by_id["gemini-3.5-flash"]["enabledByDefault"])
+        self.assertFalse(by_id["gemini-3.5-flash"]["adminOverridable"])
+        self.assertTrue(by_id["gemini-3.5-flash"]["lockedOn"])
+        self.assertTrue(by_id["gemini-3.1-pro-preview"]["isPreview"])
+        self.assertEqual(by_id["gemini-3.1-pro-preview"]["regions"], ["global", "us"])
+        self.assertEqual(by_id["claude-opus-5-5"]["group"], "partner")
+        self.assertEqual(by_id["gemini-3-pro-image"]["group"], "image")
+        self.assertEqual(by_id["gemini-3-pro-image"]["regions"], ["global"])
+        self.assertIn(ge_features.WIDGET_SOURCE, payload["meta"]["sources"])
+
+    def test_widget_admin_view_failure_is_fail_open_without_warnings(self):
+        self.cloud.fail["/widgetConfigs/"] = GcpError("denied", status=403, message=UPSTREAM_SECRET)
+        status, payload = self.call("GET", "/api/v1/gemini-enterprise/features?refresh=1")
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["meta"]["warnings"], [])
+        self.assertEqual(payload["data"]["availableModels"], [])
         self.assertNotIn(UPSTREAM_SECRET, json.dumps(payload))
 
 
