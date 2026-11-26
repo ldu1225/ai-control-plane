@@ -1,16 +1,192 @@
+<div align="center">
+
 # AI Control Plane
 
+### Observe, Govern, and Protect All Google Cloud AI from One Control Plane.
+
+**Gemini Enterprise · Agent Platform (Gateway · Registry · Engine · Model Armor) · NotebookLM · Antigravity · FinOps**
+
+[![CI Tests](https://github.com/ldu1225/ai-control-plane/actions/workflows/tests.yml/badge.svg)](https://github.com/ldu1225/ai-control-plane/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/badge/release-v2.2.1-2563EB?style=flat-square)](https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1)
+[![License](https://img.shields.io/badge/license-Apache%202.0-16A34A?style=flat-square)](LICENSE)
+[![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Cloud%20Run-4285F4?style=flat-square&logo=googlecloud&logoColor=white)](#3-quick-start-deploy-with-one-command)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](#2-architecture)
+[![Zero Mock Data](https://img.shields.io/badge/Telemetry-100%25%20Real%20Data-0F172A?style=flat-square)](#11-design-principles)
+
+[🇰🇷 한국어 (README.md)](README.md) &nbsp;|&nbsp; **🇺🇸 English**
+
+<br/>
+
 [![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/ldu1225/ai-control-plane.git&cloudshell_tutorial=TUTORIAL.md)
+&nbsp;
+[![Watch Feature Tour](https://img.shields.io/badge/%E2%96%B6%20Watch%202%3A52%20Feature%20Tour%20%281080p%20HD%29-2563EB?style=for-the-badge)](https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4)
 
-This is an AI governance dashboard for viewing and controlling Gemini Enterprise, Gemini Enterprise Agent Platform (Agent Gateway, Agent Registry, Agent Engine deployments, Model Armor), token usage per model, NotebookLM, Antigravity and cloud costs in **one management console**.
+[🎬 Feature Tour Video](#-feature-tour-video-252-full-walkthrough) &nbsp;·&nbsp;
+[📸 Screenshots](#-screenshots-at-a-glance) &nbsp;·&nbsp;
+[⚡ 1-Command Install](#-30-second-one-command-install) &nbsp;·&nbsp;
+[🏗️ Architecture](#2-architecture) &nbsp;·&nbsp;
+[📚 Table of Contents](#table-of-contents)
 
-Click **Open in Cloud Shell** above or run `scripts/install.sh` in Cloud Shell to enable all required APIs, provision service agents and least-privilege identities, configure audit log routing, Data Access audit logs and Gemini Enterprise prompt logging, and deploy the dashboard to Cloud Run with its Antigravity cap enforcement schedule and real-time enforcement (Pub/Sub) in one step. The product name, organization name, logo, colors, language, modules to use and models to track can all be changed in settings.
+<br/>
+
+<a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
+  <img src="docs/assets/feature-tour-preview.gif" alt="AI Control Plane feature tour animated preview" width="880" />
+</a>
+
+<sub>Animated highlight loop captured from real Google Cloud telemetry (only org name, project ID, and email are masked). Click to watch the full <b>1080p HD narrated Feature Tour (2:52)</b>.</sub>
+
+</div>
+
+<br/>
+
+<table>
+  <tr>
+    <td width="25%" valign="top">
+      <h4>👁️ Observe</h4>
+      <sub>Track Gemini Enterprise, NotebookLM, Agent Platform, per-model tokens, and multi-project AI activity in a single real-time console.</sub>
+    </td>
+    <td width="25%" valign="top">
+      <h4>🛡️ Protect</h4>
+      <sub>Audit Model Armor prompt-injection &amp; DLP blocks (human vs automated), manage Agent Gateway IAP authorization, and detect idle agents.</sub>
+    </td>
+    <td width="25%" valign="top">
+      <h4>🚦 Govern</h4>
+      <sub>Enforce Antigravity per-user cost/token caps in real time via Pub/Sub, protected by 5 Safety Gates (G1–G5), allow/deny backends, and bulk GE feature controls.</sub>
+    </td>
+    <td width="25%" valign="top">
+      <h4>💰 Optimize &amp; Analyze</h4>
+      <sub>Combine Billing Export with official public price estimation, department/user chargeback, Gemini cost-spike analysis, and natural-language BigQuery SQL.</sub>
+    </td>
+  </tr>
+</table>
 
 > [!IMPORTANT]
 > **There is no sample data, no demo mode and no fake data.** Every number in the UI is a value actually read from the connected Google Cloud project(s). When a BigQuery Billing Export table is not connected yet, cost metrics automatically fall back to **Token-Based Reverse Cost Estimation** (measured token usage × official Google Cloud public pricing × synced multi-currency exchange rates, clearly badged as estimated cost in the UI). Metrics whose underlying telemetry cannot be read are never fabricated — they are shown as `—` with the exact cause and remediation steps.
 
 > [!NOTE]
-> This repository is a management solution built to run in Google Cloud customer environments. It is not an officially supported Google product. Korean: [README.md](README.md)
+> This repository is a management solution built to run in Google Cloud customer environments. It is not an officially supported Google product. Korean documentation: [README.md](README.md)
+
+---
+
+## ⚡ 30-Second One-Command Install
+
+Run a **single command** in Google Cloud Shell (or macOS/Linux) on either a brand-new empty project or an existing enterprise project. The installer checks billing, enables required APIs, provisions least-privilege service accounts and custom roles, creates the settings bucket, BigQuery audit dataset, Log Router sink, Data Access audit logs, Gemini Enterprise prompt logging, builds the container image, deploys Cloud Run, and configures Cloud Scheduler + Pub/Sub real-time enforcement automatically.
+
+```bash
+# 1) Interactive one-click wizard (press Enter to accept smart defaults)
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
+
+# 2) Direct single-project deploy (or add --link-projects for a unified multi-project hub)
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --project YOUR_PROJECT_ID
+```
+
+> See [3. Quick start: deploy with one command](#3-quick-start-deploy-with-one-command) for multi-project hub deployment, `--read-only`, `--enforcement-backend iam_deny`, and automatic organization-policy handling.
+
+---
+
+## 🎬 Feature Tour Video (2:52 Full Walkthrough)
+
+<div align="center">
+  <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
+    <img src="docs/assets/video-poster-en.png" alt="Watch AI Control Plane Feature Tour (02:52, 1080p HD)" width="840" />
+  </a>
+  <p>
+    <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4"><b>▶ Watch / Download Full Video (1080p HD · Korean Narration &amp; Subtitles, 2:52)</b></a>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.srt">Subtitles (.srt)</a>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1">Release Notes (v2.2.1)</a>
+  </p>
+</div>
+
+<details>
+<summary><b>📑 Full Video Chapter Guide (19 Chapters)</b></summary>
+
+| Time | Chapter | Highlights |
+|---|---|---|
+| `0:00` | Intro | Observe, govern, and protect all Google Cloud AI from one control plane |
+| `0:17` | 01 Sign-in &amp; Access Control | Google account sign-in (IAP / OAuth) and admin-approved RBAC |
+| `0:23` | 02 Executive Overview | 8 core KPIs, cost &amp; token trends, security posture, and agent lifecycle |
+| `0:36` | 03 Gemini Enterprise | Prompts, active users, agent share, and idle license seat discovery |
+| `0:46` | 04 NotebookLM | Activity visibility from Cloud Audit Data Access logs |
+| `0:51` | 05 Agent Gateway | AI API traffic, callers, authorization decisions, and denied/error monitoring |
+| `0:57` | 06 Agent Registry | Unified agent catalog with automatic 50-day idle deprecation candidates |
+| `1:03` | 07 Agent Deployments | Agent Engine runtimes, execution identities, call volume, and cost |
+| `1:08` | 08 Model Armor | Prompt-injection &amp; DLP blocks separating human vs automated traffic |
+| `1:19` | 09 Models &amp; Tokens | Zero-hardcoding auto-discovery of new models with token and spend breakdowns |
+| `1:30` | 10 Cost &amp; FinOps | Credits, service &amp; SKU attribution, and Gemini root-cause spike analysis |
+| `1:39` | 11 Users &amp; Access | User 360 cross-service usage and IAM governance actions |
+| `1:46` | 12 Antigravity Controls | Per-user cost/token caps, auto-suspension, and 5 Safety Gates (G1–G5) |
+| `2:04` | 13 Telemetry Extensions | Automatic log discovery and 1-click dynamic dashboards |
+| `2:13` | 14 Custom Widgets | Per-user pinned dashboard widgets with drag-and-drop layouts |
+| `2:17` | 15 AI Analyst | Natural language → verified read-only BigQuery SQL → instant charts &amp; tables |
+| `2:28` | 16 Settings | White-label branding, model selection, governance policy, and access control |
+| `2:34` | 17 Deployment &amp; Outro | One-command deployment directly into your Google Cloud project |
+
+</details>
+
+---
+
+## 📸 Screenshots at a Glance
+
+### Executive Overview
+
+<p align="center">
+  <img src="docs/assets/screens/01-overview.png" alt="AI Control Plane Executive Overview" width="100%" />
+</p>
+
+> Monitor active users, prompts, model tokens, net spend, Model Armor blocks, registered agents, NotebookLM, Antigravity KPIs, and live health across all 9 Google Cloud data sources at a glance (UI supports one-click English / Korean switching).
+
+### Workspace, Agents &amp; Security
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/02-gemini-enterprise.png" alt="Gemini Enterprise adoption and license utilization" width="100%" />
+      <p><b>Gemini Enterprise &amp; Feature Management</b><br/><sub>Daily prompts, active users, per-agent share, idle license seat discovery, and bulk feature-switch matrix across apps</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/03-agent-gateway.png" alt="Agent Gateway traffic and authorization" width="100%" />
+      <p><b>Agent Gateway</b><br/><sub>Inspect inbound AI API traffic, user &amp; service-account callers, error/denial trends, and IAP authorization posture</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/04-model-armor.png" alt="Model Armor prompt injection and DLP blocking" width="100%" />
+      <p><b>Model Armor Security</b><br/><sub>Track prompt-injection and sensitive-data (DLP) blocks by filter and isolate human prompts from automated background jobs</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/05-models-tokens.png" alt="Models and tokens auto-discovery" width="100%" />
+      <p><b>Models &amp; Tokens (Zero Hardcoding)</b><br/><sub>Automatically detect newly used models (Gemini 4 Argon, 3.8 Flash, Lyria 3 Pro) and track input/output/cached tokens and cost</sub></p>
+    </td>
+  </tr>
+</table>
+
+### FinOps, Antigravity Governance, Telemetry &amp; AI Analyst
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/06-finops-ai.png" alt="Cost and FinOps dashboard" width="100%" />
+      <p><b>Cost &amp; FinOps + AI Spike Analysis</b><br/><sub>Analyze daily spend, services, top SKUs, credits, automatic public-price estimation without billing export, and Gemini root-cause analysis</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/07-antigravity-caps.png" alt="Antigravity per-user cap policy and safety gates" width="100%" />
+      <p><b>Antigravity Per-User Caps &amp; 5 Safety Gates</b><br/><sub>Configure per-user currency/token/request caps, real-time Pub/Sub suspension, automatic period-reset restore, and G1–G5 safety gates</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/08-telemetry-extensions.png" alt="Telemetry Extensions dynamic log dashboard" width="100%" />
+      <p><b>Telemetry Extensions</b><br/><sub>Auto-profile existing Cloud Logging &amp; BigQuery streams, group semantically with Gemini, and route logs with daily GiB budget guards</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/09-ai-analyst.png" alt="AI Analyst natural-language SQL and charts" width="100%" />
+      <p><b>AI Analyst</b><br/><sub>Ask governance questions in natural language to generate verified read-only BigQuery SQL with instant charts, tables, and summaries</sub></p>
+    </td>
+  </tr>
+</table>
 
 ---
 

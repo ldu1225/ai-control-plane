@@ -1,16 +1,192 @@
+<div align="center">
+
 # AI Control Plane
 
+### Google Cloud의 모든 AI를 하나의 컨트롤 플레인에서 보고, 통제하고, 지킵니다.
+
+**Gemini Enterprise · Agent Platform (Gateway · Registry · Engine · Model Armor) · NotebookLM · Antigravity · FinOps**
+
+[![CI Tests](https://github.com/ldu1225/ai-control-plane/actions/workflows/tests.yml/badge.svg)](https://github.com/ldu1225/ai-control-plane/actions/workflows/tests.yml)
+[![Release](https://img.shields.io/badge/release-v2.2.1-2563EB?style=flat-square)](https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1)
+[![License](https://img.shields.io/badge/license-Apache%202.0-16A34A?style=flat-square)](LICENSE)
+[![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Cloud%20Run-4285F4?style=flat-square&logo=googlecloud&logoColor=white)](#3-빠른-시작-명령-한-번으로-배포)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](#2-아키텍처)
+[![Zero Mock Data](https://img.shields.io/badge/Telemetry-100%25%20Real%20Data-0F172A?style=flat-square)](#11-설계-원칙)
+
+**🇰🇷 한국어** &nbsp;|&nbsp; [🇺🇸 English (README.en.md)](README.en.md)
+
+<br/>
+
 [![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/ldu1225/ai-control-plane.git&cloudshell_tutorial=TUTORIAL.md)
+&nbsp;
+[![Watch Feature Tour](https://img.shields.io/badge/%E2%96%B6%202%3A52%20%EA%B8%B0%EB%8A%A5%20%EC%86%8C%EA%B0%9C%20%EC%98%81%EC%83%81%20%281080p%20HD%29-2563EB?style=for-the-badge)](https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4)
 
-Gemini Enterprise, Gemini Enterprise Agent Platform(Agent Gateway, Agent Registry, Agent Engine 배포, Model Armor), 모델별 토큰 사용량, NotebookLM, Antigravity, 클라우드 비용을 **하나의 관리 콘솔**에서 보고 통제하는 AI 거버넌스 대시보드입니다.
+[🎬 기능 소개 영상](#-기능-소개-영상-2분-52초-풀-투어) &nbsp;·&nbsp;
+[📸 화면 스크린샷](#-화면-둘러보기-스크린샷) &nbsp;·&nbsp;
+[⚡ 1줄 원클릭 설치](#-30초-원클릭-설치) &nbsp;·&nbsp;
+[🏗️ 아키텍처](#2-아키텍처) &nbsp;·&nbsp;
+[📚 전체 목차](#목차)
 
-위 **Open in Cloud Shell** 버튼을 클릭하거나 Cloud Shell에서 명령 한 줄(`scripts/install.sh`)만 실행하면 필수 API 활성화, 서비스 에이전트 생성, 전용 서비스 계정, IAM 권한, 설정 버킷, 감사 로그 싱크, Data Access 감사 로그, Gemini Enterprise 프롬프트 로깅, Cloud Run 배포, Antigravity 한도 집행 스케줄과 실시간 집행(Pub/Sub)까지 한 번에 완료됩니다. 제품명, 조직명, 로고, 색상, 언어, 사용할 모듈, 추적할 모델은 모두 화면 설정으로 바꿀 수 있습니다.
+<br/>
+
+<a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
+  <img src="docs/assets/feature-tour-preview.gif" alt="AI Control Plane 주요 화면 하이라이트 미리보기" width="880" />
+</a>
+
+<sub>실제 Google Cloud 텔레메트리 화면을 녹화한 하이라이트 미리보기입니다 (조직명·프로젝트 ID·이메일만 마스킹). 클릭하면 음성 나레이션과 자막이 포함된 <b>1080p HD 전체 소개 영상(2분 52초)</b>을 볼 수 있습니다.</sub>
+
+</div>
+
+<br/>
+
+<table>
+  <tr>
+    <td width="25%" valign="top">
+      <h4>👁️ 통합 가시성 (Observe)</h4>
+      <sub>Gemini Enterprise, NotebookLM, Agent Platform, 모델별 토큰·호출량, 멀티 프로젝트 현황을 단일 콘솔에서 실시간으로 파악합니다.</sub>
+    </td>
+    <td width="25%" valign="top">
+      <h4>🛡️ AI 보안 관제 (Protect)</h4>
+      <sub>Model Armor 프롬프트 인젝션·DLP 차단(사람 vs 자동 실행 분리), Agent Gateway 인가 정책, 휴면 에이전트 폐기 권고를 관리합니다.</sub>
+    </td>
+    <td width="25%" valign="top">
+      <h4>🚦 실시간 거버넌스 (Govern)</h4>
+      <sub>Antigravity 사용자별 원화/달러·토큰 한도, Pub/Sub 실시간 정지, 5중 안전 게이트(G1–G5), 허용/거부 정책 집행, GE 기능 일괄 제어를 지원합니다.</sub>
+    </td>
+    <td width="25%" valign="top">
+      <h4>💰 FinOps &amp; AI 애널리스트</h4>
+      <sub>결제 내보내기 + 공식 단가 역산 추정, 부서/인원별 비용 정산, Gemini 비용 급증 원인 분석, 자연어 BigQuery SQL 분석까지 제공합니다.</sub>
+    </td>
+  </tr>
+</table>
 
 > [!IMPORTANT]
 > **샘플 데이터, 데모 모드, 가짜 데이터가 전혀 없습니다.** 화면의 모든 숫자는 연결한 Google Cloud 프로젝트에서 실제로 수집된 텔레메트리 값입니다. 데이터 소스가 없거나 권한이 없으면 임의 값으로 채우지 않고 `—`로 비워 두며, 결제 내보내기(Billing Export)가 아직 연결되지 않은 프로젝트에서는 관측된 토큰 사용량에 Google 공식 공개 단가와 실시간 환율을 곱한 역산 추정 비용임을 배지와 함께 투명하게 표시합니다.
 
 > [!NOTE]
-> 이 저장소는 Google Cloud 고객 환경에서 운영하도록 만든 관리 솔루션이며, Google이 공식 지원하는 제품이 아닙니다. English: [README.en.md](README.en.md)
+> 이 저장소는 Google Cloud 고객 환경에서 운영하도록 만든 관리 솔루션이며, Google이 공식 지원하는 제품이 아닙니다. English documentation: [README.en.md](README.en.md)
+
+---
+
+## ⚡ 30초 원클릭 설치
+
+Google Cloud Shell(또는 macOS/Linux)에서 아래 **명령 한 줄**만 실행하면 신규 빈 프로젝트든 기존 프로젝트든 필수 API 활성화, 결제 연결 확인, 전용 서비스 계정·최소 권한 IAM, 설정 버킷, BigQuery 감사 로그 싱크, Data Access 로그, Gemini Enterprise 프롬프트 로깅, 컨테이너 빌드, Cloud Run 배포, Cloud Scheduler 및 Pub/Sub 실시간 집행까지 한 번에 완료됩니다.
+
+```bash
+# 1) 대화형 원클릭 마법사 (Enter만 누르면 기본값으로 바로 배포)
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
+
+# 2) 단일 프로젝트 즉시 배포 (또는 --link-projects 로 여러 프로젝트 통합 관제)
+bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
+  --project YOUR_PROJECT_ID
+```
+
+> 자세한 배포 옵션(멀티 프로젝트 허브, 조회 전용 `--read-only`, 거부 정책 `--enforcement-backend iam_deny`, 조직 정책 자동 대응 등)은 [3. 빠른 시작: 명령 한 번으로 배포](#3-빠른-시작-명령-한-번으로-배포)를 참고하세요.
+
+---
+
+## 🎬 기능 소개 영상 (2분 52초 풀 투어)
+
+<div align="center">
+  <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
+    <img src="docs/assets/video-poster.png" alt="AI Control Plane 기능 소개 영상 보기 (02:52, 1080p HD)" width="840" />
+  </a>
+  <p>
+    <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4"><b>▶ 전체 영상 보기 / 다운로드 (1080p HD · 한국어 나레이션 &amp; 자막, 2:52)</b></a>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.srt">자막 파일 (.srt)</a>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1">릴리스 노트 (v2.2.1)</a>
+  </p>
+</div>
+
+<details>
+<summary><b>📑 영상 챕터 타임스탬프 전체 보기 (19개 구간)</b></summary>
+
+| 시각 | 챕터 | 주요 내용 |
+|---|---|---|
+| `0:00` | 인트로 | Google Cloud 모든 AI를 하나의 컨트롤 플레인에서 보고, 통제하고, 지키기 |
+| `0:17` | 01 로그인 · 접근 제어 | Google 계정(IAP / OAuth) 및 승인 사용자 RBAC |
+| `0:23` | 02 개요 | 8대 핵심 KPI, 비용·토큰 추이, 보안·에이전트 현황 |
+| `0:36` | 03 Gemini Enterprise | 사용자·프롬프트·에이전트 호출 및 휴면 라이선스 좌석 탐지 |
+| `0:46` | 04 NotebookLM | Data Access 감사 로그 기반 활동 추적 |
+| `0:51` | 05 Agent Gateway | AI API 요청·호출 주체·인가/거부 트래픽 관제 |
+| `0:57` | 06 Agent Registry | 통합 에이전트 카탈로그 및 50일 미사용 폐기 권고 |
+| `1:03` | 07 에이전트 배포 | Agent Engine 런타임, 실행 ID, 호출량·비용 관리 |
+| `1:08` | 08 Model Armor | 프롬프트 인젝션·DLP 차단 및 사람 vs 자동 실행 분리 |
+| `1:19` | 09 모델 및 토큰 | 신규 모델 무코드 자동 탐지 및 모델별 토큰·비용 |
+| `1:30` | 10 비용 및 FinOps | 크레딧·서비스·SKU 분석 및 Gemini 비용 급증 원인 조사 |
+| `1:39` | 11 사용자 및 액세스 | 사람 단위 360° 사용량 및 접근 통제 |
+| `1:46` | 12 Antigravity 통제 | 1인당 원화/토큰 한도, 자동 정지, 5중 안전 게이트(G1–G5) |
+| `2:04` | 13 텔레메트리 확장 | 기존 로그 자동 프로파일링 및 1클릭 대시보드 생성 |
+| `2:13` | 14 위젯 | 사용자별 맞춤 대시보드 위젯 고정 및 드래그 배치 |
+| `2:17` | 15 AI 애널리스트 | 자연어 질문 → 검증된 읽기 전용 BigQuery SQL → 자동 차트·표 |
+| `2:28` | 16 설정 | 브랜드 화이트라벨, 모델·거버넌스·접근 권한 실시간 변경 |
+| `2:34` | 17 배포 &amp; 아웃트로 | 고객 Google Cloud 프로젝트 안으로 명령 한 줄 배포 |
+
+</details>
+
+---
+
+## 📸 화면 둘러보기 (스크린샷)
+
+### 통합 개요 (Executive Overview)
+
+<p align="center">
+  <img src="docs/assets/screens/01-overview.png" alt="AI Control Plane 통합 개요 화면" width="100%" />
+</p>
+
+> 활성 사용자, 프롬프트, 모델 토큰, 순 비용, Model Armor 차단, 등록 에이전트, NotebookLM, Antigravity 핵심 KPI와 9개 데이터 소스 실시간 연결 상태를 한 화면에서 확인합니다.
+
+### 워크스페이스 · 에이전트 · 보안 관제
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/02-gemini-enterprise.png" alt="Gemini Enterprise 도입 및 라이선스 현황" width="100%" />
+      <p><b>Gemini Enterprise · 기능 관리</b><br/><sub>일별 프롬프트·활성 사용자·에이전트 점유율, 휴면 라이선스 좌석 탐지 및 여러 앱 기능 스위치 일괄 변경</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/03-agent-gateway.png" alt="Agent Gateway 트래픽 및 인가 관제" width="100%" />
+      <p><b>Agent Gateway</b><br/><sub>AI 서비스 유입 트래픽, 사용자·서비스 계정 호출 주체, 거부/오류율 및 IAP 액세스 인가 정책 관리</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/04-model-armor.png" alt="Model Armor 프롬프트 인젝션 및 민감 정보 차단" width="100%" />
+      <p><b>Model Armor 보안 관제</b><br/><sub>프롬프트 인젝션·민감 정보 보호(DLP) 차단 추이, 필터별 집계 및 사람 입력 vs 자동 실행 차단 분리</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/05-models-tokens.png" alt="모델별 토큰 및 신규 모델 자동 탐지" width="100%" />
+      <p><b>모델 및 토큰 (하드코딩 없음)</b><br/><sub>Gemini 4 Argon·3.8 Flash·Lyria 3 Pro 등 신규 모델 자동 탐지 및 입출력·캐시 토큰·비용 통합 추적</sub></p>
+    </td>
+  </tr>
+</table>
+
+### FinOps · Antigravity 통제 · 텔레메트리 확장 · AI 애널리스트
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/06-finops-ai.png" alt="비용 및 FinOps 대시보드" width="100%" />
+      <p><b>비용 및 FinOps + AI 급증 원인 분석</b><br/><sub>일별 비용, 서비스·SKU별 비중, 할인 크레딧, 결제 내보내기 미연결 시 공개 단가 역산 및 Gemini 급증 원인 분석</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/07-antigravity-caps.png" alt="Antigravity 사용자별 한도 정책 편집 및 안전 게이트" width="100%" />
+      <p><b>Antigravity 사용자별 한도 &amp; 5중 안전 게이트</b><br/><sub>1인당 원화(KRW)/달러·토큰·요청 한도, 실시간 Pub/Sub 자동 정지, 기간 초기화 자동 복원 및 G1–G5 안전 게이트</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/08-telemetry-extensions.png" alt="텔레메트리 확장 동적 로그 대시보드" width="100%" />
+      <p><b>텔레메트리 확장</b><br/><sub>기존 Cloud Logging·BigQuery 로그 자동 발견, Gemini 의미 클러스터링 및 일일 GiB 한도 기반 비용 제어형 라우팅</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/09-ai-analyst.png" alt="AI 애널리스트 자연어 SQL 분석 및 차트" width="100%" />
+      <p><b>AI 애널리스트</b><br/><sub>자연어로 질문하면 실시간 스키마 기반 검증된 읽기 전용 BigQuery SQL을 생성하고 표·차트·요약으로 즉시 답변</sub></p>
+    </td>
+  </tr>
+</table>
 
 ---
 
