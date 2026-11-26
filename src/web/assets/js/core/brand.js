@@ -20,13 +20,14 @@ export function applyAccent(hex) {
   root.style.setProperty('--accent-contrast', lum > 0.62 ? '#101828' : '#FFFFFF');
 }
 
-/** Default product glyph (stacked layers) drawn in the current text color. */
+/** Default product glyph: one hub connected to four AI services (the control plane over every workload),
+ *  drawn in the current text color; one node is highlighted. */
 export function brandGlyph(size = 22) {
-  const line = { fill: 'none', stroke: 'currentColor', 'stroke-width': 2.2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
-  return s('svg', { viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': 'true', focusable: 'false' },
-    s('path', { d: 'M16 7 25 11.5 16 16 7 11.5Z', fill: 'currentColor' }),
-    s('path', { d: 'M7 16 16 20.5 25 16', ...line, opacity: '.85' }),
-    s('path', { d: 'M7 20.5 16 25 25 20.5', ...line, opacity: '.6' }));
+  const node = (cx, cy, cls) => s('circle', { cx, cy, r: 2.6, fill: cls ? null : 'currentColor', class: cls || null });
+  return s('svg', { viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': 'true', focusable: 'false', class: 'brand-glyph' },
+    s('path', { d: 'M16 16 9 9M16 16 23 9M16 16 9 23M16 16 23 23', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round', opacity: '.55' }),
+    s('circle', { cx: 16, cy: 16, r: 4.2, fill: 'currentColor' }),
+    node(8.5, 8.5), node(23.5, 8.5), node(8.5, 23.5), node(23.5, 23.5, 'brand-glyph-sat'));
 }
 
 /** Brand mark: the configured logo (https:// or /assets/ only) or the default glyph. */

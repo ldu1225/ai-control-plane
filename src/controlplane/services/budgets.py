@@ -192,7 +192,7 @@ def _clean_node(entry, index, org=None, workspace=None):
     if action not in actions:
         raise ApiError("bad_request", "%s: action must be %s." % (label, _choices(actions)))
     if action == "hard_cap" and workspace is not None and target not in workspace:
-        # A hard cap becomes a Google spend cap that pauses Agent Platform in the project: only for this workspace.
+        # A hard cap becomes a Google spend cap that pauses Gemini Platform in the project: only for this workspace.
         raise ApiError("bad_request", "%s: a hard cap is allowed only for projects of this workspace. Choose notify "
                                       "or a workspace project." % label)
     thresholds = _thresholds(entry.get("thresholds"))

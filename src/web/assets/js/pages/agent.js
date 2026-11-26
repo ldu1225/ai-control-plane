@@ -194,7 +194,7 @@ function renderTelemetry(panel, d, st) {
     kpi({ label: t('Requests'), value: fmt.int(val(k.requests)), delta: deltaOf(k.requests), goodWhen: null, tip: t('Requests that reached the agent runtime, from the Cloud Monitoring metric request_count.') }),
     kpi({ label: t('Error rate'), value: fmt.pct(val(k.errorRate), 2), delta: deltaOf(k.errorRate), goodWhen: 'down', meta: isNum(k.errors) ? h('span', null, t('{n} errors', { n: fmt.int(k.errors) })) : null, tip: t('Share of requests answered with a 4xx or 5xx response code.') }),
     kpi({ label: t('P95 request latency'), value: ms(val(k.latencyP95Ms)), delta: deltaOf(k.latencyP95Ms), goodWhen: 'down', meta: h('span', null, `p50 ${ms(k.latencyP50Ms)} \u00b7 p99 ${ms(k.latencyP99Ms)}`) }),
-    kpi({ label: t('Stored sessions'), value: fmt.int(sessions && sessions.count), meta: sessions && isNum(sessions.users) ? h('span', null, t('{n} users', { n: fmt.int(sessions.users) })) : null, tip: t('Sessions kept in Agent Platform Sessions that were active in this period. Agents that keep sessions elsewhere show zero.') })));
+    kpi({ label: t('Stored sessions'), value: fmt.int(sessions && sessions.count), meta: sessions && isNum(sessions.users) ? h('span', null, t('{n} users', { n: fmt.int(sessions.users) })) : null, tip: t('Sessions kept in Gemini Platform Sessions that were active in this period. Agents that keep sessions elsewhere show zero.') })));
 
   const charts = h('div', { class: 'grid' });
   const requests = chartCard({
@@ -601,7 +601,7 @@ function renderRevisions(panel, d) {
     kpi({ label: t('Active revisions'), value: fmt.int(k.active), meta: isNum(k.total) ? h('span', null, t('of {n} revisions', { n: fmt.int(k.total) })) : null }),
     kpi({ label: t('Latest revision'), value: latest ? h('span', { class: 'mono' }, latest.id) : DASH, meta: latest && latest.createTime ? h('span', null, fmt.relative(latest.createTime)) : null })));
   panel.append(card({
-    title: t('Runtime revisions'), flush: true, source: 'Agent Platform API v1beta1 (runtimeRevisions)',
+    title: t('Runtime revisions'), flush: true, source: 'Gemini Platform API v1beta1 (runtimeRevisions)',
     subtitle: t('A revision is created whenever versioned fields of the deployment change.'),
     body: dataTable({
       columns: [
@@ -645,7 +645,7 @@ function renderEvaluation(panel, d) {
   mountCharts(row, [spanCard(5, scores), spanCard(7, trend)]);
 
   panel.append(card({
-    title: t('Online monitors'), flush: true, source: 'Agent Platform API (onlineEvaluators)',
+    title: t('Online monitors'), flush: true, source: 'Gemini Platform API (onlineEvaluators)',
     body: dataTable({
       columns: [
         { key: 'name', label: t('Monitor'), render: (r) => h('div', { class: 'cell-stack' }, h('span', { class: 'cell-main' }, r.name), h('span', { class: 'cell-sub cell-mono' }, r.id)) },
@@ -661,7 +661,7 @@ function renderEvaluation(panel, d) {
   }));
 
   panel.append(card({
-    title: t('Evaluation runs'), flush: true, source: 'Agent Platform API (evaluationRuns)',
+    title: t('Evaluation runs'), flush: true, source: 'Gemini Platform API (evaluationRuns)',
     subtitle: t('Runs that called this agent. Runs over recorded data do not name an agent and are not listed.'),
     body: dataTable({
       columns: [

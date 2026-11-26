@@ -49,9 +49,9 @@ DENY_PRINCIPAL_LIMIT = 2500     # denied principals across the deny policies of 
 DENY_WARN_AT = 2000             # gate G6 warns from this many principals at an attachment point
 ANTIGRAVITY_PERMISSION = "businessaicode.googleapis.com/locations.generateContent"
 GE_ASSIST_PERMISSION = "discoveryengine.googleapis.com/assistants.assist"
-# Antigravity signed in with Application Default Credentials (AGY_ADC_AUTH) or pay-as-you-go calls Agent Platform models
+# Antigravity signed in with Application Default Credentials (AGY_ADC_AUTH) or pay-as-you-go calls Gemini Platform models
 # directly (PredictionService.StreamGenerateContent on aiplatform.googleapis.com, seen live), so the Antigravity permission
-# does not stop it. This one does, for every Agent Platform model call of the person at the attachment point.
+# does not stop it. This one does, for every Gemini Platform model call of the person at the attachment point.
 AGENT_PLATFORM_PERMISSION = "aiplatform.googleapis.com/endpoints.predict"
 KNOWN_PERMISSIONS = frozenset((ANTIGRAVITY_PERMISSION, GE_ASSIST_PERMISSION, AGENT_PLATFORM_PERMISSION))
 DISPLAY_NAME = "AI Control Plane caps (managed)"
@@ -107,7 +107,7 @@ def _antigravity(settings):
 
 def denied_permissions(settings):
     """Permissions the managed rule denies, sorted: Antigravity always, the Gemini Enterprise assistant with
-    governance.antigravity.deny_ge_app, and Agent Platform model calls with governance.antigravity.deny_agent_platform."""
+    governance.antigravity.deny_ge_app, and Gemini Platform model calls with governance.antigravity.deny_agent_platform."""
     ag = _antigravity(settings)
     perms = {ANTIGRAVITY_PERMISSION}
     if ag.get("deny_ge_app") is True:

@@ -75,7 +75,7 @@ const FEATURES = [
   ['cross-product-intelligence', 'assistant', 'Cross-product intelligence'],
   ['remote-vm', 'assistant', 'Remote VM'],
   ['license-tier-badge', 'assistant', 'Show license tier badge'],
-  ['notebook-lm', 'knowledge', 'NotebookLM'],
+  ['notebook-lm', 'knowledge', 'Gemini Notebook'],
   ['people-search', 'knowledge', 'People search'],
   ['people-search-org-chart', 'knowledge', 'People search organization chart'],
   ['code-extraction', 'knowledge', 'Code extraction'],

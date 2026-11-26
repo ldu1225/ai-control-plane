@@ -2,8 +2,8 @@
 
 For every project budget with action hard_cap (services/budgets.py) the control plane keeps one Cloud Billing spend
 cap budget on the billing account of workspace.billing.account_id (Cloud Billing Budget API v1, "Using the Cloud
-Billing Budget API for spend cap budgets"). When the project's gross estimated cost of the Agent Platform service
-reaches the amount, Google pauses new Agent Platform usage in that project for the rest of the month. Google lifts the
+Billing Budget API for spend cap budgets"). When the project's gross estimated cost of the Gemini Platform service
+reaches the amount, Google pauses new Gemini Platform usage in that project for the rest of the month. Google lifts the
 cap at the start of the next month; an administrator can lift it earlier (lift).
 
 What Google requires of a spend cap budget, and what the control plane sends (create_body):
@@ -27,7 +27,7 @@ characters, so project ids of at most 38 characters). Other budgets of the accou
 currency and are never changed or deleted. A cap that is no longer wanted (its budget was removed or is no longer a
 hard cap) is reported as an orphan and kept; deleting it is left to an administrator in the Cloud console. The name
 alone proves nothing, so before an update or a lift the budget must also cover exactly that project (by number) and
-Agent Platform and have a spend cap (_not_owned); otherwise it is left alone and reported as not_owned.
+Gemini Platform and have a spend cap (_not_owned); otherwise it is left alone and reported as not_owned.
 
 Scope: spend caps are created or changed only for workspace projects (ctx.all_projects, see
 budgets.workspace_projects). The billing account can also pay for projects of other teams, which a dashboard
@@ -43,9 +43,9 @@ amount carries over unchanged. On any other currency the control plane refuses (
 converting with an exchange rate, because a stale rate would move the point where Google stops usage. Lifting works in
 any currency.
 
-Measurement differs from the dashboard budget: Google measures the gross estimated list cost of all Agent Platform
+Measurement differs from the dashboard budget: Google measures the gross estimated list cost of all Gemini Platform
 usage in the project (every caller, credits excluded), while the dashboard budget counts the paid share of the usage
-attributed to the project. For usage billed under Agent Platform the cap therefore stops usage no later than the
+attributed to the project. For usage billed under Gemini Platform the cap therefore stops usage no later than the
 dashboard budget is used up. Usage billed under other services (for example the Gemini API) and subscription costs
 are not covered.
 
@@ -71,10 +71,10 @@ BILLING_V1 = "https://cloudbilling.googleapis.com/v1"
 CRM_V3 = "https://cloudresourcemanager.googleapis.com/v3"
 DISPLAY_PREFIX = "AI Control Plane cap: "
 MAX_DISPLAY_NAME = 60
-# Cloud Billing Catalog display names of Agent Platform, used only to find the service: the billing product was
+# Cloud Billing Catalog display names of Gemini Platform, used only to find the service: the billing product was
 # renamed, so the new names and the old one are all matched (exact, case-insensitive).
-SERVICE_NAMES = ("Agent Platform", "Gemini Enterprise Agent Platform", "Vertex AI")
-SERVICE_ID = "C7E2-9256-1C43"   # Agent Platform in the documented list of services eligible for spend caps
+SERVICE_NAMES = ("Gemini Platform", "Agent Platform", "Gemini Enterprise Agent Platform", "Vertex AI")
+SERVICE_ID = "C7E2-9256-1C43"   # Gemini Platform in the documented list of services eligible for spend caps
 THRESHOLDS = (0.5, 0.8, 1.0)
 CONFIGURED = "CONFIGURED"
 ENFORCED = "ENFORCED"
@@ -104,7 +104,7 @@ BLOCKED = {
                          "for it.",
 }
 # The display name alone proves nothing (anyone with budget rights on the account, or a second deployment, can use it):
-# a budget is changed or lifted only when it covers exactly the project and Agent Platform and has a spend cap.
+# a budget is changed or lifted only when it covers exactly the project and Gemini Platform and has a spend cap.
 NOT_OWNED = ("The budget named for this project is not a spend cap of the control plane (it covers other projects or "
              "services, or has no spend cap), so it was left unchanged.")
 AUDIT_CHANGES = 200             # per-project results kept in the spend_caps_apply audit entry
@@ -277,7 +277,7 @@ def _find_service(ctx):
 
 
 def service_name(ctx):
-    """"services/XXXX-XXXX-XXXX" of Agent Platform in the Cloud Billing Catalog, or None when the catalog lists no such
+    """"services/XXXX-XXXX-XXXX" of Gemini Platform in the Cloud Billing Catalog, or None when the catalog lists no such
     service. A service matches by display name (SERVICE_NAMES: the new and the old billing name) or by the documented
     service id, which is preferred when several match. Cached for a day; raises GcpError."""
     return _cached(ctx, ("spend_caps", "service"), lambda: _find_service(ctx))
@@ -370,7 +370,7 @@ def read_caps(ctx):
 
 def _not_owned(ctx, project, cap):
     """NOT_OWNED when the budget `cap` (a read_caps item) is not provably the control plane's spend cap of `project`,
-    else None: it must cover exactly that project (by number) and Agent Platform, and have a spend cap. Raises
+    else None: it must cover exactly that project (by number) and Gemini Platform, and have a spend cap. Raises
     GcpError (project number and service lookups, both cached for a day)."""
     if not isinstance(cap, dict) or cap.get("hasSpendCap") is not True:
         return NOT_OWNED
@@ -490,7 +490,7 @@ def _create(ctx, item, account, known_currency):
         return _result(item, "create", "currency_mismatch", _currency_message(currency))
     service = service_name(ctx)
     if not service:
-        return _result(item, "create", "failed", "Agent Platform was not found in the Cloud Billing Catalog, so no "
+        return _result(item, "create", "failed", "Gemini Platform was not found in the Cloud Billing Catalog, so no "
                                                  "spend cap was created.")
     number = project_number(ctx, project)
     if not number:

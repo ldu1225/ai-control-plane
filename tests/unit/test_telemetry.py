@@ -130,7 +130,7 @@ class DynamicDescriptionTest(unittest.TestCase):
 
     def test_product_names_come_from_service_titles_with_brand_renames(self):
         settings = support.make_settings()
-        self.assertEqual(profile.service_display(self.TITLES, "aiplatform.googleapis.com", settings), "Agent Platform")
+        self.assertEqual(profile.service_display(self.TITLES, "aiplatform.googleapis.com", settings), "Gemini Platform")
         self.assertEqual(profile.service_display(self.TITLES, "run.googleapis.com", settings), "Cloud Run")
         self.assertEqual(profile.service_display({}, "codemender.googleapis.com", settings), "Codemender")
         custom = support.make_settings(telemetry={"display_renames": ["Cloud Run=Serverless Runtime"]})

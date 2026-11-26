@@ -1,5 +1,5 @@
 /**
- * NotebookLM: notebooks, active users and prompts from Cloud Audit Logs.
+ * Gemini Notebook: notebooks, active users and prompts from Cloud Audit Logs.
  */
 import { h } from '../core/dom.js';
 import { t } from '../core/i18n.js';
@@ -10,8 +10,8 @@ import { pageFlow, fetchRange, rangeText, deltaOf, chartCard, mountCharts, openU
 
 export default async function render(ctx) {
   const header = pageHeader({
-    title: t('NotebookLM'),
-    desc: t('Notebook activity and prompt volume for NotebookLM Enterprise, derived from data access audit logs.'),
+    title: t('Gemini Notebook'),
+    desc: t('Notebook activity and prompt volume for Gemini Notebook Enterprise, derived from data access audit logs.'),
   });
   return pageFlow(ctx, {
     header,

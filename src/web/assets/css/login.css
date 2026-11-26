@@ -17,7 +17,7 @@
   place-items: center;
   padding: 40px 24px;
   background:
-    radial-gradient(1200px 600px at -10% -20%, var(--accent-softer), transparent 60%),
+    radial-gradient(1200px 600px at -10% -20%, rgb(24 24 27 / .04), transparent 60%),
     var(--bg);
 }
 .login-panel { width: 100%; max-width: 420px; display: grid; gap: 18px; }
@@ -58,9 +58,9 @@
   font-size: 14px;
 }
 .login-input:focus {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus);
   outline-offset: 1px;
-  border-color: var(--accent);
+  border-color: var(--focus);
   background: var(--surface);
 }
 .login-divider {
@@ -96,7 +96,7 @@ a.login-btn:hover { text-decoration: none; }
   box-shadow: 0 1px 2px rgba(60, 64, 67, .3), 0 1px 3px 1px rgba(60, 64, 67, .15);
 }
 .gsi-button:active { background: light-dark(#EEF0F1, #232324); }
-.gsi-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 999px; }
+.gsi-button:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 999px; }
 .gsi-logo { display: inline-flex; width: 18px; height: 18px; }
 .gsi-label { overflow: hidden; text-overflow: ellipsis; }
 
@@ -136,9 +136,9 @@ a.login-btn:hover { text-decoration: none; }
   overflow: hidden;
   color: #FFFFFF;
   background:
-    radial-gradient(900px 520px at 85% 10%, color-mix(in srgb, #FFFFFF 16%, transparent), transparent 60%),
-    radial-gradient(700px 480px at 10% 100%, color-mix(in srgb, #7C3AED 45%, transparent), transparent 65%),
-    linear-gradient(150deg, color-mix(in srgb, var(--accent) 92%, #000) 0%, color-mix(in srgb, var(--accent) 58%, #1E1B4B) 100%);
+    radial-gradient(900px 520px at 85% 0%, rgb(255 255 255 / .10), transparent 60%),
+    radial-gradient(700px 480px at 0% 100%, rgb(59 130 246 / .18), transparent 65%),
+    linear-gradient(160deg, #18181B 0%, #09090B 100%);
 }
 .login-aside::before {
   content: "";
@@ -159,6 +159,7 @@ a.login-btn:hover { text-decoration: none; }
 }
 .aside-brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 15px; letter-spacing: .01em; }
 .aside-glyph {
+  --mark-tile: #37373B;
   width: 34px; height: 34px; border-radius: 9px;
   display: grid; place-items: center;
   background: rgba(255, 255, 255, .14);

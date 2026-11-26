@@ -87,7 +87,7 @@ function renderPage(body, d, ctx) {
   body.append(card({
     title: t('Agent catalog'), subtitle: d.agents === null ? t('Data source unavailable') : t('{n} agents', { n: agents.length }), flush: true,
     body: h('div', null, d.agents === null ? null : h('div', { class: 'table-toolbar' }, h('div', { class: 'left' }, statusChips), h('div', { class: 'right' }, platformChips)), tableHost),
-    source: 'Agent Platform reasoningEngines, Discovery Engine agents, activity logs',
+    source: 'Gemini Platform reasoningEngines, Discovery Engine agents, activity logs',
   }));
 
   const row = h('div', { class: 'grid' });

@@ -1,192 +1,168 @@
 <div align="center">
 
+<img src="docs/assets/logo.svg" alt="" width="56" height="56" />
+
 # AI Control Plane
 
-### Observe, Govern, and Protect All Google Cloud AI from One Control Plane.
+A governance console for generative AI usage, cost, security and access control across Google Cloud
 
-**Gemini Enterprise · Agent Platform (Gateway · Registry · Engine · Model Armor) · NotebookLM · Antigravity · FinOps**
+Gemini Enterprise · Gemini Platform · Gemini Notebook · Antigravity · Model Armor · FinOps
 
 [![CI Tests](https://github.com/ldu1225/ai-control-plane/actions/workflows/tests.yml/badge.svg)](https://github.com/ldu1225/ai-control-plane/actions/workflows/tests.yml)
-[![Release](https://img.shields.io/badge/release-v2.2.1-2563EB?style=flat-square)](https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1)
-[![License](https://img.shields.io/badge/license-Apache%202.0-16A34A?style=flat-square)](LICENSE)
-[![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Cloud%20Run-4285F4?style=flat-square&logo=googlecloud&logoColor=white)](#3-quick-start-deploy-with-one-command)
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](#2-architecture)
-[![Zero Mock Data](https://img.shields.io/badge/Telemetry-100%25%20Real%20Data-0F172A?style=flat-square)](#11-design-principles)
+[![Release](https://img.shields.io/badge/release-v2.2.1-18181B?style=flat-square)](https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1)
+[![License](https://img.shields.io/badge/license-Apache%202.0-18181B?style=flat-square)](LICENSE)
+[![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Cloud%20Run-18181B?style=flat-square&logo=googlecloud&logoColor=white)](#3-quick-start-deploy-with-one-command)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-18181B?style=flat-square&logo=python&logoColor=white)](#2-architecture)
 
-[🇰🇷 한국어 (README.md)](README.md) &nbsp;|&nbsp; **🇺🇸 English**
+[한국어](README.md) &nbsp;|&nbsp; **English**
 
-<br/>
-
-[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/ldu1225/ai-control-plane.git&cloudshell_tutorial=TUTORIAL.md)
-&nbsp;
-[![Watch Feature Tour](https://img.shields.io/badge/%E2%96%B6%20Watch%202%3A52%20Feature%20Tour%20%281080p%20HD%29-2563EB?style=for-the-badge)](https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4)
-
-[🎬 Feature Tour Video](#-feature-tour-video-252-full-walkthrough) &nbsp;·&nbsp;
-[📸 Screenshots](#-screenshots-at-a-glance) &nbsp;·&nbsp;
-[⚡ 1-Command Install](#-30-second-one-command-install) &nbsp;·&nbsp;
-[🏗️ Architecture](#2-architecture) &nbsp;·&nbsp;
-[📚 Table of Contents](#table-of-contents)
-
-<br/>
-
-<a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
-  <img src="docs/assets/feature-tour-preview.gif" alt="AI Control Plane feature tour animated preview" width="880" />
-</a>
-
-<sub>Animated highlight loop captured from real Google Cloud telemetry (only org name, project ID, and email are masked). Click to watch the full <b>1080p HD narrated Feature Tour (2:52)</b>.</sub>
+[Install](#install) &nbsp;·&nbsp; [Capabilities](#capabilities) &nbsp;·&nbsp; [Screens](#screens) &nbsp;·&nbsp; [Architecture](#2-architecture) &nbsp;·&nbsp; [Table of contents](#table-of-contents)
 
 </div>
 
 <br/>
 
-<table>
-  <tr>
-    <td width="25%" valign="top">
-      <h4>👁️ Observe</h4>
-      <sub>Track Gemini Enterprise, NotebookLM, Agent Platform, per-model tokens, and multi-project AI activity in a single real-time console.</sub>
-    </td>
-    <td width="25%" valign="top">
-      <h4>🛡️ Protect</h4>
-      <sub>Audit Model Armor prompt-injection &amp; DLP blocks (human vs automated), manage Agent Gateway IAP authorization, and detect idle agents.</sub>
-    </td>
-    <td width="25%" valign="top">
-      <h4>🚦 Govern</h4>
-      <sub>Enforce Antigravity per-user cost/token caps in real time via Pub/Sub, protected by 5 Safety Gates (G1–G5), allow/deny backends, and bulk GE feature controls.</sub>
-    </td>
-    <td width="25%" valign="top">
-      <h4>💰 Optimize &amp; Analyze</h4>
-      <sub>Combine Billing Export with official public price estimation, department/user chargeback, Gemini cost-spike analysis, and natural-language BigQuery SQL.</sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/assets/screens/01-overview.png" alt="AI Control Plane overview" width="100%" />
+</p>
+
+## Overview
+
+AI Control Plane runs as a Cloud Run service inside your own Google Cloud project and reads data where it already lives: audit logs, the billing export, Cloud Monitoring and the Discovery Engine API. Nothing is copied outside your project. Several projects can be viewed together or one at a time.
+
+| Area | What it provides |
+|---|---|
+| Visibility | Gemini Enterprise, Gemini Notebook, Gemini Platform and Antigravity usage, per-model tokens and calls, multi-project status |
+| Security | Model Armor prompt-injection and sensitive-data blocks (human input separated from automated runs), Agent Gateway authorization, idle-agent deprecation candidates |
+| Governance | Bulk feature and model control for Gemini Enterprise apps, Antigravity per-user cost and token caps with real-time suspension, five safety gates |
+| Cost | Invoiced cost from the billing export, token-based estimates from official prices when no export is connected, chargeback by person, project and organization, spike root-cause analysis |
+| Analysis | AI Analyst turns natural-language questions into verified read-only BigQuery SQL and answers with tables, charts and summaries |
 
 > [!IMPORTANT]
-> **There is no sample data, no demo mode and no fake data.** Every number in the UI is a value actually read from the connected Google Cloud project(s). When a BigQuery Billing Export table is not connected yet, cost metrics automatically fall back to **Token-Based Reverse Cost Estimation** (measured token usage × official Google Cloud public pricing × synced multi-currency exchange rates, clearly badged as estimated cost in the UI). Metrics whose underlying telemetry cannot be read are never fabricated — they are shown as `—` with the exact cause and remediation steps.
+> There is no sample data and no demo mode. Every value is read from the connected Google Cloud projects. Values that cannot be read are shown as `—` with the cause, never filled in. Without a billing export, costs are estimates (measured tokens × official public prices) and are labeled as such.
 
 > [!NOTE]
-> This repository is a management solution built to run in Google Cloud customer environments. It is not an officially supported Google product. Korean documentation: [README.md](README.md)
+> A management solution built to run in Google Cloud customer environments. It is not an officially supported Google product.
 
 ---
 
-## ⚡ 30-Second One-Command Install
+## Install
 
-Run a **single command** in Google Cloud Shell (or macOS/Linux) on either a brand-new empty project or an existing enterprise project. The installer checks billing, enables required APIs, provisions least-privilege service accounts and custom roles, creates the settings bucket, BigQuery audit dataset, Log Router sink, Data Access audit logs, Gemini Enterprise prompt logging, builds the container image, deploys Cloud Run, and configures Cloud Scheduler + Pub/Sub real-time enforcement automatically.
+Run in Cloud Shell or a macOS/Linux terminal, on a new or an existing project. The installer enables APIs, checks billing, creates a dedicated service account with least-privilege IAM, the settings bucket, the BigQuery audit log sink, Data Access logs and Gemini Enterprise prompt logging, builds the container, deploys Cloud Run, and sets up Cloud Scheduler and Pub/Sub real-time enforcement.
 
 ```bash
-# 1) Interactive one-click wizard (press Enter to accept smart defaults)
+# Interactive install (press Enter to accept defaults)
 bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
 
-# 2) Direct single-project deploy (or add --link-projects for a unified multi-project hub)
+# Deploy one project directly (add --link-projects to combine several projects)
 bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
   --project YOUR_PROJECT_ID
 ```
 
-> See [3. Quick start: deploy with one command](#3-quick-start-deploy-with-one-command) for multi-project hub deployment, `--read-only`, `--enforcement-backend iam_deny`, and automatic organization-policy handling.
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/ldu1225/ai-control-plane.git&cloudshell_tutorial=TUTORIAL.md)
+
+For the multi-project hub, read-only mode (`--read-only`), deny-policy enforcement (`--enforcement-backend iam_deny`) and organization-policy handling, see [3. Quick start](#3-quick-start-deploy-with-one-command).
 
 ---
 
-## 🎬 Feature Tour Video (2:52 Full Walkthrough)
+## Capabilities
 
-<div align="center">
-  <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
-    <img src="docs/assets/video-poster-en.png" alt="Watch AI Control Plane Feature Tour (02:52, 1080p HD)" width="840" />
-  </a>
-  <p>
-    <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4"><b>▶ Watch / Download Full Video (1080p HD · Korean Narration &amp; Subtitles, 2:52)</b></a>
-    &nbsp;&nbsp;|&nbsp;&nbsp;
-    <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.srt">Subtitles (.srt)</a>
-    &nbsp;&nbsp;|&nbsp;&nbsp;
-    <a href="https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1">Release Notes (v2.2.1)</a>
-  </p>
-</div>
+| Page | Description |
+|---|---|
+| Overview | Active users, prompts, model tokens, net cost, Model Armor blocks, registered agents, Gemini Notebook and Antigravity key metrics and trends |
+| Gemini Enterprise | Usage and license seats, a feature-switch and model-selection matrix for every app (bulk changes with review), AI developer tools and Antigravity allowed models |
+| Gemini Notebook | Notebook, user and prompt activity from Data Access audit logs |
+| Agent Gateway · Registry · Deployments | Gateway inventory and authorization policy, a unified agent catalog, Agent Engine runtimes, revisions, evaluations and traces |
+| Model Armor | Verdict trends, blocks by filter, events by application and user |
+| Models & Tokens | Models discovered from billing SKUs, Cloud Monitoring and Antigravity logs, with input, output and cached tokens and cost |
+| Cost & FinOps · Chargeback | Cost by service and SKU, credits, official price and exchange-rate sync, spike analysis, allocation by person, project and organization with monthly close |
+| Users & Access · Antigravity Controls | User 360 view, per-user period caps with automatic suspension, allow and deny policy enforcement, exception rules, monthly reports |
+| Telemetry Extensions · AI Analyst | Automatic profiling of existing logs with cost-controlled routing, natural-language BigQuery analysis |
+
+Shared: project switcher (all or one), light and dark themes, Korean and English, command palette (Ctrl/Cmd+K), date range, table search, sort and CSV export, data source status.
+
+---
+
+## Screens
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/02-gemini-enterprise.png" alt="Gemini Enterprise features and model selection" width="100%" />
+      <p><b>Gemini Enterprise feature management</b><br/><sub>Compare and bulk-edit model selection across every app</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/03-agent-gateway.png" alt="Agent Gateway" width="100%" />
+      <p><b>Agent Gateway</b><br/><sub>AI API traffic, callers, authorization decisions and IAP access policy</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/04-model-armor.png" alt="Model Armor" width="100%" />
+      <p><b>Model Armor</b><br/><sub>Prompt-injection and sensitive-data blocks by filter</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/05-models-tokens.png" alt="Models and tokens" width="100%" />
+      <p><b>Models & Tokens</b><br/><sub>New models discovered automatically, tokens and cost per model</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/06-finops-ai.png" alt="Cost and FinOps" width="100%" />
+      <p><b>Cost & FinOps</b><br/><sub>Daily cost, service share, credits and spike detection</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/07-antigravity-caps.png" alt="Antigravity Controls" width="100%" />
+      <p><b>Antigravity Controls</b><br/><sub>Per-user model cost, cap usage, settlement period and enforcement mode</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/08-telemetry-extensions.png" alt="Telemetry Extensions" width="100%" />
+      <p><b>Telemetry Extensions</b><br/><sub>Existing logs discovered automatically, BigQuery routing within a volume budget</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/09-access-control.png" alt="Settings, access control" width="100%" />
+      <p><b>Access control</b><br/><sub>Accounts and roles, Google sign-in methods (IAP, OAuth client)</sub></p>
+    </td>
+  </tr>
+</table>
 
 <details>
-<summary><b>📑 Full Video Chapter Guide (19 Chapters)</b></summary>
+<summary><b>Feature tour video (2:52, previous UI)</b></summary>
 
-| Time | Chapter | Highlights |
-|---|---|---|
-| `0:00` | Intro | Observe, govern, and protect all Google Cloud AI from one control plane |
-| `0:17` | 01 Sign-in &amp; Access Control | Google account sign-in (IAP / OAuth) and admin-approved RBAC |
-| `0:23` | 02 Executive Overview | 8 core KPIs, cost &amp; token trends, security posture, and agent lifecycle |
-| `0:36` | 03 Gemini Enterprise | Prompts, active users, agent share, and idle license seat discovery |
-| `0:46` | 04 NotebookLM | Activity visibility from Cloud Audit Data Access logs |
-| `0:51` | 05 Agent Gateway | AI API traffic, callers, authorization decisions, and denied/error monitoring |
-| `0:57` | 06 Agent Registry | Unified agent catalog with automatic 50-day idle deprecation candidates |
-| `1:03` | 07 Agent Deployments | Agent Engine runtimes, execution identities, call volume, and cost |
-| `1:08` | 08 Model Armor | Prompt-injection &amp; DLP blocks separating human vs automated traffic |
-| `1:19` | 09 Models &amp; Tokens | Zero-hardcoding auto-discovery of new models with token and spend breakdowns |
-| `1:30` | 10 Cost &amp; FinOps | Credits, service &amp; SKU attribution, and Gemini root-cause spike analysis |
-| `1:39` | 11 Users &amp; Access | User 360 cross-service usage and IAM governance actions |
-| `1:46` | 12 Antigravity Controls | Per-user cost/token caps, auto-suspension, and 5 Safety Gates (G1–G5) |
-| `2:04` | 13 Telemetry Extensions | Automatic log discovery and 1-click dynamic dashboards |
-| `2:13` | 14 Custom Widgets | Per-user pinned dashboard widgets with drag-and-drop layouts |
-| `2:17` | 15 AI Analyst | Natural language → verified read-only BigQuery SQL → instant charts &amp; tables |
-| `2:28` | 16 Settings | White-label branding, model selection, governance policy, and access control |
-| `2:34` | 17 Deployment &amp; Outro | One-command deployment directly into your Google Cloud project |
+<br/>
+
+<a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
+  <img src="docs/assets/video-poster-en.png" alt="AI Control Plane feature tour" width="720" />
+</a>
+
+[Full video (1080p, Korean narration and subtitles)](https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4) &nbsp;·&nbsp;
+[Subtitles (.srt)](https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.srt) &nbsp;·&nbsp;
+[Release notes (v2.2.1)](https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1)
+
+| Time | Chapter |
+|---|---|
+| `0:00` | Introduction |
+| `0:17` | Sign-in and access control |
+| `0:23` | Overview |
+| `0:36` | Gemini Enterprise |
+| `0:46` | Gemini Notebook |
+| `0:51` | Agent Gateway |
+| `0:57` | Agent Registry |
+| `1:03` | Agent deployments |
+| `1:08` | Model Armor |
+| `1:19` | Models & Tokens |
+| `1:30` | Cost & FinOps |
+| `1:39` | Users & Access |
+| `1:46` | Antigravity Controls |
+| `2:04` | Telemetry Extensions |
+| `2:13` | Widgets |
+| `2:17` | AI Analyst |
+| `2:28` | Settings |
+| `2:34` | Deployment |
 
 </details>
-
----
-
-## 📸 Screenshots at a Glance
-
-### Executive Overview
-
-<p align="center">
-  <img src="docs/assets/screens/01-overview.png" alt="AI Control Plane Executive Overview" width="100%" />
-</p>
-
-> Monitor active users, prompts, model tokens, net spend, Model Armor blocks, registered agents, NotebookLM, Antigravity KPIs, and live health across all 9 Google Cloud data sources at a glance (UI supports one-click English / Korean switching).
-
-### Workspace, Agents &amp; Security
-
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/02-gemini-enterprise.png" alt="Gemini Enterprise adoption and license utilization" width="100%" />
-      <p><b>Gemini Enterprise &amp; Feature Management</b><br/><sub>Daily prompts, active users, per-agent share, idle license seat discovery, and bulk feature-switch matrix across apps</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/03-agent-gateway.png" alt="Agent Gateway traffic and authorization" width="100%" />
-      <p><b>Agent Gateway</b><br/><sub>Inspect inbound AI API traffic, user &amp; service-account callers, error/denial trends, and IAP authorization posture</sub></p>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/04-model-armor.png" alt="Model Armor prompt injection and DLP blocking" width="100%" />
-      <p><b>Model Armor Security</b><br/><sub>Track prompt-injection and sensitive-data (DLP) blocks by filter and isolate human prompts from automated background jobs</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/05-models-tokens.png" alt="Models and tokens auto-discovery" width="100%" />
-      <p><b>Models &amp; Tokens (Zero Hardcoding)</b><br/><sub>Automatically detect newly used models (Gemini 4 Argon, 3.8 Flash, Lyria 3 Pro) and track input/output/cached tokens and cost</sub></p>
-    </td>
-  </tr>
-</table>
-
-### FinOps, Antigravity Governance, Telemetry &amp; AI Analyst
-
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/06-finops-ai.png" alt="Cost and FinOps dashboard" width="100%" />
-      <p><b>Cost &amp; FinOps + AI Spike Analysis</b><br/><sub>Analyze daily spend, services, top SKUs, credits, automatic public-price estimation without billing export, and Gemini root-cause analysis</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/07-antigravity-caps.png" alt="Antigravity per-user cap policy and safety gates" width="100%" />
-      <p><b>Antigravity Per-User Caps &amp; 5 Safety Gates</b><br/><sub>Configure per-user currency/token/request caps, real-time Pub/Sub suspension, automatic period-reset restore, and G1–G5 safety gates</sub></p>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/08-telemetry-extensions.png" alt="Telemetry Extensions dynamic log dashboard" width="100%" />
-      <p><b>Telemetry Extensions</b><br/><sub>Auto-profile existing Cloud Logging &amp; BigQuery streams, group semantically with Gemini, and route logs with daily GiB budget guards</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/09-ai-analyst.png" alt="AI Analyst natural-language SQL and charts" width="100%" />
-      <p><b>AI Analyst</b><br/><sub>Ask governance questions in natural language to generate verified read-only BigQuery SQL with instant charts, tables, and summaries</sub></p>
-    </td>
-  </tr>
-</table>
 
 ---
 
@@ -231,18 +207,18 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 |---|---|---|---|
 | Overview | `overview` | Overall KPIs with change vs the previous period, spend trend, tokens by model, security posture, agent lifecycle, recent governance actions | Each module |
 | Gemini Enterprise | `gemini_enterprise` | Active users, prompts, calls per agent, license seat assignment and idle seats, uploaded files. **Feature management**: a matrix of every app's feature switches across all projects and locations, app-to-app comparison and bulk changes to many apps (review, then apply; audit logged) | BigQuery (Gemini Enterprise logs), Discovery Engine API (`engines.list`, `engines.patch`) |
-| NotebookLM | `notebooklm` | Active notebooks, users, prompts | BigQuery `cloudaudit_googleapis_com_data_access` |
+| Gemini Notebook | `notebooklm` | Active notebooks, users, prompts | BigQuery `cloudaudit_googleapis_com_data_access` |
 | Agent Gateway | `agent_gateway` | Gateway inventory and governance posture, create/update/delete, Identity-Aware Proxy access authorization setup and audit-only ↔ enforced switching, bound workloads (Agent Runtime and Gemini Enterprise), gateway request/authorization/MCP traffic, AI API audit calls | Network Services API, Network Security API, Cloud Logging, Cloud Monitoring, BigQuery audit logs |
-| Agent Registry | `agent_registry` | Unified catalog of Agent Engine and Gemini Enterprise agents, idle agents and deprecation candidates, creation history | Agent Platform API, Discovery Engine API, audit logs |
-| Deployments | `agent_deployments` | Agent Engine runtimes, runtime identities (service accounts), invocation volume, model usage by identity, runtime cost. Per-agent details (telemetry, models and tools, traces, topology, revisions, evaluation, playground) | Agent Platform API, audit logs, billing export, Cloud Monitoring, Cloud Trace |
+| Agent Registry | `agent_registry` | Unified catalog of Agent Engine and Gemini Enterprise agents, idle agents and deprecation candidates, creation history | Gemini Platform API, Discovery Engine API, audit logs |
+| Deployments | `agent_deployments` | Agent Engine runtimes, runtime identities (service accounts), invocation volume, model usage by identity, runtime cost. Per-agent details (telemetry, models and tools, traces, topology, revisions, evaluation, playground) | Gemini Platform API, audit logs, billing export, Cloud Monitoring, Cloud Trace |
 | Model Armor | `model_armor` | Verdicts over time, matched filters, blocks by application and user, event details | BigQuery `modelarmor_googleapis_com_sanitize_operations` |
 | Models & Tokens | `model_usage` | Automatic model discovery, input/output/cached tokens per model, invocations, error rate, cost, catalog management | Cloud Monitoring, billing export, Antigravity logs, public price list |
 | Cost & FinOps | `finops` | Gross cost, credits, net cost, cost by service/SKU or per-model token cost estimate, daily `00:00` (configurable) official pricing & multi-currency FX sync with change alerts, spike detection and AI root-cause analysis | Billing export or Token-Based Reverse Cost Estimation (Cloud Billing Catalog API + official pricing docs + live FX) |
 | Chargeback | `chargeback` | Antigravity usage cost and seat cost allocated by person, project and organization unit (HR CSV tree), unassigned list, month close (immutable snapshot, optional BigQuery copy), monthly unit and project budgets, Google spend caps | Antigravity logs (same ledger as the monthly usage report), Discovery Engine license API, Resource Manager project labels, Cloud Billing Budget API |
 | Users & Access | `users` | 360-degree user view (usage across all services), Antigravity IAM state, Antigravity allow and disallow, blocking and restoring all AI access | All sources, Resource Manager IAM |
 | Antigravity Controls | `antigravity` | Per-user period caps (cost/token/request) or credit caps, automatic (real-time) or manual suspension, enforcement method (allow-policy swap, deny policy, notify only), exception rules, settlement periods, safety gates, monthly usage report, Agent activity in your cloud, audit log | Cloud Logging or BigQuery, Pub/Sub (real-time enforcement), IAM allow and deny policies, billing export, Cloud Billing Catalog API |
-| Telemetry Extensions | `telemetry` | Dynamic schema/field-stats + Gemini profiling of logs and tables, multi-log group bundling dashboards, and cost-controlled Log Router -> BigQuery routing (sampling, min severity, exclusions, retention, daily GiB caps with auto-pause/resume) | BigQuery, Cloud Logging, Cloud Monitoring, Gemini on Agent Platform |
-| AI Analyst | `analyst` | Natural language questions, validated read-only SQL, result tables and charts, summaries | BigQuery, Gemini on Agent Platform |
+| Telemetry Extensions | `telemetry` | Dynamic schema/field-stats + Gemini profiling of logs and tables, multi-log group bundling dashboards, and cost-controlled Log Router -> BigQuery routing (sampling, min severity, exclusions, retention, daily GiB caps with auto-pause/resume) | BigQuery, Cloud Logging, Cloud Monitoring, Gemini on Gemini Platform |
+| AI Analyst | `analyst` | Natural language questions, validated read-only SQL, result tables and charts, summaries | BigQuery, Gemini on Gemini Platform |
 
 Common features: light/dark theme, Korean/English switching, unified multi-project selector (`All Projects` or per-project filter), currency switch on the cost pages (USD and the display currency), command palette (Ctrl/Cmd+K), date range selection (presets and custom range), table search/sort/CSV export, data source health panel.
 
@@ -264,7 +240,7 @@ flowchart LR
   run --> logging["Cloud Logging API"]
   run --> monitoring["Cloud Monitoring API"]
   run --> de["Discovery Engine API"]
-  run --> agentplatform["Agent Platform API: Agent Engine, Gemini"]
+  run --> agentplatform["Gemini Platform API: Agent Engine, Gemini"]
   run --> rm["Resource Manager / IAM API"]
   run --> catalog["Cloud Billing Catalog API (public price list)"]
   run --> gcs["Cloud Storage: settings store"]
@@ -390,12 +366,12 @@ What the script automates end-to-end on a brand-new project:
 | Step | Details |
 |---|---|
 | 0. Preflight & billing | Bootstraps foundational control-plane APIs, verifies or self-grants missing caller IAM roles, verifies or auto-links Cloud Billing, and checks organization policies and VPC Service Controls ([14.4](#144-customer-project-preflight-organization-policies-vpc-service-controls)). |
-| 1. APIs & service agents | Enables Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Cloud Trace, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, IAP, Cloud Scheduler, Cloud Billing Budget, Pub/Sub for real-time enforcement and more, and provisions the Google-managed service agents (`service-PROJECT_NUMBER@...`) immediately. |
+| 1. APIs & service agents | Enables Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Cloud Trace, Discovery Engine, Gemini Platform, Model Armor, Storage, Secret Manager, IAP, Cloud Scheduler, Cloud Billing Budget, Pub/Sub for real-time enforcement and more, and provisions the Google-managed service agents (`service-PROJECT_NUMBER@...`) immediately. |
 | 2. Settings bucket | Creates a private (public access prevention), versioned Cloud Storage bucket. |
 | 3. Dedicated service accounts & IAM | Creates the runtime SA, the sign-in bridge SA, a **dedicated Cloud Build SA** (never the Compute Engine default SA) and, with `iam_deny`, the enforcement job SA, each with least-privilege roles including `CustomAiControlPlaneLicenseReader` ([6.6](#66-runtime-service-account-permissions)). With the control features (`ENABLE_GOVERNANCE_ACTIONS=true`, the default) it grants the IAM write roles and creates the Antigravity marker roles (`CustomAntigravityCapBlocked`, `CustomAntigravityAdminBlocked`), the Gemini Enterprise feature manager role (`CustomAiControlPlaneGeFeatureManager`) and the Agent Gateway manager custom role (`CustomAiControlPlaneGatewayManager`). It grants read roles (and `CustomAiControlPlaneGeFeatureManager` when control features are enabled) on `--link-projects` projects and auto-detects a BigQuery billing export table. |
 | 4. Container image | Creates the Artifact Registry repository and builds with Cloud Build as the dedicated builder SA (falls back from regional to global Cloud Build, then to Cloud Shell or local Docker). |
 | 5. Secrets | Creates the session signing key, a random initial password for the built-in `admin` account and the slot for an OAuth client secret connected later in the UI (`google` and `password` modes), in Secret Manager and compliant with `constraints/gcp.resourceLocations`. |
-| 6. Data sources | Creates the BigQuery dataset (`ge_analytics`) and the partitioned Log Router sink, **enables Data Access audit logs of the AI services**, turns on **Gemini Enterprise usage + prompt/user logging** for every app, onboards `--link-projects` projects (when permitted), and auto-detects the organization name and Agent Platform endpoints. |
+| 6. Data sources | Creates the BigQuery dataset (`ge_analytics`) and the partitioned Log Router sink, **enables Data Access audit logs of the AI services**, turns on **Gemini Enterprise usage + prompt/user logging** for every app, onboards `--link-projects` projects (when permitted), and auto-detects the organization name and Gemini Platform endpoints. |
 | 7. Cloud Run & sign-in fallbacks | Deploys the IAP sign-in bridge and the dashboard and, with `ENFORCEMENT_BACKEND=iam_deny`, the enforcement job (Cloud Run job `SERVICE_NAME-enforcer`) from the same image. Under domain restricted sharing or policies that block unauthenticated entry it falls back automatically: `--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** or built-in ID/password sign-in. |
 | 8. Schedules, real-time enforcement & readiness | Creates the Cloud Scheduler jobs for cap enforcement (`SERVICE_NAME-enforce`, every 5 minutes; with `iam_deny`, `SERVICE_NAME-enforcer`, which runs the enforcement job) and maintenance (`SERVICE_NAME-maintenance`, every 15 minutes: daily official pricing and FX sync at `00:00` (configurable), telemetry BigQuery route budget guard with next-day auto-resume). Creates the Pub/Sub topic and log sink (`SERVICE_NAME-agy-usage`) and the push subscription (`SERVICE_NAME-agy-usage-push`) for real-time enforcement, checks the live response (`HTTP 200/302/401`) and prints the sign-in URL, the command that reads the admin password and the Antigravity readiness. In IAP mode the scheduler jobs and the push that call the dashboard are not created. |
 
@@ -428,10 +404,10 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 
 | Step | Details |
 |---|---|
-| 1. Enable APIs | Logging, BigQuery, Monitoring, Discovery Engine, Agent Platform, Model Armor and service identities |
+| 1. Enable APIs | Logging, BigQuery, Monitoring, Discovery Engine, Gemini Platform, Model Armor and service identities |
 | 2. Log routing | Creates the BigQuery dataset (`ge_analytics`) and the Log Router sink (`ai-control-plane-ai-logs`) ([6.1](#61-audit-log-sink-bigquery)). Antigravity logs are included automatically. |
 | 3. Gemini Enterprise usage & prompt logs | Turns on observability (usage logs and user/prompt logging) by default for every Gemini Enterprise app in `global`, `us` and `eu` ([6.3](#63-gemini-enterprise-logs)). |
-| 4. Data Access audit logs | Enables Data Access audit logs (`ADMIN_READ`, `DATA_READ`, `DATA_WRITE`) of 5 AI services (Agent Platform, Discovery Engine (Gemini Enterprise and NotebookLM), Model Armor, Antigravity, Gemini Data Analytics) by default ([6.2](#62-data-access-audit-logs); pass `--no-data-access-logs` to skip). |
+| 4. Data Access audit logs | Enables Data Access audit logs (`ADMIN_READ`, `DATA_READ`, `DATA_WRITE`) of 5 AI services (Gemini Platform, Discovery Engine (Gemini Enterprise and Gemini Notebook), Model Armor, Antigravity, Gemini Data Analytics) by default ([6.2](#62-data-access-audit-logs); pass `--no-data-access-logs` to skip). |
 | 5. Check | Shows whether Gemini Enterprise, Model Armor and Antigravity logs arrived in the last 30 days. |
 
 - Safe to re-run, and `--dry-run` previews changes first. Pass `--projects proj-a,proj-b` (or `--project hub --link-projects spoke-a,spoke-b`) to prepare multiple projects at once.
@@ -488,7 +464,7 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 | `AUDIT_DATASET` | `ge_analytics` | BigQuery dataset that receives the audit logs (`--dataset`) |
 | `CREATE_LOG_SINK` | `true` | Creates the dataset and the Log Router sink, and updates an existing sink to the current filter. Use `false` if you manage a different sink yourself |
 | `DATASET_LOCATION` | Empty (`REGION`) | Location of a newly created dataset (`--dataset-location`). Empty follows `REGION`; an existing dataset never moves. In an older settings snapshot, a value equal to that run's region follows a new `--region`; a different value such as `US`, or `--dataset-location`, is kept. |
-| `ENABLE_DATA_ACCESS_LOGS` | `true` | Turns on Data Access audit logs of 5 AI services (Agent Platform, Discovery Engine, Model Armor, Antigravity, Gemini Data Analytics) ([6.2](#62-data-access-audit-logs); `--no-data-access-logs` sets `false`) |
+| `ENABLE_DATA_ACCESS_LOGS` | `true` | Turns on Data Access audit logs of 5 AI services (Gemini Platform, Discovery Engine, Model Armor, Antigravity, Gemini Data Analytics) ([6.2](#62-data-access-audit-logs); `--no-data-access-logs` sets `false`) |
 | `ENABLE_GE_OBSERVABILITY` | `true` | Turns on usage logs (observability) for every Gemini Enterprise app in `DISCOVERY_ENGINE_LOCATIONS`. Needs Owner or Gemini Enterprise Admin; without it, only a warning is printed. |
 | `GE_PROMPT_LOGGING` | `true` | Turns on `sensitiveLoggingEnabled` so user identities (`userIamPrincipal`), prompt/response text and uploaded file names are recorded instead of `<elided>` (`--no-log-prompts` sets `false`). |
 | `BILLING_PROJECT_ID` | Empty (auto-detected) | Project that holds the billing export. If empty, the billing export table is looked up in `PROJECT_ID`. |
@@ -520,7 +496,7 @@ You can also enter or update the billing values after deployment in **Settings >
 | Variable | Default | Description |
 |---|---|---|
 | `AI_DEFAULT_MODEL` | Empty | Default model for AI Analyst (if empty, the `config.yaml` value) |
-| `AI_LOCATION` | Empty (detected) | Location of the Agent Platform model endpoint. When empty, `global`, or `REGION` when `global` does not answer |
+| `AI_LOCATION` | Empty (detected) | Location of the Gemini Platform model endpoint. When empty, `global`, or `REGION` when `global` does not answer |
 | `TELEMETRY_AI_MODEL` | Empty (`gemini-4-argon`) | Gemini model that describes and groups telemetry sources |
 | `TELEMETRY_DATASET` | Empty (`telemetry_routed`) | BigQuery dataset of telemetry routes (in `DATASET_LOCATION`) |
 | `IMAGE` | Empty | Prebuilt image (`--image`, for one run only). If empty, the image is built with Cloud Build (local Docker fallback) |
@@ -686,7 +662,7 @@ Tables created by the sink and the pages that use them:
 | Table | Used by |
 |---|---|
 | `cloudaudit_googleapis_com_activity` | Agent Registry (creation history), Agent Gateway, Agent activity in your cloud (changes) |
-| `cloudaudit_googleapis_com_data_access` | Agent Gateway, NotebookLM, Deployments, Users, Agent activity in your cloud (reads) |
+| `cloudaudit_googleapis_com_data_access` | Agent Gateway, Gemini Notebook, Deployments, Users, Agent activity in your cloud (reads) |
 | `discoveryengine_googleapis_com_gen_ai_user_message` | Gemini Enterprise (prompts, uploaded file names) |
 | `discoveryengine_googleapis_com_gemini_enterprise_user_activity` | Gemini Enterprise (prompts, agent calls, uploads), Model Armor user matching |
 | `modelarmor_googleapis_com_sanitize_operations` | Model Armor |
@@ -696,10 +672,10 @@ Each table is created when its log is first written. If a table is missing, only
 
 ### 6.2 Data Access audit logs
 
-Agent Gateway, NotebookLM, Deployments and model usage by identity use Data Access audit logs. Run `scripts/prepare.sh --data-access-logs`, redeploy with `ENABLE_DATA_ACCESS_LOGS=true`, or turn on `Admin Read`, `Data Read` and `Data Write` for the services below in **IAM & Admin > Audit Logs** in the console. The scripts skip a service name that the project does not accept.
+Agent Gateway, Gemini Notebook, Deployments and model usage by identity use Data Access audit logs. Run `scripts/prepare.sh --data-access-logs`, redeploy with `ENABLE_DATA_ACCESS_LOGS=true`, or turn on `Admin Read`, `Data Read` and `Data Write` for the services below in **IAM & Admin > Audit Logs** in the console. The scripts skip a service name that the project does not accept.
 
-- Agent Platform API (`aiplatform.googleapis.com`)
-- Discovery Engine API (`discoveryengine.googleapis.com`, Gemini Enterprise and NotebookLM)
+- Gemini Platform API (`aiplatform.googleapis.com`)
+- Discovery Engine API (`discoveryengine.googleapis.com`, Gemini Enterprise and Gemini Notebook)
 - Model Armor API (`modelarmor.googleapis.com`)
 - Antigravity (`businessaicode.googleapis.com`)
 - Gemini Data Analytics API (`geminidataanalytics.googleapis.com`)
@@ -739,11 +715,11 @@ Antigravity token usage per user is read from the `businessaicode.googleapis.com
 | Developer sign-in | Calls go to | `inference_response` (tokens per person) | Stopped by denying the Antigravity permission |
 |---|---|---|---|
 | Subscription: **Use a Google Cloud project** (CLI) or **Use Business Account** (app), then a license | `businessaicode.googleapis.com` | Written (with Metadata logging on) | Yes |
-| ADC (`AGY_ADC_AUTH=true`) or pay-as-you-go | Agent Platform directly (`aiplatform.googleapis.com`, `PredictionService.StreamGenerateContent`) | None | No |
+| ADC (`AGY_ADC_AUTH=true`) or pay-as-you-go | Gemini Platform directly (`aiplatform.googleapis.com`, `PredictionService.StreamGenerateContent`) | None | No |
 
 - **Metadata logging is configured per location (`global`, `us`, `eu`).** Turning it on in `us` or `eu` alone does not log calls routed to `locations/global` (for example Gemini 4, preview models, and default Antigravity CLI routing). The Antigravity Prerequisites section checks `devToolsConfig` across `global`, `us`, and `eu` for each scanned project and warns when any location with AI developer tools enabled still has Metadata logging turned off.
-- ADC and pay-as-you-go calls leave only the person and the model in the Agent Platform Data Access audit log, without token counts. The user agent (`protoPayload.requestMetadata.callerSuppliedUserAgent`) contains `antigravity/cli/...; auth_method=adc`, so Logs Explorer finds them with `protoPayload.serviceName="aiplatform.googleapis.com" AND protoPayload.requestMetadata.callerSuppliedUserAgent:"antigravity/"`.
-- The Gemini Enterprise User role (`roles/discoveryengine.agentspaceUser`) has no `aiplatform.*` permission, so only people who were also granted Agent Platform calls (for example `roles/aiplatform.user`) can use the ADC path. To stop it, do not grant that permission to developers, or turn on `deny_agent_platform` (8.9) for suspended people.
+- ADC and pay-as-you-go calls leave only the person and the model in the Gemini Platform Data Access audit log, without token counts. The user agent (`protoPayload.requestMetadata.callerSuppliedUserAgent`) contains `antigravity/cli/...; auth_method=adc`, so Logs Explorer finds them with `protoPayload.serviceName="aiplatform.googleapis.com" AND protoPayload.requestMetadata.callerSuppliedUserAgent:"antigravity/"`.
+- The Gemini Enterprise User role (`roles/discoveryengine.agentspaceUser`) has no `aiplatform.*` permission, so only people who were also granted Gemini Platform calls (for example `roles/aiplatform.user`) can use the ADC path. To stop it, do not grant that permission to developers, or turn on `deny_agent_platform` (8.9) for suspended people.
 
 ### 6.6 Runtime service account permissions
 
@@ -808,7 +784,7 @@ Shows active users, prompts, calls per agent, uploaded files and license seats (
 
 **Feature management & model selection** (`#/gemini-enterprise/features`, `#/gemini-enterprise/features/models`, the **Feature management** tab at the top of the page): compare and bulk-update both **feature switches** (`Engine.features`) and **model selection** (`Engine.modelConfigs`) across every Gemini Enterprise app in one view.
 
-- **Feature switches**: columns are every Gemini Enterprise app (`appType=APP_TYPE_INTRANET`, or an engine with feature or model overrides) of the selected projects in every location of `DISCOVERY_ENGINE_LOCATIONS`; rows cover every Discovery Engine v1 documented feature key (agent gallery, no-code agent builder, agent marketplace, scheduling, preview agents, plugins, skill security scan, model selector, NotebookLM, code extraction, Canvas & app sharing, music & speech generation, memory and more), plus any undocumented keys already set on an app under **Other features**.
+- **Feature switches**: columns are every Gemini Enterprise app (`appType=APP_TYPE_INTRANET`, or an engine with feature or model overrides) of the selected projects in every location of `DISCOVERY_ENGINE_LOCATIONS`; rows cover every Discovery Engine v1 documented feature key (agent gallery, no-code agent builder, agent marketplace, scheduling, preview agents, plugins, skill security scan, model selector, Gemini Notebook, code extraction, Canvas & app sharing, music & speech generation, memory and more), plus any undocumented keys already set on an app under **Other features**.
 - **Model selection**: switch to **Model selection** inside the card to manage per-app `Engine.modelConfigs` overrides against the authoritative Gemini Enterprise model catalog synced live from Discovery Engine `WidgetConfig` (`GET .../widgetConfigs/default_search_widget_config?modelInfoView=ADMIN`) — covering every selectable Gemini chat, image generation, and third-party partner model along with live `enabledByDefault`, `adminOverridable`, and supported `regions` metadata. Per-app end-user `WidgetConfig` reads (`resolvedModels`) also highlight models currently active in each web app's model selector with a green dot. Third-party Claude models require Pay-as-you-go usage above quota and one-time Terms of Service acceptance per project in Google Cloud Console.
 - **States**: features show **On** (`FEATURE_STATE_ON`), **Off** (`FEATURE_STATE_OFF`) and **Default**; models show **Enabled** (`MODEL_ENABLED`), **Disabled** (`MODEL_DISABLED`) and **Default** (key absent = product default). Feature keys starting with `disable-` are **restrictions** (On blocks the capability; values are never inverted). An app with `*` (master switch) set ignores its other feature switches.
 - **Find & bulk apply (administrators)**: search, category chips, **Mixed only**, **Explicit only**, project picker, and **Export CSV**. Stage changes cell by cell, per row across all shown apps, or by copying a baseline app across features and models together, then review the unified before → after diff and apply atomically (up to 100 apps per apply).
@@ -831,9 +807,9 @@ Shows active users, prompts, calls per agent, uploaded files and license seats (
   | `POST /api/v1/gemini-enterprise/features/apply` | Administrator, CSRF, governance rate limit | Body `{"changes": [{"project", "location", "engineId", "set"?: {...}, "setModels"?: {"gemini-4-argon": "on", "claude-opus-5-5": "default"}}]}` (up to 100 apps, 64 feature keys & 64 models per app). Response `results[]`, `updated`, `unchanged`, `failed`, `auditLogged` |
   | `GET /api/v1/gemini-enterprise/dev-tools[?project=ID][&refresh=1]` | Signed in | `configs[]` (per project/location `devToolsEnabled`, `logging`, `agent`, `browser`, `mcp`, `plugins`, `models`, `overage`, `features`), `observedModels`, `observedThirdPartyModels`, `writeSupported: false`, `complete`, `unreadableProjects` |
 
-### 7.3 NotebookLM
+### 7.3 Gemini Notebook
 
-Counts active notebooks, users and prompts from NotebookLM Data Access audit logs.
+Counts active notebooks, users and prompts from Gemini Notebook Data Access audit logs.
 
 ### 7.4 Agent Gateway
 
@@ -846,25 +822,25 @@ Governs and monitors the policy enforcement points for agent traffic across thre
 
 ### 7.5 Agent Registry and Deployments
 
-- **Agent Registry**: Combines Agent Engine (Agent Platform) and Gemini Enterprise agents into one catalog. An agent is classified as idle when `agent_lifecycle.idle_days` (default 14 days) have passed since its last call, and as a deprecation candidate when `deprecation_days` (default 50 days) have passed.
+- **Agent Registry**: Combines Agent Engine (Gemini Platform) and Gemini Enterprise agents into one catalog. An agent is classified as idle when `agent_lifecycle.idle_days` (default 14 days) have passed since its last call, and as a deprecation candidate when `deprecation_days` (default 50 days) have passed.
 - **Deployments**: Shows, for each Agent Engine runtime, the runtime identities (service accounts), invocation volume, model usage by identity and runtime cost (resource-level billing export).
 - **Agent details**: open a row of the Deployments table (or an Agent Engine entry in Agent Registry) and select **Open agent details** to look at one deployment in seven views. The address is `#/deployments/<project>/<region>/<engine ID>/<view>`, and only engines the workspace lists can be opened.
 
 | View | Contents | Data source |
 |---|---|---|
-| Telemetry | Requests, error rate, latency percentiles (p50/p95/p99), CPU and memory allocation, response codes, stored sessions. Invocations, latency and tokens reported by the agent itself | Cloud Monitoring `aiplatform.googleapis.com/reasoning_engine/*`, `prometheus.googleapis.com/gen_ai.*`, Agent Platform Sessions |
+| Telemetry | Requests, error rate, latency percentiles (p50/p95/p99), CPU and memory allocation, response codes, stored sessions. Invocations, latency and tokens reported by the agent itself | Cloud Monitoring `aiplatform.googleapis.com/reasoning_engine/*`, `prometheus.googleapis.com/gen_ai.*`, Gemini Platform Sessions |
 | Models and tools | Calls, error types, latency and tokens per model. Calls, failures and latency per tool. Model and tool calls per invocation | Cloud Monitoring `prometheus.googleapis.com/gen_ai.*` |
 | Traces | The latest 100 traces and the span timeline of each (agent, model, tool) | Cloud Trace API |
 | Topology | Call graph (client, agent, sub-agents, tools, models) drawn from the latest 25 traces, with calls per edge | Cloud Trace API |
-| Revisions | Runtime revisions, their state and traffic split | Agent Platform API v1beta1 `runtimeRevisions` (preview) |
-| Evaluation | Online monitors, average score and trend per metric, evaluation runs that called this agent | Agent Platform API `onlineEvaluators`, `evaluationRuns`, Cloud Monitoring `aiplatform.googleapis.com/online_evaluator/*` |
-| Playground | Send a message to the deployed agent and see the answer, tool calls and tool results | Agent Platform API `streamQuery` |
+| Revisions | Runtime revisions, their state and traffic split | Gemini Platform API v1beta1 `runtimeRevisions` (preview) |
+| Evaluation | Online monitors, average score and trend per metric, evaluation runs that called this agent | Gemini Platform API `onlineEvaluators`, `evaluationRuns`, Cloud Monitoring `aiplatform.googleapis.com/online_evaluator/*` |
+| Playground | Send a message to the deployed agent and see the answer, tool calls and tool results | Gemini Platform API `streamQuery` |
 
   - **Agent-reported metrics** (invocations, models, tools, tokens) appear only when the agent is built with Agent Development Kit 2.6 or later and deployed with `GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true`. **Traces** are written only by agents deployed with that variable too. Without it, only runtime metrics (requests, latency, CPU and memory) are shown, and the page says why.
   - **Topology** works differently from the Topology tab of the Google Cloud console (App Topology API): it aggregates call relationships from the agent's traces, so it is drawn only when the selected period has traces.
   - **Prompts and responses are never shown.** From traces only timing, structure, agent, model and tool names, token counts and error types pass; message bodies and tool arguments and results never leave the server. User IDs follow the viewer masking setting.
   - **The playground is for administrators only.** A message runs the real deployment (model and tool calls), costs tokens and can change data in systems the agent is connected to. The signed-in administrator's account is passed as the user ID, the AI rate limit (20 per minute) applies, and every call is written to the governance audit log (`agent_playground_query`) without the message body, also when it fails (result `failed`). The dashboard does not screen messages, so prompt and response screening (Model Armor and others) follows the agent's own configuration. Only agents with a streaming query method (Agent Development Kit) can be called.
-  - **Permissions**: metrics are read with `roles/monitoring.viewer`, revisions, evaluation and sessions with Agent Platform read access. Traces and topology need `roles/cloudtrace.user`; `scripts/deploy.sh` grants it on the primary project (as an optional role) and on linked projects, Terraform on the primary project. For agents in any other project, grant it there. The playground needs `aiplatform.reasoningEngines.query` (`roles/aiplatform.user`); linked projects get only the read role (`roles/aiplatform.viewer`), so agents there cannot be called. Views without permission stay empty with a data source notice.
+  - **Permissions**: metrics are read with `roles/monitoring.viewer`, revisions, evaluation and sessions with Gemini Platform read access. Traces and topology need `roles/cloudtrace.user`; `scripts/deploy.sh` grants it on the primary project (as an optional role) and on linked projects, Terraform on the primary project. For agents in any other project, grant it there. The playground needs `aiplatform.reasoningEngines.query` (`roles/aiplatform.user`); linked projects get only the read role (`roles/aiplatform.viewer`), so agents there cannot be called. Views without permission stay empty with a data source notice.
 
 ### 7.6 Model Armor
 
@@ -872,8 +848,8 @@ Shows verdicts over time, matched filters (prompt injection, sensitive data and 
 
 ### 7.7 Models & Tokens
 
-- Models are discovered automatically from billing SKUs, Cloud Monitoring `model_user_id` and the `model` label of Antigravity inference logs (`model_id` in older entries). The SKU description is searched for a model family word (Gemini, Claude, Llama and others), and qualifiers such as region, modality, input/output and context tier are removed to group the SKUs under one key (for example, `gemini-3.8-flash`). The Agent Platform format (`Gemini 3.8 Flash Global Text Input`), the Gemini API format and the Monitoring model ID are merged into the same model.
-- Tokens per model are based on Cloud Monitoring `publisher/online_serving/token_count` (Agent Platform), plus billed Gemini API tokens that Monitoring does not capture. For models without Monitoring metrics, token usage from billing SKUs is used. Invocations and error rate are calculated from `model_invocation_count`.
+- Models are discovered automatically from billing SKUs, Cloud Monitoring `model_user_id` and the `model` label of Antigravity inference logs (`model_id` in older entries). The SKU description is searched for a model family word (Gemini, Claude, Llama and others), and qualifiers such as region, modality, input/output and context tier are removed to group the SKUs under one key (for example, `gemini-3.8-flash`). The Gemini Platform format (`Gemini 3.8 Flash Global Text Input`), the Gemini API format and the Monitoring model ID are merged into the same model.
+- Tokens per model are based on Cloud Monitoring `publisher/online_serving/token_count` (Gemini Platform), plus billed Gemini API tokens that Monitoring does not capture. For models without Monitoring metrics, token usage from billing SKUs is used. Invocations and error rate are calculated from `model_invocation_count`.
 - When a product re-bills model usage under its own SKUs, that usage is shown separately in the "Usage by product" card. The same tokens are also billed to the underlying model, so they are not added to the model token total.
 - When a new model such as Gemini 4 Carbon or Gemini 4 Argon is discovered for the first time, a "new models detected" notice appears. With `auto_enable_new_models: true`, the model is tracked immediately. With `false`, it is left out of totals until an administrator turns it on.
 - You can turn off tracking for individual models in Manage catalog (or Settings > Model catalog).
@@ -887,11 +863,11 @@ Shows verdicts over time, matched filters (prompt injection, sensitive data and 
 
 ### 7.9 Users & Access
 
-Brings each user's usage of all services, such as Gemini Enterprise, NotebookLM, Agent Gateway and Antigravity, into one row (by user, or by user and model). Select a user to open the details view. The action buttons below are shown to administrators only.
+Brings each user's usage of all services, such as Gemini Enterprise, Gemini Notebook, Agent Gateway and Antigravity, into one row (by user, or by user and model). Select a user to open the details view. The action buttons below are shown to administrators only.
 
-- **Usage**: activity over time per service, tokens and cost per model for Antigravity and Agent Platform, agents and uploaded files. Viewers get no raw text and no file names.
+- **Usage**: activity over time per service, tokens and cost per model for Antigravity and Gemini Platform, agents and uploaded files. Viewers get no raw text and no file names.
 - **Antigravity access (IAM)**: IAM state and reason, exception rule, cap period, cap usage or the credit ledger, when access returns, **Allow Antigravity** (**Restore now** for a suspended user) and **Disallow Antigravity**. The Gemini Enterprise web chat stays available.
-- **AI service and workspace access**: **Block all AI access** removes every direct AI IAM role of the user in this project (Gemini Enterprise, NotebookLM, Antigravity, Agent Platform and marker roles), ends their dashboard sessions and blocks future dashboard sign-ins. **Restore AI access** gives back the dashboard sign-in and the removed roles (or the default Gemini Enterprise access role). Dashboard administrators, your own account and users with `roles/owner`, `roles/editor` or `roles/resourcemanager.projectIamAdmin` are never blocked. Needs the control features (`ENABLE_GOVERNANCE_ACTIONS=true`).
+- **AI service and workspace access**: **Block all AI access** removes every direct AI IAM role of the user in this project (Gemini Enterprise, Gemini Notebook, Antigravity, Gemini Platform and marker roles), ends their dashboard sessions and blocks future dashboard sign-ins. **Restore AI access** gives back the dashboard sign-in and the removed roles (or the default Gemini Enterprise access role). Dashboard administrators, your own account and users with `roles/owner`, `roles/editor` or `roles/resourcemanager.projectIamAdmin` are never blocked. Needs the control features (`ENABLE_GOVERNANCE_ACTIONS=true`).
 
 ### 7.10 Telemetry Extensions
 
@@ -1026,7 +1002,7 @@ flowchart TD
 - The free share covers Gemini amounts first, in the order they were used (models whose id starts with `gemini`, `credit_model_prefixes`). When a week spans two months (for example a Monday reset and the 1st on a Wednesday), both months share that week's free share, and paid amounts count in the month they happened in.
 - Prices are found per model and direction (input/output), in this order:
   1. **Billed price**: `SUM(cost) / SUM(usage.amount)` of the model's standard text-token SKUs in the last 30 days of the billing export. Negotiated prices are included and credits are not subtracted. Variant SKUs (batch, flex, priority, cache, long context, tuning, audio/image/video) are excluded.
-  2. **Public Google price list**: models without billed usage use the public prices of the Cloud Billing Catalog API (Agent Platform, Gemini API).
+  2. **Public Google price list**: models without billed usage use the public prices of the Cloud Billing Catalog API (Gemini Platform, Gemini API).
 - Credit caps are calculated in USD. Other billing currencies are converted with the exchange rate Google publishes in the price list, shown as `1 USD = ₩1,359 (Google rate, date)`.
 - Prices are cached for six hours. The **Prices of models used in this period** table of the policy card shows each model's price and source (billed price, Google price list, no price).
 - A model without any price is shown as "no price"; when a person's amount cannot be calculated, the cap usage is shown as `—` and the person is not suspended.
@@ -1125,7 +1101,7 @@ The default backend (`iam_allow_swap`) can only change direct `user:` bindings i
 | `notify_only` | Plans and notifications only; access never changes. No write role is needed. | Nothing |
 
 - Attachment point (`deny_attachment`): `projects` (default, every workspace project) or `scope` (the folder or organization when the workspace scope is one, otherwise every project). A deny policy is inherited by every resource below its attachment point.
-- Extra denied permissions (optional, off by default): `deny_ge_app` also denies the Gemini Enterprise assistant (`discoveryengine.googleapis.com/assistants.assist`), and `deny_agent_platform` also denies Agent Platform model calls (`aiplatform.googleapis.com/endpoints.predict`). Antigravity signed in with ADC or pay-as-you-go calls Agent Platform directly, so the default permission does not stop it (6.5). With `deny_agent_platform` on, suspended people lose every Agent Platform model call at the attachment points, including their own apps and scripts.
+- Extra denied permissions (optional, off by default): `deny_ge_app` also denies the Gemini Enterprise assistant (`discoveryengine.googleapis.com/assistants.assist`), and `deny_agent_platform` also denies Gemini Platform model calls (`aiplatform.googleapis.com/endpoints.predict`). Antigravity signed in with ADC or pay-as-you-go calls Gemini Platform directly, so the default permission does not stop it (6.5). With `deny_agent_platform` on, suspended people lose every Gemini Platform model call at the attachment points, including their own apps and scripts.
 - Only people (`principal://goog/subject/EMAIL`, and Workforce principals exactly as logged, 7.12) are listed, never service accounts or groups. An administrator's **Always block** rule is applied through the same policy.
 - When one listed account cannot be found by IAM (a deleted account or a mistyped address), IAM rejects the whole write with 400 (`The principal ... was not found`), as checked on a test project. Such accounts are left out, the rest of the people are applied, and the left-out people are shown as failed with the reason.
 - Before applying, the invariants are checked (policy ID prefix `ai-control-plane-`, permissions = allow list, principals = people, attachment points = the list computed from the settings, new suspensions ≤ change budget, current etag); if any fails, nothing changes.
@@ -1235,7 +1211,7 @@ On top of the personal caps and the organization-wide budget (`org_paid_budget_m
 | Unit | Suspend people (`suspend`) | The people attributed to the unit or a unit below it are suspended while nothing is free for them, until the 1st of the next month (the same rule as the organization budget). With weekly free credit, the credit that returns each week can still be used; with fixed caps per period, people with paid usage this month are suspended until the 1st. |
 | Unit | Send to review (`review`) | Those people go to the review queue, in automatic mode too, and wait for an administrator decision. |
 | Unit, project | Notify only (`notify`) | Threshold alerts only. |
-| Project | Hard cap (`hard_cap`, workspace projects only) | Alerts, and with Google spend caps turned on, Google stops the project's Agent Platform usage (below). |
+| Project | Hard cap (`hard_cap`, workspace projects only) | Alerts, and with Google spend caps turned on, Google stops the project's Gemini Platform usage (below). |
 
 - **Spend**: the chargeable amounts (beyond the free credit) of the month's chargeback rows, in integer cents. A unit covers its sub-units; a project counts the usage recorded in it. A budget is used up when its spend reaches it; 0 allows no paid usage at all.
 - **How it is measured**: with weekly free credit, from the enforcement ledgers (8.3) on every run; with fixed caps per period, from the month's chargeback report (cached for 5 minutes). Budgets are in USD, so they only apply to a USD report; otherwise a warning is shown.
@@ -1247,14 +1223,14 @@ On top of the personal caps and the organization-wide budget (`org_paid_budget_m
 
 **Google spend caps (project hard caps)**
 
-- Uses spend cap budgets of the Cloud Billing Budget API. When the project's Agent Platform cost reaches the amount, Google pauses new Agent Platform usage in that project for the rest of the month and lifts the cap at the start of the next month. An administrator can lift it earlier (**Lift cap**; Google says usage resumes within about an hour).
+- Uses spend cap budgets of the Cloud Billing Budget API. When the project's Gemini Platform cost reaches the amount, Google pauses new Gemini Platform usage in that project for the rest of the month and lifts the cap at the start of the next month. An administrator can lift it earlier (**Lift cap**; Google says usage resumes within about an hour).
 - Google's constraints: one project, one service, calendar month, credits excluded, thresholds fixed at 50, 80 and 100%. It is not instant, so usage can go a little over.
-- **Measurement differs**: Google measures all Agent Platform usage of the project at list price (before credits), while the dashboard budget counts the paid share attributed to the project. Usage billed under Agent Platform is therefore stopped no later than the dashboard budget is used up. **Usage billed under other services (for example the Gemini API) and subscription costs are not covered. Check in the billing export which service your Antigravity usage is billed under first.**
+- **Measurement differs**: Google measures all Gemini Platform usage of the project at list price (before credits), while the dashboard budget counts the paid share attributed to the project. Usage billed under Gemini Platform is therefore stopped no later than the dashboard budget is used up. **Usage billed under other services (for example the Gemini API) and subscription costs are not covered. Check in the billing export which service your Antigravity usage is billed under first.**
 - Setup: turn on **Manage Google spend caps** (`governance.antigravity.spend_caps`) in Settings > Governance policy > Enforcement and enter the billing account ID (`workspace.billing.account_id`). The Cloud Billing Budget API (`billingbudgets.googleapis.com`) must be enabled on the dashboard project (`scripts/deploy.sh` tries to enable it), and the runtime service account needs budget permissions on the billing account including `billing.budgets.configureSpendCap` (for example Billing Account Administrator, `roles/billing.admin`, or a custom role with that permission). The deployment never grants billing account roles. Reseller billing accounts are not supported.
 - **Scope**: hard caps are allowed only for workspace projects (the primary project, configured projects and projects found by auto-discovery or in the scope). Saving a hard cap for another project fails validation; an existing cap outside the workspace shows **Not in this workspace** and is never created or changed (lifting still works). If the project list cannot be read, nothing is created or changed and hard-cap saves are refused.
-- Apply: in Chargeback > Monthly budgets > **Google spend caps**, check with **Preview changes**, then select **Apply spend caps**. Enforcement runs never change spend caps. Only budgets the dashboard created (display name `AI Control Plane cap: PROJECT_ID`) are changed; caps that are no longer needed are reported, not deleted (delete them in the Cloud console). Before an update or a lift, the budget must cover exactly that project (by project number) and Agent Platform and have a spend cap; otherwise it shows **Not managed by the control plane** (`not_owned`) and is left alone. The check reads the project number (Resource Manager) and the service (Cloud Billing Catalog), cached for 24 hours, so a lift also needs `resourcemanager.projects.get` on the project for the runtime service account. An applied run writes the counts per status and the per-project changes (project, operation, status, amount; at most 200) to the audit log (`spend_caps_apply`). On a billing account whose currency is not USD, no cap is created, so that an exchange rate cannot move the point where Google stops usage.
+- Apply: in Chargeback > Monthly budgets > **Google spend caps**, check with **Preview changes**, then select **Apply spend caps**. Enforcement runs never change spend caps. Only budgets the dashboard created (display name `AI Control Plane cap: PROJECT_ID`) are changed; caps that are no longer needed are reported, not deleted (delete them in the Cloud console). Before an update or a lift, the budget must cover exactly that project (by project number) and Gemini Platform and have a spend cap; otherwise it shows **Not managed by the control plane** (`not_owned`) and is left alone. The check reads the project number (Resource Manager) and the service (Cloud Billing Catalog), cached for 24 hours, so a lift also needs `resourcemanager.projects.get` on the project for the runtime service account. An applied run writes the counts per status and the per-project changes (project, operation, status, amount; at most 200) to the audit log (`spend_caps_apply`). On a billing account whose currency is not USD, no cap is created, so that an exchange rate cannot move the point where Google stops usage.
 - API: `GET /api/v1/budgets/spend-caps`, `POST /api/v1/budgets/spend-caps/apply` (`{"dryRun": true}` by default), `POST /api/v1/budgets/spend-caps/lift` (`{"project": "PROJECT_ID"}`).
-- Checked on a test environment: the product code created a spend cap budget (high amount) for the test project. Google stored one project (project number), the Agent Platform service (`services/C7E2-9256-1C43`), `EXCLUDE_ALL_CREDITS`, the calendar month, thresholds 0.5, 0.8 and 1.0, and `spendCap.outputState=CONFIGURED`. Planning again gave no change (`none`), and the budget was deleted afterwards. The moment Google stops usage (ENFORCED) was not observed.
+- Checked on a test environment: the product code created a spend cap budget (high amount) for the test project. Google stored one project (project number), the Gemini Platform service (`services/C7E2-9256-1C43`), `EXCLUDE_ALL_CREDITS`, the calendar month, thresholds 0.5, 0.8 and 1.0, and `spendCap.outputState=CONFIGURED`. Planning again gave no change (`none`), and the budget was deleted afterwards. The moment Google stops usage (ENFORCED) was not observed.
 
 **Administrator decisions with the deny policy**
 
@@ -1467,7 +1443,7 @@ Most of the costs that this dashboard creates are small. Actual amounts depend o
 | Pub/Sub | Real-time enforcement: one message per Antigravity request | `REALTIME_ENFORCEMENT=false` skips it |
 | Cloud Build, Artifact Registry | Build time during deployment, image storage | Clean up old images |
 | Cloud Scheduler, Secret Manager, Cloud Storage | Jobs (cap enforcement, maintenance), secrets, settings files | Very small |
-| Gemini on Agent Platform | AI Analyst questions, spike cause analysis, telemetry source analysis, agent playground (runs the deployed agent) | No cost when not used; the modules or `telemetry.ai.enabled` can be turned off |
+| Gemini on Gemini Platform | AI Analyst questions, spike cause analysis, telemetry source analysis, agent playground (runs the deployed agent) | No cost when not used; the modules or `telemetry.ai.enabled` can be turned off |
 
 Example of limiting the retention period of audit log tables (120 days):
 
@@ -1575,7 +1551,7 @@ Use `--skip-preflight-blockers` only when you are sure a finding is wrong.
 **Installing into a project inside a VPC Service Controls perimeter**
 
 1. **Container image build**: Cloud Build's default pool runs outside VPC Service Controls perimeters, so when the perimeter restricts Cloud Storage (`storage.googleapis.com`), uploading a source archive to the settings bucket is refused. On a clean checkout of the public repository (as `install.sh` creates), the default `BUILD_SOURCE=auto` has Cloud Build fetch the exact commit directly from Git with no Cloud Storage upload, so no ingress exception for the build service account (`ai-control-plane-build`) is needed. If the perimeter also restricts Cloud Build or Artifact Registry, or you are building local changes, use `--worker-pool` (a private pool inside the perimeter), `--image` (an image built and pushed with Docker), or the build service account ingress rule printed by the script.
-2. **Dashboard runtime calls**: Cloud Run without VPC egress can be treated as outside the perimeter when calling restricted APIs (Cloud Storage settings bucket, BigQuery, Discovery Engine, Agent Platform). At the end of deployment, the script checks `cloudaudit.googleapis.com/policy` audit logs for denials of the runtime service account (`ai-control-plane-sa@PROJECT_ID.iam.gserviceaccount.com`) and, if any occur, prints a single **ingress rule YAML** covering every restricted service the dashboard calls. Once a perimeter administrator adds that rule in the console (**Security > VPC Service Controls > perimeter > Edit > Ingress policy > Add rule**), the dashboard starts working without redeployment (perimeter propagation takes up to 30 minutes). Because `gcloud ... perimeters update --set-ingress-policies` replaces the entire rule list, include existing rules when updating via CLI.
+2. **Dashboard runtime calls**: Cloud Run without VPC egress can be treated as outside the perimeter when calling restricted APIs (Cloud Storage settings bucket, BigQuery, Discovery Engine, Gemini Platform). At the end of deployment, the script checks `cloudaudit.googleapis.com/policy` audit logs for denials of the runtime service account (`ai-control-plane-sa@PROJECT_ID.iam.gserviceaccount.com`) and, if any occur, prints a single **ingress rule YAML** covering every restricted service the dashboard calls. Once a perimeter administrator adds that rule in the console (**Security > VPC Service Controls > perimeter > Edit > Ingress policy > Add rule**), the dashboard starts working without redeployment (perimeter propagation takes up to 30 minutes). Because `gcloud ... perimeters update --set-ingress-policies` replaces the entire rule list, include existing rules when updating via CLI.
 
 ### 14.5 When Gemini Enterprise lives in another project
 
@@ -1698,7 +1674,7 @@ It scans the files Git would publish and fails on secrets (private keys, API key
 | `GET /api/v1/gemini-enterprise/summary`, `/licenses`, `/file-uploads` | Signed in | Gemini Enterprise |
 | `GET /api/v1/gemini-enterprise/features` (`?refresh=1` skips the cache) | Signed in | Feature switches of every Gemini Enterprise app |
 | `POST /api/v1/gemini-enterprise/features/apply` | Administrator | Bulk feature switch changes (`engines.patch`, `updateMask=features`) |
-| `GET /api/v1/notebooklm/summary` | Signed in | NotebookLM |
+| `GET /api/v1/notebooklm/summary` | Signed in | Gemini Notebook |
 | `GET /api/v1/models/usage`, `/catalog` | Signed in | Models & Tokens |
 | `GET /api/v1/agent-platform/gateway`, `/registry`, `/deployments` | Signed in | AI API audit calls, Agent Registry, Deployments |
 | `GET /api/v1/agent-platform/gateways`, `/gateways/traffic` | Signed in | Agent Gateway inventory and governance posture, traffic |

@@ -240,8 +240,8 @@ def run_health(ctx):
         url = "https://monitoring.googleapis.com/v3/projects/%s/metricDescriptors" % ctx.project
         data = ctx.rest("GET", url, params={"filter": 'metric.type = starts_with("aiplatform.googleapis.com/publisher")',
                                             "pageSize": 1})
-        return "ok", ("Agent Platform publisher metrics available" if data.get("metricDescriptors")
-                      else "Reachable; no Agent Platform publisher metrics yet")
+        return "ok", ("Gemini Platform publisher metrics available" if data.get("metricDescriptors")
+                      else "Reachable; no Gemini Platform publisher metrics yet")
 
     def logging_check():
         if not configured:
@@ -308,7 +308,7 @@ def run_health(ctx):
     checks = [("bigquery_audit", "BigQuery audit dataset", bq_audit),
               ("bigquery_billing", "BigQuery billing export", bq_billing),
               ("discovery_engine", "Discovery Engine API", discovery),
-              ("agent_engine", "Agent Engine (Agent Platform)", agent_engine),
+              ("agent_engine", "Agent Engine (Gemini Platform)", agent_engine),
               ("cloud_monitoring", "Cloud Monitoring", monitoring),
               ("cloud_logging", "Cloud Logging", logging_check),
               ("iam_policy", "Project IAM policy", iam),

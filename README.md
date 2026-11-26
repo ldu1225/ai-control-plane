@@ -1,192 +1,168 @@
 <div align="center">
 
+<img src="docs/assets/logo.svg" alt="" width="56" height="56" />
+
 # AI Control Plane
 
-### Google Cloud의 모든 AI를 하나의 컨트롤 플레인에서 보고, 통제하고, 지킵니다.
+Google Cloud의 생성형 AI 사용 현황, 비용, 보안, 접근 통제를 하나의 콘솔에서 관리하는 거버넌스 대시보드
 
-**Gemini Enterprise · Agent Platform (Gateway · Registry · Engine · Model Armor) · NotebookLM · Antigravity · FinOps**
+Gemini Enterprise · Gemini Platform · Gemini Notebook · Antigravity · Model Armor · FinOps
 
 [![CI Tests](https://github.com/ldu1225/ai-control-plane/actions/workflows/tests.yml/badge.svg)](https://github.com/ldu1225/ai-control-plane/actions/workflows/tests.yml)
-[![Release](https://img.shields.io/badge/release-v2.2.1-2563EB?style=flat-square)](https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1)
-[![License](https://img.shields.io/badge/license-Apache%202.0-16A34A?style=flat-square)](LICENSE)
-[![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Cloud%20Run-4285F4?style=flat-square&logo=googlecloud&logoColor=white)](#3-빠른-시작-명령-한-번으로-배포)
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?style=flat-square&logo=python&logoColor=white)](#2-아키텍처)
-[![Zero Mock Data](https://img.shields.io/badge/Telemetry-100%25%20Real%20Data-0F172A?style=flat-square)](#11-설계-원칙)
+[![Release](https://img.shields.io/badge/release-v2.2.1-18181B?style=flat-square)](https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1)
+[![License](https://img.shields.io/badge/license-Apache%202.0-18181B?style=flat-square)](LICENSE)
+[![Cloud Run](https://img.shields.io/badge/Google%20Cloud-Cloud%20Run-18181B?style=flat-square&logo=googlecloud&logoColor=white)](#3-빠른-시작-명령-한-번으로-배포)
+[![Python 3.12](https://img.shields.io/badge/Python-3.12-18181B?style=flat-square&logo=python&logoColor=white)](#2-아키텍처)
 
-**🇰🇷 한국어** &nbsp;|&nbsp; [🇺🇸 English (README.en.md)](README.en.md)
+**한국어** &nbsp;|&nbsp; [English](README.en.md)
 
-<br/>
-
-[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/ldu1225/ai-control-plane.git&cloudshell_tutorial=TUTORIAL.md)
-&nbsp;
-[![Watch Feature Tour](https://img.shields.io/badge/%E2%96%B6%202%3A52%20%EA%B8%B0%EB%8A%A5%20%EC%86%8C%EA%B0%9C%20%EC%98%81%EC%83%81%20%281080p%20HD%29-2563EB?style=for-the-badge)](https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4)
-
-[🎬 기능 소개 영상](#-기능-소개-영상-2분-52초-풀-투어) &nbsp;·&nbsp;
-[📸 화면 스크린샷](#-화면-둘러보기-스크린샷) &nbsp;·&nbsp;
-[⚡ 1줄 원클릭 설치](#-30초-원클릭-설치) &nbsp;·&nbsp;
-[🏗️ 아키텍처](#2-아키텍처) &nbsp;·&nbsp;
-[📚 전체 목차](#목차)
-
-<br/>
-
-<a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
-  <img src="docs/assets/feature-tour-preview.gif" alt="AI Control Plane 주요 화면 하이라이트 미리보기" width="880" />
-</a>
-
-<sub>실제 Google Cloud 텔레메트리 화면을 녹화한 하이라이트 미리보기입니다 (조직명·프로젝트 ID·이메일만 마스킹). 클릭하면 음성 나레이션과 자막이 포함된 <b>1080p HD 전체 소개 영상(2분 52초)</b>을 볼 수 있습니다.</sub>
+[설치](#설치) &nbsp;·&nbsp; [주요 기능](#주요-기능) &nbsp;·&nbsp; [화면](#화면) &nbsp;·&nbsp; [아키텍처](#2-아키텍처) &nbsp;·&nbsp; [전체 목차](#목차)
 
 </div>
 
 <br/>
 
-<table>
-  <tr>
-    <td width="25%" valign="top">
-      <h4>👁️ 통합 가시성 (Observe)</h4>
-      <sub>Gemini Enterprise, NotebookLM, Agent Platform, 모델별 토큰·호출량, 멀티 프로젝트 현황을 단일 콘솔에서 실시간으로 파악합니다.</sub>
-    </td>
-    <td width="25%" valign="top">
-      <h4>🛡️ AI 보안 관제 (Protect)</h4>
-      <sub>Model Armor 프롬프트 인젝션·DLP 차단(사람 vs 자동 실행 분리), Agent Gateway 인가 정책, 휴면 에이전트 폐기 권고를 관리합니다.</sub>
-    </td>
-    <td width="25%" valign="top">
-      <h4>🚦 실시간 거버넌스 (Govern)</h4>
-      <sub>Antigravity 사용자별 원화/달러·토큰 한도, Pub/Sub 실시간 정지, 5중 안전 게이트(G1–G5), 허용/거부 정책 집행, GE 기능 일괄 제어를 지원합니다.</sub>
-    </td>
-    <td width="25%" valign="top">
-      <h4>💰 FinOps &amp; AI 애널리스트</h4>
-      <sub>결제 내보내기 + 공식 단가 역산 추정, 부서/인원별 비용 정산, Gemini 비용 급증 원인 분석, 자연어 BigQuery SQL 분석까지 제공합니다.</sub>
-    </td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/assets/screens/01-overview.png" alt="AI Control Plane 개요 화면" width="100%" />
+</p>
+
+## 개요
+
+AI Control Plane은 고객의 Google Cloud 프로젝트 안에 Cloud Run 서비스로 배포되어, 이미 수집되고 있는 감사 로그, 결제 내보내기, Cloud Monitoring, Discovery Engine API 데이터를 그 자리에서 읽습니다. 데이터를 외부로 복사하지 않으며, 여러 프로젝트를 하나의 화면에서 통합하거나 프로젝트별로 나누어 볼 수 있습니다.
+
+| 영역 | 제공 기능 |
+|---|---|
+| 가시성 | Gemini Enterprise, Gemini Notebook, Gemini Platform, Antigravity 사용량과 모델별 토큰·호출량, 멀티 프로젝트 현황 |
+| 보안 | Model Armor 프롬프트 인젝션·민감 정보 차단(사람 입력과 자동 실행 구분), Agent Gateway 인가 정책, 휴면 에이전트 폐기 권고 |
+| 거버넌스 | Gemini Enterprise 앱별 기능·모델 일괄 제어, Antigravity 사용자별 비용·토큰 한도와 실시간 정지, 5단계 안전 게이트 |
+| 비용 | 결제 내보내기 기반 청구액, 미연결 시 공식 단가 기반 역산 추정, 사람·프로젝트·조직별 비용 정산, 비용 급증 원인 분석 |
+| 분석 | 자연어 질문을 검증된 읽기 전용 BigQuery SQL로 변환해 표·차트·요약으로 답하는 AI 애널리스트 |
 
 > [!IMPORTANT]
-> **샘플 데이터, 데모 모드, 가짜 데이터가 전혀 없습니다.** 화면의 모든 숫자는 연결한 Google Cloud 프로젝트에서 실제로 수집된 텔레메트리 값입니다. 데이터 소스가 없거나 권한이 없으면 임의 값으로 채우지 않고 `—`로 비워 두며, 결제 내보내기(Billing Export)가 아직 연결되지 않은 프로젝트에서는 관측된 토큰 사용량에 Google 공식 공개 단가와 실시간 환율을 곱한 역산 추정 비용임을 배지와 함께 투명하게 표시합니다.
+> 샘플 데이터나 데모 모드가 없습니다. 화면의 모든 값은 연결된 Google Cloud 프로젝트에서 읽은 실측값입니다. 읽을 수 없는 값은 임의로 채우지 않고 `—`와 원인으로 표시하며, 결제 내보내기가 없을 때의 비용은 실측 토큰 × 공식 공개 단가로 계산한 추정치임을 화면에 명시합니다.
 
 > [!NOTE]
-> 이 저장소는 Google Cloud 고객 환경에서 운영하도록 만든 관리 솔루션이며, Google이 공식 지원하는 제품이 아닙니다. English documentation: [README.en.md](README.en.md)
+> Google Cloud 고객 환경에서 운영하도록 만든 관리 솔루션이며, Google이 공식 지원하는 제품이 아닙니다.
 
 ---
 
-## ⚡ 30초 원클릭 설치
+## 설치
 
-Google Cloud Shell(또는 macOS/Linux)에서 아래 **명령 한 줄**만 실행하면 신규 빈 프로젝트든 기존 프로젝트든 필수 API 활성화, 결제 연결 확인, 전용 서비스 계정·최소 권한 IAM, 설정 버킷, BigQuery 감사 로그 싱크, Data Access 로그, Gemini Enterprise 프롬프트 로깅, 컨테이너 빌드, Cloud Run 배포, Cloud Scheduler 및 Pub/Sub 실시간 집행까지 한 번에 완료됩니다.
+Cloud Shell 또는 macOS/Linux 터미널에서 실행합니다. 신규 프로젝트와 기존 프로젝트 모두 지원하며, 설치 스크립트가 API 활성화, 결제 연결 확인, 전용 서비스 계정과 최소 권한 IAM, 설정 버킷, BigQuery 감사 로그 싱크, Data Access 로그, Gemini Enterprise 프롬프트 로깅, 컨테이너 빌드, Cloud Run 배포, Cloud Scheduler와 Pub/Sub 실시간 집행 구성을 순서대로 처리합니다.
 
 ```bash
-# 1) 대화형 원클릭 마법사 (Enter만 누르면 기본값으로 바로 배포)
+# 대화형 설치 (Enter로 기본값 사용)
 bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh)
 
-# 2) 단일 프로젝트 즉시 배포 (또는 --link-projects 로 여러 프로젝트 통합 관제)
+# 단일 프로젝트 바로 배포 (--link-projects로 여러 프로젝트 통합)
 bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/install.sh) \
   --project YOUR_PROJECT_ID
 ```
 
-> 자세한 배포 옵션(멀티 프로젝트 허브, 조회 전용 `--read-only`, 거부 정책 `--enforcement-backend iam_deny`, 조직 정책 자동 대응 등)은 [3. 빠른 시작: 명령 한 번으로 배포](#3-빠른-시작-명령-한-번으로-배포)를 참고하세요.
+[![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://ssh.cloud.google.com/cloudshell/editor?cloudshell_git_repo=https://github.com/ldu1225/ai-control-plane.git&cloudshell_tutorial=TUTORIAL.md)
+
+멀티 프로젝트 허브, 조회 전용 모드(`--read-only`), 거부 정책 집행(`--enforcement-backend iam_deny`), 조직 정책 대응 등 전체 옵션은 [3. 빠른 시작](#3-빠른-시작-명령-한-번으로-배포)을 참고하세요.
 
 ---
 
-## 🎬 기능 소개 영상 (2분 52초 풀 투어)
+## 주요 기능
 
-<div align="center">
-  <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
-    <img src="docs/assets/video-poster.png" alt="AI Control Plane 기능 소개 영상 보기 (02:52, 1080p HD)" width="840" />
-  </a>
-  <p>
-    <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4"><b>▶ 전체 영상 보기 / 다운로드 (1080p HD · 한국어 나레이션 &amp; 자막, 2:52)</b></a>
-    &nbsp;&nbsp;|&nbsp;&nbsp;
-    <a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.srt">자막 파일 (.srt)</a>
-    &nbsp;&nbsp;|&nbsp;&nbsp;
-    <a href="https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1">릴리스 노트 (v2.2.1)</a>
-  </p>
-</div>
+| 화면 | 설명 |
+|---|---|
+| 개요 | 활성 사용자, 프롬프트, 모델 토큰, 순 비용, Model Armor 차단, 등록 에이전트, Gemini Notebook, Antigravity 핵심 지표와 추이 |
+| Gemini Enterprise | 사용량·라이선스 좌석, 모든 앱의 기능 스위치와 모델 선택 매트릭스(일괄 변경, 검토 후 적용), AI 개발자 도구와 Antigravity 허용 모델 |
+| Gemini Notebook | Data Access 감사 로그 기반 노트북·사용자·프롬프트 활동 |
+| Agent Gateway · Registry · 배포 | 게이트웨이 인벤토리와 인가 정책, 통합 에이전트 카탈로그, Agent Engine 런타임·리비전·평가·트레이스 |
+| Model Armor | 판정 추이, 필터별 차단, 애플리케이션·사용자별 이벤트 |
+| 모델 및 토큰 | 결제 SKU, Cloud Monitoring, Antigravity 로그에서 모델을 자동 발견하고 입력·출력·캐시 토큰과 비용을 추적 |
+| 비용 및 FinOps · 정산 | 서비스·SKU별 비용, 크레딧, 공식 단가·환율 동기화, 급증 원인 분석, 사람·프로젝트·조직별 배부와 월 마감 |
+| 사용자 및 액세스 · Antigravity 통제 | 사용자 360 뷰, 사용자별 기간 한도와 자동 정지, 허용·거부 정책 집행, 예외 규칙, 월간 리포트 |
+| 텔레메트리 확장 · AI 애널리스트 | 기존 로그 자동 프로파일링과 비용 제어형 라우팅, 자연어 기반 BigQuery 분석 |
+
+공통: 프로젝트 전환(전체·개별), 라이트·다크 테마, 한국어·영어, 명령 팔레트(Ctrl/Cmd+K), 기간 선택, 표 검색·정렬·CSV 내보내기, 데이터 소스 상태 확인.
+
+---
+
+## 화면
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/02-gemini-enterprise.png" alt="Gemini Enterprise 기능 및 모델 선택" width="100%" />
+      <p><b>Gemini Enterprise 기능 관리</b><br/><sub>모든 앱의 모델 선택 상태를 한 화면에서 비교하고 일괄 변경</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/03-agent-gateway.png" alt="Agent Gateway" width="100%" />
+      <p><b>Agent Gateway</b><br/><sub>AI API 트래픽, 호출 주체, 인가 판정과 IAP 액세스 정책</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/04-model-armor.png" alt="Model Armor" width="100%" />
+      <p><b>Model Armor</b><br/><sub>프롬프트 인젝션·민감 정보 차단 추이와 필터별 집계</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/05-models-tokens.png" alt="모델 및 토큰" width="100%" />
+      <p><b>모델 및 토큰</b><br/><sub>신규 모델 자동 발견, 모델별 토큰과 비용</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/06-finops-ai.png" alt="비용 및 FinOps" width="100%" />
+      <p><b>비용 및 FinOps</b><br/><sub>일별 비용, 서비스별 비중, 크레딧과 급증 감지</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/07-antigravity-caps.png" alt="Antigravity 통제" width="100%" />
+      <p><b>Antigravity 통제</b><br/><sub>사용자별 모델 비용, 한도 사용률, 정산 기간과 집행 방식</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/08-telemetry-extensions.png" alt="텔레메트리 확장" width="100%" />
+      <p><b>텔레메트리 확장</b><br/><sub>기존 로그 자동 발견과 비용 한도 기반 BigQuery 라우팅</sub></p>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/assets/screens/09-access-control.png" alt="설정 액세스 제어" width="100%" />
+      <p><b>액세스 제어</b><br/><sub>계정·역할 관리와 Google 로그인 방식(IAP, OAuth 클라이언트)</sub></p>
+    </td>
+  </tr>
+</table>
 
 <details>
-<summary><b>📑 영상 챕터 타임스탬프 전체 보기 (19개 구간)</b></summary>
+<summary><b>기능 소개 영상 (2분 52초, 이전 버전 UI)</b></summary>
 
-| 시각 | 챕터 | 주요 내용 |
-|---|---|---|
-| `0:00` | 인트로 | Google Cloud 모든 AI를 하나의 컨트롤 플레인에서 보고, 통제하고, 지키기 |
-| `0:17` | 01 로그인 · 접근 제어 | Google 계정(IAP / OAuth) 및 승인 사용자 RBAC |
-| `0:23` | 02 개요 | 8대 핵심 KPI, 비용·토큰 추이, 보안·에이전트 현황 |
-| `0:36` | 03 Gemini Enterprise | 사용자·프롬프트·에이전트 호출 및 휴면 라이선스 좌석 탐지 |
-| `0:46` | 04 NotebookLM | Data Access 감사 로그 기반 활동 추적 |
-| `0:51` | 05 Agent Gateway | AI API 요청·호출 주체·인가/거부 트래픽 관제 |
-| `0:57` | 06 Agent Registry | 통합 에이전트 카탈로그 및 50일 미사용 폐기 권고 |
-| `1:03` | 07 에이전트 배포 | Agent Engine 런타임, 실행 ID, 호출량·비용 관리 |
-| `1:08` | 08 Model Armor | 프롬프트 인젝션·DLP 차단 및 사람 vs 자동 실행 분리 |
-| `1:19` | 09 모델 및 토큰 | 신규 모델 무코드 자동 탐지 및 모델별 토큰·비용 |
-| `1:30` | 10 비용 및 FinOps | 크레딧·서비스·SKU 분석 및 Gemini 비용 급증 원인 조사 |
-| `1:39` | 11 사용자 및 액세스 | 사람 단위 360° 사용량 및 접근 통제 |
-| `1:46` | 12 Antigravity 통제 | 1인당 원화/토큰 한도, 자동 정지, 5중 안전 게이트(G1–G5) |
-| `2:04` | 13 텔레메트리 확장 | 기존 로그 자동 프로파일링 및 1클릭 대시보드 생성 |
-| `2:13` | 14 위젯 | 사용자별 맞춤 대시보드 위젯 고정 및 드래그 배치 |
-| `2:17` | 15 AI 애널리스트 | 자연어 질문 → 검증된 읽기 전용 BigQuery SQL → 자동 차트·표 |
-| `2:28` | 16 설정 | 브랜드 화이트라벨, 모델·거버넌스·접근 권한 실시간 변경 |
-| `2:34` | 17 배포 &amp; 아웃트로 | 고객 Google Cloud 프로젝트 안으로 명령 한 줄 배포 |
+<br/>
+
+<a href="https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4">
+  <img src="docs/assets/video-poster.png" alt="AI Control Plane 기능 소개 영상" width="720" />
+</a>
+
+[전체 영상 (1080p, 한국어 나레이션·자막)](https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.mp4) &nbsp;·&nbsp;
+[자막 파일 (.srt)](https://github.com/ldu1225/ai-control-plane/releases/download/v2.2.1/AI_Control_Plane_Feature_Tour.srt) &nbsp;·&nbsp;
+[릴리스 노트 (v2.2.1)](https://github.com/ldu1225/ai-control-plane/releases/tag/v2.2.1)
+
+| 시각 | 챕터 |
+|---|---|
+| `0:00` | 소개 |
+| `0:17` | 로그인과 접근 제어 |
+| `0:23` | 개요 |
+| `0:36` | Gemini Enterprise |
+| `0:46` | Gemini Notebook |
+| `0:51` | Agent Gateway |
+| `0:57` | Agent Registry |
+| `1:03` | 에이전트 배포 |
+| `1:08` | Model Armor |
+| `1:19` | 모델 및 토큰 |
+| `1:30` | 비용 및 FinOps |
+| `1:39` | 사용자 및 액세스 |
+| `1:46` | Antigravity 통제 |
+| `2:04` | 텔레메트리 확장 |
+| `2:13` | 위젯 |
+| `2:17` | AI 애널리스트 |
+| `2:28` | 설정 |
+| `2:34` | 배포 |
 
 </details>
-
----
-
-## 📸 화면 둘러보기 (스크린샷)
-
-### 통합 개요 (Executive Overview)
-
-<p align="center">
-  <img src="docs/assets/screens/01-overview.png" alt="AI Control Plane 통합 개요 화면" width="100%" />
-</p>
-
-> 활성 사용자, 프롬프트, 모델 토큰, 순 비용, Model Armor 차단, 등록 에이전트, NotebookLM, Antigravity 핵심 KPI와 9개 데이터 소스 실시간 연결 상태를 한 화면에서 확인합니다.
-
-### 워크스페이스 · 에이전트 · 보안 관제
-
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/02-gemini-enterprise.png" alt="Gemini Enterprise 도입 및 라이선스 현황" width="100%" />
-      <p><b>Gemini Enterprise · 기능 관리</b><br/><sub>일별 프롬프트·활성 사용자·에이전트 점유율, 휴면 라이선스 좌석 탐지 및 여러 앱 기능 스위치 일괄 변경</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/03-agent-gateway.png" alt="Agent Gateway 트래픽 및 인가 관제" width="100%" />
-      <p><b>Agent Gateway</b><br/><sub>AI 서비스 유입 트래픽, 사용자·서비스 계정 호출 주체, 거부/오류율 및 IAP 액세스 인가 정책 관리</sub></p>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/04-model-armor.png" alt="Model Armor 프롬프트 인젝션 및 민감 정보 차단" width="100%" />
-      <p><b>Model Armor 보안 관제</b><br/><sub>프롬프트 인젝션·민감 정보 보호(DLP) 차단 추이, 필터별 집계 및 사람 입력 vs 자동 실행 차단 분리</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/05-models-tokens.png" alt="모델별 토큰 및 신규 모델 자동 탐지" width="100%" />
-      <p><b>모델 및 토큰 (하드코딩 없음)</b><br/><sub>Gemini 4 Argon·3.8 Flash·Lyria 3 Pro 등 신규 모델 자동 탐지 및 입출력·캐시 토큰·비용 통합 추적</sub></p>
-    </td>
-  </tr>
-</table>
-
-### FinOps · Antigravity 통제 · 텔레메트리 확장 · AI 애널리스트
-
-<table>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/06-finops-ai.png" alt="비용 및 FinOps 대시보드" width="100%" />
-      <p><b>비용 및 FinOps + AI 급증 원인 분석</b><br/><sub>일별 비용, 서비스·SKU별 비중, 할인 크레딧, 결제 내보내기 미연결 시 공개 단가 역산 및 Gemini 급증 원인 분석</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/07-antigravity-caps.png" alt="Antigravity 사용자별 한도 정책 편집 및 안전 게이트" width="100%" />
-      <p><b>Antigravity 사용자별 한도 &amp; 5중 안전 게이트</b><br/><sub>1인당 원화(KRW)/달러·토큰·요청 한도, 실시간 Pub/Sub 자동 정지, 기간 초기화 자동 복원 및 G1–G5 안전 게이트</sub></p>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/08-telemetry-extensions.png" alt="텔레메트리 확장 동적 로그 대시보드" width="100%" />
-      <p><b>텔레메트리 확장</b><br/><sub>기존 Cloud Logging·BigQuery 로그 자동 발견, Gemini 의미 클러스터링 및 일일 GiB 한도 기반 비용 제어형 라우팅</sub></p>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/assets/screens/09-ai-analyst.png" alt="AI 애널리스트 자연어 SQL 분석 및 차트" width="100%" />
-      <p><b>AI 애널리스트</b><br/><sub>자연어로 질문하면 실시간 스키마 기반 검증된 읽기 전용 BigQuery SQL을 생성하고 표·차트·요약으로 즉시 답변</sub></p>
-    </td>
-  </tr>
-</table>
 
 ---
 
@@ -231,18 +207,18 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 |---|---|---|---|
 | 개요 | `overview` | 전체 KPI와 이전 기간 대비 증감, 비용 추이, 모델별 토큰, 보안 현황, 에이전트 수명 주기, 최근 거버넌스 조치 | 각 모듈 |
 | Gemini Enterprise | `gemini_enterprise` | 활성 사용자, 프롬프트, 에이전트별 호출, 라이선스 좌석 할당과 휴면 좌석, 업로드 파일. **기능 관리**: 모든 프로젝트·위치의 앱별 기능 스위치 매트릭스, 앱 간 비교, 여러 앱 일괄 변경(검토 후 적용, 감사 로그) | BigQuery(Gemini Enterprise 로그), Discovery Engine API(`engines.list`·`engines.patch`) |
-| NotebookLM | `notebooklm` | 활성 노트북, 사용자, 프롬프트 | BigQuery `cloudaudit_googleapis_com_data_access` |
+| Gemini Notebook | `notebooklm` | 활성 노트북, 사용자, 프롬프트 | BigQuery `cloudaudit_googleapis_com_data_access` |
 | Agent Gateway | `agent_gateway` | 게이트웨이 인벤토리와 거버넌스 점검, 생성·수정·삭제, Identity-Aware Proxy 액세스 인가 설정 및 감사 전용↔적용 전환, 연결 워크로드(Agent Runtime·Gemini Enterprise), 게이트웨이 요청·인가 판정·MCP 트래픽, AI API 호출 감사 로그 | Network Services API, Network Security API, Cloud Logging, Cloud Monitoring, BigQuery 감사 로그 |
-| Agent Registry | `agent_registry` | Agent Engine과 Gemini Enterprise 에이전트 통합 카탈로그, 휴면과 폐기 권고, 생성 이력 | Agent Platform API, Discovery Engine API, 감사 로그 |
-| 에이전트 배포 | `agent_deployments` | Agent Engine 런타임, 실행 ID(서비스 계정), 호출량, ID별 모델 사용량, 런타임 비용. 에이전트별 상세(텔레메트리, 모델 및 도구, 트레이스, 토폴로지, 리비전, 평가, 플레이그라운드) | Agent Platform API, 감사 로그, 결제 내보내기, Cloud Monitoring, Cloud Trace |
+| Agent Registry | `agent_registry` | Agent Engine과 Gemini Enterprise 에이전트 통합 카탈로그, 휴면과 폐기 권고, 생성 이력 | Gemini Platform API, Discovery Engine API, 감사 로그 |
+| 에이전트 배포 | `agent_deployments` | Agent Engine 런타임, 실행 ID(서비스 계정), 호출량, ID별 모델 사용량, 런타임 비용. 에이전트별 상세(텔레메트리, 모델 및 도구, 트레이스, 토폴로지, 리비전, 평가, 플레이그라운드) | Gemini Platform API, 감사 로그, 결제 내보내기, Cloud Monitoring, Cloud Trace |
 | Model Armor | `model_armor` | 판정 추이, 필터 일치, 애플리케이션과 사용자별 차단, 이벤트 상세 | BigQuery `modelarmor_googleapis_com_sanitize_operations` |
 | 모델 및 토큰 | `model_usage` | 모델 자동 탐지, 모델별 입력/출력/캐시 토큰, 호출 수, 오류율, 비용, 카탈로그 관리 | Cloud Monitoring, 결제 내보내기, Antigravity 로그, 공개 가격표 |
 | 비용 및 FinOps | `finops` | 총 비용, 크레딧, 순 비용, 서비스·SKU별 청구액 또는 모델별 토큰 역산 비용, 자정(`00:00`, 설정 가능) 공식 단가·다중 통화 환율 동기화 및 변동 알림, 급증 감지와 AI 원인 분석 | 결제 내보내기 (미연결 시 실측 토큰 × 공식 공개 단가·환율 역산) |
 | 비용 정산 | `chargeback` | 사람·프로젝트·조직(HR CSV 트리)별 Antigravity 사용 금액과 좌석 비용 배부, 미지정 목록, 월 마감(불변 스냅샷, 선택적 BigQuery 사본), 조직·프로젝트 월 예산, Google 지출 상한 | Antigravity 로그(월간 사용 리포트와 같은 장부), Discovery Engine 라이선스 API, Resource Manager 프로젝트 라벨, Cloud Billing Budget API |
 | 사용자 및 액세스 | `users` | 사용자 360 뷰(서비스 전체 사용량), Antigravity IAM 상태, Antigravity 허용과 차단, 전체 AI 접근 차단과 복원 | 전체 소스, Resource Manager IAM |
 | Antigravity 통제 | `antigravity` | 사용자별 기간 한도(비용/토큰/요청) 또는 크레딧 한도, 자동(실시간) 또는 수동 정지, 집행 방식(허용 정책 교체, 거부 정책, 알림만), 예외 규칙, 정산 기간, 안전 게이트, 월간 사용 리포트, 클라우드에서 에이전트가 실행한 작업, 감사 로그 | Cloud Logging 또는 BigQuery, Pub/Sub(실시간 집행), IAM 허용·거부 정책, 결제 내보내기, Cloud Billing Catalog API |
-| 텔레메트리 확장 | `telemetry` | 스키마·필드 통계 + Gemini 기반 동적 로그·테이블 분석 및 그룹 묶음 대시보드, 비용 제어형(샘플링·심각도·제외 필터·보존 기간·일일 GiB 한도 자동 일시 중지/재개) Log Router → BigQuery 자동 라우팅 | BigQuery, Cloud Logging, Cloud Monitoring, Gemini on Agent Platform |
-| AI 애널리스트 | `analyst` | 자연어 질문, 검증된 읽기 전용 SQL, 결과 표와 차트, 요약 | BigQuery, Gemini on Agent Platform |
+| 텔레메트리 확장 | `telemetry` | 스키마·필드 통계 + Gemini 기반 동적 로그·테이블 분석 및 그룹 묶음 대시보드, 비용 제어형(샘플링·심각도·제외 필터·보존 기간·일일 GiB 한도 자동 일시 중지/재개) Log Router → BigQuery 자동 라우팅 | BigQuery, Cloud Logging, Cloud Monitoring, Gemini on Gemini Platform |
+| AI 애널리스트 | `analyst` | 자연어 질문, 검증된 읽기 전용 SQL, 결과 표와 차트, 요약 | BigQuery, Gemini on Gemini Platform |
 
 공통 기능: 멀티 프로젝트 통합/개별 전환 선택기, 라이트/다크 테마, 한국어/영어 전환, 비용 화면의 통화 전환(USD와 표시 통화), 명령 팔레트(Ctrl/Cmd+K), 기간 선택(프리셋과 직접 지정), 표 검색/정렬/CSV 내보내기, 데이터 소스 상태 패널.
 
@@ -264,7 +240,7 @@ flowchart LR
   run --> logging["Cloud Logging API"]
   run --> monitoring["Cloud Monitoring API"]
   run --> de["Discovery Engine API"]
-  run --> agentplatform["Agent Platform API: Agent Engine, Gemini"]
+  run --> agentplatform["Gemini Platform API: Agent Engine, Gemini"]
   run --> rm["Resource Manager / IAM API"]
   run --> catalog["Cloud Billing Catalog API (공개 가격표)"]
   run --> gcs["Cloud Storage: 설정 저장소"]
@@ -385,12 +361,12 @@ scripts/deploy.sh --project my-project-id --link-projects project-b,project-c
 | 단계 | 내용 |
 |---|---|
 | 0. 사전 권한·결제 점검 | 기반 제어 API를 먼저 켜고, 호출자 IAM 권한 확인 및 자동 보강(Self-bootstrap), 결제 계정 연결 확인·자동 연결, 조직 정책·VPC Service Controls 사전 점검([14.4](#144-고객-프로젝트-사전-점검-조직-정책vpc-service-controls))을 수행합니다. |
-| 1. 필수 API & 서비스 에이전트 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Cloud Trace, Discovery Engine, Agent Platform, Model Armor, Storage, Secret Manager, IAP, Cloud Scheduler, Cloud Billing Budget, 실시간 집행용 Pub/Sub 등 API와 Google 관리형 서비스 에이전트(`service-PROJECT_NUMBER@...`)를 즉시 생성합니다. |
+| 1. 필수 API & 서비스 에이전트 | Cloud Run, Cloud Build, Artifact Registry, BigQuery, Logging, Monitoring, Cloud Trace, Discovery Engine, Gemini Platform, Model Armor, Storage, Secret Manager, IAP, Cloud Scheduler, Cloud Billing Budget, 실시간 집행용 Pub/Sub 등 API와 Google 관리형 서비스 에이전트(`service-PROJECT_NUMBER@...`)를 즉시 생성합니다. |
 | 2. 설정 버킷 | 공개 접근이 차단되고 버전 관리가 켜진 Cloud Storage 버킷을 생성합니다. |
 | 3. 전용 서비스 계정 & IAM | 런타임 SA, 로그인 브리지 SA, **전용 Cloud Build 빌더 SA**(Compute Engine 기본 SA에 의존하지 않음), `iam_deny`이면 집행 작업 SA를 만들고 최소 권한(`CustomAiControlPlaneLicenseReader` 포함)을 부여합니다([6.6](#66-런타임-서비스-계정-권한)). 통제 기능(`ENABLE_GOVERNANCE_ACTIONS=true`, 기본)이면 IAM 쓰기 역할과 Antigravity 마커 역할(`CustomAntigravityCapBlocked`, `CustomAntigravityAdminBlocked`), Gemini Enterprise 기능 관리 커스텀 역할(`CustomAiControlPlaneGeFeatureManager`), Agent Gateway 관리 커스텀 역할(`CustomAiControlPlaneGatewayManager`)을 만듭니다. `--link-projects`로 지정한 연동 프로젝트에도 읽기 전용 스캔 권한과 기능 관리 역할(통제 기능 사용 시)을 자동 부여하며, BigQuery 결제 내보내기 테이블이 있으면 자동으로 탐지합니다. |
 | 4. 컨테이너 이미지 | Artifact Registry 저장소를 만들고 전용 빌더 SA로 Cloud Build 이미지를 빌드합니다(리전 워커 제한 시 글로벌 Cloud Build -> Cloud Shell/로컬 Docker로 3단계 자동 전환). |
 | 5. 시크릿 | 세션 서명 키, 기본 `admin` 계정의 무작위 초기 비밀번호, 화면에서 연결할 OAuth 클라이언트 보안 비밀 자리(`google`, `password` 방식)를 리전 제한 조직 정책(`constraints/gcp.resourceLocations`)에 맞춰 Secret Manager에 만듭니다. |
-| 6. 데이터 소스 일괄 활성화 | BigQuery 데이터셋(`ge_analytics`)과 파티션 Log Router 싱크 생성, **AI 서비스 Data Access 감사 로그 활성화**, 모든 Gemini Enterprise 앱의 **사용 로그 + 프롬프트·사용자 식별 로깅 활성화**, 연동 프로젝트 로그 싱크 온보딩(권한 보유 시), 조직명 및 Agent Platform 엔드포인트 자동 탐지를 수행합니다. |
+| 6. 데이터 소스 일괄 활성화 | BigQuery 데이터셋(`ge_analytics`)과 파티션 Log Router 싱크 생성, **AI 서비스 Data Access 감사 로그 활성화**, 모든 Gemini Enterprise 앱의 **사용 로그 + 프롬프트·사용자 식별 로깅 활성화**, 연동 프로젝트 로그 싱크 온보딩(권한 보유 시), 조직명 및 Gemini Platform 엔드포인트 자동 탐지를 수행합니다. |
 | 7. Cloud Run & 인증 자동 대응 | 로그인 브리지(IAP)와 대시보드를 배포하고, `ENFORCEMENT_BACKEND=iam_deny`이면 같은 이미지로 집행 작업(Cloud Run 작업 `SERVICE_NAME-enforcer`)도 배포합니다. 도메인 제한 공유(`iam.allowedPolicyMemberDomains`)나 비인증 호출 차단 조직 정책이 있어도 `--no-invoker-iam-check` -> `--allow-unauthenticated` -> **Direct Cloud Run IAP** 또는 내장 ID/비밀번호 로그인으로 자동 전환하여 실패 없이 배포합니다. |
 | 8. 스케줄, 실시간 집행 & 헬스체크 | Cloud Scheduler에 한도 집행 작업(`SERVICE_NAME-enforce`, 기본 5분마다. `iam_deny`면 집행 작업을 실행하는 `SERVICE_NAME-enforcer`)과 유지관리 작업(`SERVICE_NAME-maintenance`, 기본 15분마다: 공식 단가·환율 일일 동기화(`00:00`, 설정 가능), 텔레메트리 BigQuery 라우팅 일일 예산 점검·다음 날 자동 재개)을 등록합니다. 실시간 집행용 Pub/Sub 토픽·로그 싱크(`SERVICE_NAME-agy-usage`)와 푸시 구독(`SERVICE_NAME-agy-usage-push`)을 만들고, 엔드포인트 응답(`HTTP 200/302/401`)을 확인한 뒤 접속 주소, 관리자 비밀번호 확인 명령, Antigravity 준비 상태를 출력합니다. IAP 방식에서는 대시보드를 호출하는 스케줄러와 Pub/Sub 푸시를 만들지 않습니다. |
 
@@ -423,10 +399,10 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 
 | 단계 | 내용 |
 |---|---|
-| 1. API 사용 설정 | Logging, BigQuery, Monitoring, Discovery Engine, Agent Platform, Model Armor 등 필수 API 및 서비스 에이전트 생성 |
+| 1. API 사용 설정 | Logging, BigQuery, Monitoring, Discovery Engine, Gemini Platform, Model Armor 등 필수 API 및 서비스 에이전트 생성 |
 | 2. 로그 라우팅 | BigQuery 데이터셋(`ge_analytics`)과 Log Router 싱크(`ai-control-plane-ai-logs`)를 만듭니다([6.1](#61-감사-로그-싱크-bigquery)). Antigravity 로그도 포함되어 있어, Antigravity를 쓰기 시작하면 따로 할 일 없이 쌓입니다. |
 | 3. Gemini Enterprise 사용·프롬프트 로그 | `global`, `us`, `eu`의 모든 Gemini Enterprise 앱에서 관측 가능성(사용 로그와 사용자·프롬프트 로깅)을 기본으로 켭니다([6.3](#63-gemini-enterprise-로그)). |
-| 4. Data Access 감사 로그 | AI 서비스 5개(Agent Platform, Discovery Engine(Gemini Enterprise·NotebookLM), Model Armor, Antigravity, Gemini Data Analytics)의 Data Access 감사 로그(`ADMIN_READ`, `DATA_READ`, `DATA_WRITE`)를 기본으로 켭니다([6.2](#62-data-access-감사-로그), 제외하려면 `--no-data-access-logs`). |
+| 4. Data Access 감사 로그 | AI 서비스 5개(Gemini Platform, Discovery Engine(Gemini Enterprise·Gemini Notebook), Model Armor, Antigravity, Gemini Data Analytics)의 Data Access 감사 로그(`ADMIN_READ`, `DATA_READ`, `DATA_WRITE`)를 기본으로 켭니다([6.2](#62-data-access-감사-로그), 제외하려면 `--no-data-access-logs`). |
 | 5. 확인 | 최근 30일 동안 Gemini Enterprise, Model Armor, Antigravity 로그가 들어왔는지 보여 줍니다. |
 
 - 다시 실행해도 안전하고, `--dry-run`으로 바뀔 내용만 먼저 볼 수 있습니다. 여러 프로젝트를 한 번에 준비하려면 `--projects proj-a,proj-b`를 지정합니다.
@@ -483,7 +459,7 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 | `AUDIT_DATASET` | `ge_analytics` | 감사 로그가 들어오는 BigQuery 데이터셋(`--dataset`) |
 | `CREATE_LOG_SINK` | `true` | 데이터셋과 Log Router 싱크를 만들고, 이미 있으면 최신 필터로 갱신. 직접 관리하는 다른 싱크를 쓰면 `false` |
 | `DATASET_LOCATION` | 비어 있음(`REGION`) | 새로 만드는 데이터셋 위치(`--dataset-location`). 비우면 `REGION`을 따르고, 이미 있는 데이터셋은 옮기지 않습니다. 예전 설정 스냅샷에 그때 리전과 같은 값이 있으면 `--region`으로 다시 실행할 때 새 리전을 따르고, `US`처럼 다른 값이나 `--dataset-location`은 유지합니다. |
-| `ENABLE_DATA_ACCESS_LOGS` | `true` | AI 서비스 5개(Agent Platform, Discovery Engine, Model Armor, Antigravity, Gemini Data Analytics)의 Data Access 감사 로그 켜기([6.2](#62-data-access-감사-로그), `--no-data-access-logs`면 `false`) |
+| `ENABLE_DATA_ACCESS_LOGS` | `true` | AI 서비스 5개(Gemini Platform, Discovery Engine, Model Armor, Antigravity, Gemini Data Analytics)의 Data Access 감사 로그 켜기([6.2](#62-data-access-감사-로그), `--no-data-access-logs`면 `false`) |
 | `ENABLE_GE_OBSERVABILITY` | `true` | `DISCOVERY_ENGINE_LOCATIONS`의 모든 Gemini Enterprise 앱에서 사용 로그(관측 가능성) 켜기. Owner 또는 Gemini Enterprise 관리자 권한이 필요하며, 권한이 없으면 경고만 남깁니다. |
 | `GE_PROMPT_LOGGING` | `true` | 사용자 이메일(`userIamPrincipal`), 프롬프트·응답 원문, 업로드 파일 이름이 `<elided>`로 가려지지 않도록 함께 기록합니다. `--no-log-prompts`로 끌 수 있습니다. |
 | `BILLING_PROJECT_ID` | 비어 있음(자동 탐지) | 결제 내보내기가 있는 프로젝트. 비우면 `PROJECT_ID`에서 결제 내보내기 테이블을 찾습니다. |
@@ -515,7 +491,7 @@ bash <(curl -fsSL https://github.com/ldu1225/ai-control-plane/raw/main/scripts/i
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `AI_DEFAULT_MODEL` | 비어 있음 | AI 애널리스트 기본 모델(비우면 `config.yaml` 값) |
-| `AI_LOCATION` | 비어 있음(자동 감지) | Agent Platform 모델 엔드포인트 위치. 비우면 `global`, 응답이 없으면 `REGION` |
+| `AI_LOCATION` | 비어 있음(자동 감지) | Gemini Platform 모델 엔드포인트 위치. 비우면 `global`, 응답이 없으면 `REGION` |
 | `TELEMETRY_AI_MODEL` | 비어 있음(`gemini-4-argon`) | 텔레메트리 소스를 설명하고 묶는 Gemini 모델 |
 | `TELEMETRY_DATASET` | 비어 있음(`telemetry_routed`) | 텔레메트리 라우팅 BigQuery 데이터셋(위치는 `DATASET_LOCATION`) |
 | `IMAGE` | 비어 있음 | 미리 빌드한 이미지(`--image`, 이번 실행에만 적용). 비우면 Cloud Build로 빌드(제한 시 로컬 Docker 자동 전환) |
@@ -681,7 +657,7 @@ gcloud logging sinks describe ai-control-plane-ai-logs --project=PROJECT_ID --fo
 | 테이블 | 사용하는 화면 |
 |---|---|
 | `cloudaudit_googleapis_com_activity` | Agent Registry(생성 이력), Agent Gateway, 클라우드에서 에이전트가 실행한 작업(변경) |
-| `cloudaudit_googleapis_com_data_access` | Agent Gateway, NotebookLM, 에이전트 배포, 사용자, 클라우드에서 에이전트가 실행한 작업(조회) |
+| `cloudaudit_googleapis_com_data_access` | Agent Gateway, Gemini Notebook, 에이전트 배포, 사용자, 클라우드에서 에이전트가 실행한 작업(조회) |
 | `discoveryengine_googleapis_com_gen_ai_user_message` | Gemini Enterprise(프롬프트, 업로드 파일 이름) |
 | `discoveryengine_googleapis_com_gemini_enterprise_user_activity` | Gemini Enterprise(프롬프트, 에이전트 호출, 업로드), Model Armor 사용자 연결 |
 | `modelarmor_googleapis_com_sanitize_operations` | Model Armor |
@@ -691,10 +667,10 @@ gcloud logging sinks describe ai-control-plane-ai-logs --project=PROJECT_ID --fo
 
 ### 6.2 Data Access 감사 로그
 
-Agent Gateway, NotebookLM, 에이전트 배포, ID별 모델 사용량은 Data Access 감사 로그를 씁니다. `scripts/prepare.sh --data-access-logs`를 실행하거나 `ENABLE_DATA_ACCESS_LOGS=true`로 다시 배포하거나, 콘솔의 **IAM 및 관리자 > 감사 로그**에서 아래 서비스의 `Admin Read`, `Data Read`, `Data Write`를 켭니다. 스크립트는 프로젝트가 받지 않는 서비스 이름을 건너뜁니다.
+Agent Gateway, Gemini Notebook, 에이전트 배포, ID별 모델 사용량은 Data Access 감사 로그를 씁니다. `scripts/prepare.sh --data-access-logs`를 실행하거나 `ENABLE_DATA_ACCESS_LOGS=true`로 다시 배포하거나, 콘솔의 **IAM 및 관리자 > 감사 로그**에서 아래 서비스의 `Admin Read`, `Data Read`, `Data Write`를 켭니다. 스크립트는 프로젝트가 받지 않는 서비스 이름을 건너뜁니다.
 
-- Agent Platform API (`aiplatform.googleapis.com`)
-- Discovery Engine API (`discoveryengine.googleapis.com`, Gemini Enterprise와 NotebookLM)
+- Gemini Platform API (`aiplatform.googleapis.com`)
+- Discovery Engine API (`discoveryengine.googleapis.com`, Gemini Enterprise와 Gemini Notebook)
 - Model Armor API (`modelarmor.googleapis.com`)
 - Antigravity (`businessaicode.googleapis.com`)
 - Gemini Data Analytics API (`geminidataanalytics.googleapis.com`)
@@ -734,11 +710,11 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 | 개발자 로그인 | 호출 경로 | `inference_response` (사람별 토큰) | Antigravity 권한 거부로 정지 |
 |---|---|---|---|
 | 구독(Subscriptions): **Use a Google Cloud project**(CLI) 또는 **Use Business Account**(앱) → 라이선스 선택 | `businessaicode.googleapis.com` | 기록됨(메타데이터 로깅 켬) | 됨 |
-| ADC(`AGY_ADC_AUTH=true`) 또는 종량제 | Agent Platform 직접 호출(`aiplatform.googleapis.com`, `PredictionService.StreamGenerateContent`) | 없음 | 안 됨 |
+| ADC(`AGY_ADC_AUTH=true`) 또는 종량제 | Gemini Platform 직접 호출(`aiplatform.googleapis.com`, `PredictionService.StreamGenerateContent`) | 없음 | 안 됨 |
 
 - **메타데이터 로깅은 위치(`global`, `us`, `eu`)마다 별도 설정입니다.** `us`나 `eu`에서 켰더라도 `global`이 꺼져 있으면, `locations/global`로 라우팅되는 호출(예: Gemini 4·프리뷰 모델, 기본 Antigravity CLI 라우팅)은 `inference_response` 로그를 남기지 않습니다. 대시보드의 Antigravity 전제 조건 화면은 스캔 대상 프로젝트의 `devToolsConfig`(`global`, `us`, `eu`)를 자동으로 조회해 AI developer tools가 켜진 위치 중 메타데이터 로깅이 꺼진 곳을 바로 경고합니다.
-- ADC·종량제 호출은 Agent Platform의 Data Access 감사 로그에 사용자와 모델만 남고 토큰 수는 없습니다. 사용자 에이전트(`protoPayload.requestMetadata.callerSuppliedUserAgent`)에 `antigravity/cli/...; auth_method=adc`가 남으므로 Logs Explorer에서 `protoPayload.serviceName="aiplatform.googleapis.com" AND protoPayload.requestMetadata.callerSuppliedUserAgent:"antigravity/"`로 찾을 수 있습니다.
-- Gemini Enterprise 사용자 역할(`roles/discoveryengine.agentspaceUser`)에는 `aiplatform.*` 권한이 없습니다. 그래서 ADC 경로는 Agent Platform 호출 권한(예: `roles/aiplatform.user`)을 따로 받은 사람만 쓸 수 있습니다. 막으려면 개발자에게 그 권한을 주지 않거나, 정지된 사람에게는 8.9의 `deny_agent_platform`을 켭니다.
+- ADC·종량제 호출은 Gemini Platform의 Data Access 감사 로그에 사용자와 모델만 남고 토큰 수는 없습니다. 사용자 에이전트(`protoPayload.requestMetadata.callerSuppliedUserAgent`)에 `antigravity/cli/...; auth_method=adc`가 남으므로 Logs Explorer에서 `protoPayload.serviceName="aiplatform.googleapis.com" AND protoPayload.requestMetadata.callerSuppliedUserAgent:"antigravity/"`로 찾을 수 있습니다.
+- Gemini Enterprise 사용자 역할(`roles/discoveryengine.agentspaceUser`)에는 `aiplatform.*` 권한이 없습니다. 그래서 ADC 경로는 Gemini Platform 호출 권한(예: `roles/aiplatform.user`)을 따로 받은 사람만 쓸 수 있습니다. 막으려면 개발자에게 그 권한을 주지 않거나, 정지된 사람에게는 8.9의 `deny_agent_platform`을 켭니다.
 
 ### 6.6 런타임 서비스 계정 권한
 
@@ -803,7 +779,7 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
 
 **기능 관리 및 모델 선택** (`#/gemini-enterprise/features`, `#/gemini-enterprise/features/models`, 화면 위쪽 **기능 관리** 탭): 프로젝트마다 Gemini Enterprise 앱이 여러 개여도 모든 앱의 **기능 스위치**(`Engine.features`)와 **모델 선택**(`Engine.modelConfigs`)을 한 화면에서 비교하고 여러 앱에 일괄 적용합니다.
 
-- **기능 스위치**: 열은 선택한 프로젝트와 `DISCOVERY_ENGINE_LOCATIONS`의 모든 Gemini Enterprise 앱(`appType=APP_TYPE_INTRANET`이거나 스위치·모델 설정이 있는 엔진), 행은 Discovery Engine v1 레퍼런스의 모든 기능 키입니다(에이전트 갤러리, 노코드 에이전트 빌더, 에이전트 마켓플레이스·예약 실행·프리뷰 에이전트, 플러그인, 스킬 보안 스캔, 모델 선택기, NotebookLM, 코드 추출, Canvas·앱 공유, 음악·음성 생성, 메모리 등). 레퍼런스에 없지만 앱에 설정된 키도 **기타 기능**에 나옵니다.
+- **기능 스위치**: 열은 선택한 프로젝트와 `DISCOVERY_ENGINE_LOCATIONS`의 모든 Gemini Enterprise 앱(`appType=APP_TYPE_INTRANET`이거나 스위치·모델 설정이 있는 엔진), 행은 Discovery Engine v1 레퍼런스의 모든 기능 키입니다(에이전트 갤러리, 노코드 에이전트 빌더, 에이전트 마켓플레이스·예약 실행·프리뷰 에이전트, 플러그인, 스킬 보안 스캔, 모델 선택기, Gemini Notebook, 코드 추출, Canvas·앱 공유, 음악·음성 생성, 메모리 등). 레퍼런스에 없지만 앱에 설정된 키도 **기타 기능**에 나옵니다.
 - **모델 선택**: 상단 세그먼트에서 **모델 선택**을 고르면 Discovery Engine `WidgetConfig` 관리자 뷰(`GET .../widgetConfigs/default_search_widget_config?modelInfoView=ADMIN`)에서 Gemini Enterprise에 실제 존재하는 전체 모델 목록(Gemini 4/3.x/2.5, 이미지 생성, Anthropic Claude 서드파티 모델)과 기본 활성·고정 여부(`enabledByDefault`, `adminOverridable`), 지원 리전(`regions`)을 수동 입력 없이 실시간 동기화해 매트릭스로 관리합니다. 일반 `WidgetConfig` 조회(`resolvedModels`)도 함께 읽어 현재 웹 앱 모델 선택기에 활성 표시되는 모델을 녹색 점으로 나타냅니다. 서드파티 Claude 모델은 Cloud Console에서 종량제(PAYG) 초과 사용 활성화와 프로젝트별 1회 이용약관 동의가 필요합니다.
 - **상태**: 기능은 **켜짐**(`FEATURE_STATE_ON`)/`꺼짐`(`FEATURE_STATE_OFF`)/`기본값`, 모델은 **사용**(`MODEL_ENABLED`)/`사용 안 함`(`MODEL_DISABLED`)/`기본값`(키 없음 = 제품 기본 동작). `disable-`로 시작하는 기능 키는 **제한 항목**이라 켜면 그 기능이 차단됩니다(값을 뒤집어 보여 주지 않습니다). `*`(마스터 스위치)가 설정된 앱은 다른 기능 스위치가 무시되므로 열 머리글에 표시하고 셀을 흐리게 보여 줍니다.
 - **찾기 및 일괄 변경 (관리자)**: 검색, 분류 칩, **앱별 상이만**, **명시 설정만**, 프로젝트 선택, **CSV 내보내기**. 셀 클릭, 행 메뉴(표시된 모든 앱 일괄 설정), 열 메뉴(기준 앱 복사·기본값 재설정)로 기능과 모델 변경을 함께 대기시킨 뒤 **검토 후 적용**에서 변경 전→후를 확인하고 한 번에 적용합니다(최대 100개 앱).
@@ -827,9 +803,9 @@ Antigravity 사용자별 토큰 사용량은 Antigravity for organizations가 �
   | `POST /api/v1/gemini-enterprise/features/apply` | 관리자, CSRF, 거버넌스 속도 제한 | 본문 `{"changes": [{"project", "location", "engineId", "set"?: {...}, "setModels"?: {"gemini-4-argon": "on", "claude-opus-5-5": "default"}}]}`(최대 100개 앱, 앱당 기능 64개·모델 64개). 응답 `results[]`, `updated`, `unchanged`, `failed`, `auditLogged` |
   | `GET /api/v1/gemini-enterprise/dev-tools[?project=ID][&refresh=1]` | 로그인 | `configs[]`(프로젝트·위치별 `devToolsEnabled`, `logging`, `agent`, `browser`, `mcp`, `plugins`, `models`, `overage`, `features`), `observedModels`, `observedThirdPartyModels`, `writeSupported: false`, `complete`, `unreadableProjects` |
 
-### 7.3 NotebookLM
+### 7.3 Gemini Notebook
 
-NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬프트를 셉니다.
+Gemini Notebook Data Access 감사 로그에서 활성 노트북, 사용자, 프롬프트를 셉니다.
 
 ### 7.4 Agent Gateway
 
@@ -842,25 +818,25 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.5 Agent Registry와 에이전트 배포
 
-- **Agent Registry**: Agent Engine(Agent Platform)과 Gemini Enterprise 에이전트를 하나의 카탈로그로 합칩니다. 마지막 호출 이후 `agent_lifecycle.idle_days`(기본 14일)가 지나면 휴면, `deprecation_days`(기본 50일)가 지나면 폐기 권고로 분류합니다.
+- **Agent Registry**: Agent Engine(Gemini Platform)과 Gemini Enterprise 에이전트를 하나의 카탈로그로 합칩니다. 마지막 호출 이후 `agent_lifecycle.idle_days`(기본 14일)가 지나면 휴면, `deprecation_days`(기본 50일)가 지나면 폐기 권고로 분류합니다.
 - **에이전트 배포**: Agent Engine 런타임별 실행 ID(서비스 계정), 호출량, ID별 모델 사용량, 런타임 비용(resource 수준 결제 내보내기)을 보여 줍니다.
 - **에이전트 상세**: 에이전트 배포 표의 행(또는 Agent Registry의 Agent Engine 항목)을 열고 **에이전트 상세 열기**를 누르면 배포 하나를 일곱 가지 보기로 살펴봅니다. 주소는 `#/deployments/<프로젝트>/<리전>/<엔진 ID>/<보기>`이고, 워크스페이스가 목록에 보여 주는 엔진만 열 수 있습니다.
 
 | 보기 | 내용 | 데이터 소스 |
 |---|---|---|
-| 텔레메트리 | 요청 수, 오류율, 지연 시간 백분위수(p50/p95/p99), CPU·메모리 할당, 응답 코드, 저장된 세션 수. 에이전트가 직접 보고하는 호출 수, 지연 시간, 토큰 | Cloud Monitoring `aiplatform.googleapis.com/reasoning_engine/*`, `prometheus.googleapis.com/gen_ai.*`, Agent Platform Sessions |
+| 텔레메트리 | 요청 수, 오류율, 지연 시간 백분위수(p50/p95/p99), CPU·메모리 할당, 응답 코드, 저장된 세션 수. 에이전트가 직접 보고하는 호출 수, 지연 시간, 토큰 | Cloud Monitoring `aiplatform.googleapis.com/reasoning_engine/*`, `prometheus.googleapis.com/gen_ai.*`, Gemini Platform Sessions |
 | 모델 및 도구 | 모델별 호출 수, 오류 유형, 지연 시간, 토큰. 도구별 호출 수, 실패, 지연 시간. 호출당 모델·도구 호출 수 | Cloud Monitoring `prometheus.googleapis.com/gen_ai.*` |
 | 트레이스 | 최근 트레이스 100개와 트레이스별 스팬 타임라인(에이전트, 모델, 도구) | Cloud Trace API |
 | 토폴로지 | 최근 트레이스 25개로 그린 호출 그래프(클라이언트, 에이전트, 하위 에이전트, 도구, 모델)와 연결별 호출 수 | Cloud Trace API |
-| 리비전 | 런타임 리비전 목록, 상태, 트래픽 분할 | Agent Platform API v1beta1 `runtimeRevisions`(프리뷰) |
-| 평가 | 온라인 모니터, 지표별 평균 점수와 추이, 이 에이전트를 호출한 평가 실행 | Agent Platform API `onlineEvaluators`, `evaluationRuns`, Cloud Monitoring `aiplatform.googleapis.com/online_evaluator/*` |
-| 플레이그라운드 | 배포된 에이전트에 메시지를 보내고 답변, 도구 호출, 도구 결과를 확인 | Agent Platform API `streamQuery` |
+| 리비전 | 런타임 리비전 목록, 상태, 트래픽 분할 | Gemini Platform API v1beta1 `runtimeRevisions`(프리뷰) |
+| 평가 | 온라인 모니터, 지표별 평균 점수와 추이, 이 에이전트를 호출한 평가 실행 | Gemini Platform API `onlineEvaluators`, `evaluationRuns`, Cloud Monitoring `aiplatform.googleapis.com/online_evaluator/*` |
+| 플레이그라운드 | 배포된 에이전트에 메시지를 보내고 답변, 도구 호출, 도구 결과를 확인 | Gemini Platform API `streamQuery` |
 
   - **에이전트가 보고하는 지표**(호출, 모델, 도구, 토큰)는 에이전트를 Agent Development Kit 2.6 이상으로 만들고 `GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true`로 배포해야 생깁니다. **트레이스**도 이 변수를 켜고 배포한 에이전트만 남깁니다. 없으면 런타임 지표(요청, 지연 시간, CPU·메모리)만 표시하고 그 이유를 화면에 알립니다.
   - **토폴로지**는 Google Cloud 콘솔의 Topology 탭(App Topology API)과 다른 방식입니다. 에이전트가 남긴 트레이스에서 호출 관계를 집계하므로, 선택한 기간에 트레이스가 있어야 그려집니다.
   - **프롬프트와 응답은 보여 주지 않습니다.** 트레이스에서는 시간, 구조, 에이전트·모델·도구 이름, 토큰 수, 오류 유형만 통과시키고 메시지 본문과 도구 인자·결과는 서버 밖으로 내보내지 않습니다. 사용자 ID는 viewer 마스킹 설정을 따릅니다.
   - **플레이그라운드는 관리자 전용**입니다. 메시지를 보내면 실제 배포가 실행되어(모델·도구 호출) 토큰 비용이 들고, 에이전트에 연결된 시스템의 데이터가 바뀔 수 있습니다. 로그인한 관리자의 계정이 사용자 ID로 전달되고, AI 요청 속도 제한(분당 20회)을 받으며, 호출마다 메시지 본문 없이 거버넌스 감사 로그(`agent_playground_query`)에 기록됩니다(오류가 나도 기록하고 결과는 `failed`). 대시보드는 메시지를 검사하지 않으므로 프롬프트·응답 검사(Model Armor 등)는 에이전트 쪽 구성을 따릅니다. 스트리밍 쿼리 메서드를 제공하는 에이전트(Agent Development Kit)만 호출할 수 있습니다.
-  - **권한**: 지표는 `roles/monitoring.viewer`, 리비전·평가·세션은 Agent Platform 읽기 권한으로 읽습니다. 트레이스와 토폴로지는 `roles/cloudtrace.user`가 필요합니다. `scripts/deploy.sh`는 대표 프로젝트(선택 역할)와 연동 프로젝트에, Terraform은 대표 프로젝트에 이 역할을 부여합니다. 그 밖의 프로젝트에 있는 에이전트는 그 프로젝트에 직접 부여합니다. 플레이그라운드는 `aiplatform.reasoningEngines.query` 권한(`roles/aiplatform.user`)이 필요하고, 연동 프로젝트에는 읽기 역할(`roles/aiplatform.viewer`)만 부여하므로 그 프로젝트의 에이전트는 호출할 수 없습니다. 권한이 없는 보기는 데이터 소스 알림과 함께 비어 보입니다.
+  - **권한**: 지표는 `roles/monitoring.viewer`, 리비전·평가·세션은 Gemini Platform 읽기 권한으로 읽습니다. 트레이스와 토폴로지는 `roles/cloudtrace.user`가 필요합니다. `scripts/deploy.sh`는 대표 프로젝트(선택 역할)와 연동 프로젝트에, Terraform은 대표 프로젝트에 이 역할을 부여합니다. 그 밖의 프로젝트에 있는 에이전트는 그 프로젝트에 직접 부여합니다. 플레이그라운드는 `aiplatform.reasoningEngines.query` 권한(`roles/aiplatform.user`)이 필요하고, 연동 프로젝트에는 읽기 역할(`roles/aiplatform.viewer`)만 부여하므로 그 프로젝트의 에이전트는 호출할 수 없습니다. 권한이 없는 보기는 데이터 소스 알림과 함께 비어 보입니다.
 
 ### 7.6 Model Armor
 
@@ -868,8 +844,8 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.7 모델 및 토큰
 
-- 모델은 결제 SKU, Cloud Monitoring `model_user_id`, Antigravity 추론 로그의 `model` 라벨(이전 형식 `model_id`)에서 자동으로 발견됩니다. SKU 설명에서 모델 계열 단어(Gemini, Claude, Llama 등)를 찾고 리전, 모달리티, 입출력, 컨텍스트 구간 같은 수식어를 빼서 하나의 키(예: `gemini-3.8-flash`)로 묶습니다. Agent Platform 형식(`Gemini 3.8 Flash Global Text Input`), Gemini API 형식, Monitoring 모델 ID가 같은 모델로 합쳐집니다.
-- 모델별 토큰은 Cloud Monitoring `publisher/online_serving/token_count`(Agent Platform)를 기준으로 하고, Monitoring에 잡히지 않는 Gemini API 결제 토큰을 더합니다. Monitoring 지표가 없는 모델은 결제 SKU의 토큰 사용량을 씁니다. 호출 수와 오류율은 `model_invocation_count`에서 계산합니다.
+- 모델은 결제 SKU, Cloud Monitoring `model_user_id`, Antigravity 추론 로그의 `model` 라벨(이전 형식 `model_id`)에서 자동으로 발견됩니다. SKU 설명에서 모델 계열 단어(Gemini, Claude, Llama 등)를 찾고 리전, 모달리티, 입출력, 컨텍스트 구간 같은 수식어를 빼서 하나의 키(예: `gemini-3.8-flash`)로 묶습니다. Gemini Platform 형식(`Gemini 3.8 Flash Global Text Input`), Gemini API 형식, Monitoring 모델 ID가 같은 모델로 합쳐집니다.
+- 모델별 토큰은 Cloud Monitoring `publisher/online_serving/token_count`(Gemini Platform)를 기준으로 하고, Monitoring에 잡히지 않는 Gemini API 결제 토큰을 더합니다. Monitoring 지표가 없는 모델은 결제 SKU의 토큰 사용량을 씁니다. 호출 수와 오류율은 `model_invocation_count`에서 계산합니다.
 - 제품이 모델 사용량을 자체 SKU로 다시 청구하는 경우 "제품별 사용량" 카드에 따로 표시하고, 같은 토큰이 기반 모델에도 청구되므로 모델 토큰 합계에는 더하지 않습니다.
 - Gemini 4 Carbon, Gemini 4 Argon처럼 새 모델이 처음 발견되면 "새 모델 감지" 알림이 뜹니다. `auto_enable_new_models: true`이면 바로 추적하고, `false`이면 관리자가 켤 때까지 합계에서 뺍니다.
 - 카탈로그 관리(또는 설정 > 모델 카탈로그)에서 모델별 추적을 끌 수 있습니다.
@@ -880,11 +856,11 @@ NotebookLM Data Access 감사 로그에서 활성 노트북, 사용자, 프롬�
 
 ### 7.9 사용자 및 액세스
 
-사용자별로 Gemini Enterprise, NotebookLM, Agent Gateway, Antigravity 등 모든 서비스 사용량을 한 줄로 모읍니다(사용자별 또는 사용자·모델별 보기). 사용자를 누르면 상세 화면이 열립니다. 아래 조치 버튼은 관리자에게만 보입니다.
+사용자별로 Gemini Enterprise, Gemini Notebook, Agent Gateway, Antigravity 등 모든 서비스 사용량을 한 줄로 모읍니다(사용자별 또는 사용자·모델별 보기). 사용자를 누르면 상세 화면이 열립니다. 아래 조치 버튼은 관리자에게만 보입니다.
 
-- **사용량**: 서비스별 활동 추이, Antigravity와 Agent Platform의 모델별 토큰과 비용, 에이전트와 업로드 파일. viewer에게는 원문과 파일 이름을 주지 않습니다.
+- **사용량**: 서비스별 활동 추이, Antigravity와 Gemini Platform의 모델별 토큰과 비용, 에이전트와 업로드 파일. viewer에게는 원문과 파일 이름을 주지 않습니다.
 - **Antigravity 접근(IAM)**: IAM 상태와 사유, 예외 규칙, 정산 기간, 한도 사용률 또는 크레딧 장부, 접근이 돌아오는 시각, **Antigravity 허용**(정지된 사용자는 **지금 복원**)과 **Antigravity 차단**. Gemini Enterprise 웹 채팅은 그대로 둡니다.
-- **AI 서비스와 워크스페이스 접근**: **전체 AI 접근 차단**은 이 프로젝트에서 그 사용자의 직접 AI IAM 역할(Gemini Enterprise, NotebookLM, Antigravity, Agent Platform, 마커 역할)을 모두 빼고, 대시보드 세션을 끊고 다시 로그인하지 못하게 합니다. **AI 접근 복원**은 대시보드 로그인과 뺐던 역할(없으면 기본 Gemini Enterprise 접근 역할)을 돌려줍니다. 대시보드 관리자, 자기 계정, `roles/owner`·`roles/editor`·`roles/resourcemanager.projectIamAdmin`을 가진 사용자는 차단하지 않습니다. 통제 기능(`ENABLE_GOVERNANCE_ACTIONS=true`)이 필요합니다.
+- **AI 서비스와 워크스페이스 접근**: **전체 AI 접근 차단**은 이 프로젝트에서 그 사용자의 직접 AI IAM 역할(Gemini Enterprise, Gemini Notebook, Antigravity, Gemini Platform, 마커 역할)을 모두 빼고, 대시보드 세션을 끊고 다시 로그인하지 못하게 합니다. **AI 접근 복원**은 대시보드 로그인과 뺐던 역할(없으면 기본 Gemini Enterprise 접근 역할)을 돌려줍니다. 대시보드 관리자, 자기 계정, `roles/owner`·`roles/editor`·`roles/resourcemanager.projectIamAdmin`을 가진 사용자는 차단하지 않습니다. 통제 기능(`ENABLE_GOVERNANCE_ACTIONS=true`)이 필요합니다.
 
 ### 7.10 텔레메트리 확장
 
@@ -1019,7 +995,7 @@ flowchart TD
 - 무료 몫은 사용한 순서대로 Gemini 금액에 먼저 적용합니다(모델 ID가 `gemini`로 시작하는 모델, `credit_model_prefixes`). 한 주가 두 달에 걸치면(예: 월요일 초기화인데 1일이 수요일) 그 주의 무료 몫 하나를 두 달이 나눠 쓰고, 추가 결제는 사용한 날짜의 달로 계산합니다.
 - 단가는 모델과 방향(입력/출력)별로 다음 순서로 찾습니다.
   1. **실제 청구 단가**: 최근 30일 결제 내보내기에서 해당 모델 표준 텍스트 토큰 SKU의 `SUM(cost) / SUM(usage.amount)`. 협상 가격이 반영되며 크레딧은 빼지 않습니다. batch, flex, priority, 캐시, 장문 컨텍스트, 튜닝, 오디오/이미지/비디오 같은 변형 SKU는 제외합니다.
-  2. **Google 공개 가격표**: 청구 기록이 없는 모델은 Cloud Billing Catalog API(Agent Platform, Gemini API)의 공개 가격을 씁니다.
+  2. **Google 공개 가격표**: 청구 기록이 없는 모델은 Cloud Billing Catalog API(Gemini Platform, Gemini API)의 공개 가격을 씁니다.
 - 크레딧 한도는 USD로 계산합니다. 청구 통화가 다르면 Google이 가격표에 게시하는 환율로 환산하고, 화면에 `1 USD = ₩1,359 (Google 환율, 날짜)`처럼 근거를 표시합니다.
 - 단가는 6시간 동안 캐시됩니다. 한도 정책 카드의 **이번 기간에 사용한 모델 단가** 표에 모델별 단가와 출처(청구 단가, Google 가격표, 단가 없음)가 표시됩니다.
 - 어느 쪽에서도 단가를 찾지 못한 모델은 "단가 없음"으로 표시되고, 그 사람의 금액을 계산할 수 없으면 한도 사용률이 `—`로 표시되고 정지되지 않습니다.
@@ -1118,7 +1094,7 @@ python3 scripts/caps_drill.py --backend iam_deny --unit-budget 60   # 조직 단
 | `notify_only` | 계획과 알림만 만들고 접근은 바꾸지 않습니다. 쓰기 역할이 필요 없습니다. | 없음 |
 
 - 부착점(`deny_attachment`): `projects`(기본, 작업 공간 프로젝트마다) 또는 `scope`(작업 공간 범위가 폴더·조직이면 그 폴더·조직, 아니면 프로젝트마다). 거부 정책은 부착점 아래의 모든 리소스에 상속됩니다.
-- 추가 거부 권한(선택, 기본 꺼짐): `deny_ge_app`은 Gemini Enterprise 어시스턴트(`discoveryengine.googleapis.com/assistants.assist`), `deny_agent_platform`은 Agent Platform 모델 호출(`aiplatform.googleapis.com/endpoints.predict`)도 함께 거부합니다. ADC·종량제로 로그인한 Antigravity는 Agent Platform을 직접 호출해 기본 권한으로는 막히지 않습니다(6.5). `deny_agent_platform`을 켜면 정지된 사람은 부착점 안의 모든 Agent Platform 모델 호출(본인이 만든 앱·스크립트 포함)을 쓸 수 없습니다.
+- 추가 거부 권한(선택, 기본 꺼짐): `deny_ge_app`은 Gemini Enterprise 어시스턴트(`discoveryengine.googleapis.com/assistants.assist`), `deny_agent_platform`은 Gemini Platform 모델 호출(`aiplatform.googleapis.com/endpoints.predict`)도 함께 거부합니다. ADC·종량제로 로그인한 Antigravity는 Gemini Platform을 직접 호출해 기본 권한으로는 막히지 않습니다(6.5). `deny_agent_platform`을 켜면 정지된 사람은 부착점 안의 모든 Gemini Platform 모델 호출(본인이 만든 앱·스크립트 포함)을 쓸 수 없습니다.
 - 정책에는 사람(`principal://goog/subject/EMAIL`, 로그에 남은 그대로의 Workforce 주체, 7.12)만 올라가고 서비스 계정과 그룹은 올라가지 않습니다. 관리자의 **항상 차단** 규칙도 같은 정책으로 적용됩니다.
 - IAM이 찾지 못하는 계정(삭제된 계정, 잘못 적은 주소)이 하나라도 있으면 IAM은 그 쓰기 전체를 400(`The principal ... was not found`)으로 거절합니다(테스트 프로젝트에서 확인). 그래서 그런 계정은 빼고 나머지 사람에게 적용하며, 빠진 사람은 실패와 이유로 표시합니다.
 - 적용 전에 불변 조건(정책 ID 접두사 `ai-control-plane-`, 권한 = 허용 목록, 주체 = 사람, 부착점 = 설정에서 계산한 목록, 신규 정지 수 ≤ 변경 예산, 최신 etag)을 확인하고, 하나라도 어기면 아무것도 바꾸지 않습니다.
@@ -1228,7 +1204,7 @@ gcloud iam policies delete ai-control-plane-caps \
 | 조직 단위 | 사용자 정지(`suspend`) | 그 단위와 하위 단위에 귀속된 사람은 다음 달 1일까지 무료로 쓸 몫이 없는 동안 정지됩니다(조직 전체 한도와 같은 규칙). 주간 무료 크레딧 방식에서는 매주 돌아오는 무료 크레딧을 계속 쓸 수 있고, 기간 방식에서는 이번 달 유료 사용이 있는 사람이 다음 달 1일까지 정지됩니다. |
 | 조직 단위 | 검토 대기열로 보내기(`review`) | 자동 모드에서도 그 사람들을 검토 대기열에 올리고 관리자 결정을 기다립니다. |
 | 조직 단위, 프로젝트 | 알림만(`notify`) | 임계값 알림만 보냅니다. |
-| 프로젝트 | 하드 캡(`hard_cap`, 워크스페이스 프로젝트만) | 알림에 더해, Google 지출 상한을 켜 두면 그 프로젝트의 Agent Platform 사용을 Google이 멈춥니다(아래). |
+| 프로젝트 | 하드 캡(`hard_cap`, 워크스페이스 프로젝트만) | 알림에 더해, Google 지출 상한을 켜 두면 그 프로젝트의 Gemini Platform 사용을 Google이 멈춥니다(아래). |
 
 - **사용액**: 그 달 비용 정산 행의 청구 금액(무료 크레딧을 넘은 금액)을 정수 센트로 더합니다. 조직 단위는 하위 단위를 포함하고, 프로젝트는 그 프로젝트에 기록된 사용만 셉니다. 사용액이 예산에 도달하면 소진이고, 0은 유료 사용을 전혀 허용하지 않습니다.
 - **계산 방식**: 주간 무료 크레딧 방식은 실행마다 집행 장부(8.3)로, 기간 방식은 그 달 비용 정산 리포트(5분 캐시)로 계산합니다. 예산은 USD라서 리포트 통화가 USD일 때만 적용하고, 아니면 경고만 표시합니다.
@@ -1240,14 +1216,14 @@ gcloud iam policies delete ai-control-plane-caps \
 
 **Google 지출 상한 (프로젝트 하드 캡)**
 
-- Cloud Billing Budget API의 지출 상한(spend cap) 예산을 씁니다. 프로젝트의 Agent Platform 서비스 비용이 금액에 도달하면 Google이 그 프로젝트의 새 Agent Platform 사용을 그 달 말까지 멈추고, 다음 달 초에 Google이 풉니다. 관리자가 먼저 풀 수도 있습니다(**상한 해제**, Google 안내 기준 약 1시간 안에 재개).
+- Cloud Billing Budget API의 지출 상한(spend cap) 예산을 씁니다. 프로젝트의 Gemini Platform 서비스 비용이 금액에 도달하면 Google이 그 프로젝트의 새 Gemini Platform 사용을 그 달 말까지 멈추고, 다음 달 초에 Google이 풉니다. 관리자가 먼저 풀 수도 있습니다(**상한 해제**, Google 안내 기준 약 1시간 안에 재개).
 - Google 제약: 프로젝트 1개, 서비스 1개, 달력 월, 크레딧 제외, 임계값 50·80·100% 고정. 즉시 멈추지 않으므로 조금 넘을 수 있습니다.
-- **측정 차이**: Google은 그 프로젝트의 모든 Agent Platform 사용을 정가(크레딧 적용 전)로 재고, 대시보드 예산은 그 프로젝트에 귀속된 유료 몫만 셉니다. 그래서 Agent Platform으로 청구되는 사용은 대시보드 예산이 소진될 때보다 늦지 않게 멈춥니다. **다른 서비스로 청구되는 사용(예: Gemini API)과 구독 비용은 막지 못합니다. Antigravity 사용이 어느 서비스로 청구되는지 결제 내보내기에서 먼저 확인하세요.**
+- **측정 차이**: Google은 그 프로젝트의 모든 Gemini Platform 사용을 정가(크레딧 적용 전)로 재고, 대시보드 예산은 그 프로젝트에 귀속된 유료 몫만 셉니다. 그래서 Gemini Platform으로 청구되는 사용은 대시보드 예산이 소진될 때보다 늦지 않게 멈춥니다. **다른 서비스로 청구되는 사용(예: Gemini API)과 구독 비용은 막지 못합니다. Antigravity 사용이 어느 서비스로 청구되는지 결제 내보내기에서 먼저 확인하세요.**
 - 준비: 설정 > 거버넌스 정책 > 집행 > **Google 지출 상한 관리**(`governance.antigravity.spend_caps`)를 켜고, 결제 계정 ID(`workspace.billing.account_id`)를 넣습니다. 대시보드 프로젝트에 Cloud Billing Budget API(`billingbudgets.googleapis.com`)가 사용 설정되어 있어야 하고(`scripts/deploy.sh`가 사용 설정을 시도), 런타임 서비스 계정에 결제 계정의 예산 권한과 `billing.budgets.configureSpendCap`이 필요합니다(예: 결제 계정 관리자 `roles/billing.admin`, 또는 이 권한을 넣은 커스텀 역할). 배포는 결제 계정 역할을 부여하지 않습니다. 리셀러 결제 계정은 지원하지 않습니다.
 - **범위**: 하드 캡은 워크스페이스 프로젝트(대표 프로젝트, 설정한 프로젝트, 자동 탐지나 범위에서 찾은 프로젝트)에만 둘 수 있습니다. 다른 프로젝트에 하드 캡을 저장하면 검증 오류가 나고, 이미 있는 워크스페이스 밖 상한은 **워크스페이스 밖 프로젝트**로 표시할 뿐 만들거나 바꾸지 않습니다(해제는 됨). 프로젝트 목록을 읽지 못하면 아무것도 만들거나 바꾸지 않고 하드 캡 저장도 거절합니다.
-- 적용: 비용 정산 > 월 예산 > **Google 지출 상한** 카드에서 **변경 미리 보기**로 확인한 뒤 **지출 상한 적용**을 누릅니다. 집행 실행은 지출 상한을 바꾸지 않습니다. 대시보드가 만든 예산(표시 이름 `AI Control Plane cap: PROJECT_ID`)만 바꾸고, 더 필요 없는 상한은 지우지 않고 표시만 합니다(Cloud 콘솔에서 삭제). 바꾸거나 해제하기 전에는 그 예산이 정확히 그 프로젝트(프로젝트 번호)와 Agent Platform만 대상으로 하고 지출 상한이 있는지 확인하고, 아니면 **컨트롤 플레인 관리 대상 아님**(`not_owned`)으로 표시하고 그대로 둡니다. 이를 위해 Resource Manager(프로젝트 번호)와 Cloud Billing Catalog(서비스)를 읽어 24시간 캐시하므로, 해제에도 런타임 서비스 계정에 그 프로젝트의 `resourcemanager.projects.get` 권한이 필요합니다. 적용 실행은 감사 로그(`spend_caps_apply`)에 상태별 건수와 프로젝트별 변경(프로젝트, 작업, 상태, 금액, 최대 200건)을 남깁니다. 결제 계정 통화가 USD가 아니면 환율 때문에 멈추는 시점이 달라지지 않도록 만들지 않습니다.
+- 적용: 비용 정산 > 월 예산 > **Google 지출 상한** 카드에서 **변경 미리 보기**로 확인한 뒤 **지출 상한 적용**을 누릅니다. 집행 실행은 지출 상한을 바꾸지 않습니다. 대시보드가 만든 예산(표시 이름 `AI Control Plane cap: PROJECT_ID`)만 바꾸고, 더 필요 없는 상한은 지우지 않고 표시만 합니다(Cloud 콘솔에서 삭제). 바꾸거나 해제하기 전에는 그 예산이 정확히 그 프로젝트(프로젝트 번호)와 Gemini Platform만 대상으로 하고 지출 상한이 있는지 확인하고, 아니면 **컨트롤 플레인 관리 대상 아님**(`not_owned`)으로 표시하고 그대로 둡니다. 이를 위해 Resource Manager(프로젝트 번호)와 Cloud Billing Catalog(서비스)를 읽어 24시간 캐시하므로, 해제에도 런타임 서비스 계정에 그 프로젝트의 `resourcemanager.projects.get` 권한이 필요합니다. 적용 실행은 감사 로그(`spend_caps_apply`)에 상태별 건수와 프로젝트별 변경(프로젝트, 작업, 상태, 금액, 최대 200건)을 남깁니다. 결제 계정 통화가 USD가 아니면 환율 때문에 멈추는 시점이 달라지지 않도록 만들지 않습니다.
 - API: `GET /api/v1/budgets/spend-caps`, `POST /api/v1/budgets/spend-caps/apply`(`{"dryRun": true}`가 기본), `POST /api/v1/budgets/spend-caps/lift`(`{"project": "PROJECT_ID"}`).
-- 테스트 환경 확인: 제품 코드로 테스트 프로젝트에 지출 상한 예산(높은 금액)을 만들었습니다. Google에 저장된 모양은 프로젝트 1개(프로젝트 번호), Agent Platform 서비스(`services/C7E2-9256-1C43`), `EXCLUDE_ALL_CREDITS`, 달력 월, 임계값 0.5·0.8·1.0, `spendCap.outputState=CONFIGURED`였습니다. 같은 계획을 다시 돌리면 변경 없음(`none`)이었고, 확인 뒤 예산을 지웠습니다. 실제로 사용이 멈추는 순간(ENFORCED)은 확인하지 않았습니다.
+- 테스트 환경 확인: 제품 코드로 테스트 프로젝트에 지출 상한 예산(높은 금액)을 만들었습니다. Google에 저장된 모양은 프로젝트 1개(프로젝트 번호), Gemini Platform 서비스(`services/C7E2-9256-1C43`), `EXCLUDE_ALL_CREDITS`, 달력 월, 임계값 0.5·0.8·1.0, `spendCap.outputState=CONFIGURED`였습니다. 같은 계획을 다시 돌리면 변경 없음(`none`)이었고, 확인 뒤 예산을 지웠습니다. 실제로 사용이 멈추는 순간(ENFORCED)은 확인하지 않았습니다.
 
 **거부 정책 방식의 관리자 결정**
 
@@ -1460,7 +1436,7 @@ docker run --rm -p 127.0.0.1:8080:8080 -e PROJECT_ID=my-project -e AUTH_MODE=loc
 | Pub/Sub | 실시간 집행: Antigravity 요청마다 메시지 하나 | `REALTIME_ENFORCEMENT=false`면 만들지 않음 |
 | Cloud Build, Artifact Registry | 배포할 때 빌드 시간, 이미지 저장 | 오래된 이미지 정리 |
 | Cloud Scheduler, Secret Manager, Cloud Storage | 작업(한도 집행, 유지관리), 시크릿, 설정 파일 | 매우 적음 |
-| Gemini on Agent Platform | AI 애널리스트 질문, 급증 원인 분석, 텔레메트리 소스 분석, 에이전트 플레이그라운드(배포된 에이전트 실행) | 사용하지 않으면 비용 없음, 모듈이나 `telemetry.ai.enabled` 끄기 가능 |
+| Gemini on Gemini Platform | AI 애널리스트 질문, 급증 원인 분석, 텔레메트리 소스 분석, 에이전트 플레이그라운드(배포된 에이전트 실행) | 사용하지 않으면 비용 없음, 모듈이나 `telemetry.ai.enabled` 끄기 가능 |
 
 감사 로그 테이블 보존 기간 제한 예(120일):
 
@@ -1568,7 +1544,7 @@ done
 **VPC Service Controls 경계 안 프로젝트에 설치할 때**
 
 1. **이미지 빌드**: Cloud Build 기본 풀은 VPC-SC 경계 밖에서 실행되므로, 경계가 Cloud Storage(`storage.googleapis.com`)를 제한하면 소스 아카이브를 버킷에 올려 빌드하는 방식이 막힙니다. `install.sh`처럼 공개 저장소를 그대로 받은 깨끗한 체크아웃에서는 기본 설정(`BUILD_SOURCE=auto`)이 소스를 Cloud Storage에 올리지 않고 Cloud Build가 Git에서 직접 받아 빌드하므로, 빌드 서비스 계정(`ai-control-plane-build`) 예외 규칙 없이 통과합니다. 경계가 Cloud Build나 Artifact Registry까지 제한하거나 로컬 수정본을 빌드해야 하면 `--worker-pool`(경계 안 private pool), `--image`(Docker로 직접 빌드·push한 이미지), 또는 스크립트가 출력하는 빌드 서비스 계정 인그레스 규칙 중 하나를 사용합니다.
-2. **대시보드 런타임 호출**: Cloud Run이 별도 VPC 이그레스 없이 실행되면, 경계로 보호되는 API(Cloud Storage 설정 버킷, BigQuery, Discovery Engine, Agent Platform 등)를 호출할 때 VPC-SC가 거부할 수 있습니다. 배포가 끝나면 스크립트가 `cloudaudit.googleapis.com/policy` 감사 로그를 확인해 대시보드 런타임 서비스 계정(`ai-control-plane-sa@PROJECT_ID.iam.gserviceaccount.com`)이 막히는지 점검하고, 막혔으면 대시보드가 호출하는 제한 서비스를 모두 담은 **인그레스 규칙 YAML 하나**를 그대로 출력합니다. 보안 담당자가 콘솔(**보안 > VPC Service Controls > 경계 수정 > 인그레스 정책 > 규칙 추가**)에 그 규칙 하나를 추가하면 재배포 없이 바로 동작합니다(경계 반영 최대 30분). `gcloud ... perimeters update --set-ingress-policies`는 규칙 목록 전체를 덮어쓰므로 기존 규칙을 함께 넣어야 합니다.
+2. **대시보드 런타임 호출**: Cloud Run이 별도 VPC 이그레스 없이 실행되면, 경계로 보호되는 API(Cloud Storage 설정 버킷, BigQuery, Discovery Engine, Gemini Platform 등)를 호출할 때 VPC-SC가 거부할 수 있습니다. 배포가 끝나면 스크립트가 `cloudaudit.googleapis.com/policy` 감사 로그를 확인해 대시보드 런타임 서비스 계정(`ai-control-plane-sa@PROJECT_ID.iam.gserviceaccount.com`)이 막히는지 점검하고, 막혔으면 대시보드가 호출하는 제한 서비스를 모두 담은 **인그레스 규칙 YAML 하나**를 그대로 출력합니다. 보안 담당자가 콘솔(**보안 > VPC Service Controls > 경계 수정 > 인그레스 정책 > 규칙 추가**)에 그 규칙 하나를 추가하면 재배포 없이 바로 동작합니다(경계 반영 최대 30분). `gcloud ... perimeters update --set-ingress-policies`는 규칙 목록 전체를 덮어쓰므로 기존 규칙을 함께 넣어야 합니다.
 
 ### 14.5 Gemini Enterprise가 다른 프로젝트에 있을 때
 
@@ -1691,7 +1667,7 @@ Git이 공개할 파일을 검사해 비밀 정보(개인 키, API 키, OAuth �
 | `GET /api/v1/gemini-enterprise/summary`, `/licenses`, `/file-uploads` | 로그인 | Gemini Enterprise |
 | `GET /api/v1/gemini-enterprise/features` (`?refresh=1`로 캐시 건너뜀) | 로그인 | Gemini Enterprise 앱별 기능 스위치 |
 | `POST /api/v1/gemini-enterprise/features/apply` | 관리자 | 여러 앱의 기능 스위치 일괄 변경(`engines.patch`, `updateMask=features`) |
-| `GET /api/v1/notebooklm/summary` | 로그인 | NotebookLM |
+| `GET /api/v1/notebooklm/summary` | 로그인 | Gemini Notebook |
 | `GET /api/v1/models/usage`, `/catalog` | 로그인 | 모델 및 토큰 |
 | `GET /api/v1/agent-platform/gateway`, `/registry`, `/deployments` | 로그인 | AI API 호출 감사 로그, Agent Registry, 에이전트 배포 |
 | `GET /api/v1/agent-platform/gateways`, `/gateways/traffic` | 로그인 | Agent Gateway 인벤토리·거버넌스 점검, 트래픽 분석 |

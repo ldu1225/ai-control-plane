@@ -1261,7 +1261,7 @@ MAIN_SECRETS="${SECRETS},ADMIN_INITIAL_PASSWORD=${ADMIN_SECRET_NAME}:latest"
 ADMIN_PW_CMD="gcloud secrets versions access latest --secret=${ADMIN_SECRET_NAME} --project=${PROJECT_ID}"
 
 # ------------------------------------------------------------------------------- 6. data sources & auto-detection
-log "6/8 Data sources: audit log routing, Data Access logs, Gemini Enterprise & Agent Platform"
+log "6/8 Data sources: audit log routing, Data Access logs, Gemini Enterprise & Gemini Platform"
 if [[ -z "$ORGANIZATION_NAME" || "$ORGANIZATION_NAME" == "Your Organization" ]]; then
   DETECTED_ORG="$(auto_detect_org_name "$PROJECT_ID")"
   if [[ -n "$DETECTED_ORG" ]]; then
@@ -1274,7 +1274,7 @@ if [[ -z "$AGENT_ENGINE_REGIONS" || -z "$AI_LOCATION" ]]; then
   AI_LOC_PAIR="$(auto_detect_ai_locations "$PROJECT_ID" "$REGION")"
   [[ -n "$AGENT_ENGINE_REGIONS" ]] || AGENT_ENGINE_REGIONS="${AI_LOC_PAIR%%|*}"
   [[ -n "$AI_LOCATION" ]] || AI_LOCATION="${AI_LOC_PAIR#*|}"
-  info "Agent Platform endpoints: Agent Engine=${AGENT_ENGINE_REGIONS}, AI location=${AI_LOCATION}"
+  info "Gemini Platform endpoints: Agent Engine=${AGENT_ENGINE_REGIONS}, AI location=${AI_LOCATION}"
 fi
 
 # HUB_GE_FOUND: 1 = a Gemini Enterprise app or license configuration exists in the hub, 0 = none found,
@@ -1798,7 +1798,7 @@ PYPROBE
     fi
   fi
   # VPC Service Controls can refuse the dashboard's own calls too (settings in Cloud Storage, BigQuery, Gemini
-  # Enterprise, Agent Platform). Inside a known perimeter, wait for the audit logs of its first requests.
+  # Enterprise, Gemini Platform). Inside a known perimeter, wait for the audit logs of its first requests.
   VPCSC_WAIT=0
   [[ -n "$VPCSC_RESTRICTED" || "$BUILD_VPCSC" == "1" ]] && VPCSC_WAIT=120
   vpcsc_runtime_check "$PROJECT_ID" "$PROJECT_NUMBER" "$SA_EMAIL" "$VPCSC_WAIT"

@@ -130,8 +130,10 @@ def rising_skus(ctx, src, days, project, tz_name):
 
 
 def _display_service(name):
-    if isinstance(name, str) and name.strip().lower() in ("vertex ai", "agent platform"):
-        return "Agent Platform"
+    # Billing rows carry the former names of Gemini Platform; show the current name.
+    if isinstance(name, str) and name.strip().lower() in ("vertex ai", "agent platform", "gemini enterprise agent platform",
+                                                          "gemini platform"):
+        return "Gemini Platform"
     return name
 
 
@@ -326,7 +328,7 @@ def token_estimated_spend(ctx, rng, project, currency=None):
             for slot in ("input", "output", "cached", "other"):
                 mapped_kind = "input" if slot in ("input", "other") else slot
                 for day, val in (entry_counts.get(slot) or {}).items():
-                    add_line(day, raw_id, "Agent Platform", mapped_kind, val)
+                    add_line(day, raw_id, "Gemini Platform", mapped_kind, val)
 
     if agy_ok and agy_val:
         agy_map, agy_label = agy_val
@@ -591,7 +593,7 @@ def analyze_spike(ctx):
               "the SKU with the largest increase and the amount) and 'checkpoints' (exactly three concise, "
               "actionable checks tailored to the SKUs, for example prompt length or context caching for input "
               "tokens, max output tokens or loops for output tokens, batch jobs for analysis SKUs). A service named "
-              "'Vertex AI' in the data is Agent Platform: call it Agent Platform." % language)
+              "'Vertex AI' or 'Agent Platform' in the data is Gemini Platform: call it Gemini Platform." % language)
     data_block = "\n".join("- sku: %s | service: %s | previous: %.2f | current: %.2f | delta: %.2f" % (
         r["sku"], r["service"], r["previous"], r["current"], r["delta"]) for r in rising)
     prompt = ("Date: %s (compared with the previous day). Amounts are in the workspace FinOps currency.\n"

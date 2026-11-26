@@ -12,7 +12,7 @@
 
 product:
   name: "AI Control Plane"
-  tagline: "Unified governance for Gemini Enterprise and Agent Platform"
+  tagline: "Unified governance for Gemini Enterprise and Gemini Platform"
 
 branding:
   organization_name: "Your Organization"
@@ -220,7 +220,7 @@ telemetry:
                       "function", "type", "name"]
     status_hints: ["status", "code", "severity", "result", "outcome", "verdict", "reason", "state", "phase", "level"]
     sensitive_hints: ["prompt", "response", "content", "message", "messages", "text", "parts", "instruction", "query"]
-  display_renames: ["Vertex AI=Agent Platform"]   # naming policy applied to API titles ("From=To")
+  display_renames: ["Gemini Enterprise Agent Platform=Gemini Platform", "Vertex AI=Gemini Platform", "Agent Platform=Gemini Platform"]   # naming policy applied to API titles ("From=To")
   # Log Router -> BigQuery routes created from the dashboard. Routing everything without limits gets expensive, so
   # every route has cost controls (these are the defaults; each route can override sampling, severity, exclusions,
   # its daily budget and retention).
@@ -256,7 +256,7 @@ pricing:
   fx_sources:                     # exchange-rate feeds used when the Cloud Billing Catalog has no rate for a currency
     - "https://open.er-api.com/v6/latest/USD"
     - "https://api.frankfurter.dev/v1/latest?base=USD"
-  catalog_services:               # Cloud Billing Catalog service display names
+  catalog_services:               # Cloud Billing Catalog service display names (literal data: former names of Gemini Platform)
     - "Vertex AI"
     - "Agent Platform"
     - "Gemini API"

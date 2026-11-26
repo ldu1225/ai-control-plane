@@ -4308,8 +4308,8 @@ def _normalize_restore_roles(removed_roles, cfg, fallback=None):
 
 
 def set_user_ai_access(ctx, action, uid=None, email=None, note=""):
-    """Blocks or restores a user's entire AI access on this project (Gemini Enterprise, NotebookLM, Antigravity,
-    Agent Platform IAM roles) and revokes or restores their AI Control Plane dashboard sign-in."""
+    """Blocks or restores a user's entire AI access on this project (Gemini Enterprise, Gemini Notebook, Antigravity,
+    Gemini Platform IAM roles) and revokes or restores their AI Control Plane dashboard sign-in."""
     if action not in ("block_all", "unblock_all"):
         raise ApiError("bad_request", "Field 'action' must be 'block_all' or 'unblock_all'.")
     note = _note(note)

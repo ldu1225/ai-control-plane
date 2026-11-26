@@ -39,7 +39,7 @@ MANDATORY_EXCLUDED_SKU_PATTERNS = ("code assist", "duet ai")
 DEFAULTS = {
     "product": {
         "name": "AI Control Plane",
-        "tagline": "Unified governance for Gemini Enterprise and Agent Platform",
+        "tagline": "Unified governance for Gemini Enterprise and Gemini Platform",
     },
     "branding": {
         "organization_name": "Your Organization",
@@ -232,8 +232,8 @@ DEFAULTS = {
             "deny_policy_id": "ai-control-plane-caps",
             # Also deny the Gemini Enterprise assistant (discoveryengine assistants.assist) to suspended people.
             "deny_ge_app": False,
-            # Also deny Agent Platform model calls (aiplatform endpoints.predict) to suspended people: Antigravity
-            # signed in with Application Default Credentials or pay-as-you-go calls Agent Platform directly.
+            # Also deny Gemini Platform model calls (aiplatform endpoints.predict) to suspended people: Antigravity
+            # signed in with Application Default Credentials or pay-as-you-go calls Gemini Platform directly.
             "deny_agent_platform": False,
             # Cloud Run job that applies suspensions with its own service account
             # (projects/PROJECT/locations/REGION/jobs/JOB). Empty: the web service applies them itself.
@@ -305,7 +305,8 @@ DEFAULTS = {
                                 "instruction", "query"],
         },
         # Brand naming policy applied to service titles read from the Service Usage API ("From=To").
-        "display_renames": ["Vertex AI=Agent Platform"],
+        "display_renames": ["Gemini Enterprise Agent Platform=Gemini Platform", "Vertex AI=Gemini Platform",
+                            "Agent Platform=Gemini Platform"],
         # Log Router -> BigQuery routing created from the dashboard, with cost controls.
         "routing": {
             "dataset": "telemetry_routed",  # dedicated dataset, so retention never touches the audit dataset

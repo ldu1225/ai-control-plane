@@ -483,17 +483,17 @@ def usage_data(ctx, rng):
 
 
 def _monitored_service(service):
-    """True when the billing service reports tokens to the Agent Platform publisher metrics in Cloud Monitoring
-    (Agent Platform, Cloud Text-to-Speech Gemini voices, and partner models served on Agent Platform).
+    """True when the billing service reports tokens to the Gemini Platform publisher metrics in Cloud Monitoring
+    (Gemini Platform, Cloud Text-to-Speech Gemini voices, and partner models served on Gemini Platform).
     Gemini API (generativelanguage) traffic is not."""
     name = (service or "").strip().lower()
-    # The billing export may name Agent Platform by its former service name.
-    return (name == "vertex ai" or "agent platform" in name or "text-to-speech" in name
+    # The billing export may name Gemini Platform by its former service name.
+    return (name == "vertex ai" or "agent platform" in name or "gemini platform" in name or "text-to-speech" in name
             or _is_model_service(service))
 
 
 def _model_tokens(entry):
-    """Token figures for one model. Monitoring covers Agent Platform traffic; billing token SKUs of services that
+    """Token figures for one model. Monitoring covers Gemini Platform traffic; billing token SKUs of services that
     Monitoring does not report (Gemini API) are added on top. Without Monitoring, all billing token SKUs are
     used. Antigravity inference tokens are added in every case."""
     agy_total = sum(v["tokens"] for v in entry["agy"].values())
@@ -668,7 +668,7 @@ def build_usage(ctx, rng, data=None):
                         if tokens[slot]:
                             unit = rate_info.get(slot)
                             skus_out.append({"sku": "%s — %s (Estimated)" % (entry["name"], label),
-                                             "service": "Agent Platform", "measure": measure, "unit": "tokens",
+                                             "service": "Gemini Platform", "measure": measure, "unit": "tokens",
                                              "amount": tokens[slot],
                                              "cost": money(tokens[slot] * unit / 1_000_000.0) if unit is not None else None})
                     skus_out.sort(key=lambda s: -(s["cost"] or 0))

@@ -98,7 +98,7 @@ locals {
     "billingbudgets.googleapis.com",
   ] : []
 
-  # APIs the dashboards call (BigQuery, Cloud Logging and Monitoring, Gemini Enterprise, Agent Platform,
+  # APIs the dashboards call (BigQuery, Cloud Logging and Monitoring, Gemini Enterprise, Gemini Platform,
   # IAM policy reads, the settings bucket and the public price list used for per-user cost caps).
   # Deny-policy enforcement adds Cloud Scheduler, which runs the enforcement job.
   required_apis = concat([

@@ -2410,7 +2410,7 @@ class DataAccessLogsMessageTest(unittest.TestCase):
         self.assertEqual(services, {"aiplatform.googleapis.com", "discoveryengine.googleapis.com",
                                     "modelarmor.googleapis.com", "businessaicode.googleapis.com",
                                     "geminidataanalytics.googleapis.com"})
-        self.assertIn("(Agent Platform, Gemini Enterprise, NotebookLM, Model Armor, Antigravity, "
+        self.assertIn("(Gemini Platform, Gemini Enterprise, Gemini Notebook, Model Armor, Antigravity, "
                       "Gemini Data Analytics)", res.stdout)
         res, services = self.enable(refuse="geminidataanalytics.googleapis.com")
         self.assertNotIn("geminidataanalytics.googleapis.com", services)

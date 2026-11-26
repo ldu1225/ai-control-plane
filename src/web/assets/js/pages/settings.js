@@ -34,7 +34,7 @@ const TABS = [
 const MODULES = [
   ['overview', 'Overview', 'Cross-module KPIs and posture summary.'],
   ['gemini_enterprise', 'Gemini Enterprise', 'Prompts, active users, agent usage, licenses and uploaded files.'],
-  ['notebooklm', 'NotebookLM', 'Notebook activity and prompts from data access audit logs.'],
+  ['notebooklm', 'Gemini Notebook', 'Notebook activity and prompts from data access audit logs.'],
   ['model_usage', 'Models & Tokens', 'Per-model token, invocation and cost tracking with the model catalog.'],
   ['agent_gateway', 'Agent Gateway', 'Traffic, authentication outcomes and routing for AI services.'],
   ['agent_registry', 'Agent Registry', 'Unified agent catalog with idle and deprecation detection.'],
@@ -1208,9 +1208,9 @@ async function ai(ctx, panel, data, editable) {
     title: t('AI engine'), subtitle: t('Gemini model used by AI Analyst, FinOps spike analysis and optional SKU grouping. Users can switch among allowed models.'), section: 'ai_engine', data, editable,
     fields: [
       { path: ['default_model'], label: t('Default model'), type: 'select', options: ids.map((id) => ({ value: id, label: id })) },
-      { path: ['location'], label: t('Agent Platform location'), mono: true, help: t('global is recommended for the latest Gemini models.') },
+      { path: ['location'], label: t('Gemini Platform location'), mono: true, help: t('global is recommended for the latest Gemini models.') },
       { path: ['models'], label: t('Allowed models'), type: 'list', mono: true, help: t('Comma separated model IDs users may select.') },
-      { path: ['discover_models'], label: t('Discover available models'), type: 'switch', help: t('List Gemini models available to the project through the Agent Platform Models API.') },
+      { path: ['discover_models'], label: t('Discover available models'), type: 'switch', help: t('List Gemini models available to the project through the Gemini Platform Models API.') },
       { path: ['restrict_to_allowed'], label: t('Restrict to allowed models'), type: 'switch', help: t('Reject requests for models that are not in the allowed list.') },
       { path: ['fallback_models'], label: t('Fallback models'), type: 'list', mono: true, itemCheck: (v) => MODEL_ID_RE.test(v), itemError: (v) => t('"{value}" is not a valid model ID.', { value: v }), help: t('Comma separated model IDs tried in order when a requested model is not available in this project, for example a preview model.') },
     ],
@@ -1392,9 +1392,9 @@ function geAppToggle({ value, set, editable }) {
 function agentPlatformToggle({ value, set, editable }) {
   const warn = h('div', { hidden: value ? null : true }, banner({
     tone: 'warning',
-    text: t('Suspended people also lose every Agent Platform model call at the attachment points (for example their own scripts and apps), not only Antigravity. Turn this on only after checking it with a test user in one project.'),
+    text: t('Suspended people also lose every Gemini Platform model call at the attachment points (for example their own scripts and apps), not only Antigravity. Turn this on only after checking it with a test user in one project.'),
   }));
-  const sw = switchInput({ checked: Boolean(value), disabled: !editable, label: t('Also deny Agent Platform model calls'), onChange: (v) => { warn.hidden = !v; set(v); } });
+  const sw = switchInput({ checked: Boolean(value), disabled: !editable, label: t('Also deny Gemini Platform model calls'), onChange: (v) => { warn.hidden = !v; set(v); } });
   return { el: h('div', { class: 'stack-sm' }, h('div', { class: 'row' }, sw), warn) };
 }
 
@@ -1435,12 +1435,12 @@ function enforcementForm(ctx, data, editable) {
         help: t('Used with the IAM deny policy. The folder or organization choice attaches one policy there, inherited by every project below; without a folder or organization scope it falls back to every project.'),
       },
       { path: ['deny_ge_app'], label: t('Also deny the Gemini Enterprise app'), type: 'custom', render: geAppToggle, help: t('Used with the IAM deny policy. Off: only Antigravity is denied.') },
-      { path: ['deny_agent_platform'], label: t('Also deny Agent Platform model calls'), type: 'custom', render: agentPlatformToggle, help: t('Used with the IAM deny policy. Antigravity signed in with Application Default Credentials or pay-as-you-go calls Agent Platform models directly, which the Antigravity permission does not stop. On: suspended people are denied aiplatform.googleapis.com/endpoints.predict as well.') },
+      { path: ['deny_agent_platform'], label: t('Also deny Gemini Platform model calls'), type: 'custom', render: agentPlatformToggle, help: t('Used with the IAM deny policy. Antigravity signed in with Application Default Credentials or pay-as-you-go calls Gemini Platform models directly, which the Antigravity permission does not stop. On: suspended people are denied aiplatform.googleapis.com/endpoints.predict as well.') },
       { heading: t('Surge guard (gate G7)') },
       { path: ['surge_guard_min'], label: t('Minimum new suspensions'), type: 'number', min: 1, max: 100000, integer: true, range: true, help: t('A run that would newly suspend at least this many people, and at least the share below of everyone evaluated, suspends nobody and asks for an administrator review.') },
       { path: ['surge_guard_ratio'], label: t('Minimum share of people'), type: 'number', min: 0.01, max: 1, step: 0.01, range: true, help: t('From 0.01 to 1, for example 0.5 for half of everyone evaluated.') },
       { heading: t('Project hard caps') },
-      { path: ['spend_caps'], label: t('Manage Google spend caps'), type: 'switch', help: t('Lets project budgets set to Hard cap (Chargeback > Monthly budgets) create a Google Cloud spend cap. A spend cap stops the Agent Platform usage of one project when its budget is spent; it counts list prices and is not instant. Needs the billing account ID (Workspace settings) and budget permissions on the billing account.') },
+      { path: ['spend_caps'], label: t('Manage Google spend caps'), type: 'switch', help: t('Lets project budgets set to Hard cap (Chargeback > Monthly budgets) create a Google Cloud spend cap. A spend cap stops the Gemini Platform usage of one project when its budget is spent; it counts list prices and is not instant. Needs the billing account ID (Workspace settings) and budget permissions on the billing account.') },
     ],
   });
 }

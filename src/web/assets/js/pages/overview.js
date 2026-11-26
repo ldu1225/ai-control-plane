@@ -15,7 +15,7 @@ import { widgetBoard } from '../core/widgets.js';
 export default async function render(ctx) {
   const header = pageHeader({
     title: t('Overview'),
-    desc: t('Governance posture across Gemini Enterprise, Agent Platform, models and cloud spend.'),
+    desc: t('Governance posture across Gemini Enterprise, Gemini Platform, models and cloud spend.'),
     actions: isModuleEnabled('analyst') ? button({ label: t('Ask AI Analyst'), icon: 'spark', onClick: () => ctx.navigate('#/analyst') }) : null,
   });
   return pageFlow(ctx, {
@@ -92,7 +92,7 @@ function renderOverview(ctx, body, d) {
       tip: t('Agents registered in Agent Engine and Gemini Enterprise, plus agents observed in activity logs.'), onClick: nav('#/registry'),
     }),
     isModuleEnabled('notebooklm') ? kpi({
-      label: t('NotebookLM prompts'), value: fmt.int(k.notebooklmPrompts && k.notebooklmPrompts.value), delta: deltaOf(k.notebooklmPrompts),
+      label: t('Gemini Notebook prompts'), value: fmt.int(k.notebooklmPrompts && k.notebooklmPrompts.value), delta: deltaOf(k.notebooklmPrompts),
       disabled: k.notebooklmPrompts && k.notebooklmPrompts.disabled, onClick: nav('#/notebooklm'),
     }) : null,
     isModuleEnabled('antigravity') ? kpi({

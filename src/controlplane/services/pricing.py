@@ -6,7 +6,7 @@ know token prices. The price per model and direction (input / output tokens) com
 1. billing  - what the billing account actually paid per token in the last 30 days: SUM(cost) /
               SUM(usage.amount) over the model's standard text token SKUs in the billing export
               (negotiated prices included; credits are not subtracted).
-2. catalog  - the public Google Cloud price list (Cloud Billing Catalog API: Agent Platform and Gemini API
+2. catalog  - the public Google Cloud price list (Cloud Billing Catalog API: Gemini Platform and Gemini API
               services) for models without billed usage.
 
 Amounts are converted to the cap currency with the rate Google publishes in the Catalog

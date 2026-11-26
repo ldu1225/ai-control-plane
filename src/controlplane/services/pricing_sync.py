@@ -364,7 +364,7 @@ class _SimpleTableParser(HTMLParser):
 
 
 def _parse_rowspan_model_table(table_rows, source, today, out):
-    """Parses Agent Platform pricing-page style `[Model, Type, <= 200K price, ...]` rowspan tables."""
+    """Parses Gemini Platform pricing-page style `[Model, Type, <= 200K price, ...]` rowspan tables."""
     cur_info = None
     cur_active = True
     acc = {}

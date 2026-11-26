@@ -103,9 +103,9 @@ export function emailOrUnattributed(email) {
 
 const SURFACE_LABELS = {
   gemini_enterprise: 'Gemini Enterprise',
-  notebooklm: 'NotebookLM',
+  notebooklm: 'Gemini Notebook',
   antigravity: 'Antigravity',
-  agent_platform: 'Agent Platform',
+  agent_platform: 'Gemini Platform',
 };
 
 export function surfaceChips(list) {
@@ -114,9 +114,9 @@ export function surfaceChips(list) {
 
 const SURFACE_ITEMS = [
   { key: 'gemini_enterprise', short: 'GE', label: 'Gemini Enterprise' },
-  { key: 'notebooklm', short: 'NB', label: 'NotebookLM' },
+  { key: 'notebooklm', short: 'NB', label: 'Gemini Notebook' },
   { key: 'antigravity', short: 'AG', label: 'Antigravity' },
-  { key: 'agent_platform', short: 'AP', label: 'Agent Platform' },
+  { key: 'agent_platform', short: 'AP', label: 'Gemini Platform' },
 ];
 
 /** Legend text for the compact surface matrix (used as a column header tooltip). */
@@ -320,7 +320,7 @@ function mergeWarnings(...metas) {
  * User details. `email` is the address of the row that was opened: it is shown at once and sent with the uid, so the
  * server does not have to resolve the uid against every user's activity first (it verifies that both match).
  * The details load as two parts at the same time and each part is shown as soon as it arrives: core (Antigravity
- * usage, models, costs and access) and activity (Gemini Enterprise, NotebookLM, Agent Platform and Model Armor over
+ * usage, models, costs and access) and activity (Gemini Enterprise, Gemini Notebook, Gemini Platform and Model Armor over
  * time, agents and files: the slowest query). Closing the drawer cancels what is still loading.
  */
 export function openUserDrawer(uid, { onChanged, email } = {}) {
@@ -480,7 +480,7 @@ function detailStats(d, pending) {
     stat(t('Antigravity tokens'), show(pending.core, fmt.compact(m.antigravityTokens)), pending.core ? null : t('{n} requests', { n: fmt.int(m.antigravityRequests) })),
     stat(t('Gemini Enterprise prompts'), show(pending.activity, fmt.int(m.gePrompts))),
     stat(t('Agent calls'), show(pending.activity, fmt.int(m.agentCalls))),
-    stat(t('NotebookLM prompts'), show(pending.activity, fmt.int(m.notebooklmPrompts))),
+    stat(t('Gemini Notebook prompts'), show(pending.activity, fmt.int(m.notebooklmPrompts))),
     stat(t('Model Armor blocks'), show(pending.activity, fmt.int(m.armorBlocks))));
 }
 
@@ -488,7 +488,7 @@ function modelsSection(d) {
   const modelRows = modelRowsOf(d);
   if (!modelRows.length) return null;
   const { ccy: costCcy } = costOf(d, modelRows);
-  const surfaceLabels = { antigravity: 'Antigravity', agent_platform: 'Agent Platform' };
+  const surfaceLabels = { antigravity: 'Antigravity', agent_platform: 'Gemini Platform' };
   const surfaces = Array.from(new Set(modelRows.map((row) => row.surface).filter(Boolean)));
   let activeSurface = 'all';
   const host = h('div');
@@ -815,7 +815,7 @@ function workspaceAccessCard(drawer, d, onChanged) {
   const restoreList = aiBlock && (aiBlock.restoreRoles || []).length ? aiBlock.restoreRoles.join(', ') : null;
   return card({
     title: t('AI service & workspace access'),
-    subtitle: t('Controls Gemini Enterprise, NotebookLM, Antigravity and Agent Platform IAM roles on this project, plus sign-in to this dashboard.'),
+    subtitle: t('Controls Gemini Enterprise, Gemini Notebook, Antigravity and Gemini Platform IAM roles on this project, plus sign-in to this dashboard.'),
     actions: actions.length ? h('div', { class: 'row' }, actions) : null,
     body: h('div', { class: 'stack' },
       kv([
@@ -891,7 +891,7 @@ async function allAiAccessAction(drawer, d, action, onChanged) {
   const blocking = action === 'block_all';
   const restoreRoles = ((d.iam && d.iam.aiBlocked && d.iam.aiBlocked.restoreRoles) || []).join(', ');
   const message = blocking
-    ? t('Every direct AI IAM role (Gemini Enterprise, NotebookLM, Antigravity, Agent Platform and marker roles) on this project will be removed for {email}, active dashboard sessions will end immediately, and future dashboard sign-ins will be blocked until restored.', { email })
+    ? t('Every direct AI IAM role (Gemini Enterprise, Gemini Notebook, Antigravity, Gemini Platform and marker roles) on this project will be removed for {email}, active dashboard sessions will end immediately, and future dashboard sign-ins will be blocked until restored.', { email })
     : (restoreRoles
       ? t('Dashboard sign-in and project AI IAM roles ({roles}) will be restored for {email}.', { email, roles: restoreRoles })
       : t('Dashboard sign-in and the default Gemini Enterprise access role will be restored for {email}.', { email }));

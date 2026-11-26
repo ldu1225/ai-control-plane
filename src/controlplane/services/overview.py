@@ -72,7 +72,7 @@ def summary(ctx):
         "spend": ("bigquery:%s" % ctx.ws["billing"].get("dataset"), "The billing export table"),
         "armor": ("bigquery:%s.%s" % (ctx.audit_dataset, ARMOR_OPS), "Model Armor logs"),
         "agents": ("api:aiplatform.reasoningEngines", "The agent registry"),
-        "nb": ("bigquery:%s.%s" % (ctx.audit_dataset, AUDIT_DATA_ACCESS), "NotebookLM audit logs"),
+        "nb": ("bigquery:%s.%s" % (ctx.audit_dataset, AUDIT_DATA_ACCESS), "Gemini Notebook audit logs"),
         "agy": ("antigravity", "Antigravity usage"), "agy_prev": ("antigravity", "Antigravity usage"),
         "actions": ("logging:governance-audit", "The governance audit log"),
     }

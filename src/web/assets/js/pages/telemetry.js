@@ -41,7 +41,7 @@ const CATEGORIES = [
 const PAGES = {
   overview: ['Overview', 'overview'],
   'gemini-enterprise': ['Gemini Enterprise', 'gemini_enterprise'],
-  notebooklm: ['NotebookLM', 'notebooklm'],
+  notebooklm: ['Gemini Notebook', 'notebooklm'],
   gateway: ['Agent Gateway', 'agent_gateway'],
   registry: ['Agent Registry', 'agent_registry'],
   deployments: ['Deployments', 'agent_deployments'],

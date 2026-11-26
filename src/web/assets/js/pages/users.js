@@ -17,19 +17,19 @@ import {
 import { accessMembers } from './settings.js';
 
 const SURFACES = [
-  ['all', 'All surfaces'], ['gemini_enterprise', 'Gemini Enterprise'], ['notebooklm', 'NotebookLM'], ['antigravity', 'Antigravity'], ['agent_platform', 'Agent Platform'],
+  ['all', 'All surfaces'], ['gemini_enterprise', 'Gemini Enterprise'], ['notebooklm', 'Gemini Notebook'], ['antigravity', 'Antigravity'], ['agent_platform', 'Gemini Platform'],
 ];
 
 const MODEL_SURFACE_LABELS = {
   antigravity: 'Antigravity',
-  agent_platform: 'Agent Platform',
+  agent_platform: 'Gemini Platform',
 };
 
 export default async function render(ctx) {
   // Administrators add accounts from the Accounts card below (its "Add account" button); viewers cannot add any.
   const header = pageHeader({
     title: t('Users & Access'),
-    desc: t('One view of every person using Gemini Enterprise, NotebookLM, Antigravity and Agent Platform, with their models, costs and access enforcement state.'),
+    desc: t('One view of every person using Gemini Enterprise, Gemini Notebook, Antigravity and Gemini Platform, with their models, costs and access enforcement state.'),
   });
   return pageFlow(ctx, {
     header,
@@ -166,7 +166,7 @@ function renderPage(ctx, body, d) {
         { key: 'gePrompts', label: t('GE prompts'), align: 'num', format: fmt.int },
         { key: 'agentCalls', label: t('Agent calls'), align: 'num', format: fmt.int },
         { key: 'antigravityTokens', label: t('AG tokens'), align: 'num', format: fmt.compact },
-        { key: 'agentPlatformCalls', label: t('Agent Platform calls'), align: 'num', format: fmt.int },
+        { key: 'agentPlatformCalls', label: t('Gemini Platform calls'), align: 'num', format: fmt.int },
         { key: 'iam', label: t('IAM / AI status'), render: (u) => iamBadge(u.iam, { surfaceContext: 'users' }), value: (u) => effectiveState(u), csv: (u) => effectiveState(u) },
         { key: 'lastActive', label: t('Last active'), render: (u) => (u.lastActive ? fmt.relative(u.lastActive) : DASH), value: (u) => u.lastActive },
       ],

@@ -102,7 +102,7 @@ variable "discovery_engine_locations" {
 variable "agent_engine_regions" {
   type        = list(string)
   default     = ["us-central1"]
-  description = "Agent Engine (Agent Platform) regions to list deployed agents from."
+  description = "Agent Engine (Gemini Platform) regions to list deployed agents from."
 }
 
 variable "auth_mode" {
@@ -149,7 +149,7 @@ variable "ai_default_model" {
 variable "ai_location" {
   type        = string
   default     = "global"
-  description = "Agent Platform location for Gemini calls."
+  description = "Gemini Platform location for Gemini calls."
 }
 
 variable "enable_governance_actions" {

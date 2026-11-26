@@ -872,7 +872,7 @@ except Exception:
   [[ -n "$proj_name" ]] && printf '%s' "$proj_name"
 }
 
-# Probes Agent Platform endpoints to pick reachable AGENT_ENGINE_REGIONS and AI_LOCATION automatically.
+# Probes Gemini Platform endpoints to pick reachable AGENT_ENGINE_REGIONS and AI_LOCATION automatically.
 # Prints "AGENT_ENGINE_REGIONS|AI_LOCATION".
 auto_detect_ai_locations() {
   local project="$1" region="$2" token
@@ -1212,7 +1212,7 @@ OPTIONAL_APIS = {"cloudbuild.googleapis.com": "Cloud Build (로컬 Docker 빌드
                  "cloudscheduler.googleapis.com": "정기 작업 스케줄러 (인스턴스 내 실행으로 대체)",
                  "pubsub.googleapis.com": "실시간 한도 집행 푸시 (5분 스케줄러로 대체)",
                  "aiplatform.googleapis.com": "AI 애널리스트·Agent Engine 화면",
-                 "discoveryengine.googleapis.com": "Gemini Enterprise·NotebookLM 화면",
+                 "discoveryengine.googleapis.com": "Gemini Enterprise·Gemini Notebook 화면",
                  "monitoring.googleapis.com": "모델 사용량 지표", "modelarmor.googleapis.com": "Model Armor 화면"}
 CMEK_SERVICES = {"storage.googleapis.com", "bigquery.googleapis.com", "secretmanager.googleapis.com",
                  "artifactregistry.googleapis.com", "run.googleapis.com", "logging.googleapis.com",
@@ -2182,7 +2182,7 @@ prepare_linked_project_telemetry() {
 
 # enable_data_access_logs PROJECT
 # Enables ADMIN_READ, DATA_READ and DATA_WRITE Cloud Audit Logs across all IAM-configurable AI services
-# (Agent Platform, Discovery Engine [Gemini Enterprise & NotebookLM], Model Armor, Antigravity, and Gemini
+# (Gemini Platform, Discovery Engine [Gemini Enterprise & Gemini Notebook], Model Armor, Antigravity, and Gemini
 # Data Analytics). Retries on concurrent IAM etag conflicts and automatically skips any service identifier
 # rejected with INVALID_ARGUMENT in restricted environments.
 enable_data_access_logs() {
@@ -2237,7 +2237,7 @@ PYAUDIT
     fi
     if gcloud projects set-iam-policy "$project" "$file" --quiet >/dev/null 2>"$err_file"; then
       rm -f "$file" "$err_file"
-      info "Data Access audit logs enabled across all AI services (Agent Platform, Gemini Enterprise, NotebookLM, Model Armor, Antigravity, Gemini Data Analytics${skip_csv:+; not supported in this project, skipped: ${skip_csv}})"
+      info "Data Access audit logs enabled across all AI services (Gemini Platform, Gemini Enterprise, Gemini Notebook, Model Armor, Antigravity, Gemini Data Analytics${skip_csv:+; not supported in this project, skipped: ${skip_csv}})"
       return 0
     fi
     bad_svc="$(python3 - "$err_file" <<'PYERR' || true

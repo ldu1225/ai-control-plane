@@ -1,4 +1,4 @@
-"""Agent Gateway (Gemini Enterprise Agent Platform): inventory, governance posture, traffic and management.
+"""Agent Gateway (Gemini Platform): inventory, governance posture, traffic and management.
 
 Agent Gateway is the policy enforcement point for agent traffic: Client-to-Agent (ingress) and
 Agent-to-Anywhere (egress). This module reads the gateways and everything that governs them from the Google
@@ -8,7 +8,7 @@ between audit-only and enforced:
 - Network Services API v1: agentGateways, authzExtensions, long-running operations
 - Network Services API v1beta1: telemetryPolicies (tracing, Preview)
 - Network Security API v1: authzPolicies
-- Agent Platform API (reasoningEngines) and Discovery Engine API (engines): the workloads bound to a gateway
+- Gemini Platform API (reasoningEngines) and Discovery Engine API (engines): the workloads bound to a gateway
 - Cloud Logging: gateway request log, Identity-Aware Proxy decisions, policy engine verdicts, Log Router sinks
 - Cloud Monitoring: request counts, latency and authorization extension metrics
 

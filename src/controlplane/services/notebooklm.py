@@ -1,4 +1,4 @@
-"""NotebookLM usage from Cloud Audit data access logs."""
+"""Gemini Notebook usage from Cloud Audit data access logs."""
 
 from __future__ import annotations
 
@@ -104,12 +104,12 @@ def summary(ctx):
             timeutil.series("activeUsers", "Active users", bucket_values(rng, buckets, "users"))])
         ctx.add_source(src.label)
     else:
-        ctx.warn_error(src.label, value, "NotebookLM audit logs")
+        ctx.warn_error(src.label, value, "Gemini Notebook audit logs")
     ok, rows = res["top"]
     if ok:
         out["topUsers"] = [{"uid": uid_for(r["email"]), "email": r["email"], "prompts": to_int(r.get("prompts")),
                             "notebooks": to_int(r.get("notebooks")), "lastActive": iso(r.get("last_active"))}
                            for r in rows if r.get("email")]
     else:
-        ctx.warn_error(src.label, rows, "NotebookLM audit logs")
+        ctx.warn_error(src.label, rows, "Gemini Notebook audit logs")
     return out

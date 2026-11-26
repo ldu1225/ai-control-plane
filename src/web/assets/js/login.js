@@ -31,7 +31,7 @@ let state = null;
 let loadFailed = false;
 
 const FEATURES = [
-  ['layers', 'One view of AI usage', 'Gemini Enterprise, NotebookLM, agents, models and cost in a single workspace.'],
+  ['layers', 'One view of AI usage', 'Gemini Enterprise, Gemini Notebook, agents, models and cost in a single workspace.'],
   ['shield-check', 'Governance with guardrails', 'Policy controls with safety checks and an auditable change history.'],
   ['lock', 'Runs in your cloud', 'Deployed in your own Google Cloud project, under your organization\'s control.'],
 ];
@@ -441,7 +441,7 @@ function renderAside() {
     h('div', { class: 'aside-brand' }, h('span', { class: 'aside-glyph' }, brandGlyph(22)), h('span', null, productName())),
     h('div', { class: 'aside-copy' },
       h('p', { class: 'aside-eyebrow' }, t('AI governance workspace')),
-      h('h2', { class: 'aside-title' }, tagline ? t(tagline) : t('Unified governance for Gemini Enterprise and Agent Platform')),
+      h('h2', { class: 'aside-title' }, tagline ? t(tagline) : t('Unified governance for Gemini Enterprise and Gemini Platform')),
       h('ul', { class: 'aside-features' }, FEATURES.map(([ic, title, desc]) => h('li', null,
         h('span', { class: 'aside-feature-icon' }, icon(ic, { size: 16 })),
         h('div', { class: 'aside-feature-text' }, h('strong', null, t(title)), h('span', null, t(desc))))))),

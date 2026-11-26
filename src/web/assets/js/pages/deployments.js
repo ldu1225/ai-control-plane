@@ -36,7 +36,7 @@ function renderPage(body, d, ctx) {
     kpi({ label: t('Runtime cost'), value: fmt.currency(k.runtimeCost, ccy), tip: t('Billing export cost attributed to Agent Engine resources (resource-level export required).') })));
 
   body.append(card({
-    title: t('Agent Engine deployments'), subtitle: rangeText(), flush: true, source: 'Agent Platform reasoningEngines + audit logs + billing export',
+    title: t('Agent Engine deployments'), subtitle: rangeText(), flush: true, source: 'Gemini Platform reasoningEngines + audit logs + billing export',
     body: dataTable({
       columns: [
         { key: 'name', label: t('Deployment'), render: (r) => h('div', { class: 'cell-stack' }, h('span', { class: 'cell-main truncate', title: r.name }, r.name || r.id), h('span', { class: 'cell-sub cell-mono' }, r.id)) },

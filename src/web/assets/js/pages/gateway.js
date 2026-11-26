@@ -718,7 +718,7 @@ async function changeAccess(ctx, g, mode, drawer) {
   const bound = (g.workloads || []).filter((w) => w.path === 'egress').length;
   const ok = await confirmDialog(mode === 'enforce' ? {
     title: t('Enforce access policies on {name}', { name: g.name }),
-    message: t('Identity-Aware Proxy will block every outbound request that no IAM access policy allows. {n} workloads use this gateway. An agent fails (error 498) when a platform endpoint it needs, such as the Agent Platform or Cloud Logging APIs, is not allowed yet. Check the requests that would be blocked in the Traffic view first.', { n: fmt.int(bound) }),
+    message: t('Identity-Aware Proxy will block every outbound request that no IAM access policy allows. {n} workloads use this gateway. An agent fails (error 498) when a platform endpoint it needs, such as the Gemini Platform or Cloud Logging APIs, is not allowed yet. Check the requests that would be blocked in the Traffic view first.', { n: fmt.int(bound) }),
     confirmLabel: t('Enforce policies'), tone: 'danger', requireText: g.name,
   } : {
     title: t('Switch {name} to audit-only', { name: g.name }),

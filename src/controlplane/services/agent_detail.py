@@ -7,7 +7,7 @@ Sources, all read with the control plane's own identity:
   OpenTelemetry metrics an agent reports itself and online evaluation scores. Metrics sent through the Telemetry
   (OTLP) API are stored as prometheus.googleapis.com/{name}/{suffix} on the prometheus_target resource; an Agent
   Engine deployment gets cluster "__vae__" and job = the engine id (its OpenTelemetry service.name).
-- Agent Platform API: runtime revisions and traffic (v1beta1), online evaluators, evaluation runs and sessions
+- Gemini Platform API: runtime revisions and traffic (v1beta1), online evaluators, evaluation runs and sessions
   (v1), and query / streamQuery for the playground.
 - Cloud Trace API v1: the traces an agent exports.
 
@@ -498,7 +498,7 @@ def _session_page(ctx, url, token, ordered):
 
 
 def _sessions(ctx, t, rng):
-    """Sessions stored in Agent Platform Sessions that were active in the range (count only).
+    """Sessions stored in Gemini Platform Sessions that were active in the range (count only).
 
     The list is asked for newest first, which lets the scan stop at the first page that reaches sessions older
     than the range. The order is checked rather than trusted: a session of the range that follows an older one
@@ -550,7 +550,7 @@ def telemetry(ctx):
         (t.engine.get("spec") or {}).get("deploymentSpec"))}
     for key, label, what in (("runtime", RUNTIME_LABEL, "Cloud Monitoring runtime metrics"),
                              ("agent", OTEL_LABEL, "Cloud Monitoring agent metrics"),
-                             ("sessions", SESSION_LABEL, "Agent Platform Sessions")):
+                             ("sessions", SESSION_LABEL, "Gemini Platform Sessions")):
         ok, value = res[key]
         if ok:
             out[key] = value
@@ -714,7 +714,7 @@ def _revision(raw):
 
 
 def revisions(ctx):
-    """Runtime revisions and the traffic each one receives (Agent Platform API v1beta1)."""
+    """Runtime revisions and the traffic each one receives (Gemini Platform API v1beta1)."""
     t = target(ctx)
     out = {"splitMode": None, "kpis": {"total": None, "active": None, "archived": None}, "revisions": None}
     base = "%s/v1beta1/%s" % (_host(t.region), t.name)

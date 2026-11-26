@@ -176,8 +176,8 @@ svg { flex-shrink: 0; }
 .boot { display: grid; justify-items: center; gap: 18px; }
 .boot-mark {
   width: 40px; height: 40px; border-radius: 11px;
-  background: var(--accent);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / .14), var(--shadow-sm);
+  background: #18181B url("/assets/img/mark.svg") center / 28px no-repeat;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .12), var(--shadow-sm);
 }
 .boot-bar { width: 140px; height: 3px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .boot-bar span { display: block; height: 100%; width: 40%; background: var(--ink); border-radius: 3px; animation: boot-slide 1.1s var(--ease) infinite; }
@@ -226,14 +226,18 @@ svg { flex-shrink: 0; }
 .ws-switch-chev { display: inline-flex; color: var(--text-4); transition: color .12s var(--ease); }
 .ws-switch:hover .ws-switch-chev, .ws-switch[aria-expanded="true"] .ws-switch-chev { color: var(--text-2); }
 
+/* Product mark: a neutral ink tile with a white glyph and one blue node (a configured logo replaces it). */
 .brand-mark {
+  --mark-tile: light-dark(#18181B, #FAFAFA);
+  --mark-fg: light-dark(#FFFFFF, #18181B);
   width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
   display: grid; place-items: center;
-  color: var(--accent-contrast); font-weight: 700; font-size: 12px; letter-spacing: .02em;
-  background: var(--accent);
-  box-shadow: inset 0 0 0 1px rgb(255 255 255 / .14), var(--shadow-xs);
+  color: var(--mark-fg); font-weight: 700; font-size: 12px; letter-spacing: .02em;
+  background: var(--mark-tile);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .12), 0 1px 2px rgb(0 0 0 / .18);
   overflow: hidden;
 }
+.brand-glyph-sat { fill: light-dark(#60A5FA, #2563EB); }
 .brand-mark img { width: 100%; height: 100%; object-fit: contain; background: #fff; }
 .brand-text { min-width: 0; display: grid; line-height: 1.2; }
 .brand-name { font-weight: 600; font-size: var(--text-md); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

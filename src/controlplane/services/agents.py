@@ -73,7 +73,7 @@ def reasoning_engines(ctx):
     for (project, region), (ok, value) in res.items():
         if not ok:
             if project == ctx.project:
-                ctx.warn_error("api:aiplatform.reasoningEngines", value, "Agent Engine (Agent Platform) in %s" % region)
+                ctx.warn_error("api:aiplatform.reasoningEngines", value, "Agent Engine (Gemini Platform) in %s" % region)
             continue
         ok_count += 1
         ctx.add_source("api:aiplatform.reasoningEngines")
@@ -292,7 +292,7 @@ def registry_data(ctx, rng):
         ctx.warn_error(label or "api", value, what)
         return default
 
-    engines, engine_ok = take("engines", ([], 0), None, "Agent Engine (Agent Platform)")
+    engines, engine_ok = take("engines", ([], 0), None, "Agent Engine (Gemini Platform)")
     de_items, de_ok = take("de", ([], 0), None, "Discovery Engine")
     activity = take("activity", {}, asrc.label if asrc else None, "Gemini Enterprise activity logs")
     ecalls = take("engine_calls", {}, dsrc.label if dsrc else None, "Cloud Audit data access logs")
@@ -468,7 +468,7 @@ def deployments(ctx):
         "models": lambda: ctx.memo("models_usage", rng, lambda c: models_service.usage_data(c, rng))})
     ok, reg = res["registry"]
     if not ok:
-        ctx.warn_error("api:aiplatform.reasoningEngines", reg, "Agent Engine (Agent Platform)")
+        ctx.warn_error("api:aiplatform.reasoningEngines", reg, "Agent Engine (Gemini Platform)")
         reg = {"engines": [], "engineCalls": {}, "enginesAvailable": False, "engineCallsAvailable": False}
     ok, costs = res["costs"]
     if not ok:

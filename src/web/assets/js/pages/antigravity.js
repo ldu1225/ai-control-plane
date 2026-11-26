@@ -1312,7 +1312,7 @@ function renderEnforcementStatus(host, e, warnings, fallbackRealtime = null) {
         h('span', { class: 'muted' }, t('Denied permissions')),
         h('div', { class: 'chips' }, perms.map((p) => h('span', { class: 'chip cell-mono' }, p))),
         e.geApp ? badge(t('Gemini Enterprise app also denied'), 'warning', { size: 'sm' }) : null,
-        e.agentPlatform ? badge(t('Agent Platform model calls also denied'), 'warning', { size: 'sm' }) : null) : null,
+        e.agentPlatform ? badge(t('Gemini Platform model calls also denied'), 'warning', { size: 'sm' }) : null) : null,
       job.error ? banner({ tone: 'warning', title: t('The enforcement job could not be read'), text: gcpErrorText(job.error) }) : null,
       denySection(e),
       spendCapSection(e.spendCaps)),

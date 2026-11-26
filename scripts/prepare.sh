@@ -6,11 +6,11 @@
 #
 # Logs are recorded from the moment they are turned on, so running this early means the dashboard shows
 # history from day one. scripts/deploy.sh reuses everything created here.
-#   1. Enable all AI, Logging, BigQuery, Monitoring, Discovery Engine, Agent Platform and Model Armor APIs.
+#   1. Enable all AI, Logging, BigQuery, Monitoring, Discovery Engine, Gemini Platform and Model Armor APIs.
 #   2. Create the BigQuery dataset (asia-northeast3 by default) and the Log Router sink for AI logs.
 #   3. Turn on observability (usage + prompt/user identity logs) for every Gemini Enterprise app.
-#   4. Enable Cloud Audit Data Access logs for 5 AI services: Agent Platform, Discovery Engine (Gemini Enterprise and
-#      NotebookLM), Model Armor, Antigravity (businessaicode) and Gemini Data Analytics.
+#   4. Enable Cloud Audit Data Access logs for 5 AI services: Gemini Platform, Discovery Engine (Gemini Enterprise and
+#      Gemini Notebook), Model Armor, Antigravity (businessaicode) and Gemini Data Analytics.
 #   5. Report which sources already have log entries.
 #
 # Options

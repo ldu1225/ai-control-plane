@@ -285,7 +285,7 @@ def _user_pricing(ctx):
 
 
 def _agent_platform_models(ctx, rng, email=None):
-    """Per-user Agent Platform model call counts from Cloud Audit Data Access logs."""
+    """Per-user Gemini Platform model call counts from Cloud Audit Data Access logs."""
     dsrc = ctx.audit_source(AUDIT_DATA_ACCESS)
     if dsrc is None:
         return []
@@ -493,8 +493,8 @@ DETAIL_PARTS = ("core", "activity")
 
 
 def detail(ctx):
-    """GET /api/v1/users/detail?uid=&email=&part=. part=core: Antigravity usage, models and costs, Agent Platform models
-    and the access state. part=activity: Gemini Enterprise, NotebookLM, Agent Platform and Model Armor activity over
+    """GET /api/v1/users/detail?uid=&email=&part=. part=core: Antigravity usage, models and costs, Gemini Platform models
+    and the access state. part=activity: Gemini Enterprise, Gemini Notebook, Gemini Platform and Model Armor activity over
     time, agents and files (the slowest query). Without part, both: the drawer asks for the two parts at once and shows
     each as soon as it arrives."""
     rng = ctx.range
@@ -664,7 +664,7 @@ def detail(ctx):
     combined = dict(metrics, **activity_totals)
     out_metrics = {k: (metrics[k] if k in available else None) for k in METRICS}
     series_names = (("gePrompts", "Gemini Enterprise prompts"), ("agentCalls", "Agent calls"),
-                    ("notebooklmPrompts", "NotebookLM prompts"), ("antigravityRequests", "Antigravity requests"))
+                    ("notebooklmPrompts", "Gemini Notebook prompts"), ("antigravityRequests", "Antigravity requests"))
     activity_series = ([timeutil.series(k, name, series[k]) for k, name in series_names if k in available]
                        if want_activity else [])
     if hinted:

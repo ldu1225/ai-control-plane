@@ -452,7 +452,7 @@ function budgetEditor(ctx, doc, units, unitById, admin) {
         h('ul', { class: 'muted stack-sm' },
           h('li', null, t('A project budget covers the paid usage recorded in one project.')),
           h('li', null, t('Notify only: alerts at the thresholds.')),
-          h('li', null, t('Hard cap: a Google Cloud spend cap stops the Agent Platform usage of the project when the budget is spent. It covers one project and the Agent Platform service, counts list prices before credits and is not instant, so usage can go a little over. Google sends its alerts at 50, 80 and 100%.')),
+          h('li', null, t('Hard cap: a Google Cloud spend cap stops the Gemini Platform usage of the project when the budget is spent. It covers one project and the Gemini Platform service, counts list prices before credits and is not instant, so usage can go a little over. Google sends its alerts at 50, 80 and 100%.')),
           h('li', null, t('Hard caps apply only when Google spend caps are turned on in Settings > Governance policy > Enforcement.'))),
         doc.spendCaps === false && projectRows.some((r) => r.action === 'hard_cap') ? banner({
           tone: 'warning',
@@ -476,7 +476,7 @@ const SPEND_CAPS_PATH = '/api/v1/budgets/spend-caps';
 function capStateBadge(state, reconciling) {
   let main;
   if (state === 'CONFIGURED') main = badge(t('Configured'), 'success', { size: 'sm' });
-  else if (state === 'ENFORCED') main = badge(t('Usage paused'), 'danger', { dot: true, size: 'sm', title: t('Google has paused the Agent Platform usage of this project until the next month or until the cap is lifted.') });
+  else if (state === 'ENFORCED') main = badge(t('Usage paused'), 'danger', { dot: true, size: 'sm', title: t('Google has paused the Gemini Platform usage of this project until the next month or until the cap is lifted.') });
   else if (state === 'AWAITING_NEXT_PERIOD') main = badge(t('Lifted until next month'), 'info', { size: 'sm' });
   else main = state && state !== 'STATE_UNSPECIFIED' ? badge(String(state), 'neutral', { size: 'sm' }) : h('span', { class: 'text-muted' }, DASH);
   return reconciling ? h('div', { class: 'chips' }, main, badge(t('Updating'), 'neutral', { size: 'sm' })) : main;
@@ -613,12 +613,12 @@ function renderSpendCaps(ctx, host, sc, admin, liftCap) {
     paused ? banner({
       tone: 'danger',
       title: t('{n} projects are paused by their spend cap', { n: fmt.int(paused) }),
-      text: t('Google has paused the Agent Platform usage of these projects until the next month. An administrator can lift a cap earlier.'),
+      text: t('Google has paused the Gemini Platform usage of these projects until the next month. An administrator can lift a cap earlier.'),
     }) : null,
     rows.length
       ? dataTable({ columns, rows, pageSize: 10, searchable: rows.length > 10, exportName: 'spend-caps' })
       : h('p', { class: 'muted' }, t('No project budget is set to Hard cap.')),
-    h('p', { class: 'muted' }, t('Google counts the list cost of all Agent Platform usage in the project before credits, so a spend cap can stop usage before the dashboard budget is used up. Usage billed under other services is not covered.'))));
+    h('p', { class: 'muted' }, t('Google counts the list cost of all Gemini Platform usage in the project before credits, so a spend cap can stop usage before the dashboard budget is used up. Usage billed under other services is not covered.'))));
 }
 
 /** Google spend caps of the project budgets set to Hard cap: their state, the next apply, and lifting a paused cap. */
@@ -662,7 +662,7 @@ function spendCapsCard(ctx, admin) {
     if (!requireAdmin(t('Lift cap'))) return;
     const ok = await confirmDialog({
       title: t('Lift the spend cap of {project}?', { project }),
-      message: t('Google resumes the Agent Platform usage of the project within about an hour. The cap stays lifted until the start of the next month, or until its amount is raised.'),
+      message: t('Google resumes the Gemini Platform usage of the project within about an hour. The cap stays lifted until the start of the next month, or until its amount is raised.'),
       confirmLabel: t('Lift cap'),
       tone: 'danger',
     });
@@ -689,7 +689,7 @@ function spendCapsCard(ctx, admin) {
     if (!dryRun) {
       const ok = await confirmDialog({
         title: t('Apply spend caps'),
-        message: t('Creates or changes the Google Cloud spend caps of the project budgets set to Hard cap on the billing account. When a project reaches its cap, Google pauses its Agent Platform usage until the next month. Spend caps that are no longer needed are kept; delete them in the Cloud console.'),
+        message: t('Creates or changes the Google Cloud spend caps of the project budgets set to Hard cap on the billing account. When a project reaches its cap, Google pauses its Gemini Platform usage until the next month. Spend caps that are no longer needed are kept; delete them in the Cloud console.'),
         confirmLabel: t('Apply'),
         tone: 'danger',
       });
