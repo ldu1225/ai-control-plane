@@ -4,8 +4,7 @@
 import { h, append } from '../core/dom.js';
 import { t } from '../core/i18n.js';
 import { fmt, isNum, DASH } from '../core/format.js';
-import { store, setProject } from '../core/state.js';
-import { pageHeader, kpi, card, dataTable, badge, button, userCell, emptyState, load, progress, stat, banner, tabs } from '../core/components.js';
+import { pageHeader, kpi, card, dataTable, badge, userCell, emptyState, load, progress, stat, banner, tabs } from '../core/components.js';
 import { lineChart, barChart, fromTimeline, hbarList, TONES, colorAt } from '../core/charts.js';
 import { pageFlow, fetchRange, rangeText, deltaOf, chartCard, mountCharts, openUserDrawer } from './_shared.js';
 
@@ -13,39 +12,16 @@ const CATEGORY_LABELS = {
   document: 'Document', spreadsheet: 'Spreadsheet', presentation: 'Presentation', image: 'Image', text: 'Text', other: 'Other',
 };
 
-function projectScopeBanner() {
-  const connected = (store.boot && store.boot.workspace && store.boot.workspace.projects) || [];
-  if (!store.project || store.project === 'all' || connected.length <= 1) return null;
-  return banner({
-    tone: 'info',
-    iconName: 'filter',
-    title: t('Filtered to project: {id}', { id: store.project }),
-    text: t('Only {id} is shown because the workspace project filter is active. Switch to all {n} connected projects to view every linked project together.', {
-      id: store.project,
-      n: fmt.int(connected.length),
-    }),
-    actions: [
-      button({
-        label: t('Show all {n} connected projects', { n: fmt.int(connected.length) }),
-        icon: 'layers',
-        variant: 'primary',
-        size: 'sm',
-        onClick: () => setProject('all'),
-      }),
-    ],
-  });
-}
-
 /* Views (each has its own address): #/gemini-enterprise (usage), #/gemini-enterprise/features (features & models),
    and #/gemini-enterprise/dev-tools (AI developer tools & Antigravity authorized models). */
 export default async function render(ctx) {
   const first = ctx.params[0];
   const view = first === 'features' ? 'features' : (first === 'dev-tools' ? 'dev-tools' : 'usage');
   const desc = view === 'features'
-    ? t('Feature switches and model selection of every Gemini Enterprise app in one view. Compare apps and change many apps at once.')
+    ? t('Compare and bulk-edit features and models across every app.')
     : (view === 'dev-tools'
-      ? t('Project and location settings for AI developer tools, security policies, compliance logging, and Antigravity authorized models.')
-      : t('Adoption, license utilization, agent usage and uploaded content across Gemini Enterprise.'));
+      ? t('AI developer tool settings and Antigravity models per project.')
+      : t('Adoption, licenses, agents and uploaded content.'));
   const header = h('div', { class: 'stack' },
     pageHeader({ title: t('Gemini Enterprise'), desc }),
     tabs([
@@ -55,8 +31,7 @@ export default async function render(ctx) {
     ], view, (id) => ctx.navigate(
       id === 'features' ? '#/gemini-enterprise/features'
         : (id === 'dev-tools' ? '#/gemini-enterprise/dev-tools' : '#/gemini-enterprise'),
-    )),
-    projectScopeBanner());
+    )));
   if (view === 'features') {
     const mod = await import('./gemini_features.js');
     return mod.default(ctx, header);

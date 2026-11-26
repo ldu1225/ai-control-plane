@@ -402,10 +402,10 @@ export default async function render(ctx, header) {
 
   body.append(view.kpis);
   body.append(banner({
-    tone: 'info',
+    tone: 'neutral',
     iconName: 'lock',
-    title: t('Live read-only view (Google Cloud Console required for edits)'),
-    text: t('Google Cloud currently restricts DevToolsConfig writes (UpdateDevToolsConfig) to Google Cloud Console. Use this page to audit AI developer tools settings and Antigravity authorized models across all projects and locations, then open Cloud Console to make changes.'),
+    title: t('Read-only view'),
+    text: t('Google Cloud accepts changes to these settings only in Cloud Console.'),
     actions: [
       h('a', {
         class: 'btn btn-secondary btn-sm',
@@ -428,7 +428,7 @@ export default async function render(ctx, header) {
 
   body.append(card({
     title: t('Antigravity model selection'),
-    subtitle: t('Authorized Google (Gemini) and third-party models per project and location. An empty Google model list permits all supported Gemini models.'),
+    subtitle: t('Allowed Gemini and third-party models per project and location.'),
     actions: modelSwitchHost,
     flush: true,
     source: `Discovery Engine DevToolsConfig.modelConfig (${data.apiVersion || 'v1alpha'})`,
@@ -442,7 +442,7 @@ export default async function render(ctx, header) {
 
   body.append(card({
     title: t('AI developer tools settings'),
-    subtitle: t('Enablement, compliance logging, security policies, external web access, MCP servers and plugins across locations.'),
+    subtitle: t('Enablement, logging, security, web access, MCP and plugins per location.'),
     actions: settingsActions,
     flush: true,
     source: `Discovery Engine DevToolsConfig (${data.apiVersion || 'v1alpha'})`,
@@ -607,7 +607,7 @@ function paintModels(state, el) {
       h('td', null, partnerCell),
       h('td', { class: 'dt-act-col' },
         h('a', {
-          class: 'btn btn-secondary btn-sm',
+          class: 'btn btn-ghost btn-sm',
           href: consoleUrl(c.project),
           target: '_blank',
           rel: 'noopener noreferrer',

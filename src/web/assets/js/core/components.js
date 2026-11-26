@@ -12,37 +12,54 @@ import { noticeText, serverText } from './messages.js';
 
 /* ------------------------------------------------------------------ layout */
 
-export function pageHeader({ title, desc, actions, project }) {
+/** The single-project filter of the workspace switcher, or null when every connected project is shown. */
+function activeProjectFilter() {
   const ws = (store && store.boot && store.boot.workspace) || {};
   const projects = (Array.isArray(ws.projects) && ws.projects.length ? ws.projects : [ws.projectId]).filter(Boolean);
-  const sel = store ? store.selectedProject : null;
-  let scopeBadge = null;
-  if (!project) {
-    if (sel) {
-      scopeBadge = badge(t('Scope: Single project ({id})', { id: sel }), 'info', { size: 'sm', dot: true });
-    } else if (projects.length > 1) {
-      scopeBadge = badge(t('All {n} projects integrated', { n: projects.length }), 'success', { size: 'sm', dot: true, title: projects.join(', ') });
-    }
-  }
+  const sel = store ? store.project : null;
+  return sel && sel !== 'all' && projects.length > 1 && projects.includes(sel) ? { id: sel, total: projects.length } : null;
+}
+
+export function pageHeader({ title, desc, actions, project }) {
+  const filter = project ? null : activeProjectFilter();
+  // While one project is selected, a chip next to the title says so; pressing it shows every project again.
+  const scopeChip = filter ? h('button', {
+    type: 'button',
+    class: 'scope-chip',
+    'data-tip': t('Show all {n} connected projects', { n: filter.total }),
+    'aria-label': `${t('Filtered to project: {id}', { id: filter.id })}. ${t('Show all {n} connected projects', { n: filter.total })}`,
+    onclick: () => window.dispatchEvent(new CustomEvent('cp:clear-project')),
+  }, icon('filter', { size: 12 }), h('span', null, filter.id), h('span', { class: 'scope-chip-x' }, icon('x', { size: 12 }))) : null;
   return h('div', { class: 'page-header' },
     h('div', { class: 'page-heading' },
-      h('div', { class: 'row', style: { gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+      h('div', { class: 'page-title-row' },
         h('h1', { class: 'page-title' }, title),
-        scopeBadge),
+        scopeChip),
       desc ? h('p', { class: 'page-desc' }, desc) : null),
     actions ? h('div', { class: 'page-actions' }, actions) : null);
+}
+
+/** Small "i" whose text shows as a tooltip (and is read by screen readers). */
+export function infoTip(text, { size = 13 } = {}) {
+  if (!text) return null;
+  return h('span', { class: 'info-tip', 'data-tip': text, tabindex: 0, role: 'img', 'aria-label': text }, icon('info', { size }));
 }
 
 export function card({ title, subtitle, actions, body, footer, source, cls, flush, bordered, id }) {
   const bodyEl = h('div', { class: ['card-body', flush ? 'flush' : ''] });
   if (body) append(bodyEl, [body]);
-  const header = (title || actions) ? h('div', { class: ['card-header', bordered ? 'bordered' : ''] },
+  const hasHeader = Boolean(title || actions);
+  // The data source is reference detail: an (i) tooltip next to the title instead of a footer line.
+  const header = hasHeader ? h('div', { class: ['card-header', bordered ? 'bordered' : ''] },
     h('div', { class: 'card-heading' },
-      title ? h('h3', { class: 'card-title', title: typeof title === 'string' ? title : null }, title) : null,
+      title ? h('h3', { class: 'card-title' },
+        h('span', { title: typeof title === 'string' ? title : null }, title),
+        source ? infoTip(`${t('Data source')}: ${source}`, { size: 12 }) : null) : null,
       subtitle ? h('p', { class: 'card-subtitle', title: typeof subtitle === 'string' ? subtitle : null }, subtitle) : null),
     actions ? h('div', { class: 'card-actions' }, actions) : null) : null;
-  const foot = (footer || source) ? h('div', { class: 'card-footer' },
-    source ? sourceNote(source) : h('span'),
+  const footSource = source && !title ? sourceNote(source) : null;
+  const foot = (footer || footSource) ? h('div', { class: 'card-footer' },
+    footSource || h('span'),
     footer || null) : null;
   const el = h('section', { class: ['card', cls], id: id || null }, header, bodyEl, foot);
   el.bodyEl = bodyEl;

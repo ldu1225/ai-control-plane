@@ -13,7 +13,7 @@ import { store, isAdmin, session, isModuleEnabled } from '../core/state.js';
 import {
   pageHeader, card, button, banner, badge, statusBadge, switchInput, selectInput, field, textInput, toast, setBusy, kv, chip,
   errorState, skeleton, confirmDialog, emptyState, dataTable, openDrawer, alertPermissionRequired, requireAdmin, codeBlock,
-  segmented, openModal, listCell, warningsNotice,
+  segmented, openModal, listCell, warningsNotice, openPopover, menuItem, infoTip,
 } from '../core/components.js';
 import { errorText, serverText } from '../core/messages.js';
 import { fxRateText, fxSourceLabel, pricingSyncText } from './finops.js';
@@ -1780,16 +1780,6 @@ function access(ctx, panel, data, editable) {
   const google = s.authMode === 'google';
   panel.append(card({
     title: t('Current session'),
-    actions: button({
-      label: t('Add account'),
-      icon: 'plus',
-      size: 'sm',
-      variant: 'primary',
-      onClick: () => {
-        if (!requireAdmin(t('Add account / Manage access control'))) return;
-        openAccessDrawer({ onChanged: () => ctx.rerender() });
-      },
-    }),
     body: kv([
       [t('Signed in as'), s.email || DASH],
       [t('Role'), s.role === 'admin' ? badge(t('Administrator'), 'accent', { size: 'sm' }) : badge(t('Viewer'), 'neutral', { size: 'sm' })],
@@ -1840,13 +1830,11 @@ function openPasswordModal(account, onSaved) {
   const cancelBtn = button({ label: t('Cancel'), variant: 'ghost' });
 
   const body = h('div', { class: 'stack' },
-    banner({
-      tone: 'info',
-      title: account.email === 'admin' ? t('Administrator password (admin)') : t('Password for {email}', { email: account.email }),
-      text: account.defaultPassword
-        ? t('This account currently uses the initial default password ("admin"). Set a custom password to secure it.')
-        : t('Set a new password for signing in directly on the login page with this account ID.'),
-    }),
+    account.defaultPassword ? banner({
+      tone: 'warning',
+      title: t('Initial password in use'),
+      text: t('This account currently uses the initial default password ("admin"). Set a custom password to secure it.'),
+    }) : null,
     field({ label: t('New password'), control: pwInput }),
     field({ label: t('Confirm password'), control: confirmInput }),
     errEl,
@@ -1856,7 +1844,7 @@ function openPasswordModal(account, onSaved) {
     title: account.hasPassword ? t('Change password') : t('Set password'),
     subtitle: account.email,
     content: body,
-    width: 460,
+    width: 440,
   });
 
   cancelBtn.addEventListener('click', () => d.close());
@@ -1894,51 +1882,100 @@ function openPasswordModal(account, onSaved) {
   setTimeout(() => pwInput.focus(), 60);
 }
 
-/** Approved accounts (ID/Password & Google OAuth), roles and pending access requests (administrators only). */
+/** Content of one sign-in method row: icon, title with status, a one-line summary, actions, and an expandable detail. */
+function methodRow({ iconName, title, state, tip, desc, facts, actions, detail }) {
+  return [
+    h('div', { class: 'access-method-head' },
+      h('span', { class: 'access-method-icon', 'aria-hidden': 'true' }, icon(iconName, { size: 16 })),
+      h('div', { class: 'access-method-text' },
+        h('div', { class: 'access-method-title' }, h('span', null, title), state, infoTip(tip, { size: 12 })),
+        desc ? h('div', { class: 'access-method-desc' }, desc) : null,
+        facts || null),
+      actions && actions.length ? h('div', { class: 'access-method-actions' }, actions) : null),
+    detail || null,
+  ];
+}
+
+/** Show/hide toggle for a detail area (aria-expanded on the button, label swaps while open). */
+function detailToggle(detail, { label, openLabel, iconName, variant = 'ghost', onOpen } = {}) {
+  const btn = button({ label, icon: iconName || null, iconRight: iconName ? null : 'chevron-down', size: 'sm', variant, cls: iconName ? '' : 'btn-disclosure' });
+  const textNode = [...btn.childNodes].find((n) => n.nodeType === Node.TEXT_NODE);
+  const sync = () => {
+    btn.setAttribute('aria-expanded', detail.hidden ? 'false' : 'true');
+    if (textNode) textNode.textContent = detail.hidden ? label : (openLabel || label);
+  };
+  btn.addEventListener('click', () => {
+    detail.hidden = !detail.hidden;
+    sync();
+    if (!detail.hidden && onOpen) onOpen();
+  });
+  sync();
+  return btn;
+}
+
+/** Approved accounts (ID/Password & Google OAuth), roles, pending requests and sign-in methods (administrators only). */
 export function accessMembers(ctx = {}, editable = true) {
   const signal = ctx && ctx.signal;
   const inDrawer = Boolean(ctx && ctx.inDrawer);
   const rerender = (ctx && ctx.rerender) || (() => {});
   const requestsSlot = h('div', { class: 'access-requests' });
-  const googleSlot = h('div', { hidden: true });
-  const oauthSlot = h('div', { hidden: true });
+  const googleSlot = h('div', { class: 'access-method', hidden: true });
+  const oauthSlot = h('div', { class: 'access-method', hidden: true });
   let lastOauth = null;   // data.oauth of the last response (IAP texts point to it when a client can be connected)
   const tableSlot = h('div', { class: 'access-table-slot' }, skeleton('table'));
   const formError = h('div', { class: 'field-error', role: 'alert' });
   const emailInput = textInput({
     value: '',
-    placeholder: 'team-admin, viewer1, user@example.com, *@domain.com',
+    placeholder: 'viewer1, user@example.com, *@domain.com',
     mono: true,
     attrs: { 'aria-label': t('Account ID, email or domain'), autocomplete: 'off', spellcheck: 'false', maxlength: 2000, disabled: !editable || null },
   });
   const passwordInput = textInput({
     value: '',
     type: 'password',
-    placeholder: t('Password (required for ID login, optional for Google OAuth)'),
+    placeholder: t('Required for ID sign-in'),
     attrs: { 'aria-label': t('Password'), autocomplete: 'new-password', maxlength: 256, disabled: !editable || null },
   });
   let newRole = 'viewer';
   const roleSelect = selectInput([{ value: 'viewer', label: t('Viewer') }, { value: 'admin', label: t('Administrator') }], 'viewer', (v) => { newRole = v; }, { 'aria-label': t('Role'), disabled: !editable || null });
-  const addBtn = button({ label: t('Add account'), icon: 'plus', variant: 'primary', disabled: !editable });
-  const addForm = h('div', { class: 'access-add' },
+  const addBtn = button({ label: t('Add'), icon: 'plus', variant: 'primary', disabled: !editable });
+  const addForm = h('div', { class: 'access-add', hidden: !inDrawer },
     h('div', { class: 'access-add-row' },
-      h('div', { class: 'access-add-email' }, emailInput),
-      h('div', { class: 'access-add-password' }, passwordInput),
-      roleSelect,
+      h('div', { class: 'access-add-email' }, field({ label: t('Account ID, email or domain'), control: emailInput })),
+      h('div', { class: 'access-add-password' }, field({ label: t('Password'), control: passwordInput })),
+      field({ label: t('Role'), control: roleSelect }),
       addBtn),
-    h('span', { class: 'field-help' }, t('Enter an account ID (e.g. team-admin, viewer1) with a password for direct ID/Password login, or enter a Google email / *@domain rule.')),
+    h('span', { class: 'field-help' }, t('An ID with a password signs in on the login page. A Google email or *@domain signs in with Google.')),
     formError);
-  const c = card({
-    title: inDrawer ? null : t('Accounts & passwords'),
-    subtitle: inDrawer ? null : t('Manage ID/Password accounts (including the built-in admin account) and approved Google accounts. Administrators can change settings; viewers have read-only access.'),
-    bordered: !inDrawer,
-    body: h('div', { class: 'access-body' }, googleSlot, oauthSlot, requestsSlot, editable ? addForm : null, tableSlot),
+  const addToggle = !inDrawer && editable ? button({ label: t('Add account'), icon: 'plus', variant: 'primary', size: 'sm' }) : null;
+  if (addToggle) {
+    addToggle.setAttribute('aria-expanded', 'false');
+    addToggle.addEventListener('click', () => {
+      addForm.hidden = !addForm.hidden;
+      addToggle.setAttribute('aria-expanded', addForm.hidden ? 'false' : 'true');
+      if (!addForm.hidden) setTimeout(() => emailInput.focus(), 30);
+    });
+  }
+  const accounts = card({
+    title: inDrawer ? null : t('Accounts'),
+    subtitle: inDrawer ? null : t('Administrators can change settings; viewers have read-only access.'),
+    actions: addToggle,
+    body: h('div', { class: 'access-body' }, requestsSlot, editable ? addForm : null, tableSlot),
   });
-  c.emailInput = emailInput;
+  const methods = inDrawer || (ctx && ctx.hideMethods) ? null : card({
+    title: t('Sign-in methods'),
+    subtitle: t('How approved Google accounts reach this dashboard.'),
+    flush: true,
+    body: h('div', { class: 'access-methods' }, googleSlot, oauthSlot),
+  });
+  if (methods) methods.hidden = true;
+  const root = h('div', { class: 'stack' }, accounts, methods);
+  root.emailInput = emailInput;
 
   const apply = (data) => {
     renderOauth(data);
     renderGoogle(data);
+    if (methods) methods.hidden = googleSlot.hidden && oauthSlot.hidden;
     renderRequests(data);
     renderTable(data);
   };
@@ -1995,7 +2032,8 @@ export function accessMembers(ctx = {}, editable = true) {
   /** Google sign-in through Identity-Aware Proxy: who IAP admits, the OAuth client rule, and allow / sync actions. */
   function renderGoogle(data) {
     const g = data && data.google;
-    if (!g || !g.enabled) { mount(googleSlot); googleSlot.hidden = true; return; }
+    if (!methods || !g || !g.enabled) { mount(googleSlot); googleSlot.hidden = true; return; }
+    const wasOpen = googleSlot.querySelector('.access-method-detail:not([hidden])') !== null;
     googleSlot.hidden = false;
     const named = (g.domains || []).length + (g.users || []).length + (g.groups || []).length;
     let state;
@@ -2023,13 +2061,17 @@ export function accessMembers(ctx = {}, editable = true) {
         ? t('IAP uses the Google-managed OAuth client: only accounts of this project\'s organization can sign in with Google here. For accounts of other organizations and personal accounts (partners, Gmail), connect a Google OAuth client below or give them an ID and password.')
         : t('IAP uses the Google-managed OAuth client: only accounts of this project\'s organization can sign in with Google. Accounts of other organizations and personal accounts (partners, Gmail) stop at the IAP page; give them an ID and password.');
     }
+    let desc;
+    if (g.oauth === 'custom') desc = t('Approved accounts of any organization can sign in with Google.');
+    else if (g.orgDomain) desc = t('Accounts of {domain} can sign in with Google.', { domain: g.orgDomain });
+    else desc = t('Accounts of this organization can sign in with Google.');
 
-    const recheck = button({ label: t('Check again'), icon: 'refresh', size: 'sm', variant: 'ghost' });
+    const recheck = button({ icon: 'refresh', size: 'sm', variant: 'ghost', title: t('Check again') });
     recheck.addEventListener('click', () => load(true, recheck));
     const syncBtn = editable ? button({ label: t('Sync approved accounts'), icon: 'user-check', size: 'sm' }) : null;
     if (syncBtn) syncBtn.addEventListener('click', () => post('/api/v1/access/iap/sync', {}, null, syncBtn));
     const allowInput = textInput({ value: '', placeholder: 'example.com, user@example.com', mono: true, attrs: { 'aria-label': t('Domain or Google account'), autocomplete: 'off', spellcheck: 'false', maxlength: 254 } });
-    const allowBtn = button({ label: t('Allow Google sign-in'), icon: 'plus', size: 'sm', variant: 'primary' });
+    const allowBtn = button({ label: t('Allow Google sign-in'), icon: 'plus', size: 'sm' });
     allowBtn.addEventListener('click', async () => {
       const value = allowInput.value.trim();
       if (!value) { allowInput.focus(); return; }
@@ -2044,15 +2086,22 @@ export function accessMembers(ctx = {}, editable = true) {
         ? t('The dashboard service account needs IAP Policy Admin (roles/iap.admin) on this project. Deploy again or grant the role.')
         : t('Try again in a moment.'),
     }) : null;
-    mount(googleSlot, h('div', { class: 'stack-sm', style: { padding: '14px 16px', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', minWidth: '0' } },
-      h('div', { class: 'row between wrap' },
-        h('div', { class: 'row' }, icon('shield', { size: 15 }), h('strong', null, t('Google sign-in (Identity-Aware Proxy)')), state),
-        h('div', { class: 'row' }, recheck, syncBtn)),
-      h('span', { class: 'field-help' }, oauthText),
+    const detail = h('div', { class: 'access-method-detail', hidden: !wasOpen && !g.error },
       errBanner,
-      h('div', { class: 'row wrap' }, h('span', { class: 'text-muted' }, t('Can sign in with Google:')), chips.length ? chips : h('span', { class: 'text-muted' }, t('Nobody yet'))),
-      editable ? h('div', { class: 'row', style: { maxWidth: '620px' } }, h('div', { style: { flex: '1 1 auto', minWidth: '0' } }, allowInput), allowBtn) : null,
-      editable ? h('span', { class: 'field-help' }, t('Allow your company domain once: its accounts can then sign in with Google, and accounts that are not approved yet appear as access requests. Changes can take a few minutes to apply.')) : null));
+      h('div', { class: 'access-allow-list' }, h('span', { class: 'field-help' }, t('Can sign in with Google:')), chips.length ? chips : h('span', { class: 'text-muted' }, t('Nobody yet'))),
+      editable ? h('div', { class: 'access-inline' }, allowInput, allowBtn) : null,
+      editable ? h('span', { class: 'field-help' }, t('Allow your company domain once: its accounts can then sign in with Google, and accounts that are not approved yet appear as access requests. Changes can take a few minutes to apply.')) : null,
+      syncBtn ? h('div', null, syncBtn) : null);
+    const manage = detailToggle(detail, { label: t('Manage'), openLabel: t('Hide') });
+    mount(googleSlot, methodRow({
+      iconName: 'shield',
+      title: t('Google sign-in (Identity-Aware Proxy)'),
+      state,
+      tip: oauthText,
+      desc,
+      actions: [recheck, manage],
+      detail,
+    }));
   }
 
   /** Google OAuth client of this project: every approved Google account can sign in, including accounts of other
@@ -2060,7 +2109,7 @@ export function accessMembers(ctx = {}, editable = true) {
   function renderOauth(data) {
     const o = (data && data.oauth) || null;
     lastOauth = o;
-    if (inDrawer || !o || !o.available) { mount(oauthSlot); oauthSlot.hidden = true; return; }
+    if (!methods || !o || !o.available) { mount(oauthSlot); oauthSlot.hidden = true; return; }
     oauthSlot.hidden = false;
     const project = ((store.boot && store.boot.workspace) || {}).projectId || '';
     const consoleUrl = (page) => `https://console.cloud.google.com/auth/${page}${project ? `?project=${encodeURIComponent(project)}` : ''}`;
@@ -2079,6 +2128,10 @@ export function accessMembers(ctx = {}, editable = true) {
     else if (!o.canConnect) text = t('Deploy again with scripts/deploy.sh to connect an OAuth client here. It lets approved accounts of other organizations (partners, affiliates, Gmail) sign in with Google.');
     else if (o.bridge) text = t('Google sign-in goes through Identity-Aware Proxy, which admits accounts of your organization only. Connect an OAuth client of this project so approved accounts of other organizations (partners, affiliates, Gmail) can sign in with Google too. No redeployment is needed.');
     else text = t('Google sign-in is off: people sign in with an ID and password. Connect an OAuth client of this project so approved Google accounts, including accounts of other organizations, can sign in with Google. No redeployment is needed.');
+    let desc;
+    if (o.active) desc = t('Approved accounts of any organization can sign in with Google.');
+    else if (!o.canConnect) desc = t('Redeploy with scripts/deploy.sh to connect a client here.');
+    else desc = t('Connect to let partner and personal Google accounts sign in.');
 
     const unreadable = o.secretUnreadable ? banner({
       tone: 'warning',
@@ -2088,10 +2141,10 @@ export function accessMembers(ctx = {}, editable = true) {
         : t('Secret Manager did not return the connected client\'s secret, so Google sign-in is off for now. Connect the client again with its client secret.'),
     }) : null;
 
-    const facts = o.clientId || o.connectedAt ? h('div', { class: 'row wrap' },
-      o.clientId ? h('span', { class: 'text-muted' }, t('Client ID')) : null,
+    const facts = o.clientId || o.connectedAt ? h('div', { class: 'access-method-desc' },
       o.clientId ? h('span', { class: 'cell-mono', style: { wordBreak: 'break-all' } }, o.clientId) : null,
-      o.connectedAt ? h('span', { class: 'text-muted' }, t('Connected by {who}, {when}', { who: o.connectedBy || DASH, when: fmt.dateTime(o.connectedAt) })) : null) : null;
+      o.clientId && o.connectedAt ? ' \u00b7 ' : null,
+      o.connectedAt ? t('Connected by {who}, {when}', { who: o.connectedBy || DASH, when: fmt.dateTime(o.connectedAt) }) : null) : null;
 
     // Connect form: console steps, the redirect URI to register, then the client ID and secret (checked by Google).
     const idInput = textInput({ value: '', placeholder: '123456789012-abc123.apps.googleusercontent.com', mono: true, attrs: { 'aria-label': t('Client ID'), autocomplete: 'off', spellcheck: 'false', maxlength: 200 } });
@@ -2099,13 +2152,13 @@ export function accessMembers(ctx = {}, editable = true) {
     const formErr = h('div', { class: 'field-error', role: 'alert' });
     const connectBtn = button({ label: t('Connect'), icon: 'key', variant: 'primary' });
     const link = (page, label) => h('a', { href: consoleUrl(page), target: '_blank', rel: 'noopener noreferrer' }, label, ' ', icon('external', { size: 12 }));
-    const steps = h('ol', { class: 'stack-sm', style: { margin: '0', paddingLeft: '20px' } },
+    const steps = h('ol', { class: 'access-steps' },
       h('li', null, t('Branding: enter an app name (for example the dashboard name) and a support email, then save.'), ' ', link('branding', t('Open Branding'))),
       h('li', null, t('Audience: choose External, then select Publish app so the status is In production.'), ' ', link('audience', t('Open Audience')),
         h('div', { class: 'field-help' }, t('Internal admits your organization only, and Testing admits listed test users only. Only the basic sign-in scopes (email, profile) are used, so Google verification is not needed.'))),
       h('li', null, t('Clients: Create client, application type Web application, add the redirect URI below under Authorized redirect URIs, then Create. Copy the client ID and client secret (the secret is shown only once).'), ' ', link('clients', t('Open Clients'))));
-    const form = h('div', { class: 'stack-sm', hidden: true, style: { paddingTop: '6px', borderTop: '1px solid var(--border)' } },
-      h('strong', null, t('Connect an OAuth client (one time, a few minutes in the Google Cloud console)')),
+    const form = h('div', { class: 'access-method-detail', hidden: true },
+      unreadable,
       steps,
       field({ label: t('Authorized redirect URI'), control: codeBlock(redirect, { wrap: true }), help: t('Register exactly this address on the client.') }),
       h('div', { class: 'row wrap', style: { alignItems: 'flex-end' } },
@@ -2114,6 +2167,7 @@ export function accessMembers(ctx = {}, editable = true) {
         connectBtn),
       h('span', { class: 'field-help' }, t('Google checks the client ID, the secret and the redirect URI before anything changes. The secret is kept in Secret Manager ({secret}) and is not shown again.', { secret: o.secret || 'Secret Manager' })),
       formErr);
+    if (o.secretUnreadable) form.hidden = false;
     connectBtn.addEventListener('click', async () => {
       formErr.textContent = '';
       const clientId = idInput.value.trim();
@@ -2135,15 +2189,17 @@ export function accessMembers(ctx = {}, editable = true) {
 
     const actions = [];
     if (editable && o.canConnect) {
-      const open = button({ label: o.active || o.secretUnreadable ? t('Replace client') : t('Connect OAuth client'), icon: o.active || o.secretUnreadable ? 'edit' : 'plus', size: 'sm', variant: o.active ? 'ghost' : 'primary' });
-      open.addEventListener('click', () => {
-        form.hidden = !form.hidden;
-        if (!form.hidden) setTimeout(() => idInput.focus(), 30);
-      });
-      actions.push(open);
+      const replace = o.active || o.secretUnreadable;
+      actions.push(detailToggle(form, {
+        label: replace ? t('Replace client') : t('Connect'),
+        openLabel: t('Hide'),
+        iconName: replace ? 'edit' : 'plus',
+        variant: replace ? 'ghost' : 'secondary',
+        onOpen: () => setTimeout(() => idInput.focus(), 30),
+      }));
     }
     if (editable && !deployment && (o.active || o.secretUnreadable)) {
-      const off = button({ label: t('Disconnect'), icon: 'x', size: 'sm', variant: 'ghost' });
+      const off = button({ label: t('Disconnect'), size: 'sm', variant: 'ghost' });
       off.addEventListener('click', async () => {
         const ok = await confirmDialog({
           title: t('Disconnect the OAuth client'),
@@ -2158,19 +2214,21 @@ export function accessMembers(ctx = {}, editable = true) {
       actions.push(off);
     }
 
-    mount(oauthSlot, h('div', { class: 'stack-sm', style: { padding: '14px 16px', border: '1px solid var(--border)', borderRadius: 'var(--radius-lg)', minWidth: '0' } },
-      h('div', { class: 'row between wrap' },
-        h('div', { class: 'row' }, icon('key', { size: 15 }), h('strong', null, t('Google OAuth client')), state),
-        actions.length ? h('div', { class: 'row' }, actions) : null),
-      h('span', { class: 'field-help' }, text),
-      unreadable,
+    mount(oauthSlot, methodRow({
+      iconName: 'key',
+      title: t('Google OAuth client'),
+      state,
+      tip: text,
+      desc,
       facts,
-      editable && o.canConnect ? form : null));
+      actions,
+      detail: editable && o.canConnect ? form : unreadable,
+    }));
   }
 
   function iapBadge(u) {
     if (!u.iap) return null;
-    if (u.iap === 'covered') return badge(t('Google sign-in ready'), 'success', { size: 'sm', title: t('Identity-Aware Proxy admits this account.') });
+    if (u.iap === 'covered') return null; // the normal case needs no extra label
     if (u.iap === 'unknown') return badge(t('IAP not checked'), 'neutral', { size: 'sm' });
     if (u.iapLast && u.iapLast.result === 'rejected') {
       const title = lastOauth && lastOauth.canConnect
@@ -2249,6 +2307,30 @@ export function accessMembers(ctx = {}, editable = true) {
       })));
   }
 
+  function rowMenu(u, data) {
+    const items = [];
+    if (!u.pattern) items.push({ label: u.hasPassword ? t('Change password') : t('Set password'), iconName: 'lock', run: () => openPasswordModal(u, (updated) => apply(updated)) });
+    if (u.canRemove) {
+      items.push({
+        label: t('Remove'), iconName: 'trash', danger: true,
+        run: async () => {
+          const ok = await confirmDialog({ title: t('Remove access'), message: u.pattern ? t('Accounts in {domain} will no longer be able to sign in unless they are approved individually.', { domain: u.email.slice(2) }) : t('{email} will be signed out immediately and will no longer be able to sign in.', { email: u.email }), confirmLabel: t('Remove'), tone: 'danger' });
+          if (ok) post('/api/v1/access/users/delete', { email: u.email }, t('Access removed'));
+        },
+      });
+    }
+    if (!items.length) return null;
+    const btn = h('button', {
+      type: 'button', class: 'icon-btn', title: t('More actions'), 'aria-label': `${t('More actions')}: ${u.email}`, 'aria-haspopup': 'menu',
+      onclick: (e) => openPopover(e.currentTarget, (close) => h('div', { role: 'menu' },
+        items.map((it) => menuItem({ label: it.label, iconName: it.iconName, danger: it.danger, onClick: () => { close(); it.run(); } })))),
+    }, icon('more', { size: 16 }));
+    const quick = u.defaultPassword && !u.pattern
+      ? button({ label: t('Set password'), icon: 'lock', size: 'xs', onClick: () => openPasswordModal(u, (updated) => apply(updated)) })
+      : null;
+    return h('div', { class: 'row', style: { justifyContent: 'flex-end', gap: '4px' } }, quick, btn);
+  }
+
   function renderTable(data) {
     const rows = (data && data.users) || [];
     mount(tableSlot, dataTable({
@@ -2263,75 +2345,54 @@ export function accessMembers(ctx = {}, editable = true) {
             u.pattern ? h('span', { class: 'avatar muted', 'aria-hidden': 'true' }, icon('globe', { size: 14 })) : h('span', { class: 'avatar', 'aria-hidden': 'true' }, initials(u.email)),
             h('div', { class: 'cell-stack' },
               h('span', { class: ['cell-main', 'truncate'], title: u.email },
-                u.email === '*' ? `* (${t('Every Google account (Signed-in Viewer)')})` : u.email,
+                u.email,
                 u.self ? h('span', { class: 'access-you' }, t('You')) : null),
               u.pattern
                 ? h('span', { class: 'cell-sub' }, u.email === '*' ? t('Every Google account (Signed-in Viewer)') : t('Every account in this domain'))
-                : h('span', { class: 'cell-sub' },
-                  u.defaultPassword
-                    ? t('ID / Password login (initial password in Secret Manager)')
-                    : (u.hasPassword ? t('ID / Password login enabled') : t('Google OAuth sign-in'))))),
+                : null)),
         },
         {
-          key: 'role', label: t('Role'), width: '124px',
+          key: 'role', label: t('Role'), width: '132px',
           render: (u) => {
             if (!editable || !u.canChangeRole) return u.role === 'admin' ? badge(t('Administrator'), 'accent', { size: 'sm' }) : badge(t('Viewer'), 'neutral', { size: 'sm' });
-            return selectInput([{ value: 'viewer', label: t('Viewer') }, { value: 'admin', label: t('Administrator') }], u.role, async (v) => {
+            const sel = selectInput([{ value: 'viewer', label: t('Viewer') }, { value: 'admin', label: t('Administrator') }], u.role, async (v) => {
               if (v === 'admin') {
                 const ok = await confirmDialog({ title: t('Grant administrator role'), message: t('{email} will be able to change settings and run governance actions. Continue?', { email: u.email }), confirmLabel: t('Approve') });
                 if (!ok) { renderTable(data); return; }
               }
               const done = await post('/api/v1/access/users', { email: u.email, role: v }, t('Role updated'));
               if (!done) renderTable(data);
-            }, { 'aria-label': t('Role for {email}', { email: u.email }), style: { minWidth: '108px' } });
+            }, { 'aria-label': t('Role for {email}', { email: u.email }), style: { minWidth: '112px' } });
+            sel.classList.add('access-role');
+            return sel;
           },
         },
         {
-          key: 'source', label: t('Auth / Source'), width: '140px',
+          key: 'source', label: t('Sign-in'), width: '170px',
           render: (u) => {
             let main;
             if (u.source === 'builtin') {
-              main = badge(u.defaultPassword ? t('Initial password (Secret Manager)') : t('Built-in Admin'), u.defaultPassword ? 'warning' : 'accent', { size: 'sm' });
+              main = badge(u.defaultPassword ? t('Initial password') : t('Built-in Admin'), u.defaultPassword ? 'warning' : 'neutral', { size: 'sm', dot: Boolean(u.defaultPassword), title: u.defaultPassword ? t('ID / Password login (initial password in Secret Manager)') : null });
             } else if (u.hasPassword) {
-              main = badge(t('ID / Password'), 'success', { size: 'sm' });
+              main = badge(t('ID / Password'), 'neutral', { size: 'sm' });
+            } else if (u.pattern) {
+              main = badge(t('Google'), 'info', { size: 'sm' });
             } else {
               main = u.source === 'config'
                 ? badge(t('Deployment config'), 'neutral', { size: 'sm', title: t('Defined in config.yaml or environment variables') })
-                : badge(t('Google OAuth'), 'info', { size: 'sm' });
+                : badge(t('Google'), 'info', { size: 'sm' });
             }
             const gate = iapBadge(u);
-            return gate ? h('div', { class: 'stack-sm', style: { justifyItems: 'start' } }, main, gate) : main;
+            return gate ? h('div', { class: 'row wrap', style: { gap: '4px' } }, main, gate) : main;
           },
         },
         {
-          key: 'lastLogin', label: t('Last sign-in'), width: '130px',
+          key: 'lastLogin', label: t('Last sign-in'), width: '150px',
           render: (u) => (u.pattern ? h('span', { class: 'text-muted' }, DASH) : (u.lastLogin ? fmt.dateTime(u.lastLogin) : h('span', { class: 'text-muted' }, t('Never')))),
         },
         {
-          key: 'actions', label: '', actions: true, sortable: false, width: '185px', align: 'right',
-          render: (u) => {
-            if (!editable) return null;
-            const btns = [];
-            if (!u.pattern) {
-              const pwBtn = button({
-                label: u.hasPassword ? t('Change password') : t('Set password'),
-                size: 'sm',
-                variant: u.defaultPassword ? 'primary' : 'secondary',
-                icon: 'lock',
-              });
-              pwBtn.addEventListener('click', () => openPasswordModal(u, (updated) => apply(updated)));
-              btns.push(pwBtn);
-            }
-            if (u.canRemove) {
-              const delBtn = button({ label: t('Remove'), size: 'sm', variant: 'ghost', icon: 'trash' });
-              delBtn.addEventListener('click', async () => {
-                const ok = await confirmDialog({ title: t('Remove access'), message: u.pattern ? t('Accounts in {domain} will no longer be able to sign in unless they are approved individually.', { domain: u.email.slice(2) }) : t('{email} will be signed out immediately and will no longer be able to sign in.', { email: u.email }), confirmLabel: t('Remove'), tone: 'danger' });
-                if (ok) post('/api/v1/access/users/delete', { email: u.email }, t('Access removed'), delBtn);
-              });
-              btns.push(delBtn);
-            }
-            return btns.length ? h('div', { class: 'row', style: { justifyContent: 'flex-end', gap: '6px' } }, btns) : null;
-          },
+          key: 'actions', label: '', actions: true, sortable: false, width: '120px', align: 'right',
+          render: (u) => (editable ? rowMenu(u, data) : null),
         },
       ],
     }));
@@ -2349,7 +2410,7 @@ export function accessMembers(ctx = {}, editable = true) {
     }
   };
   load();
-  return c;
+  return root;
 }
 
 export function openAccessDrawer({ onChanged } = {}) {
@@ -2357,10 +2418,10 @@ export function openAccessDrawer({ onChanged } = {}) {
   const controller = new AbortController();
   const block = accessMembers({ signal: controller.signal, inDrawer: true, rerender: () => { if (onChanged) onChanged(); } }, isAdmin());
   const d = openDrawer({
-    title: t('Accounts & passwords'),
+    title: t('Add account'),
     subtitle: t('Create ID/Password accounts, change passwords (including admin), or pre-register Google accounts.'),
     content: block,
-    width: 920,
+    width: 880,
   });
   d.dialog.addEventListener('close', () => {
     controller.abort();

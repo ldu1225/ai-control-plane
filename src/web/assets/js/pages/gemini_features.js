@@ -17,13 +17,13 @@
 import { h, mount, append, downloadText, toCsv } from '../core/dom.js';
 import { icon } from '../core/icons.js';
 import { t } from '../core/i18n.js';
-import { fmt, DASH } from '../core/format.js';
+import { fmt } from '../core/format.js';
 import { api, isAbort } from '../core/api.js';
 import { isAdmin } from '../core/state.js';
 import { errorText } from '../core/messages.js';
 import {
-  card, kpi, badge, button, setBusy, chip, searchBox, selectInput, segmented, emptyState, errorState, banner,
-  openModal, openPopover, menuItem, toast, warningsNotice,
+  card, kpi, badge, button, setBusy, searchBox, selectInput, segmented, emptyState, errorState, banner,
+  openModal, openPopover, menuItem, toast, warningsNotice, infoTip,
 } from '../core/components.js';
 import { pageSkeleton, fetchRange } from './_shared.js';
 
@@ -384,59 +384,43 @@ export default async function render(ctx, header) {
   }
   const initialSection = ctx.params[1] === 'models' ? 'models' : 'features';
   const model = createModel(data, initialSection);
+  const scannedProjects = Array.isArray(data.projects) && data.projects.length
+    ? data.projects
+    : [...new Set(model.apps.map((a) => a.project))];
+  const appProjectSet = new Set(model.apps.map((a) => a.project));
+  model.scope = {
+    scanned: scannedProjects,
+    empty: scannedProjects.filter((p) => !appProjectSet.has(p)),
+    locations: data.locations || [],
+    source: model.liveCatalogCount
+      ? `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'}) \u00b7 widgetConfigs (v1alpha ADMIN)`
+      : `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'})`,
+  };
   const view = {
     kpis: h('div', { class: 'kpi-grid' }),
-    switchHost: h('div', { class: 'row wrap' }),
+    switchHost: h('div', { class: 'fm-head-left' }),
+    actionsHost: h('div', { class: 'fm-head-right' }),
     toolbarHost: h('div'),
-    legendHost: h('div'),
+    legendHost: h('div', { class: 'fm-legend' }),
     matrix: h('div'),
-    bar: h('div', { class: 'fm-actionbar', hidden: true }),
-    actionsHost: h('div', { class: 'row wrap' }),
+    bar: h('div', { class: 'fm-actionbar', hidden: true, role: 'region', 'aria-label': t('Pending changes') }),
   };
   const refresh = () => paint(ctx, model, view);
 
   body.append(view.kpis);
   if (!isAdmin()) {
     body.append(banner({
-      tone: 'info',
+      tone: 'neutral',
       iconName: 'lock',
       title: t('Read-only view'),
       text: t('Administrators can change features and model selection for many apps at once.'),
     }));
   }
-
-  const scannedProjects = Array.isArray(data.projects) && data.projects.length
-    ? data.projects
-    : [...new Set(model.apps.map((a) => a.project))];
-  const appProjectSet = new Set(model.apps.map((a) => a.project));
-  const emptyProjects = scannedProjects.filter((p) => !appProjectSet.has(p));
-  const locationsText = (data.locations || []).join(', ') || DASH;
-  const cardSubtitle = emptyProjects.length
-    ? t('{apps} apps \u00b7 {active}/{total} projects with apps \u00b7 Locations: {locations} \u00b7 No GE apps in {empty}', {
-      apps: fmt.int(model.apps.length),
-      active: fmt.int(appProjectSet.size),
-      total: fmt.int(scannedProjects.length),
-      locations: locationsText,
-      empty: emptyProjects.join(', '),
-    })
-    : t('{apps} apps \u00b7 {projects} projects \u00b7 Locations: {locations}', {
-      apps: fmt.int(model.apps.length),
-      projects: fmt.int(appProjectSet.size),
-      locations: locationsText,
-    });
-
   body.append(card({
-    title: t('App features and model selection'),
-    subtitle: cardSubtitle,
-    actions: view.actionsHost,
     flush: true,
-    source: model.liveCatalogCount
-      ? `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'}) · widgetConfigs (v1alpha ADMIN)`
-      : `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'})`,
     body: h('div', null,
-      h('div', { class: 'fm-section-bar' }, view.switchHost),
+      h('div', { class: 'fm-head' }, view.switchHost, view.actionsHost),
       view.toolbarHost,
-      view.legendHost,
       view.matrix,
       view.bar),
   }));
@@ -452,8 +436,9 @@ export default async function render(ctx, header) {
 function paintSectionBar(ctx, model, view, repaint) {
   const fPending = pendingCountOf(model.pending);
   const mPending = pendingCountOf(model.pendingModels);
-  const fLabel = fPending ? `${t('Feature switches')} (${fmt.int(fPending)})` : t('Feature switches');
-  const mLabel = mPending ? `${t('Model selection')} (${fmt.int(mPending)})` : t('Model selection');
+  const fLabel = fPending ? `${t('Feature switches')} \u00b7 ${fmt.int(fPending)}` : t('Feature switches');
+  const mLabel = mPending ? `${t('Model selection')} \u00b7 ${fmt.int(mPending)}` : t('Model selection');
+  const isModels = model.section === 'models';
 
   mount(view.switchHost,
     segmented([
@@ -463,22 +448,21 @@ function paintSectionBar(ctx, model, view, repaint) {
       model.section = v;
       repaint();
     }, { label: t('Configuration section') }),
-    model.section === 'models' && model.liveCatalogCount
-      ? badge(t('{n} Gemini Enterprise models synced', { n: fmt.int(model.liveCatalogCount) }), 'info', {
-        size: 'sm',
-        dot: true,
-        title: t('Synced live from Discovery Engine WidgetConfig (modelInfoView=ADMIN).'),
-      })
+    isModels && model.liveCatalogCount
+      ? h('span', { class: 'fm-synced', title: t('Synced live from Discovery Engine WidgetConfig (modelInfoView=ADMIN).') },
+        h('span', { class: 'dot dot-success', 'aria-hidden': 'true' }),
+        t('{n} Gemini Enterprise models synced', { n: fmt.int(model.liveCatalogCount) }))
       : null);
 
   mount(view.actionsHost,
-    button({ label: t('Export CSV'), icon: 'download', size: 'sm', onClick: () => exportCsv(model) }),
+    button({ label: t('Export CSV'), icon: 'download', size: 'sm', variant: 'ghost', onClick: () => exportCsv(model) }),
     h('a', {
-      class: 'btn btn-secondary btn-sm',
-      href: model.section === 'models' ? MODEL_DOCS : DOCS,
+      class: 'btn btn-ghost btn-sm',
+      href: isModels ? MODEL_DOCS : DOCS,
       target: '_blank',
       rel: 'noopener noreferrer',
-    }, model.section === 'models' ? t('Model guide') : t('API reference'), ' ', icon('external', { size: 12 })));
+    }, isModels ? t('Model guide') : t('API reference'), icon('external', { size: 12 })),
+    infoTip(`${t('Data source')}: ${model.scope.source}`));
 }
 
 function paintToolbar(model, view, refresh) {
@@ -488,45 +472,16 @@ function paintToolbar(model, view, refresh) {
   const isModels = model.section === 'models';
   const groups = isModels ? MODEL_GROUPS : GROUPS;
 
-  const groupChips = h('div', {
-    class: 'row wrap fm-chips',
-    role: 'group',
-    'aria-label': isModels ? t('Model category') : t('Feature category'),
-  });
-  const renderChips = () => {
-    const activeGroup = isModels ? f.modelGroup : f.group;
-    mount(groupChips, [['all', 'All']].concat(groups).map(([id, label]) => chip(t(label), {
-      pressed: activeGroup === id,
-      onClick: () => {
-        if (isModels) f.modelGroup = id; else f.group = id;
-        renderChips();
-        refresh();
-      },
-    })));
-  };
-  renderChips();
-
-  const toggles = h('div', { class: 'row' });
-  const renderToggles = () => mount(toggles,
-    chip(t('Mixed only'), {
-      pressed: isModels ? f.modelMixedOnly : f.mixedOnly,
-      title: isModels ? t('Models whose state differs between the shown apps') : t('Features whose state differs between the shown apps'),
-      onClick: () => {
-        if (isModels) f.modelMixedOnly = !f.modelMixedOnly; else f.mixedOnly = !f.mixedOnly;
-        renderToggles();
-        refresh();
-      },
-    }),
-    chip(t('Explicit only'), {
-      pressed: isModels ? f.modelExplicitOnly : f.explicitOnly,
-      title: isModels ? t('Models that at least one shown app overrides explicitly') : t('Features that at least one shown app sets explicitly'),
-      onClick: () => {
-        if (isModels) f.modelExplicitOnly = !f.modelExplicitOnly; else f.explicitOnly = !f.explicitOnly;
-        renderToggles();
-        refresh();
-      },
-    }));
-  renderToggles();
+  const category = selectInput(
+    [{ value: 'all', label: isModels ? t('All models') : t('All categories') }]
+      .concat(groups.map(([id, label]) => ({ value: id, label: t(label) }))),
+    isModels ? f.modelGroup : f.group,
+    (v) => {
+      if (isModels) f.modelGroup = v; else f.group = v;
+      refresh();
+    },
+    { 'aria-label': isModels ? t('Model category') : t('Feature category') },
+  );
 
   const projects = [...new Set(model.apps.map((a) => a.project))];
   const projectPick = projects.length > 1
@@ -534,40 +489,56 @@ function paintToolbar(model, view, refresh) {
       (v) => { f.project = v; refresh(); }, { 'aria-label': t('Project') })
     : null;
 
-  mount(view.toolbarHost, h('div', { class: 'fm-toolbar' },
-    h('div', { class: 'table-toolbar' },
-      h('div', { class: 'left' },
-        searchBox({
-          value: isModels ? f.modelQuery : f.query,
-          placeholder: isModels ? t('Search models') : t('Search features'),
-          onInput: (v) => {
-            if (isModels) f.modelQuery = v; else f.query = v;
-            refresh();
-          },
-        }),
-        projectPick,
-        toggles),
-      h('div', { class: 'right' })),
-    h('div', { class: 'fm-chip-row' }, groupChips)));
+  // One "show" control instead of two independent toggles: everything, rows that differ between apps, or overrides.
+  const mixed = isModels ? f.modelMixedOnly : f.mixedOnly;
+  const explicit = isModels ? f.modelExplicitOnly : f.explicitOnly;
+  const show = segmented([
+    { value: 'all', label: t('All') },
+    { value: 'mixed', label: t('Differs by app'), title: isModels ? t('Models whose state differs between the shown apps') : t('Features whose state differs between the shown apps') },
+    { value: 'explicit', label: t('Overridden'), title: isModels ? t('Models that at least one shown app overrides explicitly') : t('Features that at least one shown app sets explicitly') },
+  ], mixed ? 'mixed' : (explicit ? 'explicit' : 'all'), (v) => {
+    if (isModels) { f.modelMixedOnly = v === 'mixed'; f.modelExplicitOnly = v === 'explicit'; } else { f.mixedOnly = v === 'mixed'; f.explicitOnly = v === 'explicit'; }
+    refresh();
+  }, { label: t('Show') });
+
+  mount(view.toolbarHost, h('div', { class: 'fm-filters' },
+    searchBox({
+      value: isModels ? f.modelQuery : f.query,
+      placeholder: isModels ? t('Search models') : t('Search features'),
+      onInput: (v) => {
+        if (isModels) f.modelQuery = v; else f.query = v;
+        refresh();
+      },
+    }),
+    category,
+    projectPick,
+    show,
+    h('span', { class: 'fm-filters-spacer' }),
+    view.legendHost));
 }
 
 function paintLegend(model, el) {
   const isModels = model.section === 'models';
   const labels = isModels ? MODEL_STATE_LABELS : STATE_LABELS;
-  mount(el, h('div', { class: 'fm-legend' },
-    STATES.map((s) => h('span', { class: 'fm-legend-item' }, stateGlyph(s), t(labels[s]))),
-    h('span', { class: 'fm-legend-item' }, h('span', { class: 'fm-glyph pending' }, icon('edit', { size: 11 })), t('Pending change')),
-    isModels
-      ? h('span', { class: 'fm-legend-item' }, h('span', { class: 'fm-live-dot', 'aria-hidden': 'true' }), t('Active in web app'))
-      : null,
-    h('span', { class: 'fm-legend-note' },
-      isModels
-        ? t('Default: Google applies the product default for the app region. Third-party models require PAYG overage and one-time Terms of Service acceptance in Cloud Console.')
-        : t('Default: the switch is not set and the product default applies. Restriction: On blocks the capability.'))));
+  const item = (mark, text) => h('span', { class: 'fm-legend-item' }, mark, text);
+  mount(el,
+    item(stateMark('on'), t(labels.on)),
+    item(stateMark('off'), t(labels.off)),
+    isModels ? item(stateMark('default', { impliedOn: true }), t('Default on')) : null,
+    item(stateMark('default'), t(labels.default)),
+    isModels ? item(h('span', { class: 'fm-live-dot', 'aria-hidden': 'true' }), t('Active in web app')) : null,
+    infoTip(isModels
+      ? t('Default: Google applies the product default for the app region. Third-party models require PAYG overage and one-time Terms of Service acceptance in Cloud Console.')
+      : t('Default: the switch is not set and the product default applies. Restriction: On blocks the capability.')));
 }
 
-function stateGlyph(state) {
-  return h('span', { class: ['fm-glyph', state] }, icon(STATE_ICONS[state], { size: 11 }));
+/** State mark: explicit settings are solid, product defaults are dashed (green check when the default is on). */
+function stateMark(state, { impliedOn = false, small = false } = {}) {
+  const glyph = state === 'default' ? (impliedOn ? 'check' : 'minus') : STATE_ICONS[state];
+  return h('span', {
+    class: ['fm-mark', state, state === 'default' && impliedOn ? 'implied-on' : '', small ? 'sm' : ''],
+    'aria-hidden': 'true',
+  }, icon(glyph, { size: small ? 10 : 12, strokeWidth: 2.6 }));
 }
 
 function paintKpis(model, el) {
@@ -576,21 +547,27 @@ function paintKpis(model, el) {
   const totalPend = totalPendingCount(model);
   const totalPendApps = totalPendingApps(model);
   const activeProjCount = new Set(apps.map((a) => a.project)).size;
-  const scannedProjCount = Array.isArray(model.data.projects) ? model.data.projects.length : activeProjCount;
+  const scannedProjCount = model.scope.scanned.length || activeProjCount;
   const projMeta = model.filter.project === 'all' && scannedProjCount > activeProjCount
-    ? t('{active} of {total} scanned projects', { active: fmt.int(activeProjCount), total: fmt.int(scannedProjCount) })
+    ? t('{active}/{total} projects', { active: fmt.int(activeProjCount), total: fmt.int(scannedProjCount) })
     : t('{n} projects', { n: fmt.int(activeProjCount) });
+  const appsTip = [
+    t('Apps in the selected projects and configured locations.'),
+    model.scope.locations.length ? t('Locations: {locations}', { locations: model.scope.locations.join(', ') }) : null,
+    model.scope.empty.length ? t('No Gemini Enterprise apps: {projects}', { projects: model.scope.empty.join(', ') }) : null,
+  ].filter(Boolean).join(' ');
+  const pendingKpi = kpi({
+    label: t('Pending changes'),
+    value: fmt.int(totalPend),
+    meta: totalPendApps ? t('{n} apps', { n: fmt.int(totalPendApps) }) : null,
+    tip: t('Staged feature and model changes that are not applied yet.'),
+  });
   if (isModels) {
     const explicitModels = apps.reduce((n, a) => n + Object.keys(a.models || {}).length, 0);
     const mixedModels = model.modelRows.filter((r) => isMixed(distribution(model, apps, r.key, 'models'))).length;
     const selectorOff = apps.filter((a) => selectorDisabled(model, a)).length;
     mount(el,
-      kpi({
-        label: t('Gemini Enterprise apps'),
-        value: fmt.int(apps.length),
-        meta: projMeta,
-        tip: t('Apps in the selected projects and configured locations.'),
-      }),
+      kpi({ label: t('Gemini Enterprise apps'), value: fmt.int(apps.length), meta: projMeta, tip: appsTip }),
       kpi({
         label: t('Explicit model overrides'),
         value: fmt.int(explicitModels),
@@ -600,15 +577,10 @@ function paintKpis(model, el) {
       kpi({
         label: t('Mixed models'),
         value: fmt.int(mixedModels),
-        meta: selectorOff ? t('{n} apps have model selector off', { n: fmt.int(selectorOff) }) : t('Same state in every app when 0'),
+        meta: selectorOff ? t('{n} apps have model selector off', { n: fmt.int(selectorOff) }) : null,
         tip: t('Models whose override state differs between the shown apps.'),
       }),
-      kpi({
-        label: t('Pending changes'),
-        value: fmt.int(totalPend),
-        meta: t('{n} apps', { n: fmt.int(totalPendApps) }),
-        tip: t('Staged feature and model changes that are not applied yet.'),
-      }));
+      pendingKpi);
     return;
   }
 
@@ -616,10 +588,10 @@ function paintKpis(model, el) {
   const mixed = model.rows.filter((r) => isMixed(distribution(model, apps, r.key, 'features'))).length;
   const masters = apps.filter((a) => masterSet(model, a)).length;
   mount(el,
-    kpi({ label: t('Gemini Enterprise apps'), value: fmt.int(apps.length), meta: projMeta, tip: t('Apps in the selected projects and configured locations.') }),
+    kpi({ label: t('Gemini Enterprise apps'), value: fmt.int(apps.length), meta: projMeta, tip: appsTip }),
     kpi({ label: t('Explicit switches'), value: fmt.int(explicit), meta: t('{n} features documented', { n: fmt.int(FEATURES.length) }), tip: t('Switches set to On or Off. Unset switches follow the product default.') }),
-    kpi({ label: t('Mixed features'), value: fmt.int(mixed), meta: masters ? t('{n} apps use the master switch', { n: fmt.int(masters) }) : t('Same state in every app when 0'), tip: t('Features whose state differs between the shown apps.') }),
-    kpi({ label: t('Pending changes'), value: fmt.int(totalPend), meta: t('{n} apps', { n: fmt.int(totalPendApps) }), tip: t('Staged feature and model changes that are not applied yet.') }));
+    kpi({ label: t('Mixed features'), value: fmt.int(mixed), meta: masters ? t('{n} apps use the master switch', { n: fmt.int(masters) }) : null, tip: t('Features whose state differs between the shown apps.') }),
+    pendingKpi);
 }
 
 /* ------------------------------------------------------------------ matrix */
@@ -662,7 +634,7 @@ function paint(ctx, model, view) {
       bodyRows.push(matrixRow(model, row, apps, admin, repaint));
     });
     mount(view.matrix, h('div', { class: 'fm-wrap' },
-      h('table', { class: 'fm-table' },
+      h('table', { class: 'fm-table fm-matrix' },
         h('caption', { class: 'visually-hidden' }, isModels ? t('Gemini Enterprise app model selection matrix') : t('Gemini Enterprise app feature switch matrix')),
         h('thead', null, head),
         h('tbody', null, bodyRows))));
@@ -681,7 +653,7 @@ function appHeader(model, app, apps, admin, repaint) {
   const allSectionRows = isModels ? model.modelRows : model.rows;
 
   const menu = admin ? h('button', {
-    type: 'button', class: 'icon-btn fm-col-menu', title: t('App actions'), 'aria-label': t('App actions'), 'aria-haspopup': 'menu',
+    type: 'button', class: 'icon-btn fm-col-menu', title: t('App actions'), 'aria-label': `${t('App actions')}: ${app.displayName}`, 'aria-haspopup': 'menu',
     onclick: (e) => openPopover(e.currentTarget, (close) => h('div', { role: 'menu' },
       menuItem({
         label: t('Use as baseline for all shown apps'),
@@ -702,16 +674,22 @@ function appHeader(model, app, apps, admin, repaint) {
       }) : null)),
   }, icon('more', { size: 15 })) : null;
 
+  const where = `${app.project} \u00b7 ${app.location}`;
+  const flags = [
+    master ? h('span', { class: 'fm-tag warn', title: t('While the master switch is set, the other switches of this app are ignored.') }, t('Master switch {state}', { state: t(STATE_LABELS[effective(model, app, '*', 'features')]) })) : null,
+    selOff ? h('span', { class: 'fm-tag warn', title: t('End users cannot pick models while the model-selector feature switch is Off.') }, t('Model selector off')) : null,
+    totalAppPend ? h('span', { class: 'fm-tag info' }, t('{n} pending', { n: totalAppPend })) : null,
+  ].filter(Boolean);
   return h('th', { class: ['fm-app-col', totalAppPend ? 'has-pending' : ''], scope: 'col' },
     h('div', { class: 'fm-app' },
-      h('div', { class: 'fm-app-top' },
-        h('span', { class: 'fm-app-name', title: app.displayName }, app.displayName),
-        menu),
-      h('span', { class: 'fm-app-id', title: app.engineId }, app.engineId),
-      h('span', { class: 'fm-app-meta' }, h('span', { class: 'fm-pill', title: app.project }, app.project), h('span', { class: 'fm-pill' }, app.location)),
-      master ? badge(t('Master switch {state}', { state: t(STATE_LABELS[effective(model, app, '*', 'features')]) }), 'warning', { size: 'sm', dot: true, title: t('While the master switch is set, the other switches of this app are ignored.') }) : null,
-      selOff ? badge(t('Model selector off'), 'warning', { size: 'sm', dot: true, title: t('End users cannot pick models while the model-selector feature switch is Off.') }) : null,
-      totalAppPend ? badge(t('{n} pending', { n: totalAppPend }), 'accent', { size: 'sm' }) : null));
+      h('span', { class: 'fm-app-name', title: `${app.displayName} (${app.engineId})` }, app.displayName),
+      h('span', { class: 'fm-app-sub', title: where }, where),
+      flags.length ? h('span', { class: 'fm-app-flags' }, flags) : null,
+      menu));
+}
+
+function fmTag(text, tone, tip) {
+  return h('span', { class: ['fm-tag', tone || ''], title: tip || null }, text);
 }
 
 function matrixRow(model, row, apps, admin, repaint) {
@@ -730,7 +708,7 @@ function matrixRow(model, row, apps, admin, repaint) {
     }));
   const rowActions = isModels ? MODEL_ROW_ACTIONS : ROW_ACTIONS;
   const rowMenu = admin ? h('button', {
-    type: 'button', class: 'icon-btn fm-row-menu', title: t('Set for all shown apps'), 'aria-label': t('Set for all shown apps'), 'aria-haspopup': 'menu',
+    type: 'button', class: 'icon-btn fm-row-menu', title: t('Set for all shown apps'), 'aria-label': `${t('Set for all shown apps')}: ${row.label}`, 'aria-haspopup': 'menu',
     onclick: (e) => openPopover(e.currentTarget, (close) => h('div', { role: 'menu' },
       STATES.map((s) => menuItem({
         label: t(rowActions[s]),
@@ -742,36 +720,44 @@ function matrixRow(model, row, apps, admin, repaint) {
         iconName: 'refresh',
         onClick: () => { close(); apps.forEach((a) => stage(model, a, row.key, original(a, row.key, model.section))); repaint(); },
       }) : null), { align: 'start' }),
-  }, icon('sliders', { size: 14 })) : null;
+  }, icon('more', { size: 15 })) : null;
 
-  const badges = [];
+  const tags = [];
   if (isModels) {
-    if (row.preview) badges.push(badge(t('Preview'), 'neutral', { size: 'sm' }));
     if (row.lockedOn) {
-      badges.push(badge(t('Always on'), 'success', { size: 'sm', title: t('Always on by default in Gemini Enterprise (cannot be turned off).') }));
-    } else if (row.defaultOn) {
-      badges.push(badge(t('Default on'), 'neutral', { size: 'sm', title: t('Turned on by default when no explicit override is set.') }));
+      tags.push(h('span', {
+        class: 'fm-lock', tabindex: 0, role: 'img',
+        'data-tip': t('Always on by default in Gemini Enterprise (cannot be turned off).'), 'aria-label': t('Always on'),
+      }, icon('lock', { size: 12 })));
     }
-    if (row.partner) badges.push(badge(t('3P · PAYG'), 'accent', { size: 'sm', title: t('Requires pay-as-you-go usage above quota and one-time Terms of Service acceptance in Google Cloud Console.') }));
-    if (row.globalOnly) badges.push(badge(t('Global'), 'neutral', { size: 'sm', title: t('Available in the global region only; regional apps display a warning before routing to global.') }));
-    if (row.legacy) badges.push(badge(t('Legacy override'), 'neutral', { size: 'sm', title: t('Previously set in Engine.modelConfigs on an app, not listed in the current Gemini Enterprise model registry.') }));
+    if (row.preview) tags.push(fmTag(t('Preview')));
+    if (row.partner) tags.push(fmTag(t('3P · PAYG'), 'violet', t('Requires pay-as-you-go usage above quota and one-time Terms of Service acceptance in Google Cloud Console.')));
+    if (row.globalOnly) tags.push(fmTag(t('Global'), '', t('Available in the global region only; regional apps display a warning before routing to global.')));
+    if (row.legacy) tags.push(fmTag(t('Legacy override'), '', t('Previously set in Engine.modelConfigs on an app, not listed in the current Gemini Enterprise model registry.')));
   } else {
-    if (row.restriction) badges.push(badge(t('Restriction'), 'neutral', { size: 'sm', title: t('On blocks this capability.') }));
-    if (row.key === '*') badges.push(badge(t('Overrides all'), 'warning', { size: 'sm', title: t('While it is set, every other switch of the app is ignored.') }));
-    if (row.undocumented) badges.push(badge(t('Not in reference'), 'neutral', { size: 'sm', title: t('Set on an app but not listed in the API reference.') }));
+    if (row.restriction) tags.push(fmTag(t('Restriction'), '', t('On blocks this capability.')));
+    if (row.key === '*') tags.push(fmTag(t('Overrides all'), 'warn', t('While it is set, every other switch of the app is ignored.')));
+    if (row.undocumented) tags.push(fmTag(t('Not in reference'), '', t('Set on an app but not listed in the API reference.')));
   }
 
   return h('tr', { class: ['fm-row', isMixed(d) ? 'mixed' : ''] },
     h('th', { class: 'fm-feature-col', scope: 'row' },
       h('div', { class: 'fm-feature' },
         h('div', { class: 'fm-feature-text' },
-          h('span', { class: 'fm-feature-name', title: row.description || '' }, row.label, ...badges),
+          h('span', { class: 'fm-feature-name', title: row.description || null }, row.label, ...tags),
           h('span', { class: 'fm-feature-key' }, row.key)),
         rowMenu)),
     h('td', { class: 'fm-dist-col' }, h('div', { class: 'fm-dist' }, bar,
-      h('span', { class: 'fm-dist-text', title: distText, 'aria-hidden': 'true' }, `${d.on}\u00b7${d.off}\u00b7${d.default}`),
-      isMixed(d) ? badge(t('Mixed'), 'warning', { size: 'sm' }) : null)),
+      isMixed(d) ? h('span', { class: 'fm-mixed' }, t('Mixed')) : null)),
     apps.map((app) => cell(model, row, app, admin, repaint)));
+}
+
+/** Label of a state as shown to people; model defaults say whether the default is on or off. */
+function stateLabel(model, row, state) {
+  const isModels = model.section === 'models';
+  const labels = isModels ? MODEL_STATE_LABELS : STATE_LABELS;
+  if (!isModels || state !== 'default' || row.legacy) return t(labels[state]);
+  return row.defaultOn || row.lockedOn ? t('Default (on)') : t('Default (off)');
 }
 
 function cell(model, row, app, admin, repaint) {
@@ -782,46 +768,46 @@ function cell(model, row, app, admin, repaint) {
   const ignored = !isModels && row.key !== '*' && masterSet(model, app);
   const resolved = isModels && isResolved(app, row.key);
   const outOfRegion = isModels && Array.isArray(row.regions) && row.regions.length > 0 && !row.regions.includes(app.location);
+  const impliedOn = isModels && state === 'default' && Boolean(row.defaultOn || row.lockedOn);
   const from = original(app, row.key, model.section);
   const title = pending
-    ? t('{feature} in {app}: {from} \u2192 {to} (pending)', { feature: row.label, app: app.displayName, from: t(labels[from]), to: t(labels[state]) })
+    ? t('{feature} in {app}: {from} \u2192 {to} (pending)', { feature: row.label, app: app.displayName, from: stateLabel(model, row, from), to: stateLabel(model, row, state) })
     : (resolved
-      ? t('{feature} in {app}: {state} (active in web app)', { feature: row.label, app: app.displayName, state: t(labels[state]) })
-      : t('{feature} in {app}: {state}', { feature: row.label, app: app.displayName, state: t(labels[state]) }));
+      ? t('{feature} in {app}: {state} (active in web app)', { feature: row.label, app: app.displayName, state: stateLabel(model, row, state) })
+      : t('{feature} in {app}: {state}', { feature: row.label, app: app.displayName, state: stateLabel(model, row, state) }));
 
   const content = [
-    stateGlyph(state),
-    h('span', { class: 'fm-cell-text' }, t(labels[state])),
-    resolved ? h('span', { class: 'fm-live-dot', title: t('Active in web app model selector'), 'aria-hidden': 'true' }) : null,
+    stateMark(state, { impliedOn }),
+    resolved ? h('span', { class: 'fm-live-dot', 'aria-hidden': 'true' }) : null,
     pending ? h('span', { class: 'fm-cell-dot', 'aria-hidden': 'true' }) : null,
   ];
   const cls = ['fm-cell', state, pending ? 'pending' : '', ignored ? 'ignored' : ''];
-  if (!admin) return h('td', { class: 'fm-cell-td' }, h('span', { class: cls, title }, content));
+  if (!admin) return h('td', { class: 'fm-cell-td' }, h('span', { class: cls, title, role: 'img', 'aria-label': title }, content));
   const btn = h('button', {
-    type: 'button', class: cls, title, 'aria-haspopup': 'menu',
+    type: 'button', class: cls, title, 'aria-label': title, 'aria-haspopup': 'menu',
     onclick: (e) => openPopover(e.currentTarget, (close) => h('div', { role: 'menu' },
       h('div', { class: 'fm-pop-head' },
         h('div', { class: 'fm-pop-title' }, row.label),
-        h('div', { class: 'fm-pop-sub' }, `${app.displayName} \u00b7 ${row.key}`)),
+        h('div', { class: 'fm-pop-sub' }, `${app.displayName} \u00b7 ${app.location}`)),
       STATES.map((s) => menuItem({
-        label: t(labels[s]),
-        desc: s === from
-          ? t('Current value')
-          : (s === 'default'
-            ? (isModels ? t('Remove the override; the product default applies') : t('Remove the switch; the product default applies'))
-            : null),
+        label: s === 'default' ? stateLabel(model, row, s) : t(labels[s]),
+        desc: s === from ? t('Current value') : null,
         iconName: STATE_ICONS[s],
         checked: s === state,
         onClick: () => { close(); stage(model, app, row.key, s); repaint(); },
       })),
       resolved ? h('div', { class: 'fm-pop-info' }, t('Currently available in the web app model selector.')) : null,
-      isModels && row.lockedOn ? h('div', { class: 'fm-pop-note' }, t('Always on by default in Gemini Enterprise (cannot be turned off).')) : null,
-      outOfRegion ? h('div', { class: 'fm-pop-note' }, t('Supported natively in: {regions}. Enabling in {loc} may route traffic to global.', { regions: row.regions.join(', '), loc: app.location })) : null,
-      isModels && row.partner ? h('div', { class: 'fm-pop-note' }, t('Third-party models require PAYG overage and one-time Terms of Service acceptance in Google Cloud Console.')) : null,
-      isModels && selectorDisabled(model, app) ? h('div', { class: 'fm-pop-note' }, t('The model-selector feature switch is Off for this app.')) : null,
-      ignored ? h('div', { class: 'fm-pop-note' }, t('Ignored while the master switch of this app is set.')) : null)),
+      isModels && row.lockedOn ? popNote(t('Always on by default in Gemini Enterprise (cannot be turned off).')) : null,
+      outOfRegion ? popNote(t('Supported natively in: {regions}. Enabling in {loc} may route traffic to global.', { regions: row.regions.join(', '), loc: app.location })) : null,
+      isModels && row.partner ? popNote(t('Third-party models require PAYG overage and one-time Terms of Service acceptance in Google Cloud Console.')) : null,
+      isModels && selectorDisabled(model, app) ? popNote(t('The model-selector feature switch is Off for this app.')) : null,
+      ignored ? popNote(t('Ignored while the master switch of this app is set.')) : null)),
   }, content);
   return h('td', { class: 'fm-cell-td' }, btn);
+}
+
+function popNote(text) {
+  return h('div', { class: 'fm-pop-note' }, icon('alert-triangle', { size: 12 }), h('span', null, text));
 }
 
 function copyBaseline(model, source, apps, sectionRows) {
@@ -845,12 +831,11 @@ function paintActionBar(ctx, model, view, repaint) {
     ? ` (${t('{f} features · {m} models', { f: fmt.int(fCount), m: fmt.int(mCount) })})`
     : '';
   mount(view.bar,
-    h('div', { class: 'fm-actionbar-text' }, icon('edit', { size: 15 }),
-      h('span', null, t('{n} changes in {apps} apps are staged', { n: fmt.int(n), apps: fmt.int(appCount) }) + detail),
-      tooMany ? badge(t('At most {n} apps per apply', { n: MAX_APPS_PER_APPLY }), 'danger', { size: 'sm' }) : null),
-    h('div', { class: 'row' },
-      button({ label: t('Discard all'), onClick: () => { model.pending.clear(); model.pendingModels.clear(); repaint(); } }),
-      button({ label: t('Review and apply'), icon: 'check', variant: 'primary', disabled: tooMany, onClick: () => openReview(ctx, model) })));
+    h('span', { class: 'fm-actionbar-count', 'aria-hidden': 'true' }, fmt.int(n)),
+    h('span', { class: 'fm-actionbar-text' }, t('{n} changes in {apps} apps', { n: fmt.int(n), apps: fmt.int(appCount) }) + detail),
+    tooMany ? badge(t('At most {n} apps per apply', { n: MAX_APPS_PER_APPLY }), 'danger', { size: 'sm' }) : null,
+    button({ label: t('Discard'), variant: 'ghost', size: 'sm', onClick: () => { model.pending.clear(); model.pendingModels.clear(); repaint(); } }),
+    button({ label: t('Review and apply'), variant: 'primary', size: 'sm', disabled: tooMany, onClick: () => openReview(ctx, model) }));
 }
 
 function buildChanges(model) {
@@ -877,7 +862,7 @@ function buildChanges(model) {
 
 function stateBadge(state, isModels = false) {
   const labels = isModels ? MODEL_STATE_LABELS : STATE_LABELS;
-  return h('span', { class: ['fm-cell', 'static', state] }, stateGlyph(state), h('span', { class: 'fm-cell-text' }, t(labels[state])));
+  return h('span', { class: 'fm-state' }, stateMark(state, { small: true }), t(labels[state]));
 }
 
 function labelOf(model, key, isModels = false) {

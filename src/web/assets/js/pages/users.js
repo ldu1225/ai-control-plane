@@ -6,15 +6,15 @@ import { t } from '../core/i18n.js';
 import { fmt, isNum, DASH } from '../core/format.js';
 import { isAdmin } from '../core/state.js';
 import {
-  pageHeader, kpi, card, dataTable, chip, badge, banner, button, userCell, selectInput, segmented,
-  progress, emptyState, requireAdmin,
+  pageHeader, kpi, card, dataTable, chip, badge, banner, userCell, selectInput, segmented,
+  progress, emptyState,
 } from '../core/components.js';
 import { proportionBar } from '../core/charts.js';
 import {
   pageFlow, fetchRange, rangeText, surfaceMatrix, surfaceLegend, iamBadge, openUserDrawer, IAM_STATE_COLORS, IAM_STATE_LABELS,
   modelCostCell, costShareCell, filteredCostSummary,
 } from './_shared.js';
-import { accessMembers, openAccessDrawer } from './settings.js';
+import { accessMembers } from './settings.js';
 
 const SURFACES = [
   ['all', 'All surfaces'], ['gemini_enterprise', 'Gemini Enterprise'], ['notebooklm', 'NotebookLM'], ['antigravity', 'Antigravity'], ['agent_platform', 'Agent Platform'],
@@ -26,20 +26,10 @@ const MODEL_SURFACE_LABELS = {
 };
 
 export default async function render(ctx) {
+  // Administrators add accounts from the Accounts card below (its "Add account" button); viewers cannot add any.
   const header = pageHeader({
     title: t('Users & Access'),
     desc: t('One view of every person using Gemini Enterprise, NotebookLM, Antigravity and Agent Platform, with their models, costs and access enforcement state.'),
-    actions: [
-      button({
-        label: t('Add account'),
-        icon: 'plus',
-        variant: 'primary',
-        onClick: () => {
-          if (!requireAdmin(t('Add account / Manage access control'))) return;
-          openAccessDrawer({ onChanged: () => ctx.rerender() });
-        },
-      }),
-    ],
   });
   return pageFlow(ctx, {
     header,
@@ -68,7 +58,7 @@ function renderPage(ctx, body, d) {
     kpi({ label: t('Enforceable coverage'), value: fmt.pct(k.enforceableCoverage), meta: isNum(k.enforceableCoverage) ? progress(k.enforceableCoverage, k.enforceableCoverage >= 0.8 ? 'success' : 'warning') : null, tip: t('Share of users whose access can be safely controlled through individual project bindings.') })));
 
   if (isAdmin()) {
-    body.append(accessMembers(ctx, true));
+    body.append(accessMembers({ signal: ctx.signal, rerender: ctx.rerender, hideMethods: true }, true));
   }
 
   if (d.iamAvailable === false) {

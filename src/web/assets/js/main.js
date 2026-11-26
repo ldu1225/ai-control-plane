@@ -126,6 +126,8 @@ async function boot() {
   window.addEventListener('hashchange', route);
   on('range', () => { updateRangeControl(); if (current.route && current.route.range) renderPage(); });
   on('project', () => { renderWorkspaceChip(); });
+  // The filter chip in page headers (components.js) asks the shell to show every connected project again.
+  window.addEventListener('cp:clear-project', () => selectProject('all', connectedProjects(store.boot.workspace || {})));
   document.addEventListener('keydown', onGlobalKey);
   route();
   loadHealth(false);
@@ -148,43 +150,37 @@ function brandMark() {
 function buildShell() {
   app.className = ['app', store.sidebarCollapsed ? 'sidebar-collapsed' : ''].join(' ');
   app.removeAttribute('aria-busy');
-  shell.wsSlot = h('div', { class: 'ws-slot' });
+  shell.wsSlot = h('div', { class: 'sidebar-head' });
   shell.nav = h('nav', { class: 'nav', 'aria-label': t('Primary') });
   shell.sidebar = h('aside', { class: 'sidebar' },
-    h('div', { class: 'sidebar-brand' }, brandMark(),
-      h('div', { class: 'brand-text' }, h('span', { class: 'brand-name' }, productName()), h('span', { class: 'brand-org' }, orgName()))),
     shell.wsSlot,
     shell.nav,
     shell.navFooter = h('div', { class: 'sidebar-footer' }));
   shell.crumbs = h('div', { class: 'crumbs' });
   shell.rangeSlot = h('div', { class: 'row' });
-  shell.updated = h('span', { class: ['updated-at', 'hide-mobile'] });
-  shell.healthBtn = h('button', { type: 'button', class: ['control', 'hide-mobile'], onclick: (e) => openHealth(e.currentTarget), 'aria-label': t('Data source health') },
-    h('span', { class: 'dot' }), h('span', null, t('Data sources')));
+  shell.refreshBtn = iconButton('refresh', { title: t('Refresh data'), onClick: () => renderPage(true) });
+  shell.healthBtn = h('button', {
+    type: 'button', class: ['icon-btn', 'health-btn', 'hide-mobile'], onclick: (e) => openHealth(e.currentTarget),
+    'aria-label': t('Data source health'), 'aria-haspopup': 'dialog', title: t('Data source health'),
+  }, icon('database', { size: 16 }), h('span', { class: 'dot' }));
   shell.modelBtn = h('button', { type: 'button', class: ['control', 'mono-value', 'hide-mobile'], onclick: (e) => openModelMenu(e.currentTarget), title: t('AI engine used for analysis') },
     icon('spark', { size: 14 }), h('span', { class: 'control-value' }), h('span', { class: 'chev' }, icon('chevron-down', { size: 13 })));
+  const menuBtn = iconButton('menu', { title: t('Open navigation'), onClick: () => app.classList.toggle('mobile-nav-open') });
+  menuBtn.classList.add('show-mobile');
+  const searchBtn = iconButton('search', { title: `${t('Search and commands')} (Ctrl K)`, onClick: openPalette });
+  searchBtn.classList.add('show-mobile');
+  const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
   shell.topbar = h('header', { class: 'topbar' },
-    h('div', { class: 'topbar-left' },
-      iconButton('menu', { title: t('Open navigation'), onClick: () => app.classList.toggle('mobile-nav-open') }),
-      shell.crumbs),
+    h('div', { class: 'topbar-left' }, menuBtn, shell.crumbs),
     h('div', { class: 'topbar-right' },
       shell.rangeSlot,
-      shell.updated,
-      iconButton('refresh', { title: t('Refresh data'), onClick: () => renderPage(true) }),
-      h('span', { class: ['topbar-divider', 'hide-mobile'] }),
-      button({
-        label: t('Add account'),
-        icon: 'plus',
-        size: 'sm',
-        cls: 'hide-mobile',
-        onClick: () => {
-          if (!requireAdmin(t('Add account / Manage access control'))) return;
-          openAccessDrawer({ onChanged: () => { if (current.route && (current.route.path === 'users' || current.route.path === 'settings')) renderPage(); } });
-        },
-      }),
+      shell.refreshBtn,
+      h('span', { class: ['topbar-sep', 'hide-mobile'], 'aria-hidden': 'true' }),
+      h('button', { type: 'button', class: ['topbar-search', 'hide-mobile'], onclick: openPalette, 'aria-label': `${t('Search and commands')} (${mac ? '\u2318K' : 'Ctrl K'})` },
+        icon('search', { size: 14 }), h('span', null, `${t('Search')}\u2026`), h('kbd', null, mac ? '\u2318K' : 'Ctrl K')),
+      searchBtn,
       shell.healthBtn,
-      iconButton('search', { title: `${t('Search and commands')} (Ctrl K)`, onClick: openPalette }),
-      h('button', { type: 'button', class: 'avatar-btn', onclick: (e) => openUserMenu(e.currentTarget), 'aria-label': t('Account menu') },
+      h('button', { type: 'button', class: 'avatar-btn', onclick: (e) => openUserMenu(e.currentTarget), 'aria-label': t('Account menu'), 'aria-haspopup': 'dialog' },
         accountAvatar(displaySession()))));
   shell.banners = h('div', { class: 'banner-region' });
   shell.content = h('main', { class: 'content', id: 'main', tabindex: '-1' });
@@ -207,105 +203,118 @@ function renderWorkspaceChip() {
   mount(shell.wsSlot, workspaceChip());
 }
 
+function connectedProjects(ws) {
+  return Array.isArray(ws.projects) && ws.projects.length ? ws.projects : (ws.projectId ? [ws.projectId] : []);
+}
+
+function selectedProjectOf(projects) {
+  return store.project && store.project !== 'all' && projects.includes(store.project) ? store.project : 'all';
+}
+
+/** Stable color per project id for its initial badge in the project menu. */
+function projectHue(id) {
+  let n = 0;
+  for (const ch of String(id)) n = (n * 31 + ch.charCodeAt(0)) % 360;
+  return `hsl(${n} 52% 42%)`;
+}
+
+/** Workspace switcher (top left): product name over the project scope; opens the project menu. */
 function workspaceChip() {
   const ws = store.boot.workspace || {};
-  if (!ws.projectId) return null;
-  const projects = Array.isArray(ws.projects) && ws.projects.length ? ws.projects : [ws.projectId];
-  const sel = store.project && store.project !== 'all' && projects.includes(store.project) ? store.project : 'all';
-  const activeTitle = sel === 'all'
-    ? (projects.length > 1 ? t('All connected projects ({n})', { n: projects.length }) : ws.projectId)
-    : sel;
-  const activeSub = sel === 'all'
-    ? projects.slice(0, 2).join(', ') + (projects.length > 2 ? ` +${projects.length - 2}` : '')
-    : (sel === ws.projectId ? t('Primary workspace project') : t('Filtered to single project'));
-
+  const projects = connectedProjects(ws);
+  const sel = selectedProjectOf(projects);
+  const filtered = sel !== 'all';
+  let scope = orgName() || t('Workspace not configured');
+  if (ws.projectId) {
+    if (filtered) scope = sel;
+    else scope = projects.length > 1 ? t('All projects \u00b7 {n}', { n: projects.length }) : ws.projectId;
+  }
   return h('button', {
     type: 'button',
-    class: ['workspace-chip', sel !== 'all' ? 'filtered' : ''],
-    'aria-haspopup': 'dialog',
-    'aria-expanded': 'false',
-    title: `${t('Connected projects ({n})', { n: projects.length })}: ${projects.join(', ')}`,
-    onclick: (e) => openProjectMenu(e.currentTarget, ws, projects),
+    class: ['ws-switch', filtered ? 'filtered' : ''],
+    'aria-haspopup': ws.projectId ? 'dialog' : null,
+    'aria-expanded': ws.projectId ? 'false' : null,
+    'aria-label': `${productName()}, ${scope}`,
+    title: projects.length ? `${t('Connected projects ({n})', { n: projects.length })}: ${projects.join(', ')}` : null,
+    onclick: (e) => { if (ws.projectId) openProjectMenu(e.currentTarget, ws, projects); },
   },
-    h('div', { class: 'ws-head' },
-      h('span', { class: 'ws-label-row' },
-        h('span', { class: 'dot dot-success' }),
-        h('span', { class: 'ws-label' }, t('Connected projects ({n})', { n: projects.length }))),
-      h('span', { class: 'ws-chev' }, icon('chevron-down', { size: 14 }))),
-    h('div', { class: 'ws-value' }, activeTitle),
-    h('div', { class: 'ws-sub' }, activeSub));
+    brandMark(),
+    h('span', { class: 'ws-switch-text' },
+      h('span', { class: 'ws-switch-name' }, productName()),
+      h('span', { class: 'ws-switch-scope' },
+        ws.projectId ? h('span', { class: ['dot', filtered ? 'dot-info' : 'dot-success'] }) : null,
+        h('span', { class: 'ws-switch-scope-text' }, scope))),
+    ws.projectId ? h('span', { class: 'ws-switch-chev' }, icon('chevrons-up-down', { size: 14 })) : null);
+}
+
+function selectProject(p, projects) {
+  setProject(p);
+  toast({
+    title: p === 'all' ? t('Viewing all connected projects ({n})', { n: projects.length }) : t('Filtered to project: {id}', { id: p }),
+    tone: 'info',
+    timeout: 2200,
+  });
 }
 
 function openProjectMenu(anchor, ws, projects) {
   openPopover(anchor, (close) => {
-    const sel = store.project && store.project !== 'all' && projects.includes(store.project) ? store.project : 'all';
-    const selectProj = (p) => {
-      close();
-      setProject(p);
-      toast({
-        title: p === 'all' ? t('Viewing all connected projects ({n})', { n: projects.length }) : t('Filtered to project: {id}', { id: p }),
-        text: p === 'all' ? projects.join(', ') : t('Showing metrics and resources for {id}', { id: p }),
-        tone: 'info',
-        timeout: 2400,
-      });
-    };
+    const sel = selectedProjectOf(projects);
+    const choose = (p) => { close(); if (p !== sel) selectProject(p, projects); };
     const detailMap = new Map(((ws && ws.projectDetails) || []).map((d) => [d.id, d]));
-    const sourceBadge = (p, detail) => {
-      const src = detail ? detail.source : (p === ws.projectId ? 'primary' : 'configured');
-      if (src === 'primary') return badge(t('Primary'), 'info', { size: 'sm' });
-      if (src === 'configured') return badge(t('Explicitly linked'), 'accent', { size: 'sm' });
-      if (src === 'scope') return badge(t('In scope'), 'success', { size: 'sm' });
-      return badge(t('Auto-discovered'), 'success', { size: 'sm' });
-    };
-    return h('div', { class: 'ws-popover' },
-      h('div', { class: 'ws-pop-header' },
-        h('div', null,
-          h('div', { class: 'ws-pop-title' }, t('Connected Google Cloud projects ({n})', { n: projects.length })),
-          h('div', { class: 'ws-pop-sub' }, t('Select a project to filter or view all connected projects together.'))),
-        ws.scanAllProjects !== false ? badge(t('Auto-discovery'), 'success', { size: 'sm', dot: true }) : null),
-      h('div', { class: 'ws-project-list' },
-        h('button', {
-          type: 'button',
-          class: ['ws-proj-item', sel === 'all' ? 'active' : ''],
-          onclick: () => selectProj('all'),
-        },
-          h('span', { class: 'ws-proj-icon' }, icon('layers', { size: 15 })),
-          h('div', { class: 'ws-proj-body' },
-            h('div', { class: 'ws-proj-name' }, t('All connected projects ({n})', { n: projects.length })),
-            h('div', { class: 'ws-proj-desc' }, t('Unified governance view across all {n} projects', { n: projects.length }))),
-          sel === 'all' ? h('span', { class: 'ws-proj-check' }, icon('check', { size: 15 })) : null),
-        h('div', { class: 'menu-sep' }),
-        h('div', { class: 'menu-label' }, t('Project list ({n})', { n: projects.length })),
-        projects.map((p) => {
-          const isPrimary = p === ws.projectId;
-          const isSelected = sel === p;
-          const detail = detailMap.get(p);
-          const subParts = [];
-          if (detail && detail.name && detail.name !== p) subParts.push(detail.name);
-          if (detail && detail.sameOrg) subParts.push(t('Same organization'));
-          else if (detail && detail.parent) subParts.push(detail.parent);
-          return h('button', {
-            type: 'button',
-            class: ['ws-proj-item', isSelected ? 'active' : ''],
-            onclick: () => selectProj(p),
-          },
-            h('span', { class: ['dot', isPrimary ? 'dot-info' : 'dot-success'] }),
-            h('div', { class: 'ws-proj-body' },
-              h('div', { class: 'ws-proj-row' },
-                h('span', { class: 'mono fw-600 ws-proj-id' }, p),
-                sourceBadge(p, detail)),
-              subParts.length ? h('div', { class: 'ws-proj-desc' }, subParts.join(' \u00b7 ')) : null),
-            isSelected ? h('span', { class: 'ws-proj-check' }, icon('check', { size: 15 })) : null);
-        })),
-      h('div', { class: 'ws-pop-footer' },
-        button({
-          label: t('Manage connected projects'),
-          icon: 'settings',
-          size: 'sm',
-          cls: 'btn-block',
-          onClick: () => { close(); window.location.hash = '#/settings/workspace'; },
-        })));
-  }, { align: 'start', wide: true });
+    const item = ({ value, lead, name, tag, sub }) => h('button', {
+      type: 'button', class: 'ws-item', role: 'menuitemradio', 'aria-checked': sel === value ? 'true' : 'false',
+      dataset: { project: value }, onclick: () => choose(value),
+    }, lead,
+    h('span', { class: 'ws-item-body' },
+      h('span', { class: 'ws-item-name' }, h('span', null, name), tag || null),
+      sub ? h('span', { class: 'ws-item-sub' }, sub) : null),
+    sel === value ? h('span', { class: 'ws-item-check' }, icon('check', { size: 14 })) : null);
+
+    const rows = projects.map((p) => {
+      const detail = detailMap.get(p);
+      const sub = [];
+      if (detail && detail.name && detail.name !== p) sub.push(detail.name);
+      if (detail && detail.source === 'scope') sub.push(t('In scope'));
+      else if (detail && detail.source === 'discovered') sub.push(t('Auto-discovered'));
+      const lead = h('span', { class: 'ws-avatar', 'aria-hidden': 'true' }, p.slice(0, 1).toUpperCase());
+      lead.style.setProperty('--ws-hue', projectHue(p));
+      return item({
+        value: p,
+        lead,
+        name: p,
+        tag: p === ws.projectId ? badge(t('Primary'), 'neutral', { size: 'sm' }) : null,
+        sub: sub.join(' \u00b7 ') || null,
+      });
+    });
+    const list = h('div', { class: 'ws-menu-list', role: 'menu', 'aria-label': t('Projects') },
+      item({ value: 'all', lead: h('span', { class: ['ws-avatar', 'all'], 'aria-hidden': 'true' }, icon('layers', { size: 13 })), name: t('All projects'), sub: t('{n} projects', { n: projects.length }) }),
+      rows);
+    const empty = h('div', { class: 'ws-menu-empty', hidden: true }, t('No matching projects'));
+    let search = null;
+    if (projects.length > 6) {
+      const input = h('input', { class: 'input', type: 'search', placeholder: t('Search projects'), 'aria-label': t('Search projects'), autocomplete: 'off' });
+      input.addEventListener('input', () => {
+        const q = input.value.trim().toLowerCase();
+        let shown = 0;
+        rows.forEach((row) => {
+          const hit = !q || row.dataset.project.toLowerCase().includes(q);
+          row.hidden = !hit;
+          if (hit) shown += 1;
+        });
+        empty.hidden = shown > 0;
+      });
+      search = h('div', { class: 'ws-menu-search' }, input);
+    }
+    return h('div', { class: 'ws-menu' },
+      h('div', { class: 'ws-menu-head' },
+        h('span', { class: 'ws-menu-title' }, t('Projects')),
+        orgName() ? h('span', { class: 'ws-menu-org' }, orgName()) : null),
+      search,
+      list,
+      empty,
+      h('div', { class: 'menu-sep' }),
+      menuItem({ label: t('Manage connected projects'), iconName: 'settings', onClick: () => { close(); window.location.hash = '#/settings/workspace'; } }));
+  }, { align: 'start' });
 }
 
 function visibleRoutes() {
@@ -326,7 +335,7 @@ function renderNav() {
     title: t(r.label),
     'aria-current': r.path === active ? 'page' : null,
     onclick: () => app.classList.remove('mobile-nav-open'),
-  }, h('span', { class: 'nav-icon' }, icon(r.icon, { size: 17 })), h('span', { class: 'nav-label' }, t(r.label)));
+  }, h('span', { class: 'nav-icon' }, icon(r.icon, { size: 16 })), h('span', { class: 'nav-label' }, t(r.label)));
   mount(shell.nav, groups.map((g) => h('div', { class: 'nav-group' },
     g.name ? h('div', { class: 'nav-group-label' }, t(g.name)) : null,
     g.items.map(link))));
@@ -339,7 +348,7 @@ function renderNav() {
         app.classList.toggle('sidebar-collapsed', store.sidebarCollapsed);
         savePrefs();
       },
-    }, h('span', { class: 'nav-icon' }, icon('sidebar', { size: 17 })), h('span', { class: 'nav-label' }, t('Collapse sidebar'))));
+    }, h('span', { class: 'nav-icon' }, icon('sidebar', { size: 16 })), h('span', { class: 'nav-label' }, t('Collapse sidebar'))));
 }
 
 function formatPricingAlertLine(a) {
@@ -431,7 +440,7 @@ function updateRangeControl() {
   const btn = h('button', {
     type: 'button', class: 'control', 'aria-haspopup': 'dialog', title: fmt.dateRange(store.range.start, store.range.end),
     onclick: (e) => openRangePicker(e.currentTarget),
-  }, icon('calendar', { size: 14 }), h('span', null, rangeLabel()), h('span', { class: ['control-label', 'hide-mobile'] }, store.range.preset === 'custom' ? null : fmt.dateRange(store.range.start, store.range.end)), h('span', { class: 'chev' }, icon('chevron-down', { size: 13 })));
+  }, icon('calendar', { size: 14 }), h('span', null, rangeLabel()), h('span', { class: 'chev' }, icon('chevron-down', { size: 13 })));
   const gran = segmented([{ value: 'day', label: t('Daily') }, { value: 'week', label: t('Weekly') }], store.granularity, (v) => setGranularity(v), { label: t('Granularity') });
   gran.classList.add('hide-mobile');
   mount(shell.rangeSlot, btn, gran);
@@ -702,6 +711,7 @@ function route() {
     }
   }
   current.route = r;
+  if (shell.main) shell.main.scrollTop = 0;
   renderNav();
   renderCrumbs(r);
   updateRangeControl();
@@ -724,7 +734,7 @@ async function renderPage(force = false) {
   // Personal widgets live next to the page (not inside it), so page re-renders never remove them.
   const widgetsHost = h('div', { class: 'page-widgets' });
   mount(shell.content, h('div', { class: 'page-wrap' }, container, widgetsHost));
-  if (shell.updated) shell.updated.textContent = `${t('Loading')}\u2026`;
+  setUpdated(`${t('Loading')}\u2026`);
   try {
     const mod = await r.load();
     if (controller.signal.aborted) return;
@@ -746,12 +756,18 @@ async function renderPage(force = false) {
       if (board) mount(widgetsHost, board);
     }
     store.lastUpdated = new Date();
-    shell.updated.textContent = t('Updated {time}', { time: fmt.time(store.lastUpdated.toISOString()) });
+    setUpdated(t('Updated {time}', { time: fmt.time(store.lastUpdated.toISOString()) }));
   } catch (err) {
     if (isAbort(err)) return;
-    if (shell.updated) shell.updated.textContent = '';
+    setUpdated('');
     mount(container, errorState(err, { onRetry: () => renderPage() }));
   }
+}
+
+/** The last refresh time lives in the refresh button tooltip (the top bar stays text-free). */
+function setUpdated(text) {
+  if (!shell.refreshBtn) return;
+  shell.refreshBtn.title = text ? `${t('Refresh data')} \u00b7 ${text}` : t('Refresh data');
 }
 
 /** Settings pages call this after saving so the shell reflects new branding / modules. */

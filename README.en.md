@@ -411,8 +411,8 @@ What the script automates end-to-end on a brand-new project:
 
 ### 3.4 Post-deployment checks
 
-1. Use the **Project selector** in the top bar to switch between the primary project, linked projects and discovered projects, or **All Projects**.
-2. Select **Data sources** in the top bar to check connection status. Red items show the cause (permission, missing table and so on).
+1. Use the **workspace switcher** at the top left (`All projects · N` under the product name) to narrow the view to the primary project, a linked project or a discovered project, or to view **All projects** together. While one project is selected, a project chip appears next to each page title; select it to show every project again.
+2. Select the **Data sources** icon on the right of the top bar (its dot shows the status) to check connection status. Red items show the cause (permission, missing table and so on).
 3. Even before a BigQuery Billing Export table is connected, **Overview**, **Models & Tokens** and **Cost & FinOps** show estimated costs from measured token usage, official Google Cloud pricing and synced exchange rates. When you later connect the billing export in **Settings > Workspace and data sources**, they switch automatically to invoiced SKU costs and credits.
 4. If you created a new audit log sink, each BigQuery table is created when its first log entry arrives, so some metrics can stay empty for the first minutes to hours.
 5. To use Antigravity per-user caps, follow [Section 8](#8-antigravity-per-user-caps-and-suspension).
@@ -1483,7 +1483,7 @@ bq update --time_partitioning_expiration 10368000 PROJECT_ID:ge_analytics.modela
 
 ### 14.1 Data source health
 
-**Data sources** in the top bar shows the connection status and latency of the BigQuery audit logs, billing export, Discovery Engine, Agent Engine, Cloud Monitoring, Cloud Logging, IAM policy, AI engine and settings store. The notice at the top of each page tells you which values are empty because of which source.
+The **Data sources** icon in the top bar shows the connection status and latency of the BigQuery audit logs, billing export, Discovery Engine, Agent Engine, Cloud Monitoring, Cloud Logging, IAM policy, AI engine and settings store. The notice at the top of each page tells you which values are empty because of which source.
 
 ### 14.2 Common issues
 
