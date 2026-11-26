@@ -20,20 +20,21 @@ export function applyAccent(hex) {
   root.style.setProperty('--accent-contrast', lum > 0.62 ? '#101828' : '#FFFFFF');
 }
 
-/** Default product glyph: one hub connected to four AI services (the control plane over every workload),
- *  drawn in the current text color; one node is highlighted. */
-export function brandGlyph(size = 22) {
-  const node = (cx, cy, cls) => s('circle', { cx, cy, r: 2.6, fill: cls ? null : 'currentColor', class: cls || null });
-  return s('svg', { viewBox: '0 0 32 32', width: size, height: size, 'aria-hidden': 'true', focusable: 'false', class: 'brand-glyph' },
-    s('path', { d: 'M16 16 9 9M16 16 23 9M16 16 9 23M16 16 23 23', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round', opacity: '.55' }),
-    s('circle', { cx: 16, cy: 16, r: 4.2, fill: 'currentColor' }),
-    node(8.5, 8.5), node(23.5, 8.5), node(8.5, 23.5), node(23.5, 23.5, 'brand-glyph-sat'));
+/** Default product glyph (Central Core): Google 'G' ring converging on a single central command core. */
+export function brandGlyph(size = 28) {
+  return s('svg', { viewBox: '0 0 48 48', width: size, height: size, 'aria-hidden': 'true', focusable: 'false', class: 'brand-glyph' },
+    s('path', { fill: '#EA4335', d: 'M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z' }),
+    s('path', { fill: '#4285F4', d: 'M46.98 24.55c0-1.57-.15-3.09-.38-4.55H31.78a8.75 8.75 0 0 1 -0.62 9.02h5.77c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z' }),
+    s('path', { fill: '#FBBC05', d: 'M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z' }),
+    s('path', { fill: '#34A853', d: 'M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z' }),
+    s('circle', { cx: 24, cy: 24, r: 6.55, class: 'brand-core-outer' }),
+    s('circle', { cx: 24, cy: 24, r: 2.3, class: 'brand-core-inner' }));
 }
 
 /** Brand mark: the configured logo (https:// or /assets/ only) or the default glyph. */
-export function brandMark(branding, { size = 22, cls = '' } = {}) {
+export function brandMark(branding, { size = 30, cls = '' } = {}) {
   const url = safeImageUrl(branding && branding.logoUrl);
-  if (url) return h('span', { class: ['brand-mark', cls] }, h('img', { src: url, alt: '' }));
+  if (url) return h('span', { class: ['brand-mark', 'has-img', cls] }, h('img', { src: url, alt: '' }));
   return h('span', { class: ['brand-mark', cls], 'aria-hidden': 'true' }, brandGlyph(size));
 }
 

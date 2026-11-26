@@ -139,6 +139,8 @@
     --shadow-lg: 0 32px 64px -20px rgba(24, 24, 27, .28);
     --overlay: rgba(24, 24, 27, .38);
   }
+  .brand-core-outer { fill: #18181B; }
+  .brand-core-inner { fill: #FFFFFF; }
 }
 
 /* ---------- Base ---------- */
@@ -175,9 +177,8 @@ svg { flex-shrink: 0; }
 .boot-screen { display: grid; place-items: center; min-height: 100vh; }
 .boot { display: grid; justify-items: center; gap: 18px; }
 .boot-mark {
-  width: 40px; height: 40px; border-radius: 11px;
-  background: #18181B url("/assets/img/mark.svg") center / 28px no-repeat;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / .12), var(--shadow-sm);
+  width: 44px; height: 44px;
+  background: url("/assets/img/mark.svg") center / contain no-repeat;
 }
 .boot-bar { width: 140px; height: 3px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .boot-bar span { display: block; height: 100%; width: 40%; background: var(--ink); border-radius: 3px; animation: boot-slide 1.1s var(--ease) infinite; }
@@ -216,7 +217,7 @@ svg { flex-shrink: 0; }
 }
 .ws-switch:hover { background: var(--hover); }
 .ws-switch[aria-expanded="true"] { background: var(--surface); border-color: var(--border); box-shadow: var(--shadow-xs); }
-.ws-switch .brand-mark { width: 32px; height: 32px; border-radius: 9px; }
+.ws-switch .brand-mark { width: 30px; height: 30px; }
 .ws-switch-text { flex: 1; min-width: 0; display: grid; gap: 1px; line-height: 1.3; }
 .ws-switch-name { font-size: var(--text-sm); font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .ws-switch-scope { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: var(--text-xs); color: var(--text-3); }
@@ -226,18 +227,21 @@ svg { flex-shrink: 0; }
 .ws-switch-chev { display: inline-flex; color: var(--text-4); transition: color .12s var(--ease); }
 .ws-switch:hover .ws-switch-chev, .ws-switch[aria-expanded="true"] .ws-switch-chev { color: var(--text-2); }
 
-/* Product mark: a neutral ink tile with a white glyph and one blue node (a configured logo replaces it). */
+/* Product mark: standalone Central Core glyph (a configured logoUrl replaces it inside a rounded tile). */
 .brand-mark {
-  --mark-tile: light-dark(#18181B, #FAFAFA);
-  --mark-fg: light-dark(#FFFFFF, #18181B);
-  width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+  width: 30px; height: 30px; flex-shrink: 0;
   display: grid; place-items: center;
-  color: var(--mark-fg); font-weight: 700; font-size: 12px; letter-spacing: .02em;
-  background: var(--mark-tile);
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / .12), 0 1px 2px rgb(0 0 0 / .18);
+  background: transparent;
+}
+.brand-mark svg { width: 100%; height: 100%; display: block; }
+.brand-core-outer { fill: light-dark(#18181B, #F4F4F5); }
+.brand-core-inner { fill: light-dark(#FFFFFF, #111218); }
+.brand-mark.has-img {
+  border-radius: 8px;
+  background: #FFFFFF;
+  box-shadow: 0 1px 2px rgb(0 0 0 / .12);
   overflow: hidden;
 }
-.brand-glyph-sat { fill: light-dark(#60A5FA, #2563EB); }
 .brand-mark img { width: 100%; height: 100%; object-fit: contain; background: #fff; }
 .brand-text { min-width: 0; display: grid; line-height: 1.2; }
 .brand-name { font-weight: 600; font-size: var(--text-md); color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

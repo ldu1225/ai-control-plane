@@ -34,7 +34,7 @@
 .login-loading { display: grid; justify-items: center; gap: 18px; padding: 48px 0; }
 
 .login-brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.login-brand .brand-mark.login-mark { width: 40px; height: 40px; border-radius: 11px; }
+.login-brand .brand-mark.login-mark { width: 38px; height: 38px; }
 .login-brand .brand-name { font-size: 15px; }
 .login-brand .brand-org { font-size: 12.5px; }
 
@@ -157,14 +157,15 @@ a.login-btn:hover { text-decoration: none; }
   min-height: 100%;
   padding: 48px 56px;
 }
-.aside-brand { display: flex; align-items: center; gap: 10px; font-weight: 650; font-size: 15px; letter-spacing: .01em; }
+.aside-brand { display: flex; align-items: center; gap: 11px; font-weight: 650; font-size: 15px; letter-spacing: .01em; }
 .aside-glyph {
-  --mark-tile: #37373B;
-  width: 34px; height: 34px; border-radius: 9px;
+  width: 32px; height: 32px;
   display: grid; place-items: center;
-  background: rgba(255, 255, 255, .14);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .22);
+  background: transparent;
 }
+.aside-glyph svg { width: 100%; height: 100%; display: block; }
+.aside-glyph .brand-core-outer { fill: #F4F4F5; }
+.aside-glyph .brand-core-inner { fill: #111218; }
 .aside-copy { align-self: center; display: grid; gap: 18px; max-width: 520px; }
 .aside-eyebrow { font-size: 12px; font-weight: 650; letter-spacing: .12em; text-transform: uppercase; color: rgba(255, 255, 255, .72); }
 .aside-title { font-size: 34px; line-height: 1.2; font-weight: 700; letter-spacing: -0.02em; text-wrap: balance; }
