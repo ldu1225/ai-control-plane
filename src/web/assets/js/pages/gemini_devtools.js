@@ -33,6 +33,7 @@ const consoleUrl = (project) => `https://console.cloud.google.com/gemini-enterpr
 
 /* Verified Antigravity supported models (official Gemini Enterprise AI developer tools documentation). */
 const AGY_GOOGLE_MODELS = [
+  ['gemini-4-neon', 'Gemini 4 Neon', false],
   ['gemini-4-hydrogen', 'Gemini 4 Hydrogen', false],
   ['gemini-4-carbon', 'Gemini 4 Carbon', false],
   ['gemini-4-argon', 'Gemini 4 Argon', false],
@@ -51,7 +52,6 @@ const AGY_MODEL_LABELS = Object.fromEntries(
   AGY_GOOGLE_MODELS.map(([id, label]) => [id, label])
     .concat(AGY_THIRD_PARTY_MODELS.map(([id, label]) => [id, label]))
     .concat([
-      ['gemini-4-neon', 'Gemini 4 Neon'],
       ['gemini-3.5-flash', 'Gemini 3.5 Flash'],
       ['gemini-3.5-flash-lite', 'Gemini 3.5 Flash-Lite'],
       ['gemini-2.5-pro', 'Gemini 2.5 Pro'],
@@ -277,19 +277,47 @@ function formatExtraValue(v) {
 function agyModelRows(data) {
   const seenGoogle = new Set(AGY_GOOGLE_MODELS.map((m) => m[0]));
   const seen3p = new Set(AGY_THIRD_PARTY_MODELS.map((m) => m[0]));
-  const rows = AGY_GOOGLE_MODELS.map(([id, label, preview]) => ({
+  const googleRows = AGY_GOOGLE_MODELS.map(([id, label, preview]) => ({
     id, label, provider: 'google', preview,
   }));
-  (data.observedModels || []).filter((id) => !seenGoogle.has(id)).forEach((id) => {
-    rows.push({ id, label: modelDisplayName(id), provider: 'google', preview: id.includes('preview') });
+  const partnerRows = AGY_THIRD_PARTY_MODELS.map(([id, label]) => ({
+    id, label, provider: 'partner', preview: false,
+  }));
+  const discovered = data.discoveredModels || [];
+  discovered.forEach((item) => {
+    if (!item || !item.modelId) return;
+    const id = item.modelId;
+    if (item.group === 'partner') {
+      if (seen3p.has(id)) return;
+      seen3p.add(id);
+      partnerRows.push({
+        id,
+        label: item.displayName || modelDisplayName(id),
+        provider: 'partner',
+        preview: Boolean(item.isPreview),
+        discovered: true,
+      });
+    } else if (item.group === 'gemini') {
+      if (seenGoogle.has(id)) return;
+      seenGoogle.add(id);
+      googleRows.push({
+        id,
+        label: item.displayName || modelDisplayName(id),
+        provider: 'google',
+        preview: Boolean(item.isPreview),
+        discovered: true,
+      });
+    }
   });
-  AGY_THIRD_PARTY_MODELS.forEach(([id, label]) => {
-    rows.push({ id, label, provider: 'partner', preview: false });
+  (data.observedModels || []).filter((id) => !seenGoogle.has(id)).forEach((id) => {
+    seenGoogle.add(id);
+    googleRows.push({ id, label: modelDisplayName(id), provider: 'google', preview: id.includes('preview'), discovered: true });
   });
   (data.observedThirdPartyModels || []).filter((id) => !seen3p.has(id)).forEach((id) => {
-    rows.push({ id, label: modelDisplayName(id), provider: 'partner', preview: id.includes('preview') });
+    seen3p.add(id);
+    partnerRows.push({ id, label: modelDisplayName(id), provider: 'partner', preview: id.includes('preview'), discovered: true });
   });
-  return rows;
+  return googleRows.concat(partnerRows);
 }
 
 function modelAvailability(cfg, row) {
@@ -649,7 +677,8 @@ function paintModelMatrix(state, configs, el) {
         h('div', { class: 'fm-feature-text' },
           h('span', { class: 'fm-feature-name' }, r.label,
             r.preview ? badge(t('Preview'), 'neutral', { size: 'sm' }) : null,
-            r.provider === 'partner' ? badge(t('3P · PAYG'), 'accent', { size: 'sm' }) : null),
+            r.provider === 'partner' ? badge(t('3P · PAYG'), 'accent', { size: 'sm' }) : null,
+            r.discovered ? badge(t('Auto-discovered'), 'neutral', { size: 'sm', title: t('Automatically discovered from Google Cloud Model Garden or active app configurations.') }) : null),
           h('span', { class: 'fm-feature-key' }, r.id))),
       vals.map((v) => h('td', { class: 'fm-cell-td' },
         badge(t(MODEL_AVAIL_LABELS[v.code] || v.code), v.tone, { size: 'sm', dot: v.tone !== 'neutral' })))));

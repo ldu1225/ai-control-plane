@@ -4023,6 +4023,9 @@ const KO = {
   "Allowed (PAYG)": "허용 (PAYG)",
   "Tools off": "도구 꺼짐",
   "AI developer tools settings in {a} linked project(s) could not be read: {b}. Grant the runtime service account Discovery Engine Viewer there.": "연동 프로젝트 {a}개의 AI 개발자 도구 설정을 읽지 못했습니다: {b}. 해당 프로젝트에서 런타임 서비스 계정에 Discovery Engine 뷰어 역할을 부여하세요.",
+  "{n} models auto-discovered": "모델 {n}개 자동 발견",
+  "Automatically discovered from Discovery Engine apps, WidgetConfig, and Google Cloud Model Garden.": "Discovery Engine 앱, WidgetConfig 및 Google Cloud Model Garden에서 자동으로 발견한 모델입니다.",
+  "Automatically discovered from Google Cloud Model Garden or active app configurations.": "Google Cloud Model Garden 또는 실제 앱 설정에서 자동으로 발견한 모델입니다.",
 };
 
 export default KO;

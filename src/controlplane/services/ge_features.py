@@ -44,6 +44,7 @@ LOG = logging.getLogger("controlplane.ge_features")
 SOURCE = "api:discoveryengine.engines"
 WIDGET_SOURCE = "api:discoveryengine.widgetConfigs"
 DEV_TOOLS_SOURCE = "api:discoveryengine.devToolsConfig"
+MODEL_GARDEN_SOURCE = "api:aiplatform.publisherModels"
 COLLECTION = "default_collection"
 API_VERSION = "v1"
 ALPHA_VERSION = "v1alpha"
@@ -75,9 +76,28 @@ MAX_KEYS_PER_APP = 64
 MAX_MODELS_PER_APP = 64
 MAX_ENGINE_PAGES = 5
 MAX_WIDGET_PROBES = 50
+MAX_DISCOVERED_MODELS = 120
+MAX_PUBLISHER_PAGES = 3
 INTRANET = "APP_TYPE_INTRANET"
 
 DEV_TOOLS_DEFAULT_LOCATIONS = ("global", "us", "eu")
+
+# Live Model Garden publisher endpoints (best-effort auto-discovery of Google Gemini & Anthropic Claude models).
+MODEL_GARDEN_ENDPOINTS = (
+    ("google", "https://aiplatform.googleapis.com/v1beta1/publishers/google/models"),
+    ("google", "https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/google/models"),
+    ("anthropic", "https://aiplatform.googleapis.com/v1beta1/publishers/anthropic/models"),
+)
+# Gemini 2.5+ / 3+ / 4+ chat & image models; exclude non-GE modalities (embeddings, TTS, speech/live, robotics, etc.).
+_GOOGLE_MODEL_RE = re.compile(r"^gemini-(?:2\.5|[3-9](?:\.\d+)?|[1-9]\d+(?:\.\d+)?)-[a-z0-9][a-z0-9-]{0,60}\Z")
+_GOOGLE_EXCLUDE_RE = re.compile(
+    r"(?:embedding|(?:^|-)tts(?:$|-)|transcribe|translate|(?:^|-)live(?:$|-)|native-audio|"
+    r"robotics|computer-use|(?:^|-)omni(?:$|-)|nano-banana|-exp-|-info\Z|-\d{2}-\d{4}\Z|-\d{2}-\d{2}\Z)"
+)
+_ANTHROPIC_MODEL_RE = re.compile(r"^claude-(?:opus|sonnet|haiku|fable)-[0-9]+(?:-[0-9]+){0,3}\Z")
+_GROUP_RANK = {"gemini": 0, "image": 1, "partner": 2}
+_TIER_RANK = {"neon": 90, "hydrogen": 85, "carbon": 80, "argon": 75, "ultra": 70, "pro": 60,
+              "opus": 60, "sonnet": 50, "flash": 45, "haiku": 40, "fable": 35}
 
 # Verified DevToolsConfig (v1alpha) protobuf enum mappings.
 FILE_ACCESS_OUT = {
@@ -217,22 +237,152 @@ def _extract_widget_models(raw):
     return resolved, default_id
 
 
-def _enrich_widget_models(ctx, apps):
-    """Best-effort fetch of WidgetConfig.uiSettings.modelConfigInfo for discovered GE apps."""
+def _format_model_display_name(model_id, publisher):
+    """Readable display name derived from a Model Garden publisher model ID."""
+    if publisher == "anthropic" and model_id.startswith("claude-"):
+        parts = model_id.split("-")
+        tier = parts[1].capitalize() if len(parts) > 1 else ""
+        ver = ".".join(p for p in parts[2:] if p.isdigit())
+        return ("Anthropic Claude %s %s" % (tier, ver)).strip()
+    tokens = [p for p in model_id.split("-") if p and p != "preview"]
+    words = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "flash" and i + 1 < len(tokens) and tokens[i + 1] == "lite":
+            words.append("Flash-Lite")
+            i += 2
+            continue
+        words.append(tok.capitalize() if not tok[0].isdigit() else tok)
+        i += 1
+    return " ".join(words) or model_id
+
+
+def _model_sort_key(item):
+    """Natural newest-first ordering within each model category (gemini, image, partner)."""
+    mid = item["modelId"]
+    parts = mid.split("-")
+    major, minor = 0, 0
+    if mid.startswith("claude-") and len(parts) >= 3:
+        nums = [int(p) for p in parts[2:] if p.isdigit()]
+        major = nums[0] if nums else 0
+        minor = nums[1] if len(nums) > 1 else 0
+        tier = parts[1]
+    else:
+        for p in parts[1:]:
+            if re.match(r"^\d+(?:\.\d+)?\Z", p):
+                segs = p.split(".")
+                major = int(segs[0])
+                minor = int(segs[1]) if len(segs) > 1 else 0
+                break
+        tier = next((p for p in parts[1:] if p in _TIER_RANK), "")
+    is_lite = 1 if "lite" in parts else 0
+    return (
+        _GROUP_RANK.get(item["group"], 9),
+        -major,
+        -minor,
+        -_TIER_RANK.get(tier, 0),
+        is_lite,
+        1 if item.get("isPreview") else 0,
+        mid,
+    )
+
+
+def _classify_publisher_model(publisher, raw):
+    """Normalize a Model Garden PublisherModel entry into a GE/AGY model descriptor, or None if excluded."""
+    if not isinstance(raw, dict):
+        return None
+    name = str(raw.get("name") or "")
+    model_id = name.rsplit("/", 1)[-1].strip().lower()
+    if not model_id or len(model_id) > MAX_KEY_LEN or not MODEL_KEY_RE.match(model_id):
+        return None
+    if publisher == "google":
+        if not _GOOGLE_MODEL_RE.match(model_id) or _GOOGLE_EXCLUDE_RE.search(model_id):
+            return None
+        group = "image" if "-image" in model_id else "gemini"
+    elif publisher == "anthropic":
+        if not _ANTHROPIC_MODEL_RE.match(model_id):
+            return None
+        group = "partner"
+    else:
+        return None
+    stage = str(raw.get("launchStage") or "").upper() or None
+    is_preview = model_id.endswith("-preview") or stage in ("PUBLIC_PREVIEW", "PRIVATE_PREVIEW", "EXPERIMENTAL")
+    return {
+        "modelId": model_id,
+        "publisher": publisher,
+        "group": group,
+        "displayName": _format_model_display_name(model_id, publisher),
+        "isPreview": is_preview,
+        "launchStage": stage,
+    }
+
+
+def _fetch_publisher_models(ctx, url):
+    """Best-effort paginated fetch of a Model Garden publisher catalog."""
+    items = []
+    token = None
+    for _ in range(MAX_PUBLISHER_PAGES):
+        params = {"pageSize": 200}
+        if token:
+            params["pageToken"] = token
+        payload = ctx.rest("GET", url, params=params, timeout=10)
+        if not isinstance(payload, dict):
+            break
+        items.extend(payload.get("publisherModels") or [])
+        token = payload.get("nextPageToken")
+        if not token:
+            break
+    return items
+
+
+def _collect_discovered_models(ctx, outcomes, include_image=True):
+    """Parse publisher discovery task outcomes into a sorted, deduplicated model list."""
+    found = {}
+    for (publisher, _url), (ok, items) in outcomes.items():
+        if not ok or not isinstance(items, list):
+            continue
+        for raw in items:
+            item = _classify_publisher_model(publisher, raw)
+            if not item:
+                continue
+            if not include_image and item["group"] == "image":
+                continue
+            mid = item["modelId"]
+            if mid not in found:
+                found[mid] = item
+            elif not found[mid].get("launchStage") and item.get("launchStage"):
+                found[mid] = item
+    if found:
+        ctx.add_source(MODEL_GARDEN_SOURCE)
+    out = sorted(found.values(), key=_model_sort_key)
+    return out[:MAX_DISCOVERED_MODELS]
+
+
+def _enrich_models_and_discover(ctx, apps):
+    """Run WidgetConfig enrichment and live Model Garden publisher discovery in one parallel batch."""
     targets = [a for a in apps if a.get("_name")][:MAX_WIDGET_PROBES]
-    if not targets:
-        return {}
     tasks = {}
     for app in targets:
         url = _widget_config_url(app["location"], app["_name"])
-        tasks[app["key"]] = (lambda u=url: ctx.rest("GET", u, timeout=10))
+        tasks[("widget", app["key"])] = (lambda u=url: ctx.rest("GET", u, timeout=10))
+    for publisher, url in MODEL_GARDEN_ENDPOINTS:
+        tasks[("pub", publisher, url)] = (lambda u=url: _fetch_publisher_models(ctx, u))
+    if not tasks:
+        return {}, []
+    outcomes = ctx.run(tasks)
     meta = {}
     by_key = {a["key"]: a for a in targets}
-    for key, (ok, value) in ctx.run(tasks).items():
+    pub_outcomes = {}
+    for tkey, res in outcomes.items():
+        if tkey[0] == "pub":
+            pub_outcomes[(tkey[1], tkey[2])] = res
+            continue
+        ok, value = res
         if not ok or not isinstance(value, dict):
             continue
         resolved, default_id = _extract_widget_models(value)
-        app = by_key.get(key)
+        app = by_key.get(tkey[1])
         if not app:
             continue
         app["resolvedModels"] = [m["modelId"] for m in resolved]
@@ -248,7 +398,8 @@ def _enrich_widget_models(ctx, apps):
                 }
     if meta:
         ctx.add_source(WIDGET_SOURCE)
-    return meta
+    discovered = _collect_discovered_models(ctx, pub_outcomes, include_image=True)
+    return meta, discovered
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +412,9 @@ def inventory(ctx):
     apps: [{key, project, location, collection, engineId, displayName, createTime, updateTime, subscriptionTier,
     features: {key: "on"|"off"}, allFeatures, models: {modelId: "on"|"off"}, resolvedModels: [modelId],
     defaultModelId}] (None when no list could be read); keys: every feature key set on any app; modelKeys: every
-    model ID set or resolved on any app; resolvedModelMeta: live display metadata from WidgetConfig; otherEngines:
-    engines that are not Gemini Enterprise apps (search-only apps); complete: every list was read."""
+    model ID set or resolved on any app; resolvedModelMeta: live display metadata from WidgetConfig;
+    discoveredModels: live Gemini & Anthropic models auto-discovered from Agent Platform Model Garden;
+    otherEngines: engines that are not Gemini Enterprise apps (search-only apps); complete: every list was read."""
     projects = list(getattr(ctx, "projects", None) or [ctx.project])
     locations = discovery_locations(ctx)
     tasks = {}
@@ -308,7 +460,7 @@ def inventory(ctx):
                                          "the runtime service account Discovery Engine Viewer there." % (
                                              len(unreadable), ", ".join(sorted(unreadable))))
     apps.sort(key=lambda a: (a["project"] != ctx.project, a["project"], a["location"], a["displayName"].lower()))
-    resolved_meta = _enrich_widget_models(ctx, apps) if apps else {}
+    resolved_meta, discovered = _enrich_models_and_discover(ctx, apps) if apps else ({}, [])
     for app in apps:
         model_keys.update(app.get("resolvedModels") or [])
         app.pop("_name", None)
@@ -317,6 +469,7 @@ def inventory(ctx):
         "keys": sorted(keys),
         "modelKeys": sorted(model_keys),
         "resolvedModelMeta": resolved_meta,
+        "discoveredModels": discovered,
         "otherEngines": other,
         "complete": complete,
         "projects": projects,
@@ -673,18 +826,24 @@ def dev_tools_inventory(ctx):
 
     Reads Discovery Engine v1alpha `devToolsConfig` for every selected project and location (global, us, eu, and any
     configured Discovery Engine locations). Returns live AI Developer Tools settings and Antigravity authorized
-    models per (project, location)."""
+    models per (project, location), enriched with live Model Garden auto-discovered Gemini & Anthropic models."""
     projects = list(getattr(ctx, "projects", None) or [ctx.project])
     locations = _dev_tools_locations(ctx)
     tasks = {}
     for project in projects:
         for location in locations:
             url = _dev_tools_url(project, location)
-            tasks[(project, location)] = (lambda u=url: ctx.rest("GET", u, timeout=15))
+            tasks[("dt", project, location)] = (lambda u=url: ctx.rest("GET", u, timeout=15))
+    for publisher, url in MODEL_GARDEN_ENDPOINTS:
+        tasks[("pub", publisher, url)] = (lambda u=url: _fetch_publisher_models(ctx, u))
+
+    outcomes = ctx.run(tasks)
+    dt_outcomes = {(k[1], k[2]): v for k, v in outcomes.items() if k[0] == "dt"}
+    pub_outcomes = {(k[1], k[2]): v for k, v in outcomes.items() if k[0] == "pub"}
 
     configs, observed_models, observed_3p, read, complete = [], set(), set(), 0, True
     unreadable = {}
-    for (project, location), (ok, value) in sorted(ctx.run(tasks).items()):
+    for (project, location), (ok, value) in sorted(dt_outcomes.items()):
         if not ok:
             if isinstance(value, GcpError) and (value.kind == "not_found" or _api_disabled(value)):
                 read += 1
@@ -713,12 +872,14 @@ def dev_tools_inventory(ctx):
         )
     loc_order = {loc: idx for idx, loc in enumerate(locations)}
     configs.sort(key=lambda c: (c["project"] != ctx.project, c["project"], loc_order.get(c["location"], 99)))
+    discovered = _collect_discovered_models(ctx, pub_outcomes, include_image=False) if read else []
     return {
         "configs": configs if read else None,
         "projects": projects,
         "locations": locations,
         "observedModels": sorted(observed_models),
         "observedThirdPartyModels": sorted(observed_3p),
+        "discoveredModels": discovered,
         "complete": complete,
         "unreadableProjects": sorted(unreadable),
         "apiVersion": ALPHA_VERSION,

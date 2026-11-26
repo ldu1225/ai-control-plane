@@ -23,7 +23,7 @@ import { isAdmin } from '../core/state.js';
 import { errorText } from '../core/messages.js';
 import {
   card, kpi, badge, button, setBusy, chip, searchBox, selectInput, segmented, emptyState, errorState, banner,
-  openModal, openPopover, menuItem, toast, warningsNotice, field, textInput,
+  openModal, openPopover, menuItem, toast, warningsNotice,
 } from '../core/components.js';
 import { pageSkeleton, fetchRange } from './_shared.js';
 
@@ -32,7 +32,6 @@ const DOCS = 'https://cloud.google.com/gemini-enterprise/docs/reference/rest/v1/
 const MODEL_DOCS = 'https://docs.cloud.google.com/gemini/enterprise/docs/manage-web-app-features#enable-gemini-models';
 const CONSOLE_GE = 'https://console.cloud.google.com/gemini-enterprise';
 const MAX_APPS_PER_APPLY = 100;
-const MODEL_ID_RE = /^[a-z0-9][a-z0-9._-]{0,79}$/;
 
 const GROUPS = [
   ['global', 'Master switch'],
@@ -111,6 +110,7 @@ const MODEL_GROUPS = [
 /* Verified Engine.modelConfigs catalog from Gemini Enterprise web app documentation & live Discovery Engine v1.
    Entry shape: [modelId, group, displayName, flags] where flags may contain { defaultOn, preview, partner, globalOnly }. */
 const MODELS = [
+  ['gemini-4-neon', 'gemini', 'Gemini 4 Neon', {}],
   ['gemini-4-hydrogen', 'gemini', 'Gemini 4 Hydrogen', {}],
   ['gemini-4-carbon', 'gemini', 'Gemini 4 Carbon', {}],
   ['gemini-4-argon', 'gemini', 'Gemini 4 Argon', {}],
@@ -155,12 +155,19 @@ function featureRows(keys) {
   return rows;
 }
 
-function modelRows(modelKeys, resolvedMeta, customKeys) {
-  const known = new Set(MODELS.map((m) => m[0]));
+function modelRows(modelKeys, resolvedMeta, discoveredModels) {
+  const byGroup = Object.fromEntries(MODEL_GROUPS.map(([id]) => [id, []]));
+  const seen = new Set();
   const meta = resolvedMeta || {};
-  const rows = MODELS.map(([key, group, label, flags]) => {
+  const push = (row) => {
+    const bucket = byGroup[row.group] || byGroup.other;
+    bucket.push(row);
+    seen.add(row.key);
+  };
+
+  MODELS.forEach(([key, group, label, flags]) => {
     const live = meta[key];
-    return {
+    push({
       key,
       group,
       label: (live && live.displayName) || label,
@@ -168,35 +175,55 @@ function modelRows(modelKeys, resolvedMeta, customKeys) {
       preview: Boolean(flags.preview || (live && live.isPreview)),
       partner: Boolean(flags.partner),
       globalOnly: Boolean(flags.globalOnly),
-    };
+    });
   });
-  const extras = new Set([...(modelKeys || []), ...(customKeys || [])]);
-  [...extras].filter((k) => !known.has(k)).sort().forEach((key) => {
+
+  (discoveredModels || []).forEach((item) => {
+    if (!item || !item.modelId || seen.has(item.modelId)) return;
+    const key = item.modelId;
+    const live = meta[key];
+    const group = byGroup[item.group] ? item.group : 'other';
+    push({
+      key,
+      group,
+      label: (live && live.displayName) || item.displayName || key,
+      defaultOn: false,
+      preview: Boolean(item.isPreview || (live && live.isPreview)),
+      partner: group === 'partner' || item.publisher === 'anthropic',
+      globalOnly: false,
+      discovered: true,
+    });
+  });
+
+  [...(modelKeys || [])].filter((k) => !seen.has(k)).sort().forEach((key) => {
     const live = meta[key];
     const isPartner = key.startsWith('claude-') || key.startsWith('anthropic-');
     const isImage = key.includes('image');
-    rows.push({
+    const isGemini = key.startsWith('gemini-');
+    push({
       key,
-      group: isPartner ? 'partner' : (isImage ? 'image' : 'other'),
+      group: isPartner ? 'partner' : (isImage ? 'image' : (isGemini ? 'gemini' : 'other')),
       label: (live && live.displayName) || key,
       defaultOn: false,
       preview: Boolean((live && live.isPreview) || key.includes('preview')),
       partner: isPartner,
       globalOnly: false,
-      undocumented: !live,
+      discovered: true,
     });
   });
-  return rows;
+
+  return MODEL_GROUPS.flatMap(([id]) => byGroup[id]);
 }
 
 function createModel(data, initialSection) {
+  const discovered = data.discoveredModels || [];
   return {
     data,
     apps: data.apps || [],
     section: initialSection === 'models' ? 'models' : 'features',
     rows: featureRows(data.keys),
-    customModels: [],
-    modelRows: modelRows(data.modelKeys, data.resolvedModelMeta, []),
+    discoveredCount: discovered.length,
+    modelRows: modelRows(data.modelKeys, data.resolvedModelMeta, discovered),
     pending: new Map(), // app key -> Map(feature key -> state)
     pendingModels: new Map(), // app key -> Map(modelId -> state)
     filter: {
@@ -376,7 +403,9 @@ export default async function render(ctx, header) {
     }),
     actions: view.actionsHost,
     flush: true,
-    source: `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'})`,
+    source: model.discoveredCount
+      ? `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'}) · Model Garden publisherModels`
+      : `Discovery Engine engines.list / engines.patch (${data.apiVersion || 'v1'})`,
     body: h('div', null,
       h('div', { class: 'fm-section-bar' }, view.switchHost),
       view.toolbarHost,
@@ -407,8 +436,12 @@ function paintSectionBar(ctx, model, view, repaint) {
       model.section = v;
       repaint();
     }, { label: t('Configuration section') }),
-    model.section === 'models' && isAdmin()
-      ? button({ label: t('Add model ID'), icon: 'plus', size: 'sm', onClick: () => openAddModelModal(model, repaint) })
+    model.section === 'models' && model.discoveredCount
+      ? badge(t('{n} models auto-discovered', { n: fmt.int(model.modelRows.length) }), 'info', {
+        size: 'sm',
+        dot: true,
+        title: t('Automatically discovered from Discovery Engine apps, WidgetConfig, and Google Cloud Model Garden.'),
+      })
       : null);
 
   mount(view.actionsHost,
@@ -684,7 +717,7 @@ function matrixRow(model, row, apps, admin, repaint) {
     if (row.preview) badges.push(badge(t('Preview'), 'neutral', { size: 'sm' }));
     if (row.partner) badges.push(badge(t('3P · PAYG'), 'accent', { size: 'sm', title: t('Requires pay-as-you-go usage above quota and one-time Terms of Service acceptance in Google Cloud Console.') }));
     if (row.globalOnly) badges.push(badge(t('Global'), 'neutral', { size: 'sm', title: t('Available in the global region only; regional apps display a warning before routing to global.') }));
-    if (row.undocumented) badges.push(badge(t('Custom'), 'neutral', { size: 'sm', title: t('Observed on an app or added manually.') }));
+    if (row.discovered) badges.push(badge(t('Auto-discovered'), 'neutral', { size: 'sm', title: t('Automatically discovered from Google Cloud Model Garden or active app configurations.') }));
   } else {
     if (row.restriction) badges.push(badge(t('Restriction'), 'neutral', { size: 'sm', title: t('On blocks this capability.') }));
     if (row.key === '*') badges.push(badge(t('Overrides all'), 'warning', { size: 'sm', title: t('While it is set, every other switch of the app is ignored.') }));
@@ -756,56 +789,6 @@ function copyBaseline(model, source, apps, sectionRows) {
     if (target.key === source.key) return;
     sectionRows.forEach((r) => stage(model, target, r.key, effective(model, source, r.key)));
   });
-}
-
-function openAddModelModal(model, repaint) {
-  let raw = '';
-  let errMsg = '';
-  const input = textInput({
-    placeholder: 'e.g. gemini-4-neon',
-    mono: true,
-    onInput: (v) => { raw = v; errMsg = ''; errEl.textContent = ''; errEl.hidden = true; },
-    attrs: { name: 'modelId', autocomplete: 'off', required: true, maxlength: 80 },
-  });
-  const errEl = h('p', { class: 'fm-result-error', hidden: true, role: 'alert' });
-  const form = h('form', {
-    class: 'stack',
-    onsubmit: (e) => {
-      e.preventDefault();
-      const id = raw.trim().toLowerCase();
-      if (!MODEL_ID_RE.test(id)) {
-        errMsg = t('Use 1 to 80 lowercase letters, digits, hyphens, dots or underscores.');
-        errEl.textContent = errMsg;
-        errEl.hidden = false;
-        input.focus();
-        return;
-      }
-      if (!model.customModels.includes(id)) {
-        model.customModels.push(id);
-        model.modelRows = modelRows(model.data.modelKeys, model.data.resolvedModelMeta, model.customModels);
-      }
-      modal.close();
-      repaint();
-      toast({ title: t('Model added to matrix'), text: id, tone: 'success' });
-    },
-  },
-  field({
-    label: t('Model ID'),
-    help: t('Enter the exact Discovery Engine model identifier (for example gemini-4-argon or claude-opus-5-5).'),
-    control: input,
-  }),
-  errEl);
-
-  const modal = openModal({
-    title: t('Add model ID'),
-    subtitle: t('Stage overrides for a newly released or custom model identifier'),
-    body: (el) => append(el, [form]),
-    footer: (el, dialog) => append(el, [
-      button({ label: t('Cancel'), onClick: () => dialog.close() }),
-      button({ label: t('Add to matrix'), icon: 'plus', variant: 'primary', onClick: () => form.requestSubmit() }),
-    ]),
-  });
-  setTimeout(() => input.focus(), 20);
 }
 
 /* ------------------------------------------------------------------ apply */
